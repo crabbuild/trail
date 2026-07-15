@@ -58,6 +58,7 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
 pub(crate) trait ObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>>;
     fn heartbeat(&mut self) -> Result<()> {
         Ok(())
     }
@@ -93,6 +94,10 @@ impl ObserverDurability for SegmentWriterDurability {
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
         self.writer.append(&[record])?;
         self.writer.flush_durable()
+    }
+
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
+        self.writer.rotate_if_cut(expected)
     }
 
     fn heartbeat(&mut self) -> Result<()> {
@@ -131,6 +136,7 @@ struct State {
 enum IssuedFenceKind {
     Start,
     TailAnchor,
+    RotationAnchor,
     End { start_nonce: Vec<u8> },
 }
 
@@ -196,6 +202,10 @@ struct PlannedRecord {
 
 enum DurabilityCommand {
     Record(PlannedRecord),
+    Rotate {
+        expected: DurableCut,
+        response: SyncSender<Result<Option<(DurableCut, DurableCut)>>>,
+    },
     PolicyInvalidation {
         dependency: PathBuf,
         reason: String,
@@ -234,6 +244,73 @@ struct WorkerPolicyDirectory {
 }
 
 impl LinuxInotifyObserver {
+    pub(crate) fn authenticated_cut(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<DurableCut> {
+        Ok(self.issued_fence(expected, fence)?.durable_cut)
+    }
+
+    pub(crate) fn install_rotation_anchor(
+        &self,
+        expected: &ExpectedScope,
+        end: &ObserverFence,
+        anchor_cut: DurableCut,
+    ) -> Result<ObserverFence> {
+        self.issued_fence(expected, end)?;
+        if anchor_cut.last_sequence != end.sequence {
+            return Err(reconcile_error("inotify_rotation_anchor_sequence_mismatch"));
+        }
+        let mut nonce = vec![0_u8; 24];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| Error::InvalidInput(format!("rotation anchor entropy: {error}")))?;
+        let public = ObserverFence {
+            sequence: anchor_cut.last_sequence,
+            durable_offset: anchor_cut.durable_end_offset,
+            nonce: nonce.clone(),
+        };
+        let issued = IssuedFence {
+            public: public.clone(),
+            expected: expected.clone(),
+            root_identity: self.root_identity.clone(),
+            owner_token: self.owner_token.clone(),
+            provider_id: self.provider_id.clone(),
+            provider_identity: self.provider_identity.clone(),
+            owner_fence_nonce: self.owner_fence_nonce.clone(),
+            sentinel_path: LedgerPath::parse(".trail/rotation-anchor")?,
+            create_sequence: public.sequence,
+            delete_sequence: public.sequence,
+            segment_id: anchor_cut.segment_id.clone(),
+            durable_cut: anchor_cut,
+            kind: IssuedFenceKind::RotationAnchor,
+        };
+        self.shared.lock().issued_fences.insert(nonce, issued);
+        Ok(public)
+    }
+
+    pub(crate) fn seal_after_fence(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<Option<(DurableCut, DurableCut)>> {
+        let issued = self.issued_fence(expected, fence)?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.records
+            .send(DurabilityCommand::Rotate {
+                expected: issued.durable_cut,
+                response: response_tx,
+            })
+            .map_err(|_| reconcile_error("inotify_rotation_worker_unavailable"))?;
+        match response_rx.recv_timeout(FENCE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                self.shared.revoke("inotify_rotation_timeout");
+                Err(reconcile_error("inotify_rotation_timeout"))
+            }
+        }
+    }
+
     fn rebind_tail_anchor(
         &self,
         previous: &ExpectedScope,
@@ -477,6 +554,7 @@ impl LinuxInotifyObserver {
             self.shared.revoke("inotify_fence_unknown_or_replayed");
             return Err(reconcile_error("inotify_fence_unknown_or_replayed"));
         };
+        let rotation_anchor = matches!(issued.kind, IssuedFenceKind::RotationAnchor);
         let exact = issued.public == *fence
             && issued.expected == *expected
             && issued.root_identity == self.root_identity
@@ -488,9 +566,10 @@ impl LinuxInotifyObserver {
             && issued.durable_cut.last_sequence == fence.sequence
             && issued.durable_cut.durable_end_offset == fence.durable_offset
             && issued.durable_cut.segment_id == issued.segment_id
-            && issued.create_sequence < issued.delete_sequence
-            && issued.sentinel_path.as_str()
-                == format!(".trail-observer-fence-{}", hex::encode(&fence.nonce));
+            && (rotation_anchor
+                || (issued.create_sequence < issued.delete_sequence
+                    && issued.sentinel_path.as_str()
+                        == format!(".trail-observer-fence-{}", hex::encode(&fence.nonce))));
         if !exact {
             drop(state);
             self.shared.revoke("inotify_fence_authentication_mismatch");
@@ -573,7 +652,7 @@ impl QualifiedObserver for LinuxInotifyObserver {
         let issued_start = self.issued_fence(expected, start)?;
         if !matches!(
             issued_start.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
         ) {
             self.shared
                 .revoke("inotify_reconciliation_start_not_qualified");
@@ -587,7 +666,11 @@ impl QualifiedObserver for LinuxInotifyObserver {
                 start_nonce: start.nonce.clone(),
             },
         )?;
-        if end.sequence <= start.sequence || end.durable_offset < start.durable_offset {
+        let issued_end = self.issued_fence(expected, &end)?;
+        if end.sequence <= start.sequence
+            || (issued_start.durable_cut.segment_id == issued_end.durable_cut.segment_id
+                && end.durable_offset < start.durable_offset)
+        {
             self.shared.revoke("inotify_non_monotonic_fence");
             return Err(reconcile_error("inotify_non_monotonic_fence"));
         }
@@ -654,7 +737,7 @@ impl LinuxInotifyObserver {
         let issued_end = self.issued_fence(expected, end)?;
         if !matches!(
             issued_start.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
         ) || !matches!(
             &issued_end.kind,
             IssuedFenceKind::End { start_nonce } if *start_nonce == start.nonce
@@ -1056,6 +1139,17 @@ fn run_durability_worker(
             Ok(command) => match command {
                 DurabilityCommand::Record(record) => {
                     if persist(&shared, durability.as_mut(), record.path, record.flags).is_err() {
+                        break;
+                    }
+                }
+                DurabilityCommand::Rotate { expected, response } => {
+                    let result = durability.rotate_if_cut(&expected);
+                    if let Err(error) = &result {
+                        shared.revoke(format!("inotify_rotation_failure:{error}"));
+                    }
+                    let failed = result.is_err();
+                    let _ = response.send(result);
+                    if failed {
                         break;
                     }
                 }
@@ -1562,6 +1656,17 @@ impl ObserverDurability for MemoryDurability {
         })
     }
 
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
+        let cut = DurableCut {
+            segment_id: "linux-native-test".into(),
+            durable_end_offset: self.offset,
+            last_sequence: self.offset,
+            last_hash: [0; 32],
+            provider_cursor: self.offset.to_be_bytes().to_vec(),
+        };
+        Ok((&cut == expected).then_some((cut.clone(), cut)))
+    }
+
     fn revoke_owner(&mut self, reason: &str) -> Result<()> {
         if let Some(trace) = &self.trace {
             trace
@@ -1750,6 +1855,10 @@ impl ObserverDurability for SlowDurability {
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
         thread::sleep(Duration::from_millis(2));
         self.inner.append_and_flush(record)
+    }
+
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
+        self.inner.rotate_if_cut(expected)
     }
 }
 

@@ -1969,7 +1969,7 @@ pub struct Trail {
     config: TrailConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
-    changed_path_daemon_runtime: Option<change_ledger::WorkspaceDaemonRuntime>,
+    changed_path_daemon_registry: Mutex<change_ledger::ChangedPathDaemonRegistry>,
     git_handoff_metrics: Cell<GitHandoffMetrics>,
     case_fold_index_metrics: Cell<CaseFoldIndexMetrics>,
     operation_metrics: Option<Arc<OperationMetricsState>>,
@@ -3169,6 +3169,8 @@ mod change_ledger;
 pub(crate) use change_ledger::run_command_flow;
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::run_command_long_lock_flow;
+#[cfg(debug_assertions)]
+pub(crate) use change_ledger::run_materialized_lane_snapshot_flow;
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
 #[cfg(debug_assertions)]
@@ -3223,6 +3225,12 @@ pub(crate) use change_ledger::{
 };
 mod core;
 mod lane;
+#[cfg(debug_assertions)]
+pub(crate) use lane::{
+    install_lane_record_after_c2_write_for_current_thread,
+    set_lane_record_postcommit_failure_for_current_thread,
+    set_sparse_selection_write_failure_for_current_thread,
+};
 mod merge;
 mod performance;
 mod record;

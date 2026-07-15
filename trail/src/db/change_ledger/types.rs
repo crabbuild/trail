@@ -206,6 +206,18 @@ impl EvidenceFlags {
     pub(crate) const RENAME_FROM: Self = Self(1 << 4);
     pub(crate) const RENAME_TO: Self = Self(1 << 5);
     pub(crate) const PROVIDER_COMPLETE_PREFIX: Self = Self(1 << 6);
+    /// A controlled projection path is covered by any authenticated native
+    /// mutation for that exact path. The pinned comparison after c1 proves the
+    /// final bytes/type/mode; requiring CONTENT would reject create, delete,
+    /// rename, and chmod-only producers.
+    pub(crate) const ANY_MUTATION: Self = Self(
+        Self::CREATE.0
+            | Self::CONTENT.0
+            | Self::MODE.0
+            | Self::DELETE.0
+            | Self::RENAME_FROM.0
+            | Self::RENAME_TO.0,
+    );
 
     #[cfg(test)]
     pub(crate) const fn from_index(index: u8) -> Self {

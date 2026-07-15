@@ -48,7 +48,14 @@ impl Trail {
             Some(hydrate) => hydrate,
             None => branch_has_sparse_workdir(self, &branch)?,
         };
-        let _lock = if hydrate {
+        let ledger_authority = crate::db::change_ledger::command_authority_enabled();
+        if hydrate && ledger_authority {
+            crate::db::change_ledger::materialized_lane_daemon_expected_scope(
+                self,
+                &branch.lane_id,
+            )?;
+        }
+        let _lock = if hydrate && !ledger_authority {
             Some(self.acquire_write_lock()?)
         } else {
             None
@@ -110,7 +117,7 @@ impl Trail {
         paths: &[String],
         include_neighbors: bool,
     ) -> Result<LaneWorkdirSyncReport> {
-        let _lock = self.acquire_write_lock()?;
+        // TRAIL_FS_PRODUCER: lane_sync LaneSync controlled
         validate_ref_segment(lane)?;
         let selected_paths = normalize_record_paths(paths)?;
         let path_scoped = !selected_paths.is_empty();
@@ -210,59 +217,199 @@ impl Trail {
                 "lane `{lane}` workdir has unrecorded changes; run `trail lane record {lane}` or pass `--force` to sync: {preview}{suffix}"
             )));
         }
+        let ledger_authority = crate::db::change_ledger::command_authority_enabled();
+        let marker_before = if ledger_authority && workdir_path_is_dir {
+            self.capture_materialized_lane_marker(&workdir_path)?
+        } else {
+            None
+        };
+        let expected = if ledger_authority && workdir_path_is_dir {
+            Some(
+                crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+                    self,
+                    &branch.lane_id,
+                )?,
+            )
+        } else {
+            None
+        };
         let rescue_workdir = if force && workdir_path_is_non_dir {
+            // TRAIL_FS_PRODUCER: lane_sync_rescue exempt_rescue_output exempt
             Some(self.rescue_replaced_lane_workdir_path(lane, &workdir, &workdir_path)?)
         } else if force && workdir_exists && !changed_paths.is_empty() {
             Some(self.rescue_dirty_lane_workdir(lane, &workdir, &workdir_path, &changed_paths)?)
         } else {
             None
         };
-        let mut materialization_outcome = None;
-        if path_scoped {
-            if workdir_path_is_non_dir {
-                remove_existing_lane_workdir_path(&workdir_path)?;
-            }
-            fs::create_dir_all(&workdir_path)?;
-            self.materialize_sparse_lane_workdir_paths(
-                &workdir_path,
-                &head.root_id,
-                sparse_paths.unwrap_or_default(),
-                &target_files,
-                force,
-            )?;
-        } else {
-            let target_files = if let Some(paths) = &sparse_paths {
-                self.selected_file_entries(&target_files, paths)
-            } else {
+        // A controlled interval requires a stable directory inode before the
+        // native observer is bound. A forced non-directory replacement was
+        // already copied to the explicit rescue output above.
+        if workdir_path_is_non_dir {
+            remove_existing_lane_workdir_path(&workdir_path)?;
+        }
+        fs::create_dir_all(&workdir_path)?;
+        let mut evidence_paths = changed_paths
+            .iter()
+            .flat_map(|summary| {
+                std::iter::once(summary.path.as_str()).chain(summary.old_path.as_deref())
+            })
+            .map(crate::db::change_ledger::LedgerPath::parse)
+            .collect::<Result<Vec<_>>>()?;
+        if force {
+            evidence_paths.extend(
                 target_files
-            };
-            if force || !workdir_exists {
+                    .keys()
+                    .map(|path| crate::db::change_ledger::LedgerPath::parse(path))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        evidence_paths.sort();
+        evidence_paths.dedup();
+        let evidence = crate::db::change_ledger::IntentEvidence {
+            exact_paths: evidence_paths,
+            complete_prefixes: Vec::new(),
+        };
+        let mut materialization_outcome = None;
+        let projected_target_files = if path_scoped {
+            target_files.clone()
+        } else if let Some(paths) = &sparse_paths {
+            self.selected_file_entries(&target_files, paths)
+        } else {
+            target_files.clone()
+        };
+        if ledger_authority {
+            let expected = expected.ok_or_else(|| Error::ChangeLedgerReconcileRequired {
+                scope: crate::db::change_ledger::materialized_lane_scope_id(
+                    &self.config.workspace.id.0,
+                    &branch.lane_id,
+                )
+                .to_text(),
+                state: "reconciling".into(),
+                reason: "materialized lane root must be initialized before controlled sync".into(),
+                command: format!("trail lane workdir ensure {}", branch.lane_id),
+            })?;
+            let projection_result = crate::db::change_ledger::run_projection_alignment(
+                self,
+                &expected,
+                crate::db::change_ledger::IntentProducer::LaneSync,
+                &evidence,
+                crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+                |db, intent| {
+                    crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                        db,
+                        &branch.lane_id,
+                        intent,
+                        &evidence,
+                        |db| {
+                            if path_scoped {
+                                db.materialize_sparse_lane_workdir_paths(
+                                    &workdir_path,
+                                    &head.root_id,
+                                    sparse_paths.clone().unwrap_or_default(),
+                                    &projected_target_files,
+                                    force,
+                                )?;
+                            } else if force || !workdir_exists {
+                                db.invalidate_lane_marker_if_materialized(&branch)?;
+                                materialization_outcome = db.materialize_full_lane_workdir_staged(
+                                    &workdir_path,
+                                    &head.root_id,
+                                    &projected_target_files,
+                                    sparse_paths.is_some(),
+                                    &requested_workdir_mode,
+                                )?;
+                            } else {
+                                db.invalidate_lane_marker_if_materialized(&branch)?;
+                                if !changed_paths.is_empty() {
+                                    db.materialize_files_at(
+                                        &workdir_path,
+                                        &projected_target_files,
+                                        &projected_target_files,
+                                    )?;
+                                }
+                                if sparse_paths.is_some() {
+                                    db.write_sparse_workdir_manifest(
+                                        &workdir_path,
+                                        projected_target_files.keys(),
+                                    )?;
+                                }
+                                db.write_clean_workdir_manifest(
+                                    &workdir_path,
+                                    &head.root_id,
+                                    &projected_target_files,
+                                    projected_target_files.keys(),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                        |db, policy, candidates| {
+                            let comparison = db.compare_authoritative_candidates(
+                                policy,
+                                candidates,
+                                &head.root_id,
+                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                            )?;
+                            if comparison.summaries.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(Error::ChangeLedgerReconcileRequired {
+                                    scope: expected.scope_id.to_text(),
+                                    state: "stale_baseline".into(),
+                                    reason: "lane sync pinned verification did not match its target root"
+                                        .into(),
+                                    command: format!("trail lane status {}", branch.lane_id),
+                                })
+                            }
+                        },
+                    )
+                },
+                |db| db.publish_lane_marker_if_materialized(&branch.lane_id),
+            );
+            if let Err(error) = projection_result {
+                self.restore_materialized_lane_marker(&workdir_path, marker_before.as_deref())?;
+                return Err(error);
+            }
+        } else {
+            if path_scoped {
+                self.materialize_sparse_lane_workdir_paths(
+                    &workdir_path,
+                    &head.root_id,
+                    sparse_paths.clone().unwrap_or_default(),
+                    &projected_target_files,
+                    force,
+                )?;
+            } else if force || !workdir_exists {
+                self.invalidate_lane_marker_if_materialized(&branch)?;
                 materialization_outcome = self.materialize_full_lane_workdir_staged(
                     &workdir_path,
                     &head.root_id,
-                    &target_files,
+                    &projected_target_files,
                     sparse_paths.is_some(),
                     &requested_workdir_mode,
                 )?;
             } else {
-                fs::create_dir_all(&workdir_path)?;
+                self.invalidate_lane_marker_if_materialized(&branch)?;
                 if !changed_paths.is_empty() {
                     self.materialize_files_best_effort_at(
                         &workdir_path,
-                        &target_files,
-                        &target_files,
+                        &projected_target_files,
+                        &projected_target_files,
                     )?;
                 }
                 if sparse_paths.is_some() {
-                    self.write_sparse_workdir_manifest(&workdir_path, target_files.keys())?;
+                    self.write_sparse_workdir_manifest(
+                        &workdir_path,
+                        projected_target_files.keys(),
+                    )?;
                 }
                 self.write_clean_workdir_manifest(
                     &workdir_path,
                     &head.root_id,
-                    &target_files,
-                    target_files.keys(),
+                    &projected_target_files,
+                    projected_target_files.keys(),
                 )?;
             }
+            self.publish_lane_marker_if_materialized(&branch.lane_id)?;
         }
         if let Some(outcome) = &materialization_outcome {
             self.update_lane_materialization_metadata(
@@ -385,6 +532,46 @@ impl Trail {
         sparse: bool,
         requested_mode: &LaneWorkdirMode,
     ) -> Result<Option<MaterializationOutcome>> {
+        // A registered root may already be watched by the lane observer. Keep
+        // its directory inode stable; replacing the root would silently
+        // detach inotify/FSEvents authority from subsequent writes.
+        if workdir_path.is_dir() {
+            let disk = self.scan_files_under(workdir_path)?;
+            let mut deletion_parents = BTreeSet::new();
+            for path in disk
+                .iter()
+                .map(|file| file.path.as_str())
+                .filter(|path| !target_files.contains_key(*path))
+            {
+                let absolute = safe_join(workdir_path, path)?;
+                match fs::remove_file(absolute) {
+                    Ok(()) => {
+                        if let Some(parent) = Path::new(path).parent() {
+                            deletion_parents.insert(workdir_path.join(parent));
+                        } else {
+                            deletion_parents.insert(workdir_path.to_path_buf());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::Io(error)),
+                }
+            }
+            for parent in deletion_parents {
+                File::open(parent)?.sync_all()?;
+            }
+            self.materialize_files_at(workdir_path, target_files, target_files)?;
+            File::open(workdir_path)?.sync_all()?;
+            if sparse {
+                self.write_sparse_workdir_manifest(workdir_path, target_files.keys())?;
+            }
+            self.write_clean_workdir_manifest(
+                workdir_path,
+                root_id,
+                target_files,
+                target_files.keys(),
+            )?;
+            return Ok(None);
+        }
         let parent = workdir_path.parent().ok_or_else(|| Error::InvalidPath {
             path: workdir_path.to_string_lossy().to_string(),
             reason: "workdir path has no parent".to_string(),
@@ -404,12 +591,13 @@ impl Trail {
                 let _ = fs::remove_dir_all(&replacement);
                 return Err(error);
             }
+            self.complete_materialization_operation(&outcome.materialization_operation_id)?;
             return Ok(Some(outcome));
         }
         let stage_dir = create_unique_lane_workdir_sync_stage_dir(parent, workdir_path)?;
         let result = (|| -> Result<()> {
             let empty = BTreeMap::new();
-            self.materialize_files_best_effort_at(&stage_dir, &empty, target_files)?;
+            self.materialize_files_at(&stage_dir, &empty, target_files)?;
             if sparse {
                 self.write_sparse_workdir_manifest(&stage_dir, target_files.keys())?;
             }
@@ -556,13 +744,14 @@ impl Trail {
     }
 
     pub(crate) fn hydrate_sparse_lane_workdir_paths_unlocked(
-        &self,
+        &mut self,
         lane: &str,
         branch: &LaneBranch,
         paths: &[String],
         force: bool,
         include_neighbors: bool,
     ) -> Result<Vec<String>> {
+        // TRAIL_FS_PRODUCER: sparse_hydration LaneSync controlled
         let selected_paths = normalize_record_paths(paths)?;
         if selected_paths.is_empty() {
             return Ok(Vec::new());
@@ -606,13 +795,78 @@ impl Trail {
             )));
         }
 
-        self.materialize_sparse_lane_workdir_paths(
-            &workdir_path,
-            &head.root_id,
-            sparse_paths,
-            &target_files,
-            force,
+        if !crate::db::change_ledger::command_authority_enabled() {
+            self.materialize_sparse_lane_workdir_paths(
+                &workdir_path,
+                &head.root_id,
+                sparse_paths,
+                &target_files,
+                force,
+            )?;
+            self.publish_lane_marker_if_materialized(lane)?;
+            return Ok(target_files.keys().cloned().collect());
+        }
+
+        let marker_before = self.capture_materialized_lane_marker(&workdir_path)?;
+        let expected = crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+            self,
+            &branch.lane_id,
         )?;
+        let evidence = crate::db::change_ledger::IntentEvidence {
+            exact_paths: target_files
+                .keys()
+                .map(|path| crate::db::change_ledger::LedgerPath::parse(path))
+                .collect::<Result<Vec<_>>>()?,
+            complete_prefixes: Vec::new(),
+        };
+        let projection_result = crate::db::change_ledger::run_projection_alignment(
+            self,
+            &expected,
+            crate::db::change_ledger::IntentProducer::LaneSync,
+            &evidence,
+            crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+            |db, intent| {
+                crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                    db,
+                    &branch.lane_id,
+                    intent,
+                    &evidence,
+                    |db| {
+                        db.materialize_sparse_lane_workdir_paths(
+                            &workdir_path,
+                            &head.root_id,
+                            sparse_paths,
+                            &target_files,
+                            force,
+                        )
+                    },
+                    |db, policy, candidates| {
+                        let comparison = db.compare_authoritative_candidates(
+                            policy,
+                            candidates,
+                            &head.root_id,
+                            crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                        )?;
+                        if comparison.summaries.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(Error::ChangeLedgerReconcileRequired {
+                                scope: expected.scope_id.to_text(),
+                                state: "stale_baseline".into(),
+                                reason: "sparse hydration pinned verification did not match its target root"
+                                    .into(),
+                                command: format!("trail lane status {}", branch.lane_id),
+                            })
+                        }
+                    },
+                )
+            },
+            |db| db.publish_lane_marker_if_materialized(&branch.lane_id),
+        );
+        if let Err(error) = projection_result {
+            self.restore_materialized_lane_marker(&workdir_path, marker_before.as_deref())?;
+            return Err(error);
+        }
         Ok(target_files.keys().cloned().collect())
     }
 
@@ -627,10 +881,19 @@ impl Trail {
         let write_files = self.sparse_hydration_write_files(workdir_path, target_files, force)?;
         let transaction = SparseHydrationTransaction::begin(workdir_path, write_files.keys())?;
         let result = (|| -> Result<()> {
-            self.materialize_new_files_best_effort_at_with_workspace_cow(
-                workdir_path,
-                &write_files,
-            )?;
+            // The marker is one of the transaction snapshots, so a failure in
+            // bytes or sparse-selection publication restores all three.
+            if crate::db::change_ledger::command_authority_enabled() {
+                self.invalidate_materialized_lane_marker(workdir_path)?;
+            }
+            if crate::db::change_ledger::command_authority_enabled() {
+                self.materialize_files_at(workdir_path, &BTreeMap::new(), &write_files)?;
+            } else {
+                self.materialize_new_files_best_effort_at_with_workspace_cow(
+                    workdir_path,
+                    &write_files,
+                )?;
+            }
 
             let mut materialized_paths = sparse_paths;
             materialized_paths.extend(target_files.keys().cloned());
@@ -823,7 +1086,11 @@ fn create_unique_lane_workdir_rescue_dir(rescue_root: &Path, lane: &str) -> Resu
     for _ in 0..16 {
         let candidate = rescue_root.join(format!("{lane}-{}", now_nanos()));
         match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                sync_directory_strict(&candidate)?;
+                sync_directory_strict(rescue_root)?;
+                return Ok(candidate);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(Error::Io(err)),
         }
@@ -844,7 +1111,11 @@ fn create_unique_lane_workdir_sync_stage_dir(
     for _ in 0..16 {
         let candidate = parent.join(format!(".{leaf}.trail-sync-{}", now_nanos()));
         match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                sync_directory_strict(&candidate)?;
+                sync_directory_strict(parent)?;
+                return Ok(candidate);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(Error::Io(err)),
         }
@@ -1003,7 +1274,7 @@ impl SparseHydrationTransaction {
         let backup_dir_for_cleanup = backup_dir.clone();
         let result = (|| -> Result<Self> {
             let mut paths = BTreeSet::new();
-            paths.insert(".trail/sparse-workdir.json".to_string());
+            paths.insert(".trail/sparse-selection.json".to_string());
             paths.insert(".trail/workdir-manifest.json".to_string());
             paths.extend(write_paths.into_iter().cloned());
 

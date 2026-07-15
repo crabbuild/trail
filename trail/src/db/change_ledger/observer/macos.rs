@@ -115,6 +115,7 @@ struct CoveragePlan {
 pub(crate) trait MacObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>>;
     fn heartbeat(&mut self) -> Result<()> {
         Ok(())
     }
@@ -145,6 +146,10 @@ impl MacObserverDurability for MacSegmentWriterDurability {
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
         self.writer.append(&[record])?;
         self.writer.flush_durable()
+    }
+
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
+        self.writer.rotate_if_cut(expected)
     }
 
     fn heartbeat(&mut self) -> Result<()> {
@@ -235,6 +240,7 @@ struct DurableEvent {
 enum IssuedFenceKind {
     Start,
     TailAnchor,
+    RotationAnchor,
     End { start_nonce: Vec<u8> },
 }
 
@@ -308,6 +314,10 @@ enum DurabilityCommand {
         minimum_provider_event_id: u64,
         nonce: Vec<u8>,
         response: SyncSender<Result<(ObserverFence, DurableCut, u64)>>,
+    },
+    Rotate {
+        expected: DurableCut,
+        response: SyncSender<Result<Option<(DurableCut, DurableCut)>>>,
     },
     #[cfg(debug_assertions)]
     StopForTest,
@@ -385,6 +395,73 @@ pub(crate) struct MacOsFseventsObserver {
 }
 
 impl MacOsFseventsObserver {
+    pub(crate) fn authenticated_cut(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<DurableCut> {
+        Ok(self.issued_fence(expected, fence)?.durable_cut)
+    }
+
+    pub(crate) fn install_rotation_anchor(
+        &self,
+        expected: &ExpectedScope,
+        end: &ObserverFence,
+        anchor_cut: DurableCut,
+    ) -> Result<ObserverFence> {
+        self.issued_fence(expected, end)?;
+        if anchor_cut.last_sequence != end.sequence {
+            return Err(reconcile_error(
+                "fsevents_rotation_anchor_sequence_mismatch",
+            ));
+        }
+        let mut nonce = vec![0_u8; 24];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| Error::InvalidInput(format!("rotation anchor entropy: {error}")))?;
+        let public = ObserverFence {
+            sequence: anchor_cut.last_sequence,
+            durable_offset: anchor_cut.durable_end_offset,
+            nonce: nonce.clone(),
+        };
+        let provider_event_id = self.shared.lock().last_provider_event_id;
+        self.shared.lock().issued_fences.insert(
+            nonce,
+            IssuedFence {
+                public: public.clone(),
+                expected: expected.clone(),
+                root_identity: self.root_identity.clone(),
+                owner_token: self.owner_token.clone(),
+                owner_fence_nonce: self.owner_fence_nonce.clone(),
+                provider_event_id,
+                durable_cut: anchor_cut,
+                kind: IssuedFenceKind::RotationAnchor,
+            },
+        );
+        Ok(public)
+    }
+
+    pub(crate) fn seal_after_fence(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<Option<(DurableCut, DurableCut)>> {
+        let issued = self.issued_fence(expected, fence)?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(DurabilityCommand::Rotate {
+                expected: issued.durable_cut,
+                response: response_tx,
+            })
+            .map_err(|_| reconcile_error("fsevents_rotation_worker_unavailable"))?;
+        match response_rx.recv_timeout(FENCE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                self.shared.revoke("fsevents_rotation_timeout");
+                Err(reconcile_error("fsevents_rotation_timeout"))
+            }
+        }
+    }
+
     fn rebind_tail_anchor(
         &self,
         previous: &ExpectedScope,
@@ -1223,7 +1300,7 @@ impl QualifiedObserver for MacOsFseventsObserver {
         let issued = self.issued_fence(expected, start)?;
         if !matches!(
             issued.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
         ) {
             self.shared.revoke("fsevents_start_fence_kind_mismatch");
             return Err(reconcile_error("fsevents_start_fence_kind_mismatch"));
@@ -1234,7 +1311,11 @@ impl QualifiedObserver for MacOsFseventsObserver {
                 start_nonce: start.nonce.clone(),
             },
         )?;
-        if end.sequence <= start.sequence || end.durable_offset < start.durable_offset {
+        let issued_end = self.issued_fence(expected, &end)?;
+        if end.sequence <= start.sequence
+            || (issued.durable_cut.segment_id == issued_end.durable_cut.segment_id
+                && end.durable_offset < start.durable_offset)
+        {
             self.shared.revoke("fsevents_non_monotonic_fence");
             return Err(reconcile_error("fsevents_non_monotonic_fence"));
         }
@@ -1301,7 +1382,7 @@ impl MacOsFseventsObserver {
         let issued_end = self.issued_fence(expected, end)?;
         if !matches!(
             issued_start.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
         ) || !matches!(
             &issued_end.kind,
             IssuedFenceKind::End { start_nonce } if *start_nonce == start.nonce
@@ -2291,6 +2372,18 @@ fn run_durability_worker(
                         None,
                     )
                 }
+                DurabilityCommand::Rotate { expected, response } => {
+                    let result = durability.rotate_if_cut(&expected);
+                    if let Err(error) = &result {
+                        shared.revoke(format!("fsevents_rotation_failure:{error}"));
+                    }
+                    let failed = result.is_err();
+                    let _ = response.send(result);
+                    if failed {
+                        return;
+                    }
+                    continue;
+                }
                 #[cfg(debug_assertions)]
                 DurabilityCommand::StopForTest => unreachable!(),
                 DurabilityCommand::Shutdown => unreachable!(),
@@ -2545,6 +2638,24 @@ impl MacObserverDurability for MemoryDurability {
             last_hash: [0; 32],
             provider_cursor,
         })
+    }
+
+    fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
+        let provider_cursor = self
+            .records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .last()
+            .map(|record| record.provider_cursor.clone())
+            .unwrap_or_default();
+        let cut = DurableCut {
+            segment_id: "macos-native-test".into(),
+            durable_end_offset: self.offset,
+            last_sequence: self.offset,
+            last_hash: [0; 32],
+            provider_cursor,
+        };
+        Ok((&cut == expected).then_some((cut.clone(), cut)))
     }
 
     fn revoke_owner(&mut self, _reason: &str) -> Result<()> {

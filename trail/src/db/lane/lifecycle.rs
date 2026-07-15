@@ -1,6 +1,60 @@
 use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
 
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static FAIL_SPARSE_SELECTION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_LANE_ASSOCIATION_BOUNDARY: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_sparse_selection_write_failure_for_current_thread(enabled: bool) {
+    FAIL_SPARSE_SELECTION_WRITE.with(|fail| fail.set(enabled));
+}
+
+#[cfg(debug_assertions)]
+fn fail_sparse_selection_write_if_requested() -> Result<()> {
+    if FAIL_SPARSE_SELECTION_WRITE.with(std::cell::Cell::get) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected sparse-selection publication failure",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_lane_association_failure_for_current_thread(boundary: Option<&'static str>) {
+    FAIL_LANE_ASSOCIATION_BOUNDARY.with(|selected| *selected.borrow_mut() = boundary);
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn fail_lane_association_if_requested(boundary: &'static str) -> Result<()> {
+    if FAIL_LANE_ASSOCIATION_BOUNDARY.with(|selected| *selected.borrow() == Some(boundary)) {
+        return Err(Error::InvalidInput(format!(
+            "injected lane association failure at {boundary}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn fail_lane_association_if_requested(_boundary: &'static str) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn committed_lane_step<T>(
+    operation: &str,
+    repair: &str,
+    result: Result<T>,
+) -> Result<T> {
+    result.map_err(|error| Error::CommittedRepairRequired {
+        operation: operation.to_string(),
+        repair: repair.to_string(),
+        reason: error.to_string(),
+    })
+}
+
 const LARGE_LANE_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
 
 impl Trail {
@@ -152,7 +206,13 @@ impl Trail {
         sparse_paths: &[String],
         include_neighbors: bool,
     ) -> Result<LaneSpawnReport> {
-        let _lock = self.acquire_write_lock()?;
+        // TRAIL_FS_PRODUCER: lane_spawn_materialize Materialize controlled
+        let ledger_authority = crate::db::change_ledger::command_authority_enabled();
+        let _lock = if ledger_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         validate_ref_segment(name)?;
         validate_lane_workdir_mode_request(&workdir_mode, workdir.is_some(), sparse_paths)?;
         let sparse_paths = normalize_record_paths(sparse_paths)?;
@@ -177,6 +237,7 @@ impl Trail {
             .default_backend()
             .unwrap_or(WorkdirBackend::Clone);
         let mut materialization_report = None;
+        let mut materialization_operation_id = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
             match &workdir_mode {
                 LaneWorkdirMode::FuseCow => {
@@ -194,13 +255,16 @@ impl Trail {
                     self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
                 LaneWorkdirMode::Sparse => {
-                    if let Some(report) = self.materialize_lane_workdir_at_paths_with_neighbors(
-                        &source.root_id,
-                        dir,
-                        workdir.is_some(),
-                        &sparse_paths,
-                        include_neighbors,
-                    )? {
+                    let (report, operation_id) = self
+                        .materialize_lane_workdir_at_paths_with_neighbors(
+                            &source.root_id,
+                            dir,
+                            workdir.is_some(),
+                            &sparse_paths,
+                            include_neighbors,
+                        )?;
+                    materialization_operation_id = operation_id;
+                    if let Some(report) = report {
                         workdir_backend = report.backend();
                         materialization_report = Some(report);
                     }
@@ -225,6 +289,8 @@ impl Trail {
                     )?;
                     resolved_workdir_mode = outcome.resolved_mode;
                     workdir_backend = outcome.backend;
+                    materialization_operation_id =
+                        Some(outcome.materialization_operation_id.clone());
                     materialization_report = Some(outcome.report);
                 }
                 LaneWorkdirMode::Virtual => {}
@@ -244,71 +310,197 @@ impl Trail {
             "include_neighbors": include_neighbors,
             "transparent_cow_available": transparent_cow_available
         }))?;
-        self.set_ref(
-            &ref_name,
-            &source.change_id,
-            &source.root_id,
-            &source.operation_id,
-        )?;
         let now = now_ts();
-        self.conn.execute(
-            "INSERT INTO lanes (lane_id, name, kind, provider, model, created_at, metadata_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                lane_id,
-                name,
-                "coding-lane",
-                provider,
-                model,
-                now,
-                metadata_json
-            ],
-        )?;
-        self.conn.execute(
-            "INSERT INTO lane_branches \
-             (lane_id, ref_name, base_change, head_change, base_root, head_root, session_id, workdir, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
-            params![
-                lane_id,
-                ref_name,
-                source.change_id.0,
-                source.change_id.0,
-                source.root_id.0,
-                source.root_id.0,
-                Option::<String>::None,
-                materialized_workdir,
-                now
-            ],
-        )?;
-        if workdir_mode.is_transparent_cow() {
-            let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
-                Error::Corrupt("transparent COW lane has no mountpoint".to_string())
-            })?;
-            self.create_workspace_view(
-                &lane_id,
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let association = (|| -> Result<()> {
+            self.insert_new_ref_database_only(
+                &ref_name,
                 &source.change_id,
                 &source.root_id,
-                platform_workspace_backend(&workdir_mode),
-                Path::new(mountpoint),
+                &source.operation_id,
+            )?;
+            fail_lane_association_if_requested("spawn_after_ref")?;
+            self.conn.execute(
+                "INSERT INTO lanes (lane_id, name, kind, provider, model, created_at, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![lane_id, name, "coding-lane", provider, model, now, metadata_json],
+            )?;
+            fail_lane_association_if_requested("spawn_after_lane")?;
+            self.conn.execute(
+                "INSERT INTO lane_branches \
+                 (lane_id, ref_name, base_change, head_change, base_root, head_root, session_id, workdir, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
+                params![
+                    lane_id,
+                    ref_name,
+                    source.change_id.0,
+                    source.change_id.0,
+                    source.root_id.0,
+                    source.root_id.0,
+                    Option::<String>::None,
+                    materialized_workdir,
+                    now
+                ],
+            )?;
+            fail_lane_association_if_requested("spawn_after_branch")?;
+            Ok(())
+        })();
+        match association {
+            Ok(()) => self.conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                if let Some(operation_id) = materialization_operation_id.as_deref() {
+                    self.abort_materialization_operation(operation_id)?;
+                }
+                return Err(error);
+            }
+        }
+        let committed_operation = materialization_operation_id
+            .clone()
+            .unwrap_or_else(|| source.operation_id.0.clone());
+        committed_lane_step(
+            &committed_operation,
+            "new lane ref mirror",
+            (|| {
+                fail_lane_association_if_requested("spawn_ref_repair")?;
+                self.repair_new_ref_mirror(
+                    &ref_name,
+                    &source.change_id,
+                    &source.root_id,
+                    &source.operation_id,
+                )
+            })(),
+        )?;
+        if let Some(operation_id) = materialization_operation_id.as_deref() {
+            committed_lane_step(
+                &committed_operation,
+                "new lane materialization journal completion",
+                (|| {
+                    fail_lane_association_if_requested("spawn_journal_completion")?;
+                    self.complete_materialization_operation(operation_id)
+                })(),
             )?;
         }
-        self.insert_lane_event(
-            &lane_id,
-            "lane_spawned",
-            Some(&source.change_id),
-            None,
-            &serde_json::json!({
-                "ref_name": ref_name.clone(),
-                "base_root": source.root_id.0.clone(),
-                "workdir": materialized_workdir.clone(),
-                "requested_workdir_mode": requested_workdir_mode.as_str(),
-                "workdir_mode": resolved_workdir_mode.as_str(),
-                "workdir_backend": workdir_backend.as_str(),
-                "materialization": materialization_report,
-                "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
-                "include_neighbors": include_neighbors,
-                "transparent_cow_available": transparent_cow_available
-            }),
+        committed_lane_step(
+            &committed_operation,
+            "initial lane post-association reconciliation",
+            fail_lane_association_if_requested("spawn_after_commit"),
+        )?;
+        if ledger_authority && materialized_workdir.is_some() && !workdir_mode.is_transparent_cow()
+        {
+            let expected =
+                crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+                    self, &lane_id,
+                )
+                .map_err(|error| Error::CommittedRepairRequired {
+                    operation: materialization_operation_id
+                        .clone()
+                        .unwrap_or_else(|| source.operation_id.0.clone()),
+                    repair: "initial materialized lane ledger reconciliation".into(),
+                    reason: error.to_string(),
+                })?;
+            let evidence = crate::db::change_ledger::IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: Vec::new(),
+            };
+            crate::db::change_ledger::run_projection_alignment(
+                self,
+                &expected,
+                crate::db::change_ledger::IntentProducer::Materialize,
+                &evidence,
+                crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+                |db, intent| {
+                    crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                        db,
+                        &lane_id,
+                        intent,
+                        &evidence,
+                        |_| Ok(()),
+                        |db, policy, candidates| {
+                            let comparison = db.compare_controlled_projection_target(
+                                policy,
+                                candidates,
+                                &source.root_id,
+                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                            )?;
+                            if comparison.summaries.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(Error::ChangeLedgerReconcileRequired {
+                                    scope: expected.scope_id.to_text(),
+                                    state: "stale_baseline".into(),
+                                    reason: format!(
+                                        "initial lane materialization did not match its target root: {:?}",
+                                        comparison.summaries
+                                    ),
+                                    command: format!("trail lane status {lane_id}"),
+                                })
+                            }
+                        },
+                    )
+                },
+                |db| db.publish_lane_marker_if_materialized(&lane_id),
+            )
+            .map_err(|error| Error::CommittedRepairRequired {
+                operation: materialization_operation_id
+                    .clone()
+                    .unwrap_or_else(|| source.operation_id.0.clone()),
+                repair: "initial materialized lane ledger alignment".into(),
+                reason: error.to_string(),
+            })?;
+        } else if materialized_workdir.is_some() {
+            committed_lane_step(
+                &committed_operation,
+                "initial lane marker publication",
+                (|| {
+                    fail_lane_association_if_requested("spawn_marker")?;
+                    self.publish_lane_marker_if_materialized(name)
+                })(),
+            )?;
+        }
+        if workdir_mode.is_transparent_cow() {
+            committed_lane_step(
+                &committed_operation,
+                "initial lane workspace view publication",
+                (|| {
+                    fail_lane_association_if_requested("spawn_workspace_view")?;
+                    let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
+                        Error::Corrupt("transparent COW lane has no mountpoint".to_string())
+                    })?;
+                    self.create_workspace_view(
+                        &lane_id,
+                        &source.change_id,
+                        &source.root_id,
+                        platform_workspace_backend(&workdir_mode),
+                        Path::new(mountpoint),
+                    )
+                })(),
+            )?;
+        }
+        committed_lane_step(
+            &committed_operation,
+            "initial lane event publication",
+            (|| {
+                fail_lane_association_if_requested("spawn_event")?;
+                self.insert_lane_event(
+                    &lane_id,
+                    "lane_spawned",
+                    Some(&source.change_id),
+                    None,
+                    &serde_json::json!({
+                        "ref_name": ref_name.clone(),
+                        "base_root": source.root_id.0.clone(),
+                        "workdir": materialized_workdir.clone(),
+                        "requested_workdir_mode": requested_workdir_mode.as_str(),
+                        "workdir_mode": resolved_workdir_mode.as_str(),
+                        "workdir_backend": workdir_backend.as_str(),
+                        "materialization": materialization_report,
+                        "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
+                        "include_neighbors": include_neighbors,
+                        "transparent_cow_available": transparent_cow_available
+                    }),
+                )
+            })(),
         )?;
         Ok(LaneSpawnReport {
             lane_id,
@@ -329,7 +521,13 @@ impl Trail {
         lane: &str,
         workdir: Option<PathBuf>,
     ) -> Result<LaneWorkdirReport> {
-        let _lock = self.acquire_write_lock()?;
+        // TRAIL_FS_PRODUCER: lane_ensure_materialized Materialize controlled
+        let ledger_authority = crate::db::change_ledger::command_authority_enabled();
+        let _lock = if ledger_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         if let Some(existing) = branch.workdir.clone() {
@@ -370,25 +568,130 @@ impl Trail {
             workdir.is_some(),
             MaterializationPolicy::Auto,
         )?;
-        self.update_lane_materialization_metadata(
-            &branch.lane_id,
-            &LaneWorkdirMode::Auto,
-            &outcome,
-        )?;
         let workdir = dir.to_string_lossy().to_string();
-        self.conn.execute(
-            "UPDATE lane_branches SET workdir = ?1, updated_at = ?2 WHERE lane_id = ?3",
-            params![workdir, now_ts(), branch.lane_id],
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let association = (|| -> Result<()> {
+            self.update_lane_materialization_metadata(
+                &branch.lane_id,
+                &LaneWorkdirMode::Auto,
+                &outcome,
+            )?;
+            fail_lane_association_if_requested("ensure_after_lane_metadata")?;
+            let changed = self.conn.execute(
+                "UPDATE lane_branches SET workdir = ?1, updated_at = ?2
+                 WHERE lane_id = ?3 AND workdir IS NULL AND head_root=?4",
+                params![workdir, now_ts(), branch.lane_id, head.root_id.0],
+            )?;
+            if changed != 1 {
+                return Err(Error::StaleBranch(branch.ref_name.clone()));
+            }
+            fail_lane_association_if_requested("ensure_after_branch")?;
+            Ok(())
+        })();
+        match association {
+            Ok(()) => self.conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                self.abort_materialization_operation(&outcome.materialization_operation_id)?;
+                return Err(error);
+            }
+        }
+        let committed_operation = outcome.materialization_operation_id.clone();
+        committed_lane_step(
+            &committed_operation,
+            "ensured lane materialization journal completion",
+            (|| {
+                fail_lane_association_if_requested("ensure_journal_completion")?;
+                self.complete_materialization_operation(&committed_operation)
+            })(),
         )?;
-        self.insert_lane_event(
-            &branch.lane_id,
-            "workdir_materialized",
-            Some(&head.change_id),
-            None,
-            &serde_json::json!({
-                "workdir": workdir,
-                "root_id": head.root_id.0
-            }),
+        committed_lane_step(
+            &committed_operation,
+            "ensured lane post-association reconciliation",
+            fail_lane_association_if_requested("ensure_after_commit"),
+        )?;
+        if ledger_authority {
+            let expected =
+                crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+                    self,
+                    &branch.lane_id,
+                )
+                .map_err(|error| Error::CommittedRepairRequired {
+                    operation: outcome.materialization_operation_id.clone(),
+                    repair: "ensured materialized lane ledger reconciliation".into(),
+                    reason: error.to_string(),
+                })?;
+            let evidence = crate::db::change_ledger::IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: Vec::new(),
+            };
+            crate::db::change_ledger::run_projection_alignment(
+                self,
+                &expected,
+                crate::db::change_ledger::IntentProducer::Materialize,
+                &evidence,
+                crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+                |db, intent| {
+                    crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                        db,
+                        &branch.lane_id,
+                        intent,
+                        &evidence,
+                        |_| Ok(()),
+                        |db, policy, candidates| {
+                            let comparison = db.compare_controlled_projection_target(
+                                policy,
+                                candidates,
+                                &head.root_id,
+                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                            )?;
+                            if comparison.summaries.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(Error::ChangeLedgerReconcileRequired {
+                                    scope: expected.scope_id.to_text(),
+                                    state: "stale_baseline".into(),
+                                    reason:
+                                        "ensured lane materialization did not match its target root"
+                                            .into(),
+                                    command: format!("trail lane status {}", branch.lane_id),
+                                })
+                            }
+                        },
+                    )
+                },
+                |db| db.publish_lane_marker_if_materialized(&branch.lane_id),
+            )
+            .map_err(|error| Error::CommittedRepairRequired {
+                operation: outcome.materialization_operation_id.clone(),
+                repair: "ensured materialized lane ledger alignment".into(),
+                reason: error.to_string(),
+            })?;
+        }
+        committed_lane_step(
+            &committed_operation,
+            "ensured lane event publication",
+            (|| {
+                fail_lane_association_if_requested("ensure_event")?;
+                self.insert_lane_event(
+                    &branch.lane_id,
+                    "workdir_materialized",
+                    Some(&head.change_id),
+                    None,
+                    &serde_json::json!({
+                        "workdir": workdir,
+                        "root_id": head.root_id.0
+                    }),
+                )
+            })(),
+        )?;
+        committed_lane_step(
+            &committed_operation,
+            "ensured lane marker publication",
+            (|| {
+                fail_lane_association_if_requested("ensure_marker")?;
+                self.publish_lane_marker_if_materialized(lane)
+            })(),
         )?;
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
@@ -409,53 +712,27 @@ impl Trail {
         custom_workdir: bool,
         sparse_paths: &[String],
         include_neighbors: bool,
-    ) -> Result<Option<MaterializationReport>> {
+    ) -> Result<(Option<MaterializationReport>, Option<String>)> {
         if sparse_paths.is_empty() {
-            self.materialize_lane_root_staged(
+            let outcome = self.materialize_lane_root_staged(
                 root_id,
                 dir,
                 custom_workdir,
                 MaterializationPolicy::Auto,
             )?;
-            return Ok(None);
+            return Ok((None, Some(outcome.materialization_operation_id)));
         }
-        prepare_lane_workdir(dir, custom_workdir)?;
         let files = if include_neighbors {
             self.load_root_files_for_selections_with_neighbors(root_id, sparse_paths)?
         } else {
             self.load_root_files_for_selections(root_id, sparse_paths)?
         };
-        let empty = BTreeMap::new();
-        let mut stamps = BTreeMap::new();
-        let mut report = MaterializationReport::default();
-        for (path, entry) in &files {
-            let mut cloned = false;
-            match materialize_workspace_file_cow_status_if_matching(
-                &self.workspace_root,
-                dir,
-                path,
-                entry,
-            )? {
-                WorkspaceCowMaterializeStatus::Cloned(stamp) => {
-                    stamps.insert(path.clone(), stamp);
-                    report.cloned_files += 1;
-                    report.cloned_bytes += entry.size_bytes;
-                    cloned = true;
-                }
-                WorkspaceCowMaterializeStatus::Skipped
-                | WorkspaceCowMaterializeStatus::Unavailable(_) => {}
-            }
-            if !cloned {
-                let one = BTreeMap::from([(path.clone(), entry.clone())]);
-                let materialized = self.materialize_files_at_report(dir, &empty, &one)?;
-                stamps.extend(materialized.stamps);
-                report.copied_files += 1;
-                report.copied_bytes += entry.size_bytes;
-            }
-        }
-        self.write_sparse_workdir_manifest(dir, files.keys())?;
-        self.write_clean_workdir_manifest_from_stamps(dir, root_id, &files, files.keys(), stamps)?;
-        Ok(Some(report))
+        let outcome =
+            self.materialize_sparse_lane_root_staged(root_id, dir, custom_workdir, &files)?;
+        Ok((
+            Some(outcome.report),
+            Some(outcome.materialization_operation_id),
+        ))
     }
 
     pub(crate) fn sparse_workdir_paths(&self, dir: &Path) -> Result<Option<Vec<String>>> {
@@ -688,7 +965,9 @@ impl Trail {
             "version": 1,
             "materialized_paths": normalized.into_iter().collect::<Vec<_>>()
         });
-        write_file_atomic(&manifest, &serde_json::to_vec(&body)?, false)?;
+        #[cfg(debug_assertions)]
+        fail_sparse_selection_write_if_requested()?;
+        write_file_atomic(&manifest, &serde_json::to_vec(&body)?, true)?;
         Ok(())
     }
 
@@ -920,12 +1199,138 @@ pub(crate) fn selected_file_entries(
 }
 
 fn sparse_workdir_manifest_path(dir: &Path) -> PathBuf {
-    dir.join(".trail").join("sparse-workdir.json")
+    dir.join(".trail").join("sparse-selection.json")
 }
 
 #[cfg(test)]
 mod hard_cutover_tests {
     use super::*;
+
+    static AUTHORITY_TEST: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct AuthorityReset;
+
+    impl Drop for AuthorityReset {
+        fn drop(&mut self) {
+            crate::db::set_command_authority_override(false);
+        }
+    }
+
+    fn initialized_trail() -> (tempfile::TempDir, Trail) {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        (workspace, db)
+    }
+
+    fn assert_lane_association_absent(db: &Trail, name: &str) {
+        assert!(db.try_get_ref(&lane_ref(name)).unwrap().is_none());
+        let lane_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM lanes WHERE name=?1", [name], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let branch_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM lane_branches WHERE ref_name=?1",
+                [lane_ref(name)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((lane_count, branch_count), (0, 0));
+    }
+
+    fn assert_lane_association_present(db: &Trail, name: &str) {
+        assert!(db.try_get_ref(&lane_ref(name)).unwrap().is_some());
+        assert!(db.lane_branch(name).is_ok());
+    }
+
+    fn materialization_journal_count(db: &Trail) -> usize {
+        let journal = db.db_dir.join("materialization-operations");
+        if !journal.is_dir() {
+            return 0;
+        }
+        fs::read_dir(journal)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_lane_prepare_is_marker_free_but_ordinary_prepare_repairs_marker() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_workspace, mut db) = initialized_trail();
+        let spawned = db
+            .spawn_lane("marker-free-prepare", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        let marker = workdir.join(".trail/workdir-manifest.json");
+        fs::remove_file(&marker).unwrap();
+
+        crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+            &mut db,
+            "marker-free-prepare",
+        )
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "new controlled daemon preparation wrote its watched marker"
+        );
+
+        crate::db::change_ledger::prepare_materialized_lane_daemon(
+            &db,
+            "marker-free-prepare",
+            true,
+        )
+        .unwrap();
+        let ordinary_marker_inode = fs::metadata(&marker).unwrap().ino();
+
+        crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+            &mut db,
+            "marker-free-prepare",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&marker).unwrap().ino(),
+            ordinary_marker_inode,
+            "existing controlled daemon preparation rewrote its watched marker"
+        );
+    }
+
+    #[test]
+    fn repeated_authoritative_materialized_spawn_and_record_setup_has_no_transient_repair() {
+        let _guard = AUTHORITY_TEST
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _reset = AuthorityReset;
+
+        for index in 0..4 {
+            crate::db::set_command_authority_override(false);
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(workspace.path()).unwrap();
+            crate::db::set_command_authority_override(true);
+            let lane = format!("repeated-authority-{index}");
+            let spawned = db
+                .spawn_lane(&lane, Some("main"), true, None, None)
+                .unwrap_or_else(|error| panic!("materialized spawn {index} failed: {error}"));
+            let workdir = PathBuf::from(spawned.workdir.unwrap());
+            fs::write(
+                workdir.join("README.md"),
+                format!("recorded lane contents {index}\n"),
+            )
+            .unwrap();
+            db.record_lane_workdir(&lane, Some(format!("record setup {index}")))
+                .unwrap_or_else(|error| panic!("materialized record {index} failed: {error}"));
+        }
+    }
 
     #[test]
     fn removed_cow_mode_reports_the_recreate_lifecycle() {
@@ -938,5 +1343,218 @@ mod hard_cutover_tests {
         let native_message = native_error.to_string();
         assert!(native_message.contains("renamed to `native-cow`"));
         assert!(native_message.contains("remove and recreate the lane"));
+    }
+
+    #[test]
+    fn lane_spawn_sql_association_rolls_back_at_every_boundary() {
+        for boundary in ["spawn_after_ref", "spawn_after_lane", "spawn_after_branch"] {
+            let (_workspace, mut db) = initialized_trail();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.spawn_lane("atomic-spawn", Some("main"), false, None, None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(result.is_err(), "boundary {boundary} did not fail");
+            assert_lane_association_absent(&db, "atomic-spawn");
+        }
+    }
+
+    #[test]
+    fn sparse_lane_spawn_rolls_back_publication_and_journal_at_every_sql_boundary() {
+        for boundary in ["spawn_after_ref", "spawn_after_lane", "spawn_after_branch"] {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("README.md"), "root contents").unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(workspace.path()).unwrap();
+            let destination = workspace.path().join(format!("sparse-{boundary}"));
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "atomic-sparse",
+                Some("main"),
+                LaneWorkdirMode::Sparse,
+                None,
+                None,
+                Some(destination.clone()),
+                &["README.md".to_string()],
+                false,
+            );
+            set_lane_association_failure_for_current_thread(None);
+            assert!(result.is_err(), "boundary {boundary} did not fail");
+            assert_lane_association_absent(&db, "atomic-sparse");
+            assert!(!destination.exists());
+            let journal_dir = db.db_dir.join("materialization-operations");
+            assert!(
+                !journal_dir.exists()
+                    || fs::read_dir(&journal_dir)
+                        .unwrap()
+                        .filter_map(std::result::Result::ok)
+                        .all(
+                            |entry| entry.path().extension().and_then(|ext| ext.to_str())
+                                != Some("json")
+                        )
+            );
+            drop(db);
+            Trail::open(workspace.path()).unwrap();
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn turn_lane_spawn_sql_association_rolls_back_at_every_boundary() {
+        for boundary in ["turn_after_ref", "turn_after_lane", "turn_after_branch"] {
+            let (_workspace, mut db) = initialized_trail();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.lane_branch_for_turn("atomic-turn", Some("main"), None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(result.is_err(), "boundary {boundary} did not fail");
+            assert_lane_association_absent(&db, "atomic-turn");
+        }
+    }
+
+    #[test]
+    fn lane_ensure_sql_association_rolls_back_at_every_boundary() {
+        for boundary in ["ensure_after_lane_metadata", "ensure_after_branch"] {
+            let (workspace, mut db) = initialized_trail();
+            db.spawn_lane("atomic-ensure", Some("main"), false, None, None)
+                .unwrap();
+            let before = db.lane_record("atomic-ensure").unwrap().metadata_json;
+            let destination = workspace.path().join(format!("ensure-{boundary}"));
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result =
+                db.ensure_lane_workdir_materialized("atomic-ensure", Some(destination.clone()));
+            set_lane_association_failure_for_current_thread(None);
+            assert!(result.is_err(), "boundary {boundary} did not fail");
+            let branch = db.lane_branch("atomic-ensure").unwrap();
+            assert!(branch.workdir.is_none());
+            assert_eq!(
+                db.lane_record("atomic-ensure").unwrap().metadata_json,
+                before
+            );
+            assert!(!destination.exists());
+            assert_eq!(materialization_journal_count(&db), 0);
+            drop(db);
+            Trail::open(workspace.path()).unwrap();
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn materialized_turn_spawn_rolls_back_owned_publication_at_every_boundary() {
+        for boundary in ["turn_after_ref", "turn_after_lane", "turn_after_branch"] {
+            let (_workspace, mut db) = initialized_trail();
+            db.config_set("lane.default_materialize", "true").unwrap();
+            let destination = db
+                .default_lane_workdir_path("atomic-materialized-turn")
+                .unwrap();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.lane_branch_for_turn("atomic-materialized-turn", Some("main"), None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(result.is_err(), "boundary {boundary} did not fail");
+            assert_lane_association_absent(&db, "atomic-materialized-turn");
+            assert_eq!(materialization_journal_count(&db), 0);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn post_commit_lane_failures_are_distinct_from_rolled_back_publication() {
+        let (_workspace, mut db) = initialized_trail();
+        set_lane_association_failure_for_current_thread(Some("spawn_after_commit"));
+        let spawn = db.spawn_lane("committed-spawn", Some("main"), false, None, None);
+        set_lane_association_failure_for_current_thread(None);
+        assert!(matches!(spawn, Err(Error::CommittedRepairRequired { .. })));
+        assert_lane_association_present(&db, "committed-spawn");
+
+        set_lane_association_failure_for_current_thread(Some("turn_after_commit"));
+        let turn = db.lane_branch_for_turn("committed-turn", Some("main"), None);
+        set_lane_association_failure_for_current_thread(None);
+        assert!(matches!(turn, Err(Error::CommittedRepairRequired { .. })));
+        assert_lane_association_present(&db, "committed-turn");
+
+        db.spawn_lane("committed-ensure", Some("main"), false, None, None)
+            .unwrap();
+        set_lane_association_failure_for_current_thread(Some("ensure_after_commit"));
+        let ensure = db.ensure_lane_workdir_materialized("committed-ensure", None);
+        set_lane_association_failure_for_current_thread(None);
+        assert!(matches!(ensure, Err(Error::CommittedRepairRequired { .. })));
+        assert!(db
+            .lane_branch("committed-ensure")
+            .unwrap()
+            .workdir
+            .is_some());
+    }
+
+    #[test]
+    fn all_post_commit_lane_steps_preserve_committed_repair_semantics() {
+        for boundary in ["spawn_ref_repair", "spawn_event"] {
+            let (_workspace, mut db) = initialized_trail();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.spawn_lane("committed-spawn", Some("main"), false, None, None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(
+                matches!(result, Err(Error::CommittedRepairRequired { .. })),
+                "boundary {boundary} returned {result:?}"
+            );
+            assert_lane_association_present(&db, "committed-spawn");
+        }
+
+        for boundary in ["spawn_journal_completion", "spawn_marker"] {
+            let (_workspace, mut db) = initialized_trail();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.spawn_lane("committed-spawn", Some("main"), true, None, None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(matches!(result, Err(Error::CommittedRepairRequired { .. })));
+            assert_lane_association_present(&db, "committed-spawn");
+        }
+
+        for boundary in ["ensure_journal_completion", "ensure_event", "ensure_marker"] {
+            let (_workspace, mut db) = initialized_trail();
+            db.spawn_lane("committed-ensure", Some("main"), false, None, None)
+                .unwrap();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.ensure_lane_workdir_materialized("committed-ensure", None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(matches!(result, Err(Error::CommittedRepairRequired { .. })));
+            assert!(db
+                .lane_branch("committed-ensure")
+                .unwrap()
+                .workdir
+                .is_some());
+        }
+
+        for boundary in ["turn_ref_repair", "turn_event"] {
+            let (_workspace, mut db) = initialized_trail();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.lane_branch_for_turn("committed-turn", Some("main"), None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(
+                matches!(result, Err(Error::CommittedRepairRequired { .. })),
+                "boundary {boundary} returned {result:?}"
+            );
+            assert_lane_association_present(&db, "committed-turn");
+        }
+
+        for boundary in ["turn_journal_completion", "turn_marker"] {
+            let (_workspace, mut db) = initialized_trail();
+            db.config_set("lane.default_materialize", "true").unwrap();
+            set_lane_association_failure_for_current_thread(Some(boundary));
+            let result = db.lane_branch_for_turn("committed-turn", Some("main"), None);
+            set_lane_association_failure_for_current_thread(None);
+            assert!(matches!(result, Err(Error::CommittedRepairRequired { .. })));
+            assert_lane_association_present(&db, "committed-turn");
+        }
+
+        for repair in [
+            "journal completion",
+            "marker publication",
+            "workspace view publication",
+            "event publication",
+            "ref mirror repair",
+        ] {
+            let result: Result<()> = committed_lane_step(
+                "operation_test",
+                repair,
+                Err(Error::InvalidInput("injected post-commit failure".into())),
+            );
+            assert!(matches!(result, Err(Error::CommittedRepairRequired { .. })));
+        }
     }
 }

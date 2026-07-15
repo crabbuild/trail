@@ -153,6 +153,22 @@ pub(crate) fn materialize_workspace_file_cow_status_if_matching(
     path: &str,
     entry: &FileEntry,
 ) -> Result<WorkspaceCowMaterializeStatus> {
+    materialize_workspace_file_cow_status_if_matching_with_durability(
+        workspace_root,
+        output_root,
+        path,
+        entry,
+        false,
+    )
+}
+
+pub(crate) fn materialize_workspace_file_cow_status_if_matching_with_durability(
+    workspace_root: &Path,
+    output_root: &Path,
+    path: &str,
+    entry: &FileEntry,
+    durable: bool,
+) -> Result<WorkspaceCowMaterializeStatus> {
     let source = safe_join(workspace_root, path)?;
     let destination = safe_join(output_root, path)?;
     match fs::symlink_metadata(&destination) {
@@ -164,14 +180,18 @@ pub(crate) fn materialize_workspace_file_cow_status_if_matching(
         return Ok(WorkspaceCowMaterializeStatus::Skipped);
     }
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        if durable {
+            create_dir_all_durable(parent)?;
+        } else {
+            fs::create_dir_all(parent)?;
+        }
     }
     clone_file_cow_clean(
         &source,
         &destination,
         entry.executable,
         &entry.content_hash,
-        false,
+        durable,
     )
 }
 
@@ -194,7 +214,11 @@ pub(crate) fn materialize_workspace_file_cow_status_if_stamp_matches(
         return Ok(WorkspaceCowMaterializeStatus::Skipped);
     }
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        if durable {
+            create_dir_all_durable(parent)?;
+        } else {
+            fs::create_dir_all(parent)?;
+        }
     }
     clone_file_cow_clean(
         &source,
@@ -265,7 +289,7 @@ fn clone_file_cow_clean(
                 if clean && durable {
                     sync_cloned_file(destination)?;
                     if let Some(parent) = destination.parent() {
-                        sync_directory(parent);
+                        sync_directory_strict(parent)?;
                     }
                 }
                 Ok(clean)
@@ -593,5 +617,52 @@ mod tests {
         assert!(report.is_none());
         assert!(!output.path().join("a.txt").exists());
         assert!(!output.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn durable_matching_clone_creates_nested_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let bytes = b"nested contents\n";
+        fs::create_dir_all(workspace.path().join("one/two")).unwrap();
+        fs::write(workspace.path().join("one/two/file.txt"), bytes).unwrap();
+        let entry = parallel_cow_clone_test_entry(bytes);
+
+        let _ = materialize_workspace_file_cow_status_if_matching_with_durability(
+            workspace.path(),
+            output.path(),
+            "one/two/file.txt",
+            &entry,
+            true,
+        )
+        .unwrap();
+
+        assert!(output.path().join("one/two").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_matching_clone_rejects_symlinked_directory_component() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let bytes = b"nested contents\n";
+        fs::create_dir_all(workspace.path().join("nested")).unwrap();
+        fs::write(workspace.path().join("nested/file.txt"), bytes).unwrap();
+        symlink(outside.path(), output.path().join("nested")).unwrap();
+        let entry = parallel_cow_clone_test_entry(bytes);
+
+        let result = materialize_workspace_file_cow_status_if_matching_with_durability(
+            workspace.path(),
+            output.path(),
+            "nested/file.txt",
+            &entry,
+            true,
+        );
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("file.txt").exists());
     }
 }

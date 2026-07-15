@@ -23,6 +23,12 @@ pub enum Error {
         reason: String,
         command: String,
     },
+    #[error("operation {operation} committed but {repair} repair is required: {reason}")]
+    CommittedRepairRequired {
+        operation: String,
+        repair: String,
+        reason: String,
+    },
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -99,6 +105,7 @@ impl Error {
             Error::PathIndexRequired(_) => "PATH_INDEX_REQUIRED",
             Error::SchemaReinitializeRequired { .. } => "SCHEMA_REINITIALIZE_REQUIRED",
             Error::ChangeLedgerReconcileRequired { .. } => "CHANGE_LEDGER_RECONCILE_REQUIRED",
+            Error::CommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -152,6 +159,7 @@ impl Error {
             Error::IgnoredPath(_) => 14,
             Error::SchemaReinitializeRequired { .. } => 15,
             Error::ChangeLedgerReconcileRequired { .. } => 16,
+            Error::CommittedRepairRequired { .. } => 16,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
             | Error::CloneUnsupported
@@ -238,5 +246,14 @@ mod tests {
             reconcile.to_string(),
             "changed-path ledger reconciliation required for workspace:main: observer startup failed; run `trail status`"
         );
+
+        let committed = Error::CommittedRepairRequired {
+            operation: "op-1".into(),
+            repair: "ref mirror".into(),
+            reason: "injected failure".into(),
+        };
+        assert_eq!(committed.code(), "COMMITTED_REPAIR_REQUIRED");
+        assert_eq!(committed.exit_code(), 16);
+        assert!(committed.to_string().contains("operation op-1 committed"));
     }
 }

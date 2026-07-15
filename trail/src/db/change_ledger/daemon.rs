@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
@@ -6,16 +7,17 @@ use std::path::Path;
 use std::time::Duration;
 
 use getrandom::getrandom;
-use rusqlite::{named_params, params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::FencedCandidateSnapshot;
 use super::{
     compile_policy, fold_observer_interval, raw_event_invalidates_policy, reconcile_full_with_tail,
-    BaselineIdentity, CompiledPolicy, EvidenceCut, EvidenceSource, ExpectedScope,
-    FilesystemIdentity, ObserverEvent, ObserverFence, ObserverLease, PolicyCompileContext,
-    PolicyDependencyMetrics, PolicyIdentity, ProviderCapabilities, ProviderIdentity,
-    QualifiedObserver, ScopeId, ScopeIdentity, ScopeKind, SegmentWriter,
+    BaselineIdentity, CompiledPolicy, DurableCut, EvidenceCut, EvidenceSource, ExpectedScope,
+    FilesystemIdentity, IntentEvidence, IntentId, ObserverEvent, ObserverFence, ObserverLease,
+    PersistedLogLimits, PolicyCompileContext, PolicyDependencyMetrics, PolicyIdentity,
+    ProviderCapabilities, ProviderIdentity, QualifiedFilesystemProof, QualifiedObserver,
+    RecoveryScope, ScopeId, ScopeIdentity, ScopeKind, SegmentWriter,
 };
 use crate::error::{Error, Result};
 use crate::Trail;
@@ -26,49 +28,75 @@ pub(crate) struct WorkspaceDaemonProof {
     pub(crate) cut: EvidenceCut,
 }
 
+#[derive(Default)]
+pub(crate) struct ChangedPathDaemonRegistry {
+    pub(super) workspace: Option<WorkspaceDaemonRuntime>,
+    pub(super) materialized_lanes: HashMap<String, WorkspaceDaemonRuntime>,
+}
+
+struct DaemonScopeTarget {
+    root: std::path::PathBuf,
+    identity: ScopeIdentity,
+    baseline: BaselineIdentity,
+}
+
 pub(crate) fn prepare_workspace_daemon(
-    db: &mut Trail,
+    db: &Trail,
     replace_verified_stale_owner: bool,
 ) -> Result<WorkspaceDaemonProof> {
-    if db.changed_path_daemon_runtime.is_some() {
+    if daemon_registry(db).workspace.is_some() {
         return workspace_daemon_fence(db, None, None);
     }
-    let mut runtime = WorkspaceDaemonRuntime::start(db, replace_verified_stale_owner)?;
+    let mut runtime = WorkspaceDaemonRuntime::start(
+        db,
+        workspace_daemon_target(db)?,
+        replace_verified_stale_owner,
+        false,
+    )?;
     let proof = runtime.reconcile(db, "daemon_initial_full_reconciliation")?;
-    db.changed_path_daemon_runtime = Some(runtime);
+    daemon_registry(db).workspace = Some(runtime);
     Ok(proof)
 }
 
+pub(crate) fn prepare_workspace_controlled_projection(db: &mut Trail) -> Result<ExpectedScope> {
+    prepare_workspace_daemon(db, true)?;
+    with_workspace_runtime(db, |runtime, db| {
+        runtime.fence_and_seal(db)?;
+        Ok(runtime.expected.clone())
+    })
+}
+
 pub(crate) fn workspace_daemon_fence(
-    db: &mut Trail,
+    db: &Trail,
     scope_id: Option<&str>,
     epoch: Option<u64>,
 ) -> Result<WorkspaceDaemonProof> {
-    let mut runtime = db.changed_path_daemon_runtime.take().ok_or_else(|| {
+    let mut runtime = daemon_registry(db).workspace.take().ok_or_else(|| {
         Error::DaemonUnavailable("changed-path observer runtime is unavailable".into())
     })?;
     runtime.validate_request(scope_id, epoch)?;
     let result = runtime.fence(db);
-    db.changed_path_daemon_runtime = Some(runtime);
+    daemon_registry(db).workspace = Some(runtime);
     result
 }
 
 pub(crate) fn workspace_daemon_reconcile(
-    db: &mut Trail,
+    db: &Trail,
     scope_id: Option<&str>,
     epoch: Option<u64>,
 ) -> Result<WorkspaceDaemonProof> {
-    let mut runtime = db.changed_path_daemon_runtime.take().ok_or_else(|| {
+    let mut runtime = daemon_registry(db).workspace.take().ok_or_else(|| {
         Error::DaemonUnavailable("changed-path observer runtime is unavailable".into())
     })?;
     runtime.validate_request(scope_id, epoch)?;
     let result = runtime.reconcile(db, "daemon_requested_full_reconciliation");
-    db.changed_path_daemon_runtime = Some(runtime);
+    daemon_registry(db).workspace = Some(runtime);
     result
 }
 
 pub(crate) fn workspace_daemon_ready_proof(db: &Trail) -> Result<WorkspaceDaemonProof> {
-    db.changed_path_daemon_runtime
+    daemon_registry(db)
+        .workspace
         .as_ref()
         .ok_or_else(|| {
             Error::DaemonUnavailable("changed-path observer runtime is unavailable".into())
@@ -76,7 +104,595 @@ pub(crate) fn workspace_daemon_ready_proof(db: &Trail) -> Result<WorkspaceDaemon
         .current_proof()
 }
 
+pub(crate) fn prepare_materialized_lane_daemon(
+    db: &Trail,
+    lane: &str,
+    replace_verified_stale_owner: bool,
+) -> Result<WorkspaceDaemonProof> {
+    prepare_materialized_lane_daemon_inner(db, lane, replace_verified_stale_owner, true, true)
+}
+
+pub(super) fn prepare_materialized_lane_daemon_verified_replacement(
+    db: &Trail,
+    lane: &str,
+) -> Result<WorkspaceDaemonProof> {
+    prepare_materialized_lane_daemon_inner(db, lane, true, false, false)
+}
+
+fn prepare_materialized_lane_daemon_inner(
+    db: &Trail,
+    lane: &str,
+    replace_verified_stale_owner: bool,
+    refuse_live_unverified_owner: bool,
+    publish_marker: bool,
+) -> Result<WorkspaceDaemonProof> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    if daemon_registry(db)
+        .materialized_lanes
+        .contains_key(&lane_id)
+    {
+        let proof = with_materialized_lane_runtime(db, &lane_id, |runtime, db| runtime.fence(db))?;
+        if publish_marker {
+            db.publish_lane_marker_if_materialized(&lane_id)?;
+        }
+        return Ok(proof);
+    }
+    let target = materialized_lane_daemon_target(db, &lane_id)?;
+    let mut runtime = WorkspaceDaemonRuntime::start(
+        db,
+        target,
+        replace_verified_stale_owner,
+        refuse_live_unverified_owner,
+    )?;
+    let proof = runtime.reconcile(db, "materialized_lane_initial_full_reconciliation")?;
+    daemon_registry(db)
+        .materialized_lanes
+        .insert(lane_id.clone(), runtime);
+    if publish_marker {
+        db.publish_lane_marker_if_materialized(&lane_id)?;
+    }
+    Ok(proof)
+}
+
+pub(crate) fn materialized_lane_daemon_fence(
+    db: &Trail,
+    lane: &str,
+) -> Result<WorkspaceDaemonProof> {
+    let proof = with_materialized_lane_runtime(db, lane, |runtime, db| runtime.fence(db))?;
+    db.publish_lane_marker_if_materialized(lane)?;
+    Ok(proof)
+}
+
+/// Establish an exact sidecar boundary immediately before preparing a
+/// controlled materialized-lane intent.  The returned scope's provider cursor
+/// is the start cursor of the newly-opened segment, so the subsequent intent
+/// cannot begin ambiguously in the middle of an observer segment.
+pub(crate) fn prepare_materialized_lane_controlled_projection(
+    db: &mut Trail,
+    lane: &str,
+) -> Result<ExpectedScope> {
+    // Controlled preparation must not write the marker inside the watched
+    // workdir. Such a write is native observer traffic in the fence-to-seal
+    // gap. The projection protocol repairs the marker after its terminal SQL
+    // publication through its existing repair callback.
+    prepare_materialized_lane_daemon_verified_replacement(db, lane)?;
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    let expected = with_materialized_lane_runtime(db, &lane_id, |runtime, db| {
+        runtime.fence_and_seal(db)?;
+        Ok(runtime.expected.clone())
+    })?;
+    Ok(expected)
+}
+
+pub(crate) fn materialized_lane_daemon_matches_target(db: &Trail, lane: &str) -> Result<bool> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    let registry = daemon_registry(db);
+    let Some(runtime) = registry.materialized_lanes.get(&lane_id) else {
+        return Ok(false);
+    };
+    runtime.matches_target(&materialized_lane_daemon_target(db, &lane_id)?)
+}
+
+pub(crate) fn materialized_lane_daemon_reconcile(
+    db: &Trail,
+    lane: &str,
+    reason: &str,
+) -> Result<WorkspaceDaemonProof> {
+    let proof =
+        with_materialized_lane_runtime(db, lane, |runtime, db| runtime.reconcile(db, reason))?;
+    db.publish_lane_marker_if_materialized(lane)?;
+    Ok(proof)
+}
+
+pub(crate) fn accept_materialized_lane_daemon_baseline(
+    db: &Trail,
+    lane: &str,
+    expected: &ExpectedScope,
+    target: &BaselineIdentity,
+) -> Result<()> {
+    with_materialized_lane_runtime(db, lane, |runtime, _| {
+        runtime.accept_observed_baseline(expected, target)
+    })?;
+    db.publish_lane_marker_if_materialized(lane)
+}
+
+/// Run one controlled materialized-lane filesystem interval. The intent must
+/// already be durably prepared at the runtime's retained cut. `apply_and_sync`
+/// mutates and durably syncs bytes; c1 is then fenced before `pinned_verify`
+/// compares the intended paths through descriptor-relative reads. A final c2
+/// retains every post-c1 race and the returned sidecar-backed proof is suitable
+/// for `mark_filesystem_applied`.
+pub(crate) fn with_materialized_lane_controlled_interval<A, V>(
+    db: &mut Trail,
+    lane: &str,
+    intent_id: &IntentId,
+    evidence: &IntentEvidence,
+    apply_and_sync: A,
+    pinned_verify: V,
+) -> Result<QualifiedFilesystemProof>
+where
+    A: FnOnce(&mut Trail) -> Result<()>,
+    V: FnOnce(&mut Trail, &CompiledPolicy, &super::CandidateSnapshot) -> Result<()>,
+{
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    with_controlled_interval(
+        db,
+        ControlledRuntimeKey::MaterializedLane(lane_id),
+        intent_id,
+        evidence,
+        apply_and_sync,
+        pinned_verify,
+    )
+}
+
+pub(crate) fn with_workspace_controlled_interval<A, V>(
+    db: &mut Trail,
+    intent_id: &IntentId,
+    evidence: &IntentEvidence,
+    apply_and_sync: A,
+    pinned_verify: V,
+) -> Result<QualifiedFilesystemProof>
+where
+    A: FnOnce(&mut Trail) -> Result<()>,
+    V: FnOnce(&mut Trail, &CompiledPolicy, &super::CandidateSnapshot) -> Result<()>,
+{
+    with_controlled_interval(
+        db,
+        ControlledRuntimeKey::Workspace,
+        intent_id,
+        evidence,
+        apply_and_sync,
+        pinned_verify,
+    )
+}
+
+#[derive(Clone)]
+enum ControlledRuntimeKey {
+    Workspace,
+    MaterializedLane(String),
+}
+
+fn with_controlled_interval<A, V>(
+    db: &mut Trail,
+    runtime_key: ControlledRuntimeKey,
+    intent_id: &IntentId,
+    evidence: &IntentEvidence,
+    apply_and_sync: A,
+    pinned_verify: V,
+) -> Result<QualifiedFilesystemProof>
+where
+    A: FnOnce(&mut Trail) -> Result<()>,
+    V: FnOnce(&mut Trail, &CompiledPolicy, &super::CandidateSnapshot) -> Result<()>,
+{
+    // Establish/recover the exact lane scope before inspecting the prepared
+    // intent. A no-op snapshot supplies the authenticated retained c1 cut; it
+    // must happen before prepare_intent, so callers normally invoke this only
+    // after an earlier status/producer preparation fence.
+    ensure_controlled_runtime(db, &runtime_key)?;
+    let command = controlled_status_command(&runtime_key);
+    let expected = {
+        let registry = daemon_registry(db);
+        controlled_runtime(&registry, &runtime_key)
+            .ok_or_else(|| Error::DaemonUnavailable("lane runtime disappeared".into()))?
+            .expected
+            .clone()
+    };
+    let (intent_scope, expected_root_id, start_cursor): (String, String, Option<Vec<u8>>) =
+        db.conn.query_row(
+            "SELECT scope_id,expected_root_id,start_cursor FROM changed_path_intents
+             WHERE intent_id=?1 AND lifecycle_state='prepared'",
+            [&intent_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if intent_scope != expected.scope_id.to_text() {
+        return Err(Error::Conflict(format!(
+            "intent `{}` belongs to a different changed-path scope",
+            intent_id.0
+        )));
+    }
+    apply_and_sync(db)?;
+    if !controlled_runtime_matches_target(db, &runtime_key)? {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "stale_baseline".into(),
+            reason: "controlled lane projection replaced or rebound the pinned root".into(),
+            command: command.clone(),
+        });
+    }
+    // c1 closes the controlled write interval before any comparison. An
+    // external same-path write after this fence can never be acknowledged by
+    // the intent, even if it races the pinned verification below.
+    let c1 =
+        with_controlled_runtime(db, &runtime_key, |runtime, db| runtime.fence_and_seal(db))?.cut;
+    let (policy, mut candidates) = {
+        let registry = daemon_registry(db);
+        let runtime = controlled_runtime(&registry, &runtime_key)
+            .ok_or_else(|| Error::DaemonUnavailable("lane runtime disappeared".into()))?;
+        (
+            runtime.policy.clone(),
+            db.changed_path_ledger()
+                .snapshot_candidates_for_controlled_intent(
+                    &runtime.expected,
+                    &intent_id.0,
+                    start_cursor.as_deref(),
+                )?,
+        )
+    };
+    candidates.cut = c1.clone();
+    let sparse_selection = match &runtime_key {
+        ControlledRuntimeKey::Workspace => None,
+        ControlledRuntimeKey::MaterializedLane(lane) => {
+            db.filter_controlled_lane_sparse_candidates(lane, &policy, &mut candidates)?
+        }
+    };
+    pinned_verify(db, &policy, &candidates)?;
+    if !controlled_runtime_matches_target(db, &runtime_key)? {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "stale_baseline".into(),
+            reason: "controlled lane verification lost its pinned root".into(),
+            command: command.clone(),
+        });
+    }
+    // c2 closes the post-c1 comparison interval without another rotation.
+    // c1 already sealed the controlled segment and advanced to a fresh
+    // anchor; this ordinary fence leaves the scope exactly at publication_cut
+    // while every event in (c1,c2] remains pending.
+    let c2 = with_controlled_runtime(db, &runtime_key, |runtime, db| runtime.fence(db))?.cut;
+    if let ControlledRuntimeKey::MaterializedLane(lane) = &runtime_key {
+        let branch = db.lane_branch(lane)?;
+        let workdir = std::path::PathBuf::from(branch.workdir.as_deref().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "lane `{}` does not have a materialized workdir",
+                branch.lane_id
+            ))
+        })?);
+        if db.authenticated_lane_sparse_selection(&workdir)? != sparse_selection {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: expected.scope_id.to_text(),
+                state: "stale_baseline".into(),
+                reason: "sparse lane selection changed during controlled projection".into(),
+                command: command.clone(),
+            });
+        }
+    }
+
+    let (
+        scope_root_identity,
+        filesystem_identity,
+        provider_id,
+        provider_identity,
+        owner_token,
+        fence_nonce,
+        max_log_bytes,
+        max_segment_bytes,
+        max_tail_records,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+        i64,
+    ) = db.conn.query_row(
+        "SELECT scope.scope_root_identity,scope.filesystem_identity,
+                scope.provider_id,scope.provider_identity,owner.owner_token,owner.fence_nonce,
+                scope.max_observer_log_bytes,scope.max_segment_bytes,
+                scope.max_unfolded_tail_records
+         FROM changed_path_scopes scope
+         JOIN changed_path_observer_owners owner
+           ON owner.scope_id=scope.scope_id AND owner.epoch=scope.epoch
+         WHERE scope.scope_id=?1 AND scope.epoch=?2 AND scope.trust_state='trusted'
+           AND owner.lease_state='active' AND owner.error_state IS NULL
+           AND owner.expires_at>strftime('%s','now')",
+        params![
+            expected.scope_id.to_text(),
+            i64::try_from(expected.epoch)
+                .map_err(|_| Error::InvalidInput("lane epoch overflow".into()))?
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    let owner_bytes: [u8; 32] = hex::decode(&owner_token)
+        .map_err(|_| Error::Corrupt("invalid lane observer owner token".into()))?
+        .try_into()
+        .map_err(|_| Error::Corrupt("invalid lane observer owner token length".into()))?;
+    let trail_directory = super::secure_fs::SecureDirectory::open_absolute(&db.db_dir)?;
+    let observer_directory = trail_directory.open_dir("observer-segments")?;
+    let secure_segment_directory = observer_directory.open_dir(&expected.scope_id.to_text())?;
+    let recovery_scope = RecoveryScope {
+        scope_id: expected.scope_id,
+        epoch: expected.epoch,
+        owner_token: owner_bytes,
+    };
+    let limits = PersistedLogLimits {
+        max_log_bytes: u64::try_from(max_log_bytes)
+            .map_err(|_| Error::Corrupt("negative observer log limit".into()))?,
+        max_segment_bytes: u64::try_from(max_segment_bytes)
+            .map_err(|_| Error::Corrupt("negative observer segment limit".into()))?,
+        max_unfolded_tail_records: usize::try_from(max_tail_records)
+            .map_err(|_| Error::Corrupt("invalid observer tail limit".into()))?,
+    };
+    let mut recovered = None;
+    for attempt in 0..16 {
+        let candidate = super::recover_segments_from_directory(
+            &db.sqlite_path,
+            &secure_segment_directory,
+            &recovery_scope,
+            limits,
+        )
+        .map_err(|error| Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: format!("controlled interval sidecar authentication failed: {error}"),
+            command: command.clone(),
+        })?;
+        if !candidate.requires_reconciliation || attempt == 15 {
+            recovered = Some(candidate);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let recovered = recovered.ok_or_else(|| {
+        Error::Corrupt("controlled interval sidecar recovery did not produce a result".into())
+    })?;
+    if recovered.requires_reconciliation {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "controlled interval sidecar chain requires reconciliation".into(),
+            command: command.clone(),
+        });
+    }
+    let segment = recovered
+        .segments
+        .iter()
+        .find(|segment| {
+            segment.state == "sealed"
+                && segment.last_sequence == c1.sequence
+                && segment.durable_end_offset == c1.durable_offset
+                && segment.folded_end_offset >= c1.folded_offset
+                && Some(segment.start_cursor.as_slice()) == start_cursor.as_deref()
+        })
+        .ok_or_else(|| Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "prepared intent cut does not start the authenticated controlled interval"
+                .into(),
+            command,
+        })?;
+    Ok(QualifiedFilesystemProof {
+        scope_id: expected.scope_id,
+        epoch: expected.epoch,
+        expected_root_id: crate::ObjectId(expected_root_id),
+        scope_root_identity: hex::decode(scope_root_identity)
+            .map_err(|_| Error::Corrupt("invalid lane scope root identity".into()))?,
+        filesystem_identity: hex::decode(filesystem_identity)
+            .map_err(|_| Error::Corrupt("invalid lane filesystem identity".into()))?,
+        provider_id,
+        provider_identity: hex::decode(provider_identity)
+            .map_err(|_| Error::Corrupt("invalid lane provider identity".into()))?,
+        observer_owner_token: owner_token,
+        owner_fence_nonce: fence_nonce,
+        durable_segment_id: segment.segment_id.clone(),
+        durable_segment_hash: segment.segment_hash,
+        segment_directory: format!("observer-segments/{}", expected.scope_id.to_text()),
+        segment_path: segment.segment_path.clone(),
+        start_cursor,
+        end_cursor: segment.end_cursor.clone(),
+        start_sequence: segment.first_sequence,
+        end_cut: c1.clone(),
+        publication_cut: c2,
+        segment_durable_offset: c1.durable_offset,
+        segment_folded_offset: c1.folded_offset,
+        verified_paths: evidence.exact_paths.len().try_into().unwrap_or(u64::MAX),
+        verified_prefixes: evidence
+            .complete_prefixes
+            .len()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        complete_root_interval: true,
+        complete_policy_interval: true,
+        persisted_evidence_through_end: true,
+    })
+}
+
+pub(crate) fn materialized_lane_daemon_ready_proof(
+    db: &Trail,
+    lane: &str,
+) -> Result<WorkspaceDaemonProof> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    daemon_registry(db)
+        .materialized_lanes
+        .get(&lane_id)
+        .ok_or_else(|| {
+            Error::DaemonUnavailable(format!(
+                "changed-path observer runtime for materialized lane `{lane_id}` is unavailable"
+            ))
+        })?
+        .current_proof()
+}
+
+pub(crate) fn materialized_lane_daemon_marker_cut(
+    db: &Trail,
+    lane: &str,
+) -> Result<Option<(EvidenceCut, String)>> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    let registry = daemon_registry(db);
+    let Some(runtime) = registry.materialized_lanes.get(&lane_id) else {
+        return Ok(None);
+    };
+    let proof = runtime.current_proof()?;
+    let anchor = runtime.tail_anchor.as_ref().ok_or_else(|| {
+        Error::DaemonUnavailable("lane runtime has no authenticated marker anchor".into())
+    })?;
+    let durable = runtime
+        .observer
+        .authenticated_cut(&runtime.expected, anchor)?;
+    if durable.last_sequence != proof.cut.sequence
+        || durable.durable_end_offset != proof.cut.durable_offset
+    {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: runtime.expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "lane marker runtime cut lost its exact sidecar boundary".into(),
+            command: format!("trail lane status {lane_id}"),
+        });
+    }
+    Ok(Some((proof.cut, durable.segment_id)))
+}
+
+pub(crate) fn materialized_lane_daemon_expected_scope(
+    db: &Trail,
+    lane: &str,
+) -> Result<ExpectedScope> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    if !daemon_registry(db)
+        .materialized_lanes
+        .contains_key(&lane_id)
+    {
+        prepare_materialized_lane_daemon(db, &lane_id, true)?;
+    }
+    daemon_registry(db)
+        .materialized_lanes
+        .get(&lane_id)
+        .map(|runtime| runtime.expected.clone())
+        .ok_or_else(|| Error::DaemonUnavailable("lane runtime disappeared".into()))
+}
+
+fn with_materialized_lane_runtime<T>(
+    db: &Trail,
+    lane: &str,
+    operation: impl FnOnce(&mut WorkspaceDaemonRuntime, &Trail) -> Result<T>,
+) -> Result<T> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    let mut runtime = daemon_registry(db)
+        .materialized_lanes
+        .remove(&lane_id)
+        .ok_or_else(|| {
+            Error::DaemonUnavailable(format!(
+                "changed-path observer runtime for materialized lane `{lane_id}` is unavailable"
+            ))
+        })?;
+    let result = operation(&mut runtime, db);
+    daemon_registry(db)
+        .materialized_lanes
+        .insert(lane_id, runtime);
+    result
+}
+
+fn with_workspace_runtime<T>(
+    db: &Trail,
+    operation: impl FnOnce(&mut WorkspaceDaemonRuntime, &Trail) -> Result<T>,
+) -> Result<T> {
+    let mut runtime = daemon_registry(db).workspace.take().ok_or_else(|| {
+        Error::DaemonUnavailable("changed-path workspace runtime is unavailable".into())
+    })?;
+    let result = operation(&mut runtime, db);
+    daemon_registry(db).workspace = Some(runtime);
+    result
+}
+
+fn controlled_runtime<'a>(
+    registry: &'a ChangedPathDaemonRegistry,
+    key: &ControlledRuntimeKey,
+) -> Option<&'a WorkspaceDaemonRuntime> {
+    match key {
+        ControlledRuntimeKey::Workspace => registry.workspace.as_ref(),
+        ControlledRuntimeKey::MaterializedLane(lane) => registry.materialized_lanes.get(lane),
+    }
+}
+
+fn with_controlled_runtime<T>(
+    db: &Trail,
+    key: &ControlledRuntimeKey,
+    operation: impl FnOnce(&mut WorkspaceDaemonRuntime, &Trail) -> Result<T>,
+) -> Result<T> {
+    match key {
+        ControlledRuntimeKey::Workspace => with_workspace_runtime(db, operation),
+        ControlledRuntimeKey::MaterializedLane(lane) => {
+            with_materialized_lane_runtime(db, lane, operation)
+        }
+    }
+}
+
+fn ensure_controlled_runtime(db: &Trail, key: &ControlledRuntimeKey) -> Result<()> {
+    match key {
+        ControlledRuntimeKey::Workspace => {
+            if daemon_registry(db).workspace.is_none() {
+                prepare_workspace_daemon(db, true)?;
+            }
+        }
+        ControlledRuntimeKey::MaterializedLane(lane) => {
+            if !daemon_registry(db).materialized_lanes.contains_key(lane) {
+                prepare_materialized_lane_daemon(db, lane, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn controlled_runtime_matches_target(db: &Trail, key: &ControlledRuntimeKey) -> Result<bool> {
+    let registry = daemon_registry(db);
+    let Some(runtime) = controlled_runtime(&registry, key) else {
+        return Ok(false);
+    };
+    let target = match key {
+        ControlledRuntimeKey::Workspace => workspace_daemon_target(db)?,
+        ControlledRuntimeKey::MaterializedLane(lane) => materialized_lane_daemon_target(db, lane)?,
+    };
+    runtime.matches_target(&target)
+}
+
+fn controlled_status_command(key: &ControlledRuntimeKey) -> String {
+    match key {
+        ControlledRuntimeKey::Workspace => "trail status".into(),
+        ControlledRuntimeKey::MaterializedLane(lane) => format!("trail lane status {lane}"),
+    }
+}
+
+fn daemon_registry(db: &Trail) -> std::sync::MutexGuard<'_, ChangedPathDaemonRegistry> {
+    db.changed_path_daemon_registry
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 pub(crate) struct WorkspaceDaemonRuntime {
+    root: std::path::PathBuf,
     expected: ExpectedScope,
     policy: CompiledPolicy,
     observer: PlatformObserver,
@@ -85,22 +701,23 @@ pub(crate) struct WorkspaceDaemonRuntime {
 }
 
 impl WorkspaceDaemonRuntime {
-    fn start(db: &Trail, replace_verified_stale_owner: bool) -> Result<Self> {
-        let branch = db.current_branch()?;
-        let head = db.resolve_branch_ref(&branch)?;
-        let scope_id = workspace_scope_id(db);
+    fn start(
+        db: &Trail,
+        target: DaemonScopeTarget,
+        replace_verified_stale_owner: bool,
+        refuse_live_unverified_owner: bool,
+    ) -> Result<Self> {
+        let DaemonScopeTarget {
+            root: scope_root,
+            identity: scope_identity,
+            baseline,
+        } = target;
+        let scope_id = scope_identity.scope_id;
         let segment_directory = db.db_dir.join("observer-segments").join(scope_id.to_text());
         fs::create_dir_all(&segment_directory)?;
-        let filesystem_identity = root_identity(db.workspace_root())?;
+        let filesystem_identity = root_identity(&scope_root)?;
         let provider_identity = platform_provider_identity();
         let capabilities = platform_capabilities();
-        let baseline = BaselineIdentity {
-            ref_name: head.name,
-            ref_generation: u64::try_from(head.generation)
-                .map_err(|_| Error::Corrupt("negative daemon ref generation".into()))?,
-            change_id: head.change_id,
-            root_id: head.root_id,
-        };
         let ledger = db.changed_path_ledger();
         let existing = load_existing_scope(db, scope_id)?;
         #[cfg(debug_assertions)]
@@ -110,11 +727,7 @@ impl WorkspaceDaemonRuntime {
         let (epoch, mut resume_cursor) = match existing {
             None => {
                 ledger.begin_scope(
-                    &ScopeIdentity {
-                        scope_id,
-                        kind: ScopeKind::Workspace,
-                        owner_id: db.config.workspace.id.0.clone(),
-                    },
+                    &scope_identity,
                     &baseline,
                     &PolicyIdentity {
                         fingerprint: [0; 32],
@@ -169,6 +782,18 @@ impl WorkspaceDaemonRuntime {
                             .into(),
                     ));
                 }
+                if refuse_live_unverified_owner
+                    && stored.observer_owner.as_ref().is_some_and(|owner| {
+                        owner.lease_state == "active"
+                            && owner.error_state.is_none()
+                            && owner.expires_at > crate::db::util::now_ts()
+                    })
+                {
+                    return Err(Error::DaemonUnavailable(
+                        "materialized-lane observer owner is still live; refusing unverified authority replacement"
+                            .into(),
+                    ));
+                }
                 let old_epoch = stored.epoch;
                 let next = old_epoch.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("changed-path daemon scope epoch overflow".into())
@@ -188,7 +813,7 @@ impl WorkspaceDaemonRuntime {
                             && (provider_binding_matches_loaded_scope
                                 || provider_binding_is_verified_drift_target)
                     }
-                    None => stored.observer_owner_token.is_none(),
+                    None => stored.observer_owner_token.is_none() || !refuse_live_unverified_owner,
                 };
                 if !owner_authority_consistent {
                     return Err(daemon_owner_authority_inconsistent(scope_id));
@@ -417,7 +1042,7 @@ impl WorkspaceDaemonRuntime {
             &db.conn,
             &expected,
             &PolicyCompileContext {
-                workspace_root: &db.workspace_root,
+                workspace_root: &scope_root,
                 db_dir: &db.db_dir,
                 recording: &db.config.recording,
                 case_sensitive: true,
@@ -508,7 +1133,7 @@ impl WorkspaceDaemonRuntime {
             Duration::from_secs(30),
         )?;
         let observer = PlatformObserver::start(
-            db.workspace_root(),
+            &scope_root,
             writer,
             expected.provider_identity.clone(),
             fence_nonce.to_vec(),
@@ -521,7 +1146,7 @@ impl WorkspaceDaemonRuntime {
             &db.conn,
             &expected,
             &PolicyCompileContext {
-                workspace_root: &db.workspace_root,
+                workspace_root: &scope_root,
                 db_dir: &db.db_dir,
                 recording: &db.config.recording,
                 case_sensitive: true,
@@ -549,12 +1174,22 @@ impl WorkspaceDaemonRuntime {
         policy = verified_policy;
         policy.authorize_native_reconciliation(&expected, &lease)?;
         Ok(Self {
+            root: scope_root,
             expected,
             policy,
             observer,
             tail_anchor: None,
             last_cut: None,
         })
+    }
+
+    fn matches_target(&self, target: &DaemonScopeTarget) -> Result<bool> {
+        Ok(self.root == target.root
+            && self.expected.scope_id == target.identity.scope_id
+            && self.expected.ref_name == target.baseline.ref_name
+            && self.expected.ref_generation == target.baseline.ref_generation
+            && self.expected.baseline_root == target.baseline.root_id
+            && self.expected.filesystem_identity == root_identity(&target.root)?)
     }
 
     fn validate_request(&self, scope_id: Option<&str>, epoch: Option<u64>) -> Result<()> {
@@ -639,6 +1274,30 @@ impl WorkspaceDaemonRuntime {
             &mut qualification,
             &events,
         )?;
+        let authenticated_end = self.observer.authenticated_cut(&self.expected, &fence)?;
+        let cursor_changed = db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,updated_at=?2
+             WHERE scope_id=?3 AND epoch=?4 AND durable_offset=?5 AND folded_offset=?5
+               AND observer_owner_token=?6 AND trust_state='trusted'",
+            params![
+                authenticated_end.provider_cursor,
+                crate::db::util::now_ts(),
+                self.expected.scope_id.to_text(),
+                i64::try_from(self.expected.epoch)
+                    .map_err(|_| Error::InvalidInput("observer epoch overflow".into()))?,
+                i64::try_from(fence.durable_offset)
+                    .map_err(|_| Error::InvalidInput("observer fence offset overflow".into()))?,
+                lease.owner_token,
+            ],
+        )?;
+        if cursor_changed != 1 {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: self.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "continuous observer cursor lost its exact scope CAS".into(),
+                command: "trail status".into(),
+            });
+        }
         db.note_operation_metrics(crate::db::OperationMetricsDelta {
             observer_tail_record_fold_count: events.len().try_into().unwrap_or(u64::MAX),
             ledger_row_touch_count: events.len().try_into().unwrap_or(u64::MAX),
@@ -651,6 +1310,167 @@ impl WorkspaceDaemonRuntime {
             epoch: self.expected.epoch,
             cut,
         })
+    }
+
+    /// Fence, fold, and seal an exact observer segment boundary.  A native
+    /// event may be queued after the filesystem fence but before the rotate
+    /// command reaches the single durability worker.  In that case the sealed
+    /// cut is later than the folded fence, so retry from the retained anchor;
+    /// no event is acknowledged or lost across the segment switch.
+    fn fence_and_seal(&mut self, db: &Trail) -> Result<WorkspaceDaemonProof> {
+        // A newly materialized lane can still have a finite burst of native
+        // events queued behind its initial metadata writes. Give that backlog
+        // a short bounded interval to drain instead of spinning through a few
+        // immediate fence/rotate mismatches and reporting a repair failure.
+        const MAX_SEAL_ATTEMPTS: usize = 32;
+        for attempt in 0..MAX_SEAL_ATTEMPTS {
+            let proof = self.fence(db)?;
+            let sealed = self.observer.seal_after_fence(
+                &self.expected,
+                self.tail_anchor.as_ref().ok_or_else(|| {
+                    Error::DaemonUnavailable("sealed fence lost its retained anchor".into())
+                })?,
+            )?;
+            if let Some((sealed, anchor_cut)) = sealed {
+                if sealed.last_sequence == proof.cut.sequence
+                    && sealed.durable_end_offset == proof.cut.durable_offset
+                {
+                    let end = self.tail_anchor.clone().ok_or_else(|| {
+                        Error::DaemonUnavailable("sealed fence lost its end anchor".into())
+                    })?;
+                    let anchor = self.observer.install_rotation_anchor(
+                        &self.expected,
+                        &end,
+                        anchor_cut.clone(),
+                    )?;
+                    self.advance_rotation_anchor(db, &sealed, &anchor_cut)?;
+                    self.tail_anchor = Some(anchor);
+                    self.last_cut = Some(EvidenceCut {
+                        source: EvidenceSource::Observer,
+                        sequence: anchor_cut.last_sequence,
+                        durable_offset: anchor_cut.durable_end_offset,
+                        folded_offset: anchor_cut.durable_end_offset,
+                    });
+                    return Ok(proof);
+                }
+            }
+            if attempt + 1 < MAX_SEAL_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Err(Error::ChangeLedgerReconcileRequired {
+            scope: self.expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "observer traffic prevented an exact controlled segment boundary".into(),
+            command: "trail lane status".into(),
+        })
+    }
+
+    fn advance_rotation_anchor(
+        &self,
+        db: &Trail,
+        sealed: &DurableCut,
+        anchor: &DurableCut,
+    ) -> Result<()> {
+        if sealed.last_sequence != anchor.last_sequence
+            || sealed.provider_cursor != anchor.provider_cursor
+            || sealed.segment_id == anchor.segment_id
+        {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: self.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "observer rotation did not preserve an exact linked anchor".into(),
+                command: "trail status".into(),
+            });
+        }
+        let tx = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate)?;
+        let owner = self.observer.lease()?.owner_token;
+        let now = crate::db::util::now_ts();
+        let anchor_offset = i64::try_from(anchor.durable_end_offset)
+            .map_err(|_| Error::InvalidInput("rotation anchor offset overflow".into()))?;
+        let sealed_offset = i64::try_from(sealed.durable_end_offset)
+            .map_err(|_| Error::InvalidInput("sealed offset overflow".into()))?;
+        let epoch = i64::try_from(self.expected.epoch)
+            .map_err(|_| Error::InvalidInput("rotation epoch overflow".into()))?;
+        let sealed_segment_hash: String = tx.query_row(
+            "SELECT segment_hash FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3 AND owner_token=?4
+               AND COALESCE(last_sequence,0)=?5 AND durable_end_offset=?6 AND state='sealed'
+               AND segment_hash IS NOT NULL",
+            params![
+                self.expected.scope_id.to_text(),
+                epoch,
+                sealed.segment_id,
+                owner,
+                i64::try_from(sealed.last_sequence)
+                    .map_err(|_| Error::InvalidInput("sealed sequence overflow".into()))?,
+                sealed_offset,
+            ],
+            |row| row.get(0),
+        )?;
+        let segment_changed = tx.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=?1,updated_at=?2
+             WHERE scope_id=?3 AND epoch=?4 AND segment_id=?5 AND owner_token=?6
+               AND previous_segment_id=?7 AND previous_segment_hash=?8
+               AND durable_end_offset>=?1 AND folded_end_offset=0 AND state='open'",
+            params![
+                anchor_offset,
+                now,
+                self.expected.scope_id.to_text(),
+                epoch,
+                anchor.segment_id,
+                owner,
+                sealed.segment_id,
+                sealed_segment_hash,
+            ],
+        )?;
+        let scope_changed = tx.execute(
+            "UPDATE changed_path_scopes SET durable_offset=?1,folded_offset=?1,
+                    provider_cursor=?2,trust_reason='observer_rotation_anchor',updated_at=?3
+             WHERE scope_id=?4 AND epoch=?5 AND durable_offset=?6 AND folded_offset=?6
+               AND observer_owner_token=?7 AND trust_state='trusted'",
+            params![
+                anchor_offset,
+                anchor.provider_cursor,
+                now,
+                self.expected.scope_id.to_text(),
+                epoch,
+                sealed_offset,
+                owner,
+            ],
+        )?;
+        if segment_changed != 1 || scope_changed != 1 {
+            let segment_state: Option<(i64, i64, Option<String>, Option<String>, String, String)> =
+                tx.query_row(
+                    "SELECT durable_end_offset,folded_end_offset,previous_segment_id,
+                            previous_segment_hash,state,owner_token
+                     FROM changed_path_observer_segments
+                     WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3",
+                    params![self.expected.scope_id.to_text(), epoch, anchor.segment_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: self.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: format!(
+                    "observer rotation anchor lost its exact sidecar CAS (segment={segment_changed}, scope={scope_changed}, expected_anchor_offset={anchor_offset}, expected_previous_id={}, expected_previous_hash={sealed_segment_hash}, actual={segment_state:?})",
+                    sealed.segment_id,
+                ),
+                command: "trail status".into(),
+            });
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn current_proof(&self) -> Result<WorkspaceDaemonProof> {
@@ -740,6 +1560,17 @@ impl WorkspaceDaemonRuntime {
         expected: &ExpectedScope,
         target: &BaselineIdentity,
     ) -> Result<()> {
+        // Post-commit repair may be retried after a caller loses the result.
+        // Treat an already-rebound runtime as success, while still rejecting a
+        // different target or scope.
+        if self.expected.scope_id == expected.scope_id
+            && self.expected.epoch == expected.epoch
+            && self.expected.ref_name == target.ref_name
+            && self.expected.ref_generation == target.ref_generation
+            && self.expected.baseline_root == target.root_id
+        {
+            return Ok(());
+        }
         if self.expected != *expected
             || self
                 .last_cut
@@ -869,6 +1700,46 @@ impl PlatformObserver {
             Self::MacOs(observer) => observer.lease(),
         }
     }
+
+    fn seal_after_fence(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<Option<(DurableCut, DurableCut)>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.seal_after_fence(expected, fence),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.seal_after_fence(expected, fence),
+        }
+    }
+
+    fn install_rotation_anchor(
+        &self,
+        expected: &ExpectedScope,
+        end: &ObserverFence,
+        anchor: DurableCut,
+    ) -> Result<ObserverFence> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.install_rotation_anchor(expected, end, anchor),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.install_rotation_anchor(expected, end, anchor),
+        }
+    }
+
+    fn authenticated_cut(
+        &self,
+        expected: &ExpectedScope,
+        fence: &ObserverFence,
+    ) -> Result<DurableCut> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.authenticated_cut(expected, fence),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.authenticated_cut(expected, fence),
+        }
+    }
 }
 
 impl QualifiedObserver for PlatformObserver {
@@ -957,6 +1828,72 @@ fn workspace_scope_id(db: &Trail) -> ScopeId {
     let mut digest = Sha256::new();
     digest.update(b"trail-workspace-changed-path-scope-v1\0");
     digest.update(db.config.workspace.id.0.as_bytes());
+    ScopeId(digest.finalize().into())
+}
+
+fn workspace_daemon_target(db: &Trail) -> Result<DaemonScopeTarget> {
+    let branch = db.current_branch()?;
+    let head = db.resolve_branch_ref(&branch)?;
+    Ok(DaemonScopeTarget {
+        root: db.workspace_root().to_path_buf(),
+        identity: ScopeIdentity {
+            scope_id: workspace_scope_id(db),
+            kind: ScopeKind::Workspace,
+            owner_id: db.config.workspace.id.0.clone(),
+        },
+        baseline: BaselineIdentity {
+            ref_name: head.name,
+            ref_generation: u64::try_from(head.generation)
+                .map_err(|_| Error::Corrupt("negative daemon ref generation".into()))?,
+            change_id: head.change_id,
+            root_id: head.root_id,
+        },
+    })
+}
+
+fn materialized_lane_daemon_target(db: &Trail, lane: &str) -> Result<DaemonScopeTarget> {
+    let branch = db.lane_branch(lane)?;
+    let workdir = branch.workdir.as_deref().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "lane `{}` does not have a materialized workdir",
+            branch.lane_id
+        ))
+    })?;
+    let root = std::path::PathBuf::from(workdir);
+    if !root.is_dir() {
+        return Err(Error::InvalidInput(format!(
+            "materialized lane workdir `{}` is unavailable",
+            root.display()
+        )));
+    }
+    let head = db.get_ref(&branch.ref_name)?;
+    if head.change_id != branch.head_change || head.root_id != branch.head_root {
+        return Err(Error::StaleBranch(branch.ref_name));
+    }
+    let scope_id = materialized_lane_scope_id(&db.config.workspace.id.0, &branch.lane_id);
+    Ok(DaemonScopeTarget {
+        root,
+        identity: ScopeIdentity {
+            scope_id,
+            kind: ScopeKind::MaterializedLane,
+            owner_id: branch.lane_id,
+        },
+        baseline: BaselineIdentity {
+            ref_name: head.name,
+            ref_generation: u64::try_from(head.generation)
+                .map_err(|_| Error::Corrupt("negative lane ref generation".into()))?,
+            change_id: head.change_id,
+            root_id: head.root_id,
+        },
+    })
+}
+
+pub(crate) fn materialized_lane_scope_id(workspace_id: &str, lane_id: &str) -> ScopeId {
+    let mut digest = Sha256::new();
+    digest.update(b"trail-materialized-lane-changed-path-scope-v2\0");
+    digest.update(workspace_id.as_bytes());
+    digest.update([0]);
+    digest.update(lane_id.as_bytes());
     ScopeId(digest.finalize().into())
 }
 

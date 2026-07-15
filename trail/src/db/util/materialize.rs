@@ -95,8 +95,25 @@ where
     for path in previous.keys() {
         if !target.contains_key(path) {
             let abs = safe_join(output_root, path)?;
-            if abs.exists() {
-                fs::remove_file(abs)?;
+            match fs::symlink_metadata(&abs) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(Error::InvalidPath {
+                            path: path.clone(),
+                            reason: "path selected for deletion is not a regular file".into(),
+                        });
+                    }
+                    fs::remove_file(&abs)?;
+                    if durable {
+                        let parent = abs.parent().ok_or_else(|| Error::InvalidPath {
+                            path: path.clone(),
+                            reason: "path has no parent directory".into(),
+                        })?;
+                        sync_directory_strict(parent)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
             }
         }
     }
@@ -142,7 +159,11 @@ where
     for (path, entry) in batch {
         let abs = safe_join(output_root, path)?;
         if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
+            if durable {
+                create_dir_all_durable(parent)?;
+            } else {
+                fs::create_dir_all(parent)?;
+            }
         }
         let Some(file_bytes) = bytes.get(path) else {
             return Err(Error::Corrupt(format!(
@@ -200,7 +221,11 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], durable: bool) -> Res
         path: path.to_string_lossy().to_string(),
         reason: "path has no parent directory".to_string(),
     })?;
-    fs::create_dir_all(parent)?;
+    if durable {
+        create_dir_all_durable(parent)?;
+    } else {
+        fs::create_dir_all(parent)?;
+    }
 
     let (tmp, mut file) = create_materialize_temp_file(parent, path)?;
     let result = (|| -> Result<()> {
@@ -211,7 +236,7 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], durable: bool) -> Res
         drop(file);
         fs::rename(&tmp, path)?;
         if durable {
-            sync_directory(parent);
+            sync_directory_strict(parent)?;
         }
         Ok(())
     })();
@@ -329,19 +354,26 @@ fn write_materialized_file_with_durability(
         path: rel.to_string(),
         reason: "path has no parent directory".to_string(),
     })?;
-    fs::create_dir_all(parent)?;
+    if durable {
+        create_dir_all_durable(parent)?;
+    } else {
+        fs::create_dir_all(parent)?;
+    }
 
     let (tmp, mut file) = create_materialize_temp_file(parent, path)?;
     let result = (|| -> Result<WorkdirFileStamp> {
         file.write_all(bytes)?;
+        // Mode is part of the authoritative file image. Apply it before the
+        // file durability barrier so a crash cannot publish bytes with the
+        // previous/default executable bit.
+        set_executable(&tmp, executable)?;
         if durable {
             file.sync_all()?;
         }
         drop(file);
-        set_executable(&tmp, executable)?;
         fs::rename(&tmp, path)?;
         if durable {
-            sync_directory(parent);
+            sync_directory_strict(parent)?;
         }
         let metadata = fs::symlink_metadata(path)?;
         Ok(WorkdirFileStamp::from_metadata(&metadata))
@@ -377,4 +409,60 @@ pub(crate) fn sync_directory(path: &Path) {
     if let Ok(dir) = OpenOptions::new().read(true).open(path) {
         let _ = dir.sync_all();
     }
+}
+
+pub(crate) fn sync_directory_strict(path: &Path) -> Result<()> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// Create every missing path component and durably publish each directory
+/// entry. This is intentionally used only by strict materialization paths;
+/// legacy best-effort projections retain their previous behavior.
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::InvalidPath {
+                        path: path.to_string_lossy().to_string(),
+                        reason: "directory path contains a non-directory or symlink".into(),
+                    });
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or_else(|| Error::InvalidPath {
+                    path: path.to_string_lossy().to_string(),
+                    reason: "directory path has no existing ancestor".into(),
+                })?;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::InvalidPath {
+                        path: directory.to_string_lossy().to_string(),
+                        reason: "concurrently created path is not a directory".into(),
+                    });
+                }
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        sync_directory_strict(&directory)?;
+        let parent = directory.parent().ok_or_else(|| Error::InvalidPath {
+            path: directory.to_string_lossy().to_string(),
+            reason: "created directory has no parent".into(),
+        })?;
+        sync_directory_strict(parent)?;
+    }
+    Ok(())
 }

@@ -30,6 +30,29 @@ pub mod test_support {
     pub fn changed_path_command_long_lock_flow() -> std::result::Result<(), String> {
         crate::db::run_command_long_lock_flow()
     }
+
+    pub fn changed_path_materialized_lane_snapshot_flow() -> std::result::Result<(), String> {
+        crate::db::run_materialized_lane_snapshot_flow()
+    }
+
+    pub fn set_sparse_selection_write_failure_for_current_thread(enabled: bool) {
+        crate::db::set_sparse_selection_write_failure_for_current_thread(enabled);
+    }
+
+    pub fn install_lane_record_after_c2_write_for_current_thread(
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+    ) {
+        crate::db::install_lane_record_after_c2_write_for_current_thread(path, bytes);
+    }
+
+    pub fn set_lane_record_postcommit_failure_for_current_thread(boundary: Option<&'static str>) {
+        crate::db::set_lane_record_postcommit_failure_for_current_thread(boundary);
+    }
+
+    pub fn set_changed_path_authority_override(enabled: bool) {
+        crate::db::set_command_authority_override(enabled);
+    }
     #[cfg(target_os = "macos")]
     fn run_macos_integration(
         test: fn() -> std::result::Result<(), String>,

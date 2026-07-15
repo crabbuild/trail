@@ -270,6 +270,7 @@ pub(super) fn recover_bytes(
     }
     let durable_start = offset as u64;
     let mut records = Vec::new();
+    let mut record_boundaries = Vec::new();
     let mut previous_hash = [0; 32];
     let mut last_sequence = 0;
     while offset < bytes.len() {
@@ -277,6 +278,7 @@ pub(super) fn recover_bytes(
         if remaining < LENGTH_PREFIX_BYTES {
             return Ok(RecoveredTail {
                 records,
+                record_boundaries,
                 durable_end: offset as u64,
                 last_sequence,
                 last_hash: previous_hash,
@@ -298,6 +300,7 @@ pub(super) fn recover_bytes(
         if end > bytes.len() {
             return Ok(RecoveredTail {
                 records,
+                record_boundaries,
                 durable_end: offset as u64,
                 last_sequence,
                 last_hash: previous_hash,
@@ -318,11 +321,18 @@ pub(super) fn recover_bytes(
         }
         last_sequence = record.sequence;
         previous_hash = hash;
+        record_boundaries.push(AuthenticatedRecordBoundary {
+            segment_id: String::new(),
+            sequence: record.sequence,
+            durable_end_offset: end as u64,
+            provider_cursor: record.provider_cursor.clone(),
+        });
         records.push(record);
         offset = end;
     }
     Ok(RecoveredTail {
         records,
+        record_boundaries,
         durable_end: if offset as u64 == durable_start {
             durable_start
         } else {
@@ -426,6 +436,7 @@ pub(crate) fn recover_segments_from_directory(
         validate_recovery_owner(&connection, expected, epoch)?;
         return Ok(RecoveredTail {
             records: Vec::new(),
+            record_boundaries: Vec::new(),
             durable_end: 0,
             last_sequence: 0,
             last_hash: [0; 32],
@@ -449,6 +460,7 @@ pub(crate) fn recover_segments_from_directory(
     let expected_owner = hex::encode(expected.owner_token);
     let mut total_bytes = 0_u64;
     let mut records = Vec::new();
+    let mut record_boundaries = Vec::new();
     let mut durable_end = 0_u64;
     let mut last_sequence = 0_u64;
     let mut last_hash = [0; 32];
@@ -630,6 +642,10 @@ pub(crate) fn recover_segments_from_directory(
             folded_end_offset: db_u64(row.folded_end_offset, "folded observer offset")?,
             segment_hash,
         });
+        record_boundaries.extend(recovered.record_boundaries.into_iter().map(|mut boundary| {
+            boundary.segment_id = row.segment_id.clone();
+            boundary
+        }));
         records.extend(recovered.records);
         durable_end = durable_end
             .checked_add(recovered.durable_end)
@@ -671,6 +687,7 @@ pub(crate) fn recover_segments_from_directory(
     }
     let recovered = RecoveredTail {
         records,
+        record_boundaries,
         durable_end,
         last_sequence,
         last_hash,

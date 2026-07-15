@@ -28,7 +28,14 @@ mod workspace_recipe;
 mod workspace_runtime;
 mod workspace_view;
 
+#[cfg(debug_assertions)]
+pub(crate) use lifecycle::set_sparse_selection_write_failure_for_current_thread;
 pub(crate) use workdir::ViewMutationBarrier;
+#[cfg(debug_assertions)]
+pub(crate) use workdir::{
+    install_lane_record_after_c2_write_for_current_thread,
+    set_lane_record_postcommit_failure_for_current_thread,
+};
 pub(crate) use workspace_layer::{
     EnvironmentLayerActivation, EnvironmentLayerOutputActivation, WorkspaceLayerBinding,
 };

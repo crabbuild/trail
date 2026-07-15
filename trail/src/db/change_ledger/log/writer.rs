@@ -686,17 +686,62 @@ impl SegmentWriter {
     }
 
     pub(crate) fn rotate(&mut self) -> Result<()> {
+        self.rotate_and_cut().map(|_| ())
+    }
+
+    /// Seal the current append-only segment and return the exact durable cut
+    /// authenticated by that segment.  Controlled filesystem producers use
+    /// this to prove that an intent interval starts and ends on unambiguous
+    /// sidecar boundaries.
+    pub(crate) fn rotate_and_cut(&mut self) -> Result<DurableCut> {
+        self.rotate_and_cuts().map(|(sealed, _anchor)| sealed)
+    }
+
+    pub(crate) fn rotate_and_cuts(&mut self) -> Result<(DurableCut, DurableCut)> {
+        let sealed = DurableCut {
+            segment_id: self.segment_id.clone(),
+            durable_end_offset: self.current_offset,
+            last_sequence: self.last_sequence,
+            last_hash: self.last_hash,
+            provider_cursor: self.last_cursor.clone(),
+        };
         let result = match crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         ) {
-            Ok(_workspace_lock) => self.rotate_inner(),
+            Ok(_workspace_lock) => self.rotate_inner().map(|_| {
+                let anchor = DurableCut {
+                    segment_id: self.segment_id.clone(),
+                    durable_end_offset: self.current_offset,
+                    last_sequence: self.last_sequence,
+                    last_hash: self.last_hash,
+                    provider_cursor: self.last_cursor.clone(),
+                };
+                (sealed, anchor)
+            }),
             Err(error) => Err(error),
         };
         if result.is_err() {
             self.retire("rotation_failed");
         }
         result
+    }
+
+    pub(crate) fn rotate_if_cut(
+        &mut self,
+        expected: &DurableCut,
+    ) -> Result<Option<(DurableCut, DurableCut)>> {
+        let current = DurableCut {
+            segment_id: self.segment_id.clone(),
+            durable_end_offset: self.current_offset,
+            last_sequence: self.last_sequence,
+            last_hash: self.last_hash,
+            provider_cursor: self.last_cursor.clone(),
+        };
+        if &current != expected {
+            return Ok(None);
+        }
+        self.rotate_and_cuts().map(Some)
     }
 
     fn rotate_inner(&mut self) -> Result<()> {

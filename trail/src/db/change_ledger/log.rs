@@ -91,11 +91,20 @@ impl PersistedLogLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveredTail {
     pub(crate) records: Vec<ObserverRecord>,
+    pub(crate) record_boundaries: Vec<AuthenticatedRecordBoundary>,
     pub(crate) durable_end: u64,
     pub(crate) last_sequence: u64,
     pub(crate) last_hash: [u8; 32],
     pub(crate) requires_reconciliation: bool,
     pub(crate) segments: Vec<AuthenticatedSegment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedRecordBoundary {
+    pub(crate) segment_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) durable_end_offset: u64,
+    pub(crate) provider_cursor: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

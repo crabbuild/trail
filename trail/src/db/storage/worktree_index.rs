@@ -86,15 +86,16 @@ impl Trail {
         &self,
         policy: &CompiledPolicy,
     ) -> Result<PinnedWorktreeRoot> {
-        if policy.workspace_root() != self.workspace_root {
-            return Err(Error::InvalidInput(
-                "compiled recording policy belongs to a different workspace root".into(),
-            ));
-        }
-        let descriptor = open_absolute_directory_no_follow(&self.workspace_root)?;
+        // A compiled policy is rooted at the exact authoritative scope it was
+        // compiled for.  That is normally the primary workspace, but qualified
+        // materialized lanes use their own pinned workdir root.  Never silently
+        // substitute Trail's primary workspace here: doing so would compare a
+        // lane's evidence against the wrong filesystem tree.
+        let scope_root = policy.workspace_root();
+        let descriptor = open_absolute_directory_no_follow(scope_root)?;
         let identity = root_descriptor_identity(&descriptor)?;
         Ok(PinnedWorktreeRoot {
-            path: self.workspace_root.clone(),
+            path: scope_root.to_path_buf(),
             descriptor,
             identity,
         })
@@ -108,6 +109,35 @@ impl Trail {
         let current = open_absolute_directory_no_follow(&root.path)?;
         Ok(root_descriptor_identity(&current)? == root.identity
             && root_descriptor_identity(&root.descriptor)? == root.identity)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn pinned_worktree_path_is_visible(
+        &self,
+        root: &PinnedWorktreeRoot,
+        path: &str,
+    ) -> Result<bool> {
+        let path = normalize_relative_path(path)?;
+        if reconcile_path_ignored(&path) {
+            return Ok(false);
+        }
+        if read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text, false)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(open_relative_directory_no_follow(&root.descriptor, &path)?.is_some())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn pinned_worktree_path_is_visible(
+        &self,
+        _root: &PinnedWorktreeRoot,
+        _path: &str,
+    ) -> Result<bool> {
+        Err(Error::InvalidInput(
+            "pinned changed-path visibility requires Linux or macOS".into(),
+        ))
     }
 
     pub(crate) fn visit_pinned_worktree_files<F>(

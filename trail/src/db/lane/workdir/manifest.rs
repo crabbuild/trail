@@ -92,6 +92,13 @@ impl Trail {
         manifest_path: &Path,
         root_id: &ObjectId,
     ) -> Result<CachedWorkdirManifestStatus> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            // Registered lane authority is the qualified v2 marker plus its
+            // ledger snapshot. A legacy N-entry manifest is never consulted.
+            return Ok(CachedWorkdirManifestStatus::Missing);
+        }
         let Some(manifest) = self.read_clean_workdir_manifest_from_path(manifest_path)? else {
             return Ok(CachedWorkdirManifestStatus::Missing);
         };
@@ -402,6 +409,22 @@ impl Trail {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let target_paths = target.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &target_paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            if !self
+                .diff_file_maps_to_manifest_for_paths(target, &disk_manifest, &target_paths)?
+                .is_empty()
+            {
+                self.invalidate_materialized_lane_marker(dir)?;
+                return Ok(false);
+            }
+            self.invalidate_materialized_lane_marker(dir)?;
+            return Ok(true);
+        }
         let Some(mut manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -453,6 +476,16 @@ impl Trail {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let previous_paths = previous.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &previous_paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            return Ok(self
+                .diff_file_maps_to_manifest_for_paths(previous, &disk_manifest, &previous_paths)?
+                .is_empty());
+        }
         let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -537,6 +570,15 @@ impl Trail {
         root_id: &ObjectId,
         entries: BTreeMap<String, CleanWorkdirManifestEntry>,
     ) -> Result<()> {
+        if let Some(workdir) = workdir_root_for_manifest_path(path) {
+            if crate::db::change_ledger::command_authority_enabled()
+                && self
+                    .registered_materialized_lane_for_root(workdir)?
+                    .is_some()
+            {
+                return self.invalidate_materialized_lane_marker(workdir);
+            }
+        }
         let parent = path.parent().ok_or_else(|| Error::InvalidPath {
             path: path.to_string_lossy().to_string(),
             reason: "clean workdir manifest has no parent".to_string(),
@@ -547,7 +589,7 @@ impl Trail {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, false)?;
+        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, true)?;
         Ok(())
     }
 
@@ -557,6 +599,16 @@ impl Trail {
         root_id: &ObjectId,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let paths = target.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            return Ok(self
+                .diff_file_maps_to_manifest_for_paths(target, &disk_manifest, &paths)?
+                .is_empty());
+        }
         let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -600,6 +652,15 @@ impl Trail {
         &self,
         path: &Path,
     ) -> Result<Option<CleanWorkdirManifest>> {
+        if let Some(workdir) = workdir_root_for_manifest_path(path) {
+            if crate::db::change_ledger::command_authority_enabled()
+                && self
+                    .registered_materialized_lane_for_root(workdir)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+        }
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -739,6 +800,26 @@ impl Trail {
         }
         Ok((files, observed_insertions))
     }
+
+    fn registered_materialized_lane_for_root(&self, root: &Path) -> Result<Option<String>> {
+        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        self.conn
+            .query_row(
+                "SELECT lane.name FROM lanes lane JOIN lane_branches branch USING(lane_id)
+                 WHERE branch.workdir=?1 AND branch.status<>'removed'",
+                [normalized.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+}
+
+fn workdir_root_for_manifest_path(path: &Path) -> Option<&Path> {
+    (path.file_name().and_then(|name| name.to_str()) == Some("workdir-manifest.json")
+        && path.parent()?.file_name().and_then(|name| name.to_str()) == Some(".trail"))
+    .then(|| path.parent().and_then(Path::parent))
+    .flatten()
 }
 
 fn open_observed_exact_regular_file_stamp(

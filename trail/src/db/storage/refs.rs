@@ -1,6 +1,32 @@
 use super::*;
 
 impl Trail {
+    pub(crate) fn insert_new_ref_database_only(
+        &self,
+        name: &str,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO refs
+             (name,change_id,root_id,operation_id,generation,updated_at)
+             VALUES (?1,?2,?3,?4,1,?5)",
+            params![name, change_id.0, root_id.0, operation_id.0, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn repair_new_ref_mirror(
+        &self,
+        name: &str,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        write_ref_file(&self.db_dir, name, change_id, root_id, operation_id, 1)
+    }
+
     pub(crate) fn set_ref(
         &self,
         name: &str,

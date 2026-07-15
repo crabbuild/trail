@@ -8,7 +8,6 @@ impl Trail {
         mode: &str,
         ttl_secs: u64,
     ) -> Result<LeaseAcquireReport> {
-        let _lock = self.acquire_write_lock()?;
         validate_ref_segment(lane)?;
         let mode = parse_lease_mode(mode)?;
         if ttl_secs == 0 {
@@ -17,6 +16,15 @@ impl Trail {
             ));
         }
         let branch = self.lane_branch(lane)?;
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.lane_uses_native_materialized_ledger(&branch)?
+        {
+            crate::db::change_ledger::materialized_lane_daemon_expected_scope(
+                self,
+                &branch.lane_id,
+            )?;
+        }
+        let _lock = self.acquire_write_lock()?;
         let path = path.map(normalize_relative_path).transpose()?;
         let file_id = if let Some(path) = &path {
             let ref_record = self.get_ref(&branch.ref_name)?;
@@ -219,7 +227,7 @@ impl Trail {
     }
 
     fn claim_sparse_hydration(
-        &self,
+        &mut self,
         lane: &str,
         branch: &LaneBranch,
         path: &str,

@@ -251,7 +251,6 @@ impl ObserverQualification {
             && self.segment_initial_folded_offset <= self.segment_consumed_offset
             && self.segment_consumed_offset <= self.segment_durable_offset
             && end.sequence >= start.sequence
-            && end.durable_offset >= start.durable_offset
             && self.complete_root_interval
             && self.complete_policy_interval
             && self.persisted_evidence_through_end
@@ -698,7 +697,7 @@ pub(crate) fn fold_observer_interval(
     qualification: &mut ObserverQualification,
     events: &[ObserverEvent],
 ) -> Result<EvidenceCut> {
-    if end.sequence <= start.sequence || end.durable_offset < start.durable_offset {
+    if end.sequence <= start.sequence {
         return Err(reconcile_required(
             expected,
             TrustState::UntrustedGap.as_str(),
@@ -980,9 +979,7 @@ impl ReconciliationAttempt {
         writer.flush()?;
 
         let end = observer.end_fence(&self.expected, &self.start_fence)?;
-        if end.sequence < self.start_fence.sequence
-            || end.durable_offset < self.start_fence.durable_offset
-        {
+        if end.sequence < self.start_fence.sequence {
             return self.fail(
                 ledger,
                 "observer end fence regressed behind reconciliation start fence",

@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Component, Path};
 
 use crate::error::{Error, Result};
@@ -188,6 +189,181 @@ impl SecureDirectory {
         Ok(file)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn read_regular_optional_bounded(
+        &self,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut file = match self.open_regular(name) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if file.metadata()?.len() > max_bytes {
+            return Err(Error::InvalidInput(format!(
+                "secure marker `{name}` exceeds {max_bytes} bytes"
+            )));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(Error::InvalidInput(format!(
+                "secure marker `{name}` grew beyond {max_bytes} bytes"
+            )));
+        }
+        self.verify_opened_regular(name, &file)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn read_regular_optional_bounded(
+        &self,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let _ = (self, name, max_bytes);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative marker read is unsupported".into(),
+        ))
+    }
+
+    /// Atomically replace a regular leaf without following either the
+    /// temporary or destination pathname. The pinned directory descriptor is
+    /// the sole rename authority.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn write_atomic_regular(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        use rustix::fs::{openat, renameat, Mode, OFlags};
+
+        validate_leaf(name)?;
+        let mut random = [0_u8; 12];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+        let temporary = format!(".marker-{}.tmp", hex::encode(random));
+        let mut file = File::from(
+            openat(
+                &self.file,
+                Path::new(&temporary),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|error| Error::Io(error.into()))?,
+        );
+        let result = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            renameat(
+                &self.file,
+                Path::new(&temporary),
+                &self.file,
+                Path::new(name),
+            )
+            .map_err(|error| Error::Io(error.into()))?;
+            self.sync()
+        })();
+        if result.is_err() {
+            let _ = rustix::fs::unlinkat(
+                &self.file,
+                Path::new(&temporary),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+        result
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn write_atomic_regular(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let _ = (self, name, bytes);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative marker write is unsupported".into(),
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn remove_leaf(&self, name: &str) -> Result<()> {
+        validate_leaf(name)?;
+        match rustix::fs::unlinkat(&self.file, Path::new(name), rustix::fs::AtFlags::empty()) {
+            Ok(()) => self.sync(),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+            Err(error) => Err(Error::Io(error.into())),
+        }
+    }
+
+    /// Remove one directory tree using only descriptor-relative traversal.
+    /// The caller must first authenticate this directory and the child inode
+    /// against persisted ownership authority.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn remove_owned_tree_leaf(
+        &self,
+        name: &str,
+        expected_identity: (u64, u64),
+    ) -> Result<()> {
+        validate_leaf(name)?;
+        let child = self.open_dir(name)?;
+        child.verify_identity(expected_identity)?;
+        child.remove_owned_tree_contents()?;
+        // Reopen through the pinned parent immediately before rmdir so a
+        // pathname substitution cannot redirect deletion to another inode.
+        self.open_dir(name)?.verify_identity(expected_identity)?;
+        rustix::fs::unlinkat(&self.file, Path::new(name), rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(|error| Error::Io(error.into()))?;
+        self.sync()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn remove_owned_tree_contents(&self) -> Result<()> {
+        for name in self.entry_names()? {
+            let name = name.to_str().ok_or_else(|| {
+                Error::InvalidInput("owned materialization tree has a non-UTF8 leaf".into())
+            })?;
+            match self.open_dir(name) {
+                Ok(directory) => {
+                    let identity = directory.identity()?;
+                    directory.remove_owned_tree_contents()?;
+                    self.open_dir(name)?.verify_identity(identity)?;
+                    rustix::fs::unlinkat(
+                        &self.file,
+                        Path::new(name),
+                        rustix::fs::AtFlags::REMOVEDIR,
+                    )
+                    .map_err(|error| Error::Io(error.into()))?;
+                }
+                Err(Error::Io(error)) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                    let opened = self.open_regular(name)?;
+                    self.verify_opened_regular(name, &opened)?;
+                    rustix::fs::unlinkat(&self.file, Path::new(name), rustix::fs::AtFlags::empty())
+                        .map_err(|error| Error::Io(error.into()))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.sync()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn remove_owned_tree_leaf(
+        &self,
+        name: &str,
+        expected_identity: (u64, u64),
+    ) -> Result<()> {
+        let _ = (self, name, expected_identity);
+        Err(Error::InvalidInput(
+            "secure owned-tree removal is unsupported".into(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn remove_leaf(&self, name: &str) -> Result<()> {
+        let _ = (self, name);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative marker removal is unsupported".into(),
+        ))
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn open_regular(&self, name: &str) -> Result<File> {
         let _ = (self, name);
@@ -374,6 +550,21 @@ impl SecureDirectory {
 
     pub(crate) fn sync(&self) -> Result<()> {
         self.file.sync_all().map_err(Error::Io)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn restrict_private(&self) -> Result<()> {
+        rustix::fs::fchmod(&self.file, rustix::fs::Mode::from_raw_mode(0o700))
+            .map_err(|error| Error::Io(error.into()))?;
+        self.verify_private()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn restrict_private(&self) -> Result<()> {
+        let _ = self;
+        Err(Error::InvalidInput(
+            "secure private marker directory is unsupported".into(),
+        ))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

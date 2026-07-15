@@ -204,6 +204,22 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::CommittedRepairRequired { .. } => {
+            let mut diagnostic = UiDiagnostic::new(
+                err.code(),
+                "Operation committed; a derived mirror still needs repair",
+            );
+            diagnostic.consequence = Some(
+                "Do not retry the mutation: its authoritative database transaction already committed."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail status".to_string(),
+                reason: "Reopen authoritative state and idempotently repair ref, marker, and runtime mirrors."
+                    .to_string(),
+            });
+            diagnostic
+        }
         Error::InvalidInput(_) | Error::InvalidPath { .. } => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail cannot use the supplied input");

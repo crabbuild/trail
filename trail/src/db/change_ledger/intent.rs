@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use getrandom::getrandom;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -130,7 +131,12 @@ pub(crate) struct QualifiedFilesystemProof {
     pub(crate) start_cursor: Option<Vec<u8>>,
     pub(crate) end_cursor: Vec<u8>,
     pub(crate) start_sequence: u64,
+    /// Cut through which the controlled apply was pinned and may be
+    /// acknowledged. Events after this cut are never consumed by publication.
     pub(crate) end_cut: EvidenceCut,
+    /// Final folded cut used only for the scope baseline CAS. Evidence in
+    /// `(end_cut, publication_cut]` remains pending for the next snapshot.
+    pub(crate) publication_cut: EvidenceCut,
     pub(crate) segment_durable_offset: u64,
     pub(crate) segment_folded_offset: u64,
     pub(crate) verified_paths: u64,
@@ -211,7 +217,7 @@ pub(crate) fn prepare_intent(
         tx.execute(
             "INSERT INTO changed_path_intent_paths(intent_id,normalized_path,event_flags)
              VALUES(?1,?2,?3)",
-            params![id.0, path.as_str(), EvidenceFlags::CONTENT.0],
+            params![id.0, path.as_str(), EvidenceFlags::ANY_MUTATION.0],
         )?;
     }
     for prefix in &evidence.complete_prefixes {
@@ -223,7 +229,7 @@ pub(crate) fn prepare_intent(
                 id.0,
                 prefix.path.as_str(),
                 prefix.reason,
-                EvidenceFlags::CONTENT.0
+                EvidenceFlags::ANY_MUTATION.0
             ],
         )?;
     }
@@ -429,8 +435,11 @@ pub(super) fn validate_qualified_filesystem_proof(
         || proof.provider_identity != expected.provider_identity
         || proof.start_cursor != intent.start_cursor
         || proof.end_cut.source != super::EvidenceSource::Observer
+        || proof.publication_cut.source != super::EvidenceSource::Observer
         || proof.start_sequence > proof.end_cut.sequence
+        || proof.end_cut.sequence > proof.publication_cut.sequence
         || proof.end_cut.durable_offset != proof.end_cut.folded_offset
+        || proof.publication_cut.durable_offset != proof.publication_cut.folded_offset
         || proof.segment_folded_offset != proof.segment_durable_offset
         || proof.observer_owner_token.is_empty()
         || proof.provider_id.is_empty()
@@ -506,8 +515,8 @@ pub(super) fn validate_qualified_filesystem_proof(
             .and_then(|identity| hex::decode(identity).ok())
             .as_deref()
             != Some(proof.provider_identity.as_slice())
-        || db_u64(durable_offset, "scope durable offset")? < proof.end_cut.durable_offset
-        || db_u64(folded_offset, "scope folded offset")? < proof.end_cut.folded_offset
+        || db_u64(durable_offset, "scope durable offset")? != proof.publication_cut.durable_offset
+        || db_u64(folded_offset, "scope folded offset")? != proof.publication_cut.folded_offset
     {
         return Err(invalid(
             "filesystem proof no longer matches the trusted scope boundary",
@@ -599,17 +608,27 @@ pub(super) fn validate_qualified_filesystem_proof(
         )?)
         .map_err(|_| Error::Corrupt("unfolded observer record limit exceeds usize".into()))?,
     };
-    let recovered = super::recover_segments_from_directory(
-        database_path,
-        &segment_directory,
-        &super::RecoveryScope {
-            scope_id: expected.scope_id,
-            epoch: expected.epoch,
-            owner_token,
-        },
-        limits,
-    )
-    .map_err(|error| invalid(&format!("observer sidecar verification failed: {error}")))?;
+    let recovery_scope = super::RecoveryScope {
+        scope_id: expected.scope_id,
+        epoch: expected.epoch,
+        owner_token,
+    };
+    let mut recovered = None;
+    for attempt in 0..16 {
+        let candidate = super::recover_segments_from_directory(
+            database_path,
+            &segment_directory,
+            &recovery_scope,
+            limits,
+        )
+        .map_err(|error| invalid(&format!("observer sidecar verification failed: {error}")))?;
+        if !candidate.requires_reconciliation || attempt == 15 {
+            recovered = Some(candidate);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let recovered = recovered.ok_or_else(|| invalid("observer sidecar verification vanished"))?;
     if recovered.requires_reconciliation {
         return Err(invalid(
             "observer sidecar chain is incomplete or contains unpublished entries",
@@ -620,6 +639,21 @@ pub(super) fn validate_qualified_filesystem_proof(
         .iter()
         .find(|segment| segment.segment_id == proof.durable_segment_id)
         .ok_or_else(|| invalid("filesystem proof segment is absent from verified chain"))?;
+    let publication_boundary = recovered.record_boundaries.iter().find(|boundary| {
+        boundary.sequence == proof.publication_cut.sequence
+            && boundary.durable_end_offset == proof.publication_cut.durable_offset
+            && provider_cursor.as_deref() == Some(boundary.provider_cursor.as_slice())
+    });
+    let publication_authenticated = publication_boundary.is_some_and(|boundary| {
+        recovered.segments.iter().any(|segment| {
+            segment.segment_id == boundary.segment_id
+                && matches!(segment.state.as_str(), "open" | "sealed")
+                && segment.first_sequence <= boundary.sequence
+                && segment.last_sequence >= boundary.sequence
+                && segment.durable_end_offset >= boundary.durable_end_offset
+                && segment.folded_end_offset == proof.publication_cut.folded_offset
+        })
+    });
     if authenticated.state != "sealed"
         || authenticated.segment_path != proof.segment_path
         || authenticated.start_cursor != proof.start_cursor.clone().unwrap_or_default()
@@ -631,11 +665,8 @@ pub(super) fn validate_qualified_filesystem_proof(
         || authenticated.segment_hash != proof.durable_segment_hash
         || proof.end_cut.durable_offset != proof.segment_durable_offset
         || proof.end_cut.folded_offset != proof.segment_folded_offset
-        || recovered.last_sequence < proof.end_cut.sequence
-        || recovered
-            .segments
-            .last()
-            .is_none_or(|segment| provider_cursor.as_deref() != Some(segment.end_cursor.as_slice()))
+        || recovered.last_sequence < proof.publication_cut.sequence
+        || !publication_authenticated
     {
         return Err(invalid(
             "filesystem proof is not an authenticated prefix of the observer chain",
@@ -681,13 +712,13 @@ pub(super) fn validate_qualified_filesystem_proof(
     let paths_covered = intent_paths.iter().all(|(path, required)| {
         exact_flags
             .get(path.as_str())
-            .is_some_and(|observed| observed & required == *required)
+            .is_some_and(|observed| observed & required != 0)
     });
     let prefixes_covered = intent_prefixes.iter().all(|(prefix, reason, required)| {
         reason == "provider_complete"
             && prefix_flags
                 .get(prefix.as_str())
-                .is_some_and(|observed| observed & required == *required)
+                .is_some_and(|observed| observed & required != 0)
     });
     if !paths_covered
         || !prefixes_covered

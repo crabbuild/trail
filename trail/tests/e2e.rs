@@ -22500,7 +22500,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(sparse_hydrated.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_hydrated.workdir_changed_paths.is_empty());
     let sparse_manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(sparse_workdir.join(".trail/sparse-workdir.json")).unwrap(),
+        &fs::read_to_string(sparse_workdir.join(".trail/sparse-selection.json")).unwrap(),
     )
     .unwrap();
     let sparse_manifest_paths = sparse_manifest["materialized_paths"]
@@ -22851,19 +22851,15 @@ fn sparse_lane_path_sync_rolls_back_hydrated_files_when_manifest_update_fails() 
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
 
-    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-selection.json");
     let clean_manifest_path = sparse_workdir.join(".trail/workdir-manifest.json");
     let sparse_manifest_before = fs::read(&sparse_manifest_path).unwrap();
     let clean_manifest_before = fs::read(&clean_manifest_path).unwrap();
 
-    let metadata_dir = sparse_workdir.join(".trail");
-    let original_permissions = fs::metadata(&metadata_dir).unwrap().permissions();
-    let mut readonly_permissions = original_permissions.clone();
-    readonly_permissions.set_mode(0o555);
-    fs::set_permissions(&metadata_dir, readonly_permissions).unwrap();
+    trail::test_support::set_sparse_selection_write_failure_for_current_thread(true);
     let sync_result =
         db.sync_lane_workdir_with_paths("sparse-rollback", false, &["src/lib.rs".to_string()]);
-    fs::set_permissions(&metadata_dir, original_permissions).unwrap();
+    trail::test_support::set_sparse_selection_write_failure_for_current_thread(false);
 
     let err = sync_result.unwrap_err();
     assert!(matches!(err, Error::Io(_)));
@@ -22909,7 +22905,7 @@ fn sparse_lane_path_sync_recovers_when_sparse_manifest_is_missing() {
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
 
-    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-selection.json");
     fs::remove_file(&sparse_manifest_path).unwrap();
     let report = db
         .sync_lane_workdir_with_paths(
@@ -23756,7 +23752,7 @@ fn sparse_lane_path_enforcement_blocks_patch_and_record_outside_selected_paths()
     let err = apply_lane_patch_at_head(&mut db, "sparse-bot", blocked_rename).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(message) if message.contains("src/renamed.md")));
 
-    let sparse_manifest = workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest = workdir.join(".trail/sparse-selection.json");
     fs::remove_file(&sparse_manifest).unwrap();
     let blocked_without_manifest: PatchDocument = serde_json::from_value(serde_json::json!({
         "edits": [

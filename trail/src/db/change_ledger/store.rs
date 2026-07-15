@@ -263,7 +263,19 @@ impl<'a> ChangedPathLedger<'a> {
         expected: &ExpectedScope,
     ) -> Result<CandidateSnapshot> {
         self.recover_scope(expected)?;
-        self.snapshot_candidates_in_transaction(expected, || {})
+        self.snapshot_candidates_in_transaction(expected, None, || {})
+    }
+
+    /// Read candidates while one exact live controlled intent is Prepared.
+    /// This narrowly avoids treating that caller-owned intent as crash
+    /// residue; every ordinary snapshot still runs full recovery first.
+    pub(crate) fn snapshot_candidates_for_controlled_intent(
+        &self,
+        expected: &ExpectedScope,
+        intent_id: &str,
+        start_cursor: Option<&[u8]>,
+    ) -> Result<CandidateSnapshot> {
+        self.snapshot_candidates_in_transaction(expected, Some((intent_id, start_cursor)), || {})
     }
 
     #[cfg(test)]
@@ -275,18 +287,54 @@ impl<'a> ChangedPathLedger<'a> {
     where
         F: FnOnce(),
     {
-        self.snapshot_candidates_in_transaction(expected, after_scope_read)
+        self.snapshot_candidates_in_transaction(expected, None, after_scope_read)
     }
 
     fn snapshot_candidates_in_transaction<F>(
         &self,
         expected: &ExpectedScope,
+        controlled_intent: Option<(&str, Option<&[u8]>)>,
         after_scope_read: F,
     ) -> Result<CandidateSnapshot>
     where
         F: FnOnce(),
     {
         let tx = self.conn.unchecked_transaction()?;
+        if let Some((intent_id, start_cursor)) = controlled_intent {
+            let exact: bool = tx.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM changed_path_intents intent
+                   JOIN changed_path_scopes scope ON scope.scope_id=intent.scope_id
+                   WHERE intent.intent_id=?1 AND intent.scope_id=?2
+                     AND intent.expected_scope_epoch=?3
+                     AND intent.expected_ref_name=?4
+                     AND intent.expected_ref_generation=?5
+                     AND intent.expected_root_id=?6
+                     AND intent.expected_change_id=scope.change_id
+                     AND scope.epoch=?3 AND scope.ref_name=?4
+                     AND scope.ref_generation=?5 AND scope.baseline_root_id=?6
+                     AND intent.lifecycle_state='prepared' AND intent.start_cursor IS ?7
+                 )",
+                params![
+                    intent_id,
+                    expected.scope_id.to_text(),
+                    i64::try_from(expected.epoch)
+                        .map_err(|_| Error::InvalidInput("intent epoch overflow".into()))?,
+                    expected.ref_name,
+                    i64::try_from(expected.ref_generation).map_err(|_| Error::InvalidInput(
+                        "intent ref generation overflow".into()
+                    ))?,
+                    expected.baseline_root.0,
+                    start_cursor,
+                ],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                return Err(Error::Conflict(format!(
+                    "controlled intent `{intent_id}` changed before its fenced candidate read"
+                )));
+            }
+        }
         let scope = load_scope(&tx, expected)?;
         if scope.state != TrustState::Trusted {
             return Err(reconcile_error(expected, scope.state, &scope.reason));
@@ -542,10 +590,17 @@ impl<'a> ChangedPathLedger<'a> {
         for token in tokens {
             // A mixed-source row or a row advanced beyond c1 cannot be proved
             // fully represented by the observed record.
-            if token.source_mask != EvidenceSource::Observer.mask()
-                || token
+            let source_is_acknowledgeable = if token.source_mask == EvidenceSource::Observer.mask()
+            {
+                token
                     .provider_sequence
-                    .is_none_or(|sequence| sequence > through_sequence)
+                    .is_some_and(|sequence| sequence <= through_sequence)
+            } else if token.source_mask == EvidenceSource::Intent.mask() {
+                token.provider_sequence.is_none() && token.last_sequence <= through_sequence
+            } else {
+                false
+            };
+            if !source_is_acknowledgeable
                 || (token.kind == EvidenceRowKind::CompletePrefix && !acknowledge_complete_prefixes)
             {
                 continue;

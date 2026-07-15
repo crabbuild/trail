@@ -7,9 +7,10 @@ mod intent;
 mod log;
 mod observer;
 mod policy;
+mod projection;
 mod reconcile;
 mod recovery;
-mod secure_fs;
+pub(crate) mod secure_fs;
 mod snapshot;
 mod store;
 mod types;
@@ -22,17 +23,32 @@ pub(crate) use snapshot::{
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
-    run_command_flow, run_command_long_lock_flow, set_command_authority_override,
+    run_command_flow, run_command_long_lock_flow, run_materialized_lane_snapshot_flow,
+    set_command_authority_override,
 };
 
+#[allow(unused_imports)]
 pub(crate) use daemon::{
-    prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,
-    workspace_daemon_reconcile, WorkspaceDaemonProof, WorkspaceDaemonRuntime,
+    accept_materialized_lane_daemon_baseline, materialized_lane_daemon_expected_scope,
+    materialized_lane_daemon_fence, materialized_lane_daemon_marker_cut,
+    materialized_lane_daemon_matches_target, materialized_lane_daemon_ready_proof,
+    materialized_lane_daemon_reconcile, materialized_lane_scope_id,
+    prepare_materialized_lane_controlled_projection, prepare_materialized_lane_daemon,
+    prepare_workspace_controlled_projection, prepare_workspace_daemon,
+    with_materialized_lane_controlled_interval, with_workspace_controlled_interval,
+    workspace_daemon_fence, workspace_daemon_ready_proof, workspace_daemon_reconcile,
+    ChangedPathDaemonRegistry, WorkspaceDaemonProof, WorkspaceDaemonRuntime,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{
     mark_filesystem_applied, prepare_intent, publish_intent, IntentEvidence, IntentId,
     IntentProducer, IntentState, IntentTarget, QualifiedFilesystemProof,
+};
+#[allow(unused_imports)]
+pub(crate) use projection::{
+    commit_lane_operation_atomic, publish_alignment_in_transaction,
+    publish_ref_advancing_projection, run_projection_alignment, run_ref_advancing_projection,
+    ProjectionAlignmentMode, ProjectionPublication, RefAdvancingProjectionMode,
 };
 
 #[allow(unused_imports)]

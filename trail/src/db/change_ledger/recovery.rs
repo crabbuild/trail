@@ -2539,6 +2539,12 @@ mod harness {
                         durable_offset: durable.durable_end_offset,
                         folded_offset: durable.durable_end_offset,
                     },
+                    publication_cut: EvidenceCut {
+                        source: EvidenceSource::Observer,
+                        sequence,
+                        durable_offset: durable.durable_end_offset,
+                        folded_offset: durable.durable_end_offset,
+                    },
                     segment_durable_offset: db_u64(segment.2, "fixture segment durable")?,
                     segment_folded_offset: db_u64(segment.3, "fixture segment folded")?,
                     verified_paths: 1,
@@ -2662,6 +2668,12 @@ mod harness {
                 end_cursor: durable.provider_cursor.clone(),
                 start_sequence,
                 end_cut: EvidenceCut {
+                    source: EvidenceSource::Observer,
+                    sequence: durable.last_sequence,
+                    durable_offset: durable.durable_end_offset,
+                    folded_offset: durable.durable_end_offset,
+                },
+                publication_cut: EvidenceCut {
                     source: EvidenceSource::Observer,
                     sequence: durable.last_sequence,
                     durable_offset: durable.durable_end_offset,
@@ -5126,6 +5138,12 @@ mod harness {
             end_cursor: b"cursor-end".to_vec(),
             start_sequence: 1,
             end_cut: EvidenceCut {
+                source: EvidenceSource::Observer,
+                sequence: 1,
+                durable_offset: durable.durable_end_offset,
+                folded_offset: durable.durable_end_offset,
+            },
+            publication_cut: EvidenceCut {
                 source: EvidenceSource::Observer,
                 sequence: 1,
                 durable_offset: durable.durable_end_offset,

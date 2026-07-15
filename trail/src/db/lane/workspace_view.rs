@@ -1008,6 +1008,7 @@ impl Trail {
         root_id: &ObjectId,
         operation: Option<&ChangeId>,
     ) -> Result<u64> {
+        // TRAIL_FS_PRODUCER: cow_checkpoint CowPublication task12_callback_boundary
         let Some(view) = self.lane_workspace_view(lane)? else {
             return Ok(0);
         };
