@@ -426,6 +426,9 @@ impl Trail {
                 continue;
             }
             let record_path = entry.path();
+            if record_path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
             let record: MaterializationOperationRecord =
                 serde_json::from_slice(&fs::read(&record_path)?)?;
             if record.version != 1
@@ -683,5 +686,21 @@ mod tests {
             "complete"
         );
         assert!(!record.exists());
+    }
+
+    #[test]
+    fn startup_recovery_ignores_atomic_journal_temporary_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let journal_dir = db.db_dir.join("materialization-operations");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let temporary = journal_dir.join(".materialize-1.json.trail-tmp-2");
+        fs::write(&temporary, b"partial").unwrap();
+        drop(db);
+
+        Trail::open(workspace.path()).unwrap();
+
+        assert!(temporary.exists());
     }
 }

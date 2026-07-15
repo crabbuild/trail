@@ -1959,6 +1959,40 @@ fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
         .is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn acp_doctor_and_relay_preflight_report_legacy_path_index() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    make_current_branch_root_legacy(temp.path());
+
+    let doctor = run_trail_json(temp.path(), &["agent", "acp", "doctor", "claude-code"]);
+    assert_eq!(doctor["status"], "failed");
+    assert!(doctor["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "path_invariant_index"
+            && check["status"] == "failed"
+            && check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("trail index rebuild"))
+    }));
+
+    let relay = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["acp", "relay", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(relay.status.code(), Some(9));
+    assert!(relay.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&relay.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("trail index rebuild")));
+}
+
 #[test]
 fn cli_env_defaults_select_workspace_db_branch_and_format() {
     let temp = tempfile::tempdir().unwrap();
@@ -2420,7 +2454,7 @@ fn init_creates_lane_observability_indexes() {
 }
 
 #[test]
-fn agent_acp_commands_report_status_setup_and_doctor() {
+fn agent_acp_doctor_reports_status_setup_and_verifiable_evidence() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2481,9 +2515,76 @@ fn agent_acp_commands_report_status_setup_and_doctor() {
         .any(|check| check["name"] == "workspace" && check["status"] == "ok"));
     assert!(checks
         .iter()
-        .any(|check| check["name"] == "capture" && check["status"] == "skipped"));
+        .any(|check| { check["name"] == "capture_journal" && check["status"] == "ok" }));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "path_mapping" && check["status"] == "ok"));
+    assert_eq!(doctor["conformance"]["wire_version"], 1);
+    assert_eq!(
+        doctor["conformance"]["schema_commit"],
+        "64cbd71ae520b89aac54164d8c1d364333c8ee5f"
+    );
+    assert_eq!(
+        doctor["conformance"]["schema_sha256"],
+        "92c1dfcda10dd47e99127500a3763da2b471f9ac61e12b9bf0430c32cf953796"
+    );
+    assert_eq!(
+        doctor["conformance"]["meta_sha256"],
+        "e0bf36f8123b2544b499174197fdc371ec49a1b4572a35114513d56492741599"
+    );
+    assert_eq!(doctor["conformance"]["transport"], "stdio");
+    assert_eq!(doctor["conformance"]["method_count"], 23);
+    let source_revision = option_env!("TRAIL_SOURCE_REVISION")
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or("unverified");
+    let expected_evidence = if source_revision != "unverified"
+        && option_env!("TRAIL_ACP_V1_CONFORMANCE_VERIFIED") == Some(source_revision)
+    {
+        "verified"
+    } else {
+        "unverified"
+    };
+    assert_eq!(doctor["conformance"]["evidence_status"], expected_evidence);
+    assert!(doctor["conformance"]["build_identifier"]
+        .as_str()
+        .unwrap()
+        .starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
+    assert_eq!(
+        doctor["conformance"]["exclusions"],
+        serde_json::json!(["ACP v2", "draft remote HTTP transport"])
+    );
     assert!(doctor["lane"].is_null());
     assert!(doctor["session_id"].is_null());
+
+    let human = Command::new(trail_bin())
+        .current_dir(temp.path())
+        .args(["agent", "acp", "doctor", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    for expected in [
+        "Wire version",
+        "Schema commit",
+        "Schema SHA-256",
+        "Metadata SHA-256",
+        "Transport",
+        "Evidence",
+        "ACP v2",
+        "draft remote HTTP transport",
+        "capture_journal",
+        "path_mapping",
+    ] {
+        assert!(
+            human.contains(expected),
+            "missing `{expected}` in:\n{human}"
+        );
+    }
+    if expected_evidence == "unverified" {
+        assert!(!human.contains("ACP v1 conformant"));
+    } else {
+        assert!(human.contains("ACP v1 conformant"));
+    }
 
     let custom_doctor = run_trail_json(
         temp.path(),
@@ -2910,16 +3011,14 @@ fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|command| command == "write_file"));
-    assert!(agent_tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "write README"
+    assert!(agent_tools["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["name"] == "write README"
             && tool["turns"][0]["changed_paths"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|path| path["path"] == "README.md")));
+                .any(|path| path["path"] == "README.md")
+    }));
     let impact = run_trail_json(temp.path(), &["agent", "impact", "latest"]);
     assert_eq!(impact["task"]["lane"], view["task"]["lane"]);
     assert_eq!(impact["highest_impact"], "low");
@@ -3381,14 +3480,11 @@ fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|item| item.as_str().unwrap().contains("Git preflight failed")));
-    assert!(diagnose["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item
-            .as_str()
+    assert!(diagnose["evidence"].as_array().unwrap().iter().any(|item| {
+        item.as_str()
             .unwrap()
-            .contains("friendly checkpoint target")));
+            .contains("friendly checkpoint target")
+    }));
     assert!(diagnose["recovery_options"]
         .as_array()
         .unwrap()
@@ -4728,14 +4824,12 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .iter()
         .any(|step| step["command"] == format!("trail agent action {task_name}")));
-    assert!(task_guide["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|step| step["command"]
+    assert!(task_guide["steps"].as_array().unwrap().iter().any(|step| {
+        step["command"]
             .as_str()
             .unwrap()
-            .contains("trail agent ask --selector")));
+            .contains("trail agent ask --selector")
+    }));
     assert!(task_guide["concepts"]
         .as_array()
         .unwrap()
@@ -5258,7 +5352,7 @@ fn acp_relay_captures_session_prompt_mcp_and_workdir_edits() {
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let stub_agent = temp.path().join("stub-acp-agent.sh");
-    let session_request_log = temp.path().join("session-new.jsonl");
+    let session_request_log = temp.path().join(".trail/session-new.jsonl");
     let lane_workdir = temp
         .path()
         .canonicalize()
@@ -5427,7 +5521,20 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .operations
         .iter()
         .any(|operation| operation.kind == OperationKind::LaneRecord));
+    let envelope = turn
+        .turn_envelope
+        .as_ref()
+        .expect("ACP prompt must have a typed turn envelope");
+    assert_eq!(envelope.outcome.status.as_deref(), Some("completed"));
+    assert!(!envelope.outcome.no_changes);
+    assert!(envelope.outcome.checkpoint.is_some());
+    assert_eq!(envelope.outcome.checkpoint, turn.turn.after_change);
+    assert!(turn
+        .events
+        .iter()
+        .any(|event| event.event_type == "workdir_recorded"));
     let status = db.lane_status("acp-test").unwrap();
+    assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
     assert!(status
         .changed_paths
         .iter()
@@ -5453,6 +5560,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .unwrap()
         .iter()
         .any(|summary| summary.as_str().unwrap().contains("write README")));
+    assert_eq!(
+        transcript["turns"][0]["checkpoint"],
+        transcript["turns"][0]["turn_envelope"]["outcome"]["checkpoint"]
+    );
 
     let turn_alias = run_trail_json(
         temp.path(),
@@ -5469,6 +5580,231 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
             .as_str()
             .unwrap()
             .contains("trail transcript acp-test")));
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_remaps_workspace_file_resources_into_lane() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let stub_agent = temp.path().join("resource-acp-agent.sh");
+    let forwarded_prompt_log = temp.path().join(".trail/forwarded-resource-prompt.jsonl");
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".trail/worktrees/acp-resource-test");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_resource_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' "$prompt" > "{}"
+resource_uri=${{prompt#*\"uri\":\"}}
+resource_uri=${{resource_uri%%\"*}}
+case "$resource_uri" in
+  file://*) resource_path=${{resource_uri#file://}} ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' 'changed through forwarded resource' > "$resource_path"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            forwarded_prompt_log.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-resource-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = std::io::BufReader::new(stdout);
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_resource_stub","prompt":[{{"type":"resource","resource":{{"uri":"file://{}/README.md","text":"hello"}}}},{{"type":"resource_link","name":"source","uri":"file://{}/src/lib.rs"}},{{"type":"resource_link","name":"external","uri":"file:///outside/shared.md"}},{{"type":"resource_link","name":"remote","uri":"https://example.com/context"}}]}}}}"#,
+        temp.path().display(),
+        temp.path().display(),
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":2"#), "unexpected relay frame: {line}");
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "relay failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let forwarded_prompt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&forwarded_prompt_log).unwrap()).unwrap();
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][0]["resource"]["uri"],
+        format!("file://{}/README.md", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][1]["uri"],
+        format!("file://{}/src/lib.rs", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][2]["uri"],
+        "file:///outside/shared.md"
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][3]["uri"],
+        "https://example.com/context"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "hello\n",
+        "the ACP agent must not edit the main workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(lane_workdir.join("README.md")).unwrap(),
+        "changed through forwarded resource\n"
+    );
+
+    let db = Trail::open(temp.path()).unwrap();
+    let status = db.lane_status("acp-resource-test").unwrap();
+    assert!(status
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "README.md"));
+    let mapping = db
+        .try_lane_acp_session("sess_resource_stub")
+        .unwrap()
+        .unwrap();
+    let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+    let turn = db.show_lane_turn(&session.turns[0].turn_id).unwrap();
+    assert!(turn
+        .operations
+        .iter()
+        .any(|operation| operation.kind == OperationKind::LaneRecord));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acp_relay_blocks_materialized_agent_writes_to_main_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let escaped_path = temp.path().join("ESCAPED.md");
+    let stub_agent = temp.path().join("escaping-acp-agent.sh");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_escape_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' 'escaped' > "{}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            escaped_path.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-escape-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_escape_stub","prompt":[{{"type":"text","text":"escape"}}]}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "relay unexpectedly allowed an ACP agent to write the main workspace"
+    );
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
+        "relay failed for an unexpected reason:\n{stderr}"
+    );
+    assert!(
+        !escaped_path.exists(),
+        "materialized ACP agent escaped its Trail lane"
+    );
 }
 
 #[cfg(unix)]
@@ -5534,14 +5870,13 @@ fn acp_relay_closes_failed_turn_on_malformed_upstream_json() {
         .unwrap();
     let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
     assert_eq!(session.turns[0].status, "failed");
-    assert!(session
-        .events
-        .iter()
-        .any(|event| event.event_type == "acp_relay_turn_closed"
+    assert!(session.events.iter().any(|event| {
+        event.event_type == "acp_relay_turn_closed"
             && event
                 .payload
                 .as_ref()
-                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))));
+                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))
+    }));
 }
 
 #[cfg(unix)]
@@ -5907,14 +6242,20 @@ fn run_stub_acp_relay_scenario_with_session_id(
 
 #[cfg(unix)]
 #[test]
-fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
+fn acp_relay_runs_three_synchronized_relays_on_distinct_lanes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let workspace_a = temp.path().to_path_buf();
+    let barrier_a = std::sync::Arc::clone(&barrier);
     let workspace_b = temp.path().to_path_buf();
+    let barrier_b = std::sync::Arc::clone(&barrier);
+    let workspace_c = temp.path().to_path_buf();
+    let barrier_c = std::sync::Arc::clone(&barrier);
     let relay_a = thread::spawn(move || {
+        barrier_a.wait();
         run_stub_acp_relay_scenario_with_session_id(
             &workspace_a,
             "acp-parallel-a",
@@ -5924,6 +6265,7 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
         )
     });
     let relay_b = thread::spawn(move || {
+        barrier_b.wait();
         run_stub_acp_relay_scenario_with_session_id(
             &workspace_b,
             "acp-parallel-b",
@@ -5932,9 +6274,20 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
             true,
         )
     });
+    let relay_c = thread::spawn(move || {
+        barrier_c.wait();
+        run_stub_acp_relay_scenario_with_session_id(
+            &workspace_c,
+            "acp-parallel-c",
+            "sess_parallel_c",
+            &["--sleep-before-result-ms", "100"],
+            true,
+        )
+    });
 
     let output_a = relay_a.join().unwrap();
     let output_b = relay_b.join().unwrap();
+    let output_c = relay_c.join().unwrap();
     assert!(
         output_a.status.success(),
         "relay a failed\nstdout:\n{}\nstderr:\n{}",
@@ -5947,11 +6300,18 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
         String::from_utf8_lossy(&output_b.stdout),
         String::from_utf8_lossy(&output_b.stderr)
     );
+    assert!(
+        output_c.status.success(),
+        "relay c failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output_c.stdout),
+        String::from_utf8_lossy(&output_c.stderr)
+    );
 
     let db = Trail::open(temp.path()).unwrap();
     for (lane, session_id) in [
         ("acp-parallel-a", "sess_parallel_a"),
         ("acp-parallel-b", "sess_parallel_b"),
+        ("acp-parallel-c", "sess_parallel_c"),
     ] {
         let mapping = db.try_lane_acp_session(session_id).unwrap().unwrap();
         let lane_details = db.lane_details(lane).unwrap();

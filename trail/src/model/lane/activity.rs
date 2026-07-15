@@ -22,6 +22,13 @@ pub struct LaneSessionContextReport {
     pub recent_operations: Vec<TimelineEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcpPathMapping {
+    pub original: String,
+    pub effective: String,
+    pub isolated: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneAcpSession {
     pub acp_session_id: String,
@@ -29,10 +36,13 @@ pub struct LaneAcpSession {
     pub lane_id: String,
     pub trail_session_id: String,
     pub cwd: String,
+    pub path_mappings: Vec<AcpPathMapping>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub upstream_command_json: Option<String>,
     pub status: String,
+    pub current_mode_id: Option<String>,
+    pub config_options: serde_json::Value,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -58,12 +68,26 @@ pub struct AcpDoctorCheck {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpConformanceEvidence {
+    pub wire_version: u16,
+    pub schema_commit: String,
+    pub schema_sha256: String,
+    pub meta_sha256: String,
+    pub transport: String,
+    pub method_count: u16,
+    pub evidence_status: String,
+    pub build_identifier: String,
+    pub exclusions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcpDoctorReport {
     pub status: String,
     pub provider: String,
     pub relay_command: Vec<String>,
     pub lane: Option<String>,
     pub session_id: Option<String>,
+    pub conformance: AcpConformanceEvidence,
     pub checks: Vec<AcpDoctorCheck>,
     pub warnings: Vec<String>,
 }

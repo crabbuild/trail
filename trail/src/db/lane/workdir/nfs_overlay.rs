@@ -414,7 +414,9 @@ mod macos {
         // unmounted and remounted with only the preceding truncate visible.
         // `sync` makes successful writes an actual durability boundary; the
         // server itself fsyncs every WRITE before reporting FILE_SYNC.
-        let opts = format!("locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,noac,actimeo=0,nonegnamecache,nobrowse,port={port},mountport={port}");
+        let opts = format!(
+            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,noac,actimeo=0,nonegnamecache,nobrowse,port={port},mountport={port}"
+        );
         let status = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])
             .status()?;
@@ -1988,7 +1990,7 @@ impl Trail {
         prepare_nfs_cow_workdir(self, lane, dir, custom)
     }
 
-    pub fn mount_nfs_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+    pub fn mount_nfs_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop + use<>> {
         mount_nfs_cow_for_lane(self, lane)
     }
 
@@ -1998,7 +2000,7 @@ impl Trail {
         source_upper: PathBuf,
         source_root: ObjectId,
         bindings: Vec<WorkspaceLayerBinding>,
-    ) -> Result<impl Drop> {
+    ) -> Result<impl Drop + use<>> {
         mount_nfs_cow_for_lane_with_ephemeral_bindings(
             self,
             lane,

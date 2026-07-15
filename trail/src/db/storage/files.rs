@@ -11,6 +11,32 @@ struct PathFileRead {
 }
 
 impl Trail {
+    /// Rejects agent/integration startup when any mutable live ref still uses a
+    /// non-empty legacy root without the persistent path-invariant index.
+    ///
+    /// This is deliberately read-only. The explicit recovery boundary remains
+    /// `trail index rebuild`, which repairs all live branch and lane refs in one
+    /// auditable operation.
+    pub fn ensure_live_path_invariant_indexes(&self) -> Result<()> {
+        let mut examined_roots = BTreeSet::new();
+        for reference in self.all_refs()?.into_iter().filter(|reference| {
+            reference.name.starts_with(MAIN_REF_PREFIX)
+                || reference.name.starts_with(LANE_REF_PREFIX)
+        }) {
+            if !examined_roots.insert(reference.root_id.clone()) {
+                continue;
+            }
+            let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &reference.root_id)?;
+            if root.file_count > 0 && root.case_fold_map_root.is_none() {
+                return Err(Error::PathIndexRequired(format!(
+                    "live ref `{}` has a legacy root with no case-fold index; run `trail index rebuild`",
+                    reference.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)] // Task 5 resets metrics around scale scenarios.
     pub(crate) fn reset_case_fold_index_metrics(&self) {
         self.case_fold_index_metrics

@@ -1,5 +1,5 @@
 use crate::model::{Actor, OperationKind, RecordOptions};
-use crate::server::transport::{HttpRequest, HttpResponse};
+use crate::server::transport::{HttpRequest, HttpResponse, ServerAuth};
 use crate::{Error, Result};
 
 use super::utils;
@@ -17,6 +17,7 @@ struct LedgerFenceRequest {
 pub(super) fn handle_system_route(
     db: &mut crate::Trail,
     request: &HttpRequest,
+    auth: &ServerAuth,
     path: &str,
     query: &str,
     parts: &[&str],
@@ -51,13 +52,13 @@ pub(super) fn handle_system_route(
         )
     {
         let body: LedgerFenceRequest = serde_json::from_slice(&request.body)?;
-        let expected_owner = std::env::var("TRAIL_WORKSPACE_DAEMON_OWNER_NONCE").ok();
-        let expected_workspace = std::env::var("TRAIL_WORKSPACE_DAEMON_WORKSPACE_IDENTITY").ok();
-        let expected_executable = std::env::var("TRAIL_WORKSPACE_DAEMON_EXECUTABLE_IDENTITY").ok();
+        let expected_identity = auth.daemon_identity.as_ref();
         if body.protocol_version != 2
-            || expected_owner.as_deref() != Some(body.owner_nonce.as_str())
-            || expected_workspace.as_deref() != Some(body.workspace_identity.as_str())
-            || expected_executable.as_deref() != Some(body.executable_identity.as_str())
+            || expected_identity.is_none_or(|identity| {
+                identity.owner_nonce != body.owner_nonce
+                    || identity.workspace_identity != body.workspace_identity
+                    || identity.executable_identity != body.executable_identity
+            })
         {
             return Err(Error::DaemonUnavailable(
                 "changed-path ledger RPC identity mismatch".into(),
@@ -89,9 +90,11 @@ pub(super) fn handle_system_route(
             "OK",
             &serde_json::json!({
                 "pid": std::process::id(),
-                "process_start_identity": std::env::var("TRAIL_WORKSPACE_DAEMON_PROCESS_START_IDENTITY")
+                "process_start_identity": expected_identity
+                    .map(|identity| identity.process_start_identity.as_str())
                     .unwrap_or_default(),
-                "executable_identity": std::env::var("TRAIL_WORKSPACE_DAEMON_EXECUTABLE_IDENTITY")
+                "executable_identity": expected_identity
+                    .map(|identity| identity.executable_identity.as_str())
                     .unwrap_or_default(),
                 "owner_nonce": body.owner_nonce,
                 "workspace_identity": body.workspace_identity,

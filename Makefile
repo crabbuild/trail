@@ -326,8 +326,9 @@ info: ## Show build environment info
 
 .PHONY: toolchain
 toolchain: ## Install/verify the correct Rust toolchain
-	@rustup show active-toolchain 2>/dev/null || rustup toolchain install stable
-	@rustup component add clippy rustfmt 2>/dev/null || true
+	@rustup update stable
+	@rustup default stable
+	@rustup component add clippy rustfmt --toolchain stable
 	@printf "  $(CHECK) toolchain ready\n"
 
 # ── CI ─────────────────────────────────────────────────────────────

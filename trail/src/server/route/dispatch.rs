@@ -52,7 +52,7 @@ pub(crate) fn route_request_result(
         return Ok(response);
     }
 
-    if let Some(response) = system::handle_system_route(db, &request, path, query, &parts)? {
+    if let Some(response) = system::handle_system_route(db, &request, auth, path, query, &parts)? {
         return Ok(response);
     }
 

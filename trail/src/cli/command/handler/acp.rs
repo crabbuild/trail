@@ -49,15 +49,63 @@ pub(super) fn handle_acp_sessions(ctx: &RuntimeContext, args: AgentAcpSessionsAr
 
 pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) -> Result<()> {
     let mut checks = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let mut status = "ok".to_string();
 
     let db_result = open_db(ctx);
     match &db_result {
-        Ok(_) => checks.push(acp_check("workspace", "ok", "Trail workspace opened")),
+        Ok(db) => {
+            checks.push(acp_check("workspace", "ok", "Trail workspace opened"));
+            match db.ensure_live_path_invariant_indexes() {
+                Ok(()) => checks.push(acp_check(
+                    "path_invariant_index",
+                    "ok",
+                    "all live branch and lane roots can accept safe mutations",
+                )),
+                Err(err) => {
+                    status = "failed".to_string();
+                    checks.push(acp_check(
+                        "path_invariant_index",
+                        "failed",
+                        &err.to_string(),
+                    ));
+                }
+            }
+            let capture_journal = capture_journal_check(db);
+            if capture_journal.status == "failed" {
+                status = "failed".to_string();
+            }
+            checks.push(capture_journal);
+            match trail::acp::validate_acp_path_mapping(db.workspace_root()) {
+                Ok(()) => checks.push(acp_check(
+                    "path_mapping",
+                    "ok",
+                    "workspace paths isolate correctly and external roots are preserved",
+                )),
+                Err(err) => {
+                    status = "failed".to_string();
+                    checks.push(acp_check("path_mapping", "failed", &err.to_string()));
+                }
+            }
+        }
         Err(err) => {
             status = "failed".to_string();
             checks.push(acp_check("workspace", "failed", &format!("{err}")));
+            checks.push(acp_check(
+                "capture_journal",
+                "skipped",
+                "workspace unavailable",
+            ));
+            checks.push(acp_check(
+                "path_invariant_index",
+                "skipped",
+                "workspace unavailable",
+            ));
+            checks.push(acp_check(
+                "path_mapping",
+                "skipped",
+                "workspace unavailable",
+            ));
         }
     }
 
@@ -146,15 +194,11 @@ pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) 
         ));
     }
 
-    if db_result.is_ok() {
-        checks.push(acp_check(
-            "capture",
-            "skipped",
-            "external provider launch is validated by command availability; run a real ACP prompt through an editor to verify capture",
-        ));
-    } else {
-        warnings.push("capture smoke skipped because workspace could not be opened".to_string());
-    }
+    checks.push(acp_check(
+        "capture_smoke",
+        "skipped",
+        "run a real ACP prompt through an editor to add provider-specific capture evidence",
+    ));
 
     let report = AcpDoctorReport {
         status,
@@ -162,14 +206,41 @@ pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) 
         relay_command,
         lane: None,
         session_id: None,
+        conformance: trail::acp::acp_v1_conformance_evidence(),
         checks,
         warnings,
     };
     render_acp_doctor(&report, ctx.json, &ctx.render)
 }
 
+fn capture_journal_check(db: &trail::Trail) -> AcpDoctorCheck {
+    let journal = db.db_dir().join("acp-ingress");
+    if let Err(err) = std::fs::create_dir_all(&journal) {
+        return acp_check(
+            "capture_journal",
+            "failed",
+            &format!("cannot prepare durable ACP capture journal: {err}"),
+        );
+    }
+    match std::fs::read_dir(&journal) {
+        Ok(entries) => {
+            let pending = entries.filter_map(|entry| entry.ok()).count();
+            acp_check(
+                "capture_journal",
+                "ok",
+                &format!("durable capture journal is accessible ({pending} pending spill files)"),
+            )
+        }
+        Err(err) => acp_check(
+            "capture_journal",
+            "failed",
+            &format!("cannot read durable ACP capture journal: {err}"),
+        ),
+    }
+}
+
 fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
-    let db = open_db(ctx)?;
+    let db = open_acp_relay_db(ctx)?;
     let materialize = if args.no_materialize {
         false
     } else if let Some(materialize) = args.materialize {
@@ -194,6 +265,24 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
         upstream_command,
         upstream_env,
     })
+}
+
+fn open_acp_relay_db(ctx: &RuntimeContext) -> Result<trail::Trail> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        match open_db(ctx) {
+            Ok(db) => return Ok(db),
+            Err(Error::SchemaReinitializeRequired { ref found, .. })
+                if found == "schema main/WAL/SHM generation changed during mutable handoff"
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn resolve_acp_relay_command(

@@ -7,7 +7,7 @@ pub use openapi::openapi_spec;
 pub use transport::{
     handle_http_request, handle_http_request_with_auth, serve_listener, serve_listener_with_auth,
     serve_listener_with_auth_and_rate_limit, serve_listener_with_auth_rate_limit_and_timeout,
-    HttpResponse, ServerAuth, ServerRateLimit,
+    DaemonServerIdentity, HttpResponse, ServerAuth, ServerRateLimit,
 };
 
 #[cfg(unix)]

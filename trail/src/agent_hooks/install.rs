@@ -362,7 +362,7 @@ fn target_for(
                 other => {
                     return Err(Error::InvalidInput(format!(
                         "provider `{other}` does not declare a user hook target"
-                    )))
+                    )));
                 }
             };
             Ok((home.to_path_buf(), PathBuf::from(relative)))
@@ -412,7 +412,7 @@ fn validate_target_path(base: &Path, target: &Path) -> Result<()> {
                 return Err(Error::InvalidPath {
                     path: cursor.display().to_string(),
                     reason: "agent hook installation refuses symlinked path components".to_string(),
-                })
+                });
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
@@ -472,7 +472,7 @@ fn merge_json_hooks(
             Some(_) => {
                 return Err(Error::Conflict(
                     "Cursor hook config `version` must be the number 1".to_string(),
-                ))
+                ));
             }
             None => {
                 root.insert("version".to_string(), Value::from(1));

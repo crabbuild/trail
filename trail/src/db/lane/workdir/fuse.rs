@@ -1265,7 +1265,7 @@ impl Trail {
         prepare_fuse_cow_workdir(self, lane, dir, custom_workdir)
     }
 
-    pub fn mount_fuse_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+    pub fn mount_fuse_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop + use<>> {
         mount_fuse_cow_for_lane(self, lane)
     }
 
@@ -1275,7 +1275,7 @@ impl Trail {
         source_upper: PathBuf,
         source_root: ObjectId,
         bindings: Vec<WorkspaceLayerBinding>,
-    ) -> Result<impl Drop> {
+    ) -> Result<impl Drop + use<>> {
         mount_fuse_cow_for_lane_with_ephemeral_bindings(
             self,
             lane,

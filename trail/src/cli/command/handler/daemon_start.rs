@@ -543,7 +543,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     let token_fd = required_env("TRAIL_WORKSPACE_DAEMON_TOKEN_FD")?
         .parse::<RawFd>()
         .map_err(|_| Error::InvalidInput("workspace daemon token fd is invalid".into()))?;
-    std::env::remove_var("TRAIL_WORKSPACE_DAEMON_TOKEN_FD");
     let mut token_reader = unsafe { File::from_raw_fd(token_fd) };
     let mut token = String::new();
     (&mut token_reader).take(65).read_to_string(&mut token)?;
@@ -557,7 +556,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     let ready_fd = required_env("TRAIL_WORKSPACE_DAEMON_READY_FD")?
         .parse::<RawFd>()
         .map_err(|_| Error::InvalidInput("workspace daemon readiness fd is invalid".into()))?;
-    std::env::remove_var("TRAIL_WORKSPACE_DAEMON_READY_FD");
 
     let socket_path = db.db_dir().join(SOCKET_FILE);
     authority.verify_trail_identity(db.db_dir())?;
@@ -674,18 +672,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         durable_offset: ledger_ready.durable_offset,
         folded_offset: ledger_ready.folded_offset,
     };
-    std::env::set_var(
-        "TRAIL_WORKSPACE_DAEMON_WORKSPACE_IDENTITY",
-        &endpoint.workspace_identity,
-    );
-    std::env::set_var(
-        "TRAIL_WORKSPACE_DAEMON_EXECUTABLE_IDENTITY",
-        &endpoint.executable_identity,
-    );
-    std::env::set_var(
-        "TRAIL_WORKSPACE_DAEMON_PROCESS_START_IDENTITY",
-        &endpoint.process_start_identity,
-    );
     publish_owner_file(
         &authority,
         TOKEN_FILE,
@@ -713,7 +699,14 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     let result = trail::server::serve_unix_listener_with_auth_and_timeout(
         &mut db,
         socket,
-        trail::server::ServerAuth::bearer(token)?,
+        trail::server::ServerAuth::bearer(token)?.with_daemon_identity(
+            trail::server::DaemonServerIdentity::new(
+                endpoint.owner_nonce.clone(),
+                endpoint.workspace_identity.clone(),
+                endpoint.executable_identity.clone(),
+                endpoint.process_start_identity.clone(),
+            ),
+        ),
         Duration::from_secs(30),
     );
     if result.as_ref().is_err_and(|error| {

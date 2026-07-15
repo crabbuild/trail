@@ -59,10 +59,15 @@ impl Trail {
             );
         } else if selector.starts_with("session_") {
             changes.extend(self.session_change_ids(selector)?);
-        } else if let Ok(lane) = self.lane_branch(selector) {
-            changes.extend(self.lane_change_ids(&lane.lane_id)?);
         } else {
-            changes.extend(self.session_change_ids(selector)?);
+            match self.lane_branch(selector) {
+                Ok(lane) => {
+                    changes.extend(self.lane_change_ids(&lane.lane_id)?);
+                }
+                _ => {
+                    changes.extend(self.session_change_ids(selector)?);
+                }
+            }
         }
 
         let mut operations = Vec::new();

@@ -38,6 +38,9 @@ pub(in crate::db::storage) fn agent_capture_schema_complete(conn: &Connection) -
         && receipt_columns.contains("raw_object_id")
         && receipt_columns.contains("attempt_count")
         && receipt_columns.contains("next_attempt_at")
+        && receipt_columns.contains("connection_id")
+        && receipt_columns.contains("direction")
+        && receipt_columns.contains("connection_sequence")
         && artifact_columns.contains("retention_status")
         && artifact_columns.contains("trust"))
 }

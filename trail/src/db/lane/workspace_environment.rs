@@ -1158,7 +1158,9 @@ impl Trail {
                 .filter(|component| component_id.is_none_or(|id| component.component_id == id))
                 .collect::<Vec<_>>();
             match candidates.as_slice() {
-                [component] if component.adapter_identity == command_metadata.canonical_identity => {
+                [component]
+                    if component.adapter_identity == command_metadata.canonical_identity =>
+                {
                     (
                         self.command_recipe_plan(&head.root_id, &component.component_id)?,
                         None,
@@ -1191,30 +1193,33 @@ impl Trail {
                             &component.component_root,
                             &component.component_id,
                         )?;
-                        (
-                            plan,
-                            None,
-                            Some(plugin),
-                            component.component_id.clone(),
-                        )
+                        (plan, None, Some(plugin), component.component_id.clone())
                     }
                 }
                 [] => {
                     return Err(Error::InvalidInput(format!(
                         "no workspace environment adapter detected at `{}`; specify --adapter explicitly",
-                        if component_root.is_empty() { "." } else { component_root }
-                    )))
+                        if component_root.is_empty() {
+                            "."
+                        } else {
+                            component_root
+                        }
+                    )));
                 }
                 components => {
                     return Err(Error::InvalidInput(format!(
                         "multiple workspace environment adapters or components detected at `{}`: {}; specify --adapter explicitly",
-                        if component_root.is_empty() { "." } else { component_root },
+                        if component_root.is_empty() {
+                            "."
+                        } else {
+                            component_root
+                        },
                         components
                             .iter()
                             .map(|component| component.adapter_identity.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
-                    )))
+                    )));
                 }
             }
         } else if command_metadata.selectors.contains(&adapter_selector) {
@@ -5680,7 +5685,7 @@ fn ensure_restricted_recipe_sandbox_available() -> Result<()> {
     ))]
     {
         Err(Error::InvalidInput(format!(
-                "restricted command recipe sandboxing is unavailable on {}; Trail refuses to run the repository command without native enforcement",
+            "restricted command recipe sandboxing is unavailable on {}; Trail refuses to run the repository command without native enforcement",
             std::env::consts::OS
         )))
     }

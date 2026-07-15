@@ -637,9 +637,9 @@ impl Trail {
                 "writable_private" => WorkspaceEnvironmentOutputPolicy::WritablePrivate,
                 _ => {
                     return Err(Error::InvalidInput(format!(
-                    "command component `{}` output policy must be `immutable_seed_private` or `writable_private`",
-                    component.id
-                )));
+                        "command component `{}` output policy must be `immutable_seed_private` or `writable_private`",
+                        component.id
+                    )));
                 }
             };
             if output.portability != "host" && output.portability != "platform" {

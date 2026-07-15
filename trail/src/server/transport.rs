@@ -25,14 +25,39 @@ pub(crate) struct HttpRequest {
     pub(crate) body: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DaemonServerIdentity {
+    pub(crate) owner_nonce: String,
+    pub(crate) workspace_identity: String,
+    pub(crate) executable_identity: String,
+    pub(crate) process_start_identity: String,
+}
+
+impl DaemonServerIdentity {
+    pub fn new(
+        owner_nonce: impl Into<String>,
+        workspace_identity: impl Into<String>,
+        executable_identity: impl Into<String>,
+        process_start_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            owner_nonce: owner_nonce.into(),
+            workspace_identity: workspace_identity.into(),
+            executable_identity: executable_identity.into(),
+            process_start_identity: process_start_identity.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ServerAuth {
     pub(crate) token: Option<String>,
+    pub(crate) daemon_identity: Option<DaemonServerIdentity>,
 }
 
 impl ServerAuth {
     pub fn disabled() -> Self {
-        Self { token: None }
+        Self::default()
     }
 
     pub fn bearer(token: impl Into<String>) -> Result<Self> {
@@ -42,7 +67,15 @@ impl ServerAuth {
                 "daemon auth token cannot be empty".to_string(),
             ));
         }
-        Ok(Self { token: Some(token) })
+        Ok(Self {
+            token: Some(token),
+            daemon_identity: None,
+        })
+    }
+
+    pub fn with_daemon_identity(mut self, identity: DaemonServerIdentity) -> Self {
+        self.daemon_identity = Some(identity);
+        self
     }
 
     pub fn is_required(&self) -> bool {

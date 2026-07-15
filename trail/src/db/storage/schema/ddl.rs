@@ -62,6 +62,9 @@ CREATE TABLE agent_hook_receipts (
                  raw_object_id TEXT NOT NULL REFERENCES objects(object_id),
                  raw_artifact_id TEXT REFERENCES lane_artifacts(artifact_id),
                  receive_sequence INTEGER,
+                 connection_id TEXT,
+                 direction TEXT,
+                 connection_sequence INTEGER,
                  status TEXT NOT NULL,
                  attempt_count INTEGER NOT NULL DEFAULT 0,
                  next_attempt_at INTEGER,
@@ -443,6 +446,9 @@ CREATE TABLE lane_acp_sessions (
                 provider TEXT,
                 model TEXT,
                 upstream_command_json TEXT,
+                path_mappings_json TEXT NOT NULL DEFAULT '[]',
+                current_mode_id TEXT,
+                config_options_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -945,6 +951,11 @@ CREATE INDEX agent_hook_receipts_session_idx
                  ON agent_hook_receipts(workspace_id, provider, native_session_id, received_at);
 CREATE INDEX agent_hook_receipts_turn_idx
                  ON agent_hook_receipts(native_turn_id, received_at);
+CREATE UNIQUE INDEX agent_hook_receipts_connection_sequence_idx
+                 ON agent_hook_receipts(connection_id, direction, connection_sequence)
+                 WHERE connection_id IS NOT NULL
+                   AND direction IS NOT NULL
+                   AND connection_sequence IS NOT NULL;
 CREATE INDEX anchors_file_idx ON anchors(file_id, created_at);
 CREATE INDEX anchors_line_idx ON anchors(line_id, created_at);
 CREATE INDEX conflict_resolution_suggestions_signature_idx ON conflict_resolution_suggestions(signature, created_at);

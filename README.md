@@ -459,7 +459,8 @@ The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
 macFUSE, and the Dokan driver are otherwise relevant only to their
 corresponding mounted-workspace modes.
 
-To build from source instead, install Rust 1.81 or newer and use the Makefile:
+To build from source instead, install Rust 1.89 or newer and use the Makefile.
+Trail's parent-owned crates use Rust edition 2024:
 
 ```sh
 # Build the debug binary at target/debug/trail.
@@ -814,12 +815,22 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail agent acp status` | List built-in aliases and current official ACP registry agents |
 | `trail agent acp setup claude-code --editor generic` | Print a generic Claude Code ACP entry |
 | `trail agent acp setup codex --editor zed` | Preview the Codex entry for Zed; add `--yes` to apply it |
-| `trail agent acp doctor claude-code` | Check ACP provider and relay readiness |
+| `trail agent acp doctor claude-code` | Report provider readiness and verifiable ACP v1 compatibility evidence |
 | `trail agent acp sessions` | List captured ACP sessions |
 | `trail transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
 | `trail doctor` | Run workspace and integration diagnostics |
 | `trail backup create <output>` | Create a Trail workspace backup |
 | `trail fsck` | Verify repository integrity |
+
+Trail is a transparent ACP v1 stdio compatibility layer between an editor and
+an agent. It covers all 23 stable ACP v1 methods while adding isolated lanes,
+durable transcripts, provenance, and optional Trail MCP injection. Run
+`trail agent acp doctor <agent>` for the exact wire version, pinned schema
+digests, build-attestation status, capture-journal health, and path-mapping
+health. Editor setup and agent installation/authentication are reported
+separately from protocol conformance. See
+[ACP v1 compatibility](docs/acp-v1-compatibility.md) for the evidence, precise
+boundary, exclusions, and opt-in Zed/agent smoke procedures.
 
 ## Core Local Workflows
 

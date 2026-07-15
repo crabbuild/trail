@@ -1196,7 +1196,7 @@ impl DaemonEndpoint {
             Some(_) => {
                 return Err(Error::InvalidInput(
                     "--daemon-url must include a non-empty host".to_string(),
-                ))
+                ));
             }
         };
         let base_path = if path.is_empty() {

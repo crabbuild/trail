@@ -274,7 +274,7 @@ impl ViewCore {
                     if metadata.file_type().is_symlink()
                         && !(allow_leaf_symlink && index + 1 == components.len()) =>
                 {
-                    return Err(EPERM)
+                    return Err(EPERM);
                 }
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1083,7 +1083,7 @@ impl ViewCore {
             other => {
                 return Err(Error::InvalidInput(format!(
                     "workspace layer kind `{other}` cannot own a writable mount path"
-                )))
+                )));
             }
         };
         self.prepare_validated_layer_mount_path(&path, class, replacement_layer_id, false)
@@ -1123,7 +1123,7 @@ impl ViewCore {
             other => {
                 return Err(Error::InvalidInput(format!(
                     "environment kind `{other}` cannot own a writable-private path"
-                )))
+                )));
             }
         };
         let upper = self
@@ -1174,7 +1174,7 @@ impl ViewCore {
             other => {
                 return Err(Error::InvalidInput(format!(
                     "workspace layer kind `{other}` cannot own a writable mount path"
-                )))
+                )));
             }
         };
         self.prepare_validated_layer_mount_path(&path, class, "binding-removed", true)

@@ -60,7 +60,7 @@ const GAP_FLAGS: u32 = fs_events::kFSEventStreamEventFlagMustScanSubDirs
 static NULL_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[link(name = "CoreServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn FSEventsCopyUUIDForDevice(device: libc::dev_t) -> CFUUIDRef;
 }
 
