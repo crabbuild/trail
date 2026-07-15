@@ -854,6 +854,142 @@ fn populate_socket_tombstones(fixture: &Fixture, count: usize) {
     }
 }
 
+fn is_exact_private_socket_leaf(name: &str) -> bool {
+    name.len() == 14
+        && name.starts_with(".s")
+        && name[2..]
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_exact_socket_tombstone(name: &str) -> bool {
+    let Some(hex) = name
+        .strip_prefix(".changed-path-socket-tombstone.")
+        .and_then(|name| name.strip_suffix(".removing"))
+    else {
+        return false;
+    };
+    hex.len() == 24
+        && hex
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn socket_cleanup_artifacts(fixture: &Fixture) -> Vec<String> {
+    let mut artifacts = fs::read_dir(fixture.root().join(".trail"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_exact_socket_tombstone(name) || is_exact_private_socket_leaf(name))
+        .collect::<Vec<_>>();
+    artifacts.sort();
+    artifacts
+}
+
+fn spawn_status_waiting_at_private_socket_bind(
+    fixture: &Fixture,
+    barrier: &Path,
+) -> std::process::Child {
+    fs::create_dir(barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_BOUND_BARRIER", barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !barrier.join("bound").exists() || !barrier.join("pid").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon exited before socket bind boundary: status={status} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(Instant::now() < deadline, "socket bind barrier timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+fn kill_bound_daemon_and_wait_for_status_failure(
+    child: std::process::Child,
+    barrier: &Path,
+) -> std::process::Output {
+    let daemon_pid = fs::read_to_string(barrier.join("pid"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGKILL) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    output
+}
+
+#[test]
+fn sigkill_before_starting_intent_leaves_counted_orphan_and_next_status_starts() {
+    let fixture = Fixture::new();
+    let barrier = fixture.root().join("socket-pre-intent-sigkill");
+    let child = spawn_status_waiting_at_private_socket_bind(&fixture, &barrier);
+    let orphan_leaf = fs::read_to_string(barrier.join("bound")).unwrap();
+    assert!(is_exact_private_socket_leaf(&orphan_leaf));
+    let orphan_path = fixture.root().join(".trail").join(&orphan_leaf);
+    assert!(orphan_path.exists());
+    kill_bound_daemon_and_wait_for_status_failure(child, &barrier);
+    assert!(orphan_path.exists());
+    assert_eq!(
+        socket_cleanup_artifacts(&fixture),
+        vec![orphan_leaf.clone()]
+    );
+
+    let restarted = fixture.status();
+    assert!(
+        restarted.status.success(),
+        "below-cap restart failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert!(orphan_path.exists());
+    assert!(socket_cleanup_artifacts(&fixture).contains(&orphan_leaf));
+}
+
+#[test]
+fn sigkill_private_leaf_reaches_total_cap_and_next_status_refuses_before_bind() {
+    let fixture = Fixture::new();
+    populate_socket_tombstones(&fixture, 1023);
+    fs::write(fixture.root().join(".trail/.s00000000000G"), b"near-match").unwrap();
+    fs::write(fixture.root().join(".trail/.s-short"), b"near-match").unwrap();
+    assert_eq!(socket_cleanup_artifacts(&fixture).len(), 1023);
+
+    let barrier = fixture.root().join("socket-cap-pre-intent-sigkill");
+    let child = spawn_status_waiting_at_private_socket_bind(&fixture, &barrier);
+    let orphan_leaf = fs::read_to_string(barrier.join("bound")).unwrap();
+    let orphan_path = fixture.root().join(".trail").join(&orphan_leaf);
+    assert_eq!(socket_cleanup_artifacts(&fixture).len(), 1024);
+    kill_bound_daemon_and_wait_for_status_failure(child, &barrier);
+    assert!(orphan_path.exists());
+
+    let refused = fixture.status();
+    assert_status_failed(&refused);
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("reinitialize this workspace"),
+        "missing reinitialize guidance: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(socket_cleanup_artifacts(&fixture).len(), 1024);
+    assert!(orphan_path.exists());
+}
+
 #[test]
 fn socket_tombstone_cap_minus_one_permits_exactly_the_final_slot() {
     let fixture = Fixture::new();

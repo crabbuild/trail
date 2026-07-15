@@ -25,7 +25,7 @@ const STARTING_FILE: &str = "daemon.starting.json";
 const SOCKET_FILE: &str = "changed-path.sock";
 const SOCKET_TOMBSTONE_PREFIX: &str = ".changed-path-socket-tombstone.";
 const SOCKET_TOMBSTONE_SUFFIX: &str = ".removing";
-const SOCKET_TOMBSTONE_CAP: usize = 1024;
+const SOCKET_CLEANUP_ARTIFACT_CAP: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct WorkspaceDaemonEndpoint {
@@ -563,7 +563,7 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     authority.verify_trail_identity(db.db_dir())?;
     // Keep the private bind leaf shorter than the stable leaf so workspaces
     // whose final socket fits SUN_LEN do not fail only during publication.
-    ensure_socket_tombstone_capacity(&authority.trail_directory)?;
+    ensure_socket_cleanup_artifact_capacity(&authority.trail_directory)?;
     let socket_tmp_leaf = format!(".s{}", random_hex(6)?);
     let socket_tmp_path = db.db_dir().join(&socket_tmp_leaf);
     // This process was exec'd solely as the workspace daemon, and this bind
@@ -1280,6 +1280,7 @@ fn test_socket_bound_boundary(leaf: &str) -> Result<()> {
     };
     let barrier = PathBuf::from(barrier);
     fs::write(barrier.join("bound"), leaf.as_bytes())?;
+    fs::write(barrier.join("pid"), std::process::id().to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !barrier.join("continue").exists() {
         if Instant::now() >= deadline {
@@ -1320,7 +1321,7 @@ fn remove_socket_leaf_if_identity(
     #[cfg(not(debug_assertions))]
     let _ = run_test_boundary;
 
-    ensure_socket_tombstone_capacity(&authority.trail_directory)?;
+    ensure_socket_cleanup_artifact_capacity(&authority.trail_directory)?;
     let quarantine = format!(
         "{SOCKET_TOMBSTONE_PREFIX}{}{SOCKET_TOMBSTONE_SUFFIX}",
         random_hex(12)?
@@ -1361,7 +1362,7 @@ fn remove_socket_leaf_if_identity(
     Ok(())
 }
 
-fn ensure_socket_tombstone_capacity(parent: &File) -> Result<()> {
+fn ensure_socket_cleanup_artifact_capacity(parent: &File) -> Result<()> {
     // Foreground stale cleanup holds daemon.lock. A spawned child completes
     // its unpublished guard while that caller still owns the lock, and a
     // published child remains live until its publication guard runs at exit,
@@ -1372,16 +1373,20 @@ fn ensure_socket_tombstone_capacity(parent: &File) -> Result<()> {
     let mut count = 0_usize;
     while let Some(entry) = directory.read() {
         let entry = entry.map_err(|error| Error::Io(std::io::Error::from(error)))?;
-        if is_socket_tombstone_name(entry.file_name().to_bytes()) {
+        if is_socket_cleanup_artifact_name(entry.file_name().to_bytes()) {
             count += 1;
-            if count >= SOCKET_TOMBSTONE_CAP {
+            if count >= SOCKET_CLEANUP_ARTIFACT_CAP {
                 return Err(Error::DaemonUnavailable(format!(
-                    "workspace daemon retained socket tombstone limit ({SOCKET_TOMBSTONE_CAP}) reached; reinitialize this workspace"
+                    "workspace daemon retained socket cleanup artifact limit ({SOCKET_CLEANUP_ARTIFACT_CAP}) reached; reinitialize this workspace"
                 )));
             }
         }
     }
     Ok(())
+}
+
+fn is_socket_cleanup_artifact_name(name: &[u8]) -> bool {
+    is_socket_tombstone_name(name) || is_private_socket_leaf_name(name)
 }
 
 fn is_socket_tombstone_name(name: &[u8]) -> bool {
@@ -1396,6 +1401,14 @@ fn is_socket_tombstone_name(name: &[u8]) -> bool {
     name[prefix.len()..prefix.len() + 24]
         .iter()
         .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_private_socket_leaf_name(name: &[u8]) -> bool {
+    name.len() == 14
+        && name.starts_with(b".s")
+        && name[2..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn renameat_noreplace(parent: &File, old: &str, new: &str) -> std::io::Result<()> {
