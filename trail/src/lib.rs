@@ -26,6 +26,10 @@ pub mod test_support {
     pub fn changed_path_command_flow() -> std::result::Result<(), String> {
         crate::db::run_command_flow()
     }
+
+    pub fn changed_path_command_long_lock_flow() -> std::result::Result<(), String> {
+        crate::db::run_command_long_lock_flow()
+    }
     #[cfg(target_os = "macos")]
     fn run_macos_integration(
         test: fn() -> std::result::Result<(), String>,

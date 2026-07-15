@@ -16,8 +16,14 @@ impl Trail {
         let head = self.resolve_branch_ref(&branch)?;
         let (comparison, _fenced) =
             self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
-                db.compare_authoritative_candidates(policy, candidates, &head.root_id)
+                db.compare_authoritative_candidates(
+                    policy,
+                    candidates,
+                    &head.root_id,
+                    crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                )
             })?;
+        debug_assert!(comparison.disk_files.is_none());
         Ok(DiffSummary {
             from: branch,
             to: "dirty".into(),

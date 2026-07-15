@@ -9,6 +9,11 @@ static OBSERVED_RECORD_AFTER_COMPARE_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(debug_assertions)]
+static OBSERVED_RECORD_WITH_LOCK_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedRecordAfterCompareHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(debug_assertions)]
 pub(crate) fn install_observed_record_after_compare_hook(
     hook: impl FnOnce() -> Result<()> + Send + 'static,
 ) {
@@ -19,8 +24,31 @@ pub(crate) fn install_observed_record_after_compare_hook(
 }
 
 #[cfg(debug_assertions)]
+pub(crate) fn install_observed_record_with_lock_hook(
+    hook: impl FnOnce() -> Result<()> + Send + 'static,
+) {
+    *OBSERVED_RECORD_WITH_LOCK_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Box::new(hook));
+}
+
+#[cfg(debug_assertions)]
 fn run_observed_record_after_compare_hook() -> Result<()> {
     let hook = OBSERVED_RECORD_AFTER_COMPARE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn run_observed_record_with_lock_hook() -> Result<()> {
+    let hook = OBSERVED_RECORD_WITH_LOCK_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -371,18 +399,27 @@ impl Trail {
         let kind = options.kind.unwrap_or(OperationKind::ManualRecord);
         let (built_record, fenced) =
             self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
-                let comparison =
-                    db.compare_authoritative_candidates(policy, candidates, &head.root_id)?;
+                let comparison = db.compare_authoritative_candidates(
+                    policy,
+                    candidates,
+                    &head.root_id,
+                    crate::db::change_ledger::CandidateMaterialization::RecordBytes,
+                )?;
                 if comparison.summaries.is_empty() {
                     return Ok(None);
                 }
                 #[cfg(debug_assertions)]
                 run_observed_record_after_compare_hook()?;
                 let change_id = db.allocate_change_id(&actor_for_build.id, "record")?;
+                let disk_files = comparison.disk_files.as_ref().ok_or_else(|| {
+                    crate::Error::Corrupt(
+                        "record candidate comparison omitted pinned contents".into(),
+                    )
+                })?;
                 let built = db.build_root_for_selected_disk_files_incremental(
                     &head.root_id,
                     &comparison.baseline_files,
-                    &comparison.disk_files,
+                    disk_files,
                     &comparison.selections,
                     &change_id,
                 )?;
@@ -448,9 +485,17 @@ impl Trail {
             c2: fenced.c2,
             acknowledgement_tokens: fenced.candidates.acknowledgement_tokens,
         };
+        let _observer_exclusion =
+            crate::db::begin_authorized_observer_write_exclusion(&self.db_dir);
         let _lock = Self::with_write_lock_wait(std::time::Duration::from_secs(5), || {
             self.acquire_write_lock()
         })?;
+        // Keep exclusion through mirror repair, daemon baseline rebind, and
+        // worktree-index baseline publication. Narrowing it to the SQLite
+        // COMMIT would expose those shared persistent transitions to another
+        // writer even though the authoritative SQL transaction had finished.
+        #[cfg(debug_assertions)]
+        run_observed_record_with_lock_hook()?;
         self.commit_observed_record(&operation, &head, &observed, true, None)?;
         self.set_worktree_index_baseline(&root_id)?;
         Ok(RecordReport {

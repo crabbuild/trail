@@ -49,8 +49,20 @@ pub(crate) struct CandidateComparison {
     pub(crate) selections: Vec<String>,
     pub(crate) baseline_files: BTreeMap<String, FileEntry>,
     pub(crate) disk_manifest: BTreeMap<String, DiskManifest>,
-    pub(crate) disk_files: Vec<DiskFile>,
+    pub(crate) disk_files: Option<Vec<DiskFile>>,
     pub(crate) summaries: Vec<FileDiffSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateMaterialization {
+    ManifestOnly,
+    RecordBytes,
+}
+
+impl CandidateMaterialization {
+    fn retains_bytes(self) -> bool {
+        matches!(self, Self::RecordBytes)
+    }
 }
 
 impl crate::Trail {
@@ -59,6 +71,7 @@ impl crate::Trail {
         policy: &super::CompiledPolicy,
         snapshot: &CandidateSnapshot,
         root_id: &ObjectId,
+        materialization: CandidateMaterialization,
     ) -> Result<CandidateComparison> {
         if snapshot.expected.baseline_root != *root_id
             || snapshot.expected.policy_fingerprint != policy.fingerprint()
@@ -103,7 +116,7 @@ impl crate::Trail {
                 selections,
                 baseline_files,
                 disk_manifest: BTreeMap::new(),
-                disk_files: Vec::new(),
+                disk_files: materialization.retains_bytes().then(Vec::new),
                 summaries: Vec::new(),
             });
         }
@@ -118,17 +131,33 @@ impl crate::Trail {
             });
         }
         let mut disk_manifest = BTreeMap::new();
-        let mut disk_files = Vec::new();
+        let mut disk_files = materialization.retains_bytes().then(Vec::new);
         for path in exact {
             if matcher.is_ignored(&path, false)? {
                 continue;
             }
-            if let Some(file) = self.read_pinned_candidate_path(&pinned, policy, &path)? {
-                let bytes = file.bytes.ok_or_else(|| {
-                    crate::Error::Corrupt(
-                        "authoritative candidate read omitted captured contents".into(),
-                    )
-                })?;
+            if let Some(file) = self.read_pinned_candidate_path(
+                &pinned,
+                policy,
+                &path,
+                materialization.retains_bytes(),
+            )? {
+                let bytes = file.bytes;
+                if let Some(disk_files) = disk_files.as_mut() {
+                    disk_files.push(DiskFile {
+                        path: path.clone(),
+                        bytes: bytes.ok_or_else(|| {
+                            crate::Error::Corrupt(
+                                "record candidate read omitted captured contents".into(),
+                            )
+                        })?,
+                        executable: file.executable,
+                    });
+                } else if bytes.is_some() {
+                    return Err(crate::Error::Corrupt(
+                        "manifest-only candidate comparison retained file contents".into(),
+                    ));
+                }
                 disk_manifest.insert(
                     path.clone(),
                     DiskManifest {
@@ -137,32 +166,41 @@ impl crate::Trail {
                         content_hash: file.content_hash,
                     },
                 );
-                disk_files.push(DiskFile {
-                    path,
-                    bytes,
-                    executable: file.executable,
-                });
             }
         }
-        self.visit_pinned_worktree_prefix_files(&pinned, &matcher, &prefixes, |file| {
-            let bytes = file.bytes.ok_or_else(|| {
-                crate::Error::Corrupt("authoritative prefix read omitted captured contents".into())
-            })?;
-            disk_manifest.insert(
-                file.path.clone(),
-                DiskManifest {
-                    kind: file_kind_from_index(&file.file_kind)?,
-                    executable: file.executable,
-                    content_hash: file.content_hash,
-                },
-            );
-            disk_files.push(DiskFile {
-                path: file.path,
-                bytes,
-                executable: file.executable,
-            });
-            Ok(())
-        })?;
+        self.visit_pinned_worktree_prefix_files(
+            &pinned,
+            &matcher,
+            &prefixes,
+            materialization.retains_bytes(),
+            |file| {
+                let bytes = file.bytes;
+                if let Some(disk_files) = disk_files.as_mut() {
+                    disk_files.push(DiskFile {
+                        path: file.path.clone(),
+                        bytes: bytes.ok_or_else(|| {
+                            crate::Error::Corrupt(
+                                "record prefix read omitted captured contents".into(),
+                            )
+                        })?,
+                        executable: file.executable,
+                    });
+                } else if bytes.is_some() {
+                    return Err(crate::Error::Corrupt(
+                        "manifest-only prefix comparison retained file contents".into(),
+                    ));
+                }
+                disk_manifest.insert(
+                    file.path.clone(),
+                    DiskManifest {
+                        kind: file_kind_from_index(&file.file_kind)?,
+                        executable: file.executable,
+                        content_hash: file.content_hash,
+                    },
+                );
+                Ok(())
+            },
+        )?;
         if !self.verify_pinned_worktree_root(&pinned)? {
             return Err(crate::Error::ChangeLedgerReconcileRequired {
                 scope: snapshot.expected.scope_id.to_text(),
@@ -188,6 +226,16 @@ impl crate::Trail {
 
 #[cfg(debug_assertions)]
 pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
+    run_command_flow_inner(false)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_command_long_lock_flow() -> std::result::Result<(), String> {
+    run_command_flow_inner(true)
+}
+
+#[cfg(debug_assertions)]
+fn run_command_flow_inner(long_record_lock: bool) -> std::result::Result<(), String> {
     use crate::model::Actor;
     use crate::{InitImportMode, Trail};
     use sha2::{Digest, Sha256};
@@ -209,6 +257,9 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
     let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
     Trail::init(temp.path(), "main", InitImportMode::Empty, false)
         .map_err(|error| error.to_string())?;
+    fs::create_dir(temp.path().join("tree")).map_err(|error| error.to_string())?;
+    fs::write(temp.path().join("tree/nested.txt"), vec![b'x'; 256 * 1024])
+        .map_err(|error| error.to_string())?;
     fs::write(temp.path().join("tracked.txt"), b"baseline\n").map_err(|error| error.to_string())?;
     let mut db = Trail::open(temp.path()).map_err(|error| error.to_string())?;
     db.record(None, Some("baseline".into()), Actor::human(), false)
@@ -216,6 +267,63 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
     super::prepare_workspace_daemon(&mut db, false).map_err(|error| error.to_string())?;
     set_command_authority_override(true);
     let _reset = OverrideReset;
+
+    let (scope_id, provider_id): (String, String) = db
+        .conn
+        .query_row(
+            "SELECT scope_id,provider_id FROM changed_path_scopes
+             WHERE scope_kind='workspace'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    db.conn
+        .execute(
+            "INSERT INTO changed_path_prefixes(
+                 scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                 first_sequence,last_sequence,provider_id,provider_sequence,created_at,updated_at
+             ) VALUES(?1,'tree','provider_complete',?2,?3,1,1,?4,1,
+                      strftime('%s','now'),strftime('%s','now'))",
+            params![
+                scope_id,
+                super::EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0,
+                super::EvidenceSource::Observer.mask(),
+                provider_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let (metadata_only, _) = db
+        .with_workspace_authoritative_snapshot(|db, policy, candidates| {
+            db.compare_authoritative_candidates(
+                policy,
+                candidates,
+                &candidates.expected.baseline_root,
+                CandidateMaterialization::ManifestOnly,
+            )
+        })
+        .map_err(|error| format!("metadata-only complete-prefix comparison: {error}"))?;
+    if metadata_only.disk_files.is_some()
+        || !metadata_only.disk_manifest.contains_key("tree/nested.txt")
+    {
+        return Err("metadata-only complete-prefix comparison retained content bytes".into());
+    }
+    let (record_bytes, _) = db
+        .with_workspace_authoritative_snapshot(|db, policy, candidates| {
+            db.compare_authoritative_candidates(
+                policy,
+                candidates,
+                &candidates.expected.baseline_root,
+                CandidateMaterialization::RecordBytes,
+            )
+        })
+        .map_err(|error| format!("record-byte complete-prefix comparison: {error}"))?;
+    let retained = record_bytes.disk_files.as_ref().ok_or_else(|| {
+        "record-byte complete-prefix comparison omitted its explicit materialization".to_string()
+    })?;
+    if retained.len() != 1 || retained[0].path != "tree/nested.txt" {
+        return Err("record-byte complete-prefix comparison retained the wrong path set".into());
+    }
 
     let consume_attempts = std::cell::Cell::new(0_u8);
     db.with_workspace_authoritative_snapshot(|_, _, candidates| {
@@ -275,6 +383,14 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
         fs::write(changed_after_comparison, b"changed-after-comparison\n")?;
         Ok(())
     });
+    if long_record_lock {
+        let changed_with_lock = temp.path().join("tracked.txt");
+        crate::db::install_observed_record_with_lock_hook(move || {
+            fs::write(changed_with_lock, b"changed-while-record-lock-held\n")?;
+            std::thread::sleep(std::time::Duration::from_millis(5_500));
+            Ok(())
+        });
+    }
     let recorded = db
         .record(None, Some("observed".into()), Actor::human(), false)
         .map_err(|error| format!("observed record: {error}"))?;

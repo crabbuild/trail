@@ -428,7 +428,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn append(&mut self, records: &[ObserverRecord]) -> Result<()> {
-        let result = match crate::db::acquire_workspace_lock_for_database(
+        let result = match crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         ) {
@@ -543,7 +543,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn flush_durable(&mut self) -> Result<DurableCut> {
-        let result = match crate::db::acquire_workspace_lock_for_database(
+        let result = match crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         ) {
@@ -610,7 +610,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn heartbeat(&mut self) -> Result<()> {
-        let result = match crate::db::acquire_workspace_lock_for_database(
+        let result = match crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         ) {
@@ -627,7 +627,7 @@ impl SegmentWriter {
     /// invalidation marker has been flushed.
     pub(crate) fn revoke(&mut self, reason: &str) -> Result<()> {
         self.ensure_authorized()?;
-        let _workspace_lock = crate::db::acquire_workspace_lock_for_database(
+        let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         )?;
@@ -686,7 +686,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn rotate(&mut self) -> Result<()> {
-        let result = match crate::db::acquire_workspace_lock_for_database(
+        let result = match crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
         ) {
@@ -869,7 +869,7 @@ impl SegmentWriter {
     fn retire(&mut self, reason: &str) {
         if self.authorized {
             self.authorized = false;
-            if let Ok(_workspace_lock) = crate::db::acquire_workspace_lock_for_database(
+            if let Ok(_workspace_lock) = crate::db::acquire_workspace_lock_for_observer(
                 &self.workspace_db_dir,
                 &self.database_path,
             ) {

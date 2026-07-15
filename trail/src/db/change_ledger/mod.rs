@@ -16,11 +16,14 @@ mod types;
 
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
-    command_authority_enabled, CandidateComparison, FencedCandidateSnapshot, ObservedRecordCut,
+    command_authority_enabled, CandidateComparison, CandidateMaterialization,
+    FencedCandidateSnapshot, ObservedRecordCut,
 };
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
-pub(crate) use snapshot::{run_command_flow, set_command_authority_override};
+pub(crate) use snapshot::{
+    run_command_flow, run_command_long_lock_flow, set_command_authority_override,
+};
 
 pub(crate) use daemon::{
     prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,

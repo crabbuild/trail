@@ -199,12 +199,13 @@ impl Trail {
         root: &PinnedWorktreeRoot,
         _policy: &CompiledPolicy,
         path: &str,
+        retain_bytes: bool,
     ) -> Result<Option<ReconciliationFile>> {
         let path = normalize_relative_path(path)?;
         if reconcile_path_ignored(&path) {
             return Ok(None);
         }
-        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text, true)
+        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text, retain_bytes)
     }
 
     /// Walk only the selected complete prefixes from descriptor-relative,
@@ -217,6 +218,7 @@ impl Trail {
         root: &PinnedWorktreeRoot,
         matcher: &CompiledRecordingMatcher,
         prefixes: &[String],
+        retain_bytes: bool,
         mut visitor: F,
     ) -> Result<()>
     where
@@ -235,7 +237,7 @@ impl Trail {
                 &root.descriptor,
                 &prefix,
                 &self.config.text,
-                true,
+                retain_bytes,
             )? {
                 visitor(file)?;
                 continue;
@@ -294,7 +296,7 @@ impl Trail {
                                 &root.descriptor,
                                 &relative,
                                 &self.config.text,
-                                true,
+                                retain_bytes,
                             )? {
                                 visitor(file)?;
                             }
@@ -313,6 +315,7 @@ impl Trail {
         _root: &PinnedWorktreeRoot,
         _matcher: &CompiledRecordingMatcher,
         _prefixes: &[String],
+        _retain_bytes: bool,
         _visitor: F,
     ) -> Result<()>
     where

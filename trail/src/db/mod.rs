@@ -2949,6 +2949,90 @@ pub(crate) struct WorkspaceLock {
     _schema_exclusion: File,
 }
 
+#[derive(Default)]
+struct AuthorizedObserverExclusionEntry {
+    active: usize,
+    release_generation: u64,
+}
+
+#[derive(Default)]
+struct AuthorizedObserverExclusionState {
+    entries: HashMap<PathBuf, AuthorizedObserverExclusionEntry>,
+}
+
+static AUTHORIZED_OBSERVER_EXCLUSIONS: OnceLock<(
+    Mutex<AuthorizedObserverExclusionState>,
+    Condvar,
+)> = OnceLock::new();
+
+pub(crate) struct AuthorizedObserverWriteExclusion {
+    db_dir: PathBuf,
+}
+
+pub(crate) fn begin_authorized_observer_write_exclusion(
+    db_dir: &Path,
+) -> AuthorizedObserverWriteExclusion {
+    let (state, _) = AUTHORIZED_OBSERVER_EXCLUSIONS.get_or_init(|| {
+        (
+            Mutex::new(AuthorizedObserverExclusionState::default()),
+            Condvar::new(),
+        )
+    });
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    state
+        .entries
+        .entry(db_dir.to_path_buf())
+        .or_default()
+        .active += 1;
+    AuthorizedObserverWriteExclusion {
+        db_dir: db_dir.to_path_buf(),
+    }
+}
+
+/// Active observer durability participates in an explicit same-process
+/// handoff with observed-record publication. It waits without an arbitrary
+/// timeout only while that exact authorized handoff is live; unrelated writer
+/// contention and every durability/integrity failure remain terminal.
+pub(crate) fn acquire_workspace_lock_for_observer(
+    db_dir: &Path,
+    schema_path: &Path,
+) -> Result<WorkspaceLock> {
+    let coordination = AUTHORIZED_OBSERVER_EXCLUSIONS.get_or_init(|| {
+        (
+            Mutex::new(AuthorizedObserverExclusionState::default()),
+            Condvar::new(),
+        )
+    });
+    loop {
+        let generation = {
+            let (state, changed) = coordination;
+            let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            loop {
+                let entry = state.entries.entry(db_dir.to_path_buf()).or_default();
+                if entry.active == 0 {
+                    break entry.release_generation;
+                }
+                state = changed
+                    .wait(state)
+                    .unwrap_or_else(|poison| poison.into_inner());
+            }
+        };
+        match acquire_workspace_lock_for_database(db_dir, schema_path) {
+            Ok(lock) => return Ok(lock),
+            Err(error @ Error::WorkspaceLocked(_)) => {
+                let (state, _) = coordination;
+                let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                let entry = state.entries.entry(db_dir.to_path_buf()).or_default();
+                if entry.active > 0 || entry.release_generation != generation {
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(crate) fn acquire_workspace_lock(db_dir: &Path) -> Result<WorkspaceLock> {
     acquire_workspace_lock_for_database(db_dir, &db_dir.join(DB_RELATIVE_PATH))
 }
@@ -3053,6 +3137,22 @@ impl Drop for WorkspaceLock {
     }
 }
 
+impl Drop for AuthorizedObserverWriteExclusion {
+    fn drop(&mut self) {
+        let Some((state, changed)) = AUTHORIZED_OBSERVER_EXCLUSIONS.get() else {
+            return;
+        };
+        let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let entry = state.entries.entry(self.db_dir.clone()).or_default();
+        debug_assert!(entry.active > 0);
+        entry.active = entry.active.saturating_sub(1);
+        if entry.active == 0 {
+            entry.release_generation = entry.release_generation.wrapping_add(1);
+            changed.notify_all();
+        }
+    }
+}
+
 struct WriteLockWaitGuard {
     previous: Option<Instant>,
 }
@@ -3067,6 +3167,8 @@ mod agent;
 mod change_ledger;
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::run_command_flow;
+#[cfg(debug_assertions)]
+pub(crate) use change_ledger::run_command_long_lock_flow;
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
 #[cfg(debug_assertions)]
@@ -3125,7 +3227,9 @@ mod merge;
 mod performance;
 mod record;
 #[cfg(debug_assertions)]
-pub(crate) use record::install_observed_record_after_compare_hook;
+pub(crate) use record::{
+    install_observed_record_after_compare_hook, install_observed_record_with_lock_hook,
+};
 mod storage;
 use self::performance::*;
 pub(crate) use storage::{observed_exact_paths_for_candidates, ObservedPathKind};
