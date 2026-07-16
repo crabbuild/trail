@@ -10,7 +10,30 @@ use sha2::{Digest, Sha256};
 
 use super::codec::{encode_header, encode_record};
 use super::*;
-use crate::db::util::{apply_sqlite_pragmas, now_ts};
+use crate::db::util::{apply_sqlite_runtime_pragmas, now_ts};
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_FLUSH_BOUNDARY_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnOnce(&Path, &Path)>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn install_append_flush_boundary_hook(hook: impl FnOnce(&Path, &Path) + 'static) {
+    APPEND_FLUSH_BOUNDARY_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_append_flush_boundary_hook(workspace_db_dir: &Path, database_path: &Path) {
+    APPEND_FLUSH_BOUNDARY_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(workspace_db_dir, database_path);
+        }
+    });
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -97,11 +120,23 @@ pub(crate) struct SegmentWriter {
     limits: PersistedLogLimits,
     lease_duration: Duration,
     authorized: bool,
+    revoke_owner_on_drop: bool,
     current_offset: u64,
+    /// Whether the currently open segment contains a record after its header.
+    /// `last_sequence` is scope-global and intentionally survives rotation, so
+    /// it cannot by itself distinguish a header-only segment.
+    current_segment_has_records: bool,
     last_sequence: u64,
     last_hash: [u8; 32],
     last_cursor: Vec<u8>,
     faults: Arc<FaultScript>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonLaunchBinding {
+    pub(crate) nonce: String,
+    pub(crate) pid: u32,
+    pub(crate) process_start_identity: String,
 }
 
 impl SegmentWriter {
@@ -167,6 +202,11 @@ impl SegmentWriter {
             ));
         }
         transaction.commit()?;
+        // A writer becomes runtime authority only after its native provider
+        // identity and fence are durably bound. From this point onward an
+        // ordinary runtime shutdown must revoke that exact owner and force a
+        // full reconciliation before the scope can be trusted again.
+        self.revoke_owner_on_drop = true;
         Ok(super::ObserverWriterBinding {
             owner_token,
             provider_id: self.provider_id.clone(),
@@ -195,6 +235,33 @@ impl SegmentWriter {
             provider_id,
             provider_cursor,
             lease_duration,
+            None,
+            Arc::new(FaultScript::default()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn acquire_for_daemon(
+        database_path: &Path,
+        segment_directory: &Path,
+        scope_id: ScopeId,
+        epoch: u64,
+        owner_token: [u8; 32],
+        provider_id: &str,
+        provider_cursor: Vec<u8>,
+        lease_duration: Duration,
+        daemon_launch: DaemonLaunchBinding,
+    ) -> Result<Self> {
+        Self::acquire_inner(
+            database_path,
+            segment_directory,
+            scope_id,
+            epoch,
+            owner_token,
+            provider_id,
+            provider_cursor,
+            lease_duration,
+            Some(daemon_launch),
             Arc::new(FaultScript::default()),
         )
     }
@@ -221,6 +288,7 @@ impl SegmentWriter {
             provider_id,
             provider_cursor,
             lease_duration,
+            None,
             faults,
         )
     }
@@ -235,6 +303,7 @@ impl SegmentWriter {
         provider_id: &str,
         provider_cursor: Vec<u8>,
         lease_duration: Duration,
+        daemon_launch: Option<DaemonLaunchBinding>,
         faults: Arc<FaultScript>,
     ) -> Result<Self> {
         if epoch == 0 || provider_id.is_empty() || lease_duration.is_zero() {
@@ -245,9 +314,23 @@ impl SegmentWriter {
         let workspace_db_dir = workspace_db_dir_for_database(database_path)?;
         let _workspace_lock =
             crate::db::acquire_workspace_lock_for_database(&workspace_db_dir, database_path)?;
-        let mut control = Connection::open(database_path)?;
-        apply_sqlite_pragmas(&control)?;
-        control.busy_timeout(Duration::from_secs(5))?;
+        let mut control = Connection::open(database_path).map_err(|error| {
+            Error::DaemonUnavailable(format!(
+                "observer segment writer could not open its control connection: {error}"
+            ))
+        })?;
+        apply_sqlite_runtime_pragmas(&control).map_err(|error| {
+            Error::DaemonUnavailable(format!(
+                "observer segment writer could not configure its control connection: {error}"
+            ))
+        })?;
+        control
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| {
+                Error::DaemonUnavailable(format!(
+                    "observer segment writer could not configure its busy timeout: {error}"
+                ))
+            })?;
         let now = now_ts();
         let expires_at = lease_expiry(now, lease_duration)?;
         let scope_text = scope_id.to_text();
@@ -279,7 +362,12 @@ impl SegmentWriter {
                     })
                 },
             )
-            .optional()?
+            .optional()
+            .map_err(|error| {
+                Error::DaemonUnavailable(format!(
+                    "observer segment writer could not read its persisted limits: {error}"
+                ))
+            })?
             .ok_or_else(|| Error::InvalidInput("observer scope/epoch is stale".into()))?;
         limits
             .validate()
@@ -298,7 +386,12 @@ impl SegmentWriter {
                     ))
                 },
             )
-            .optional()?;
+            .optional()
+            .map_err(|error| {
+                Error::DaemonUnavailable(format!(
+                    "observer segment writer could not read its existing owner: {error}"
+                ))
+            })?;
         if let Some((owner_epoch, _token, state, owner_expiry)) = existing_owner {
             let owner_epoch = u64::try_from(owner_epoch)
                 .map_err(|_| Error::Corrupt("negative observer owner epoch".into()))?;
@@ -364,7 +457,10 @@ impl SegmentWriter {
                  provider_id=excluded.provider_id, provider_identity=excluded.provider_identity,
                  lease_state='active', fence_nonce=NULL, acquired_at=excluded.acquired_at,
                  heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at,
-                 error_state=NULL, error_at=NULL, updated_at=excluded.updated_at",
+                 error_state=NULL, error_at=NULL,
+                 daemon_launch_nonce=NULL, daemon_pid=NULL,
+                 daemon_process_start_identity=NULL,
+                 updated_at=excluded.updated_at",
             params![
                 scope_text,
                 epoch_sql,
@@ -374,6 +470,34 @@ impl SegmentWriter {
                 expires_at
             ],
         )?;
+        if let Some(daemon_launch) = &daemon_launch {
+            if daemon_launch.nonce.len() != 64
+                || daemon_launch.pid == 0
+                || daemon_launch.process_start_identity.is_empty()
+            {
+                return Err(Error::InvalidInput(
+                    "daemon observer launch binding is malformed".into(),
+                ));
+            }
+            let bound = transaction.execute(
+                "UPDATE changed_path_observer_owners
+                 SET daemon_launch_nonce=?1,daemon_pid=?2,daemon_process_start_identity=?3
+                 WHERE scope_id=?4 AND epoch=?5 AND owner_token=?6 AND lease_state='active'",
+                params![
+                    daemon_launch.nonce,
+                    i64::from(daemon_launch.pid),
+                    daemon_launch.process_start_identity,
+                    scope_text,
+                    epoch_sql,
+                    owner_text,
+                ],
+            )?;
+            if bound != 1 {
+                return Err(Error::WorkspaceLocked(
+                    "daemon observer owner launch binding lost exact authority".into(),
+                ));
+            }
+        }
         let inserted = transaction.execute(
             "INSERT INTO changed_path_observer_segments(
                  scope_id, epoch, segment_id, log_format_version, owner_token,
@@ -419,7 +543,9 @@ impl SegmentWriter {
             limits,
             lease_duration,
             authorized: true,
+            revoke_owner_on_drop: daemon_launch.is_some(),
             current_offset,
+            current_segment_has_records: false,
             last_sequence: 0,
             last_hash: [0; 32],
             last_cursor: provider_cursor,
@@ -437,6 +563,56 @@ impl SegmentWriter {
         };
         if result.is_err() {
             self.retire("append_failed");
+        }
+        result
+    }
+
+    /// Append and publish one durable batch without exposing the
+    /// file-before-SQLite window to a command workspace lock holder.
+    pub(crate) fn append_and_flush(&mut self, records: &[ObserverRecord]) -> Result<DurableCut> {
+        let result = (|| {
+            let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
+                &self.workspace_db_dir,
+                &self.database_path,
+            )?;
+            self.append_inner(records)?;
+            #[cfg(test)]
+            run_append_flush_boundary_hook(&self.workspace_db_dir, &self.database_path);
+            self.flush_inner()
+        })();
+        if result.is_err() {
+            self.retire("append_and_flush_failed");
+        }
+        result
+    }
+
+    /// Append and publish an authenticated boundary record, then rotate that
+    /// exact durable cut while retaining one observer workspace lock. The
+    /// native durability worker calls this as one queue operation, so records
+    /// ordered after the boundary cannot advance the segment before it seals.
+    pub(crate) fn append_flush_and_rotate(
+        &mut self,
+        records: &[ObserverRecord],
+    ) -> Result<(DurableCut, DurableCut)> {
+        let result = (|| {
+            let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
+                &self.workspace_db_dir,
+                &self.database_path,
+            )?;
+            self.append_inner(records)?;
+            let sealed = self.flush_inner()?;
+            self.rotate_inner()?;
+            let anchor = DurableCut {
+                segment_id: self.segment_id.clone(),
+                durable_end_offset: self.current_offset,
+                last_sequence: self.last_sequence,
+                last_hash: self.last_hash,
+                provider_cursor: self.last_cursor.clone(),
+            };
+            Ok((sealed, anchor))
+        })();
+        if result.is_err() {
+            self.retire("append_flush_and_rotate_failed");
         }
         result
     }
@@ -536,6 +712,7 @@ impl SegmentWriter {
         validate_lease_on(&transaction, &self.identity)?;
         transaction.commit()?;
         self.current_offset = next_offset;
+        self.current_segment_has_records = true;
         self.last_sequence = sequence;
         self.last_hash = hash;
         self.last_cursor = records.last().unwrap().provider_cursor.clone();
@@ -582,7 +759,7 @@ impl SegmentWriter {
                )",
             params![
                 sql_i64(self.current_offset, "durable observer offset")?,
-                if self.last_sequence == 0 {
+                if !self.current_segment_has_records {
                     None
                 } else {
                     Some(sql_i64(self.last_sequence, "observer sequence")?)
@@ -610,13 +787,12 @@ impl SegmentWriter {
     }
 
     pub(crate) fn heartbeat(&mut self) -> Result<()> {
-        let result = match crate::db::acquire_workspace_lock_for_observer(
-            &self.workspace_db_dir,
-            &self.database_path,
-        ) {
-            Ok(_workspace_lock) => self.heartbeat_inner(),
-            Err(error) => Err(error),
-        };
+        // Lease renewal publishes no filesystem evidence and changes no
+        // segment boundary. It must remain live while an ordinary command
+        // holds the high-level workspace lock for a long materialization or
+        // checkpoint. SQLite serialization plus the exact owner CAS below are
+        // the authority boundary for this owner-only heartbeat row.
+        let result = self.heartbeat_inner();
         if result.is_err() {
             self.retire("heartbeat_failed");
         }
@@ -758,6 +934,16 @@ impl SegmentWriter {
                 "observer segment length changed during rotation".into(),
             ));
         }
+        // A header-only segment already represents an exact durable boundary.
+        // Rotating it cannot advance `first_sequence`, and both the segment-id
+        // derivation and schema intentionally reject a second segment for the
+        // same first sequence. Keep the existing open anchor after rechecking
+        // its durability and owner authority.
+        if !self.current_segment_has_records {
+            validate_lease_on(&transaction, &self.identity)?;
+            transaction.commit()?;
+            return Ok(());
+        }
         let old_segment_hash: [u8; 32] = Sha256::digest(&bytes).into();
         self.faults.check(FaultPoint::FirstDirectorySync)?;
         sync_directory(&self.segment_directory)?;
@@ -835,7 +1021,7 @@ impl SegmentWriter {
                      AND lease_state='active' AND expires_at>?4
                )",
             params![
-                if self.last_sequence == 0 {
+                if !self.current_segment_has_records {
                     None
                 } else {
                     Some(sql_i64(self.last_sequence, "observer sequence")?)
@@ -895,6 +1081,7 @@ impl SegmentWriter {
         self.segment_id = next_segment_id;
         self.identity = next_identity;
         self.current_offset = header_len;
+        self.current_segment_has_records = false;
         self.last_hash = [0; 32];
         Ok(())
     }
@@ -950,6 +1137,14 @@ impl SegmentWriter {
                 .query_row("PRAGMA temp_store", [], |row| row.get(0))
                 .unwrap(),
         )
+    }
+}
+
+impl Drop for SegmentWriter {
+    fn drop(&mut self) {
+        if self.revoke_owner_on_drop {
+            self.retire("observer_writer_dropped");
+        }
     }
 }
 

@@ -107,12 +107,10 @@ fn apply_patch_schema() -> Value {
             "allow_stale": { "type": "boolean" },
             "edits": {
                 "type": "array",
-                "minItems": 1,
                 "items": patch_edit_schema()
             },
             "files": {
                 "type": "array",
-                "minItems": 1,
                 "items": api_patch_file_schema()
             }
         }),
@@ -238,7 +236,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.apply_patch",
             "title": "Apply Lane Patch",
-            "description": "Apply a native Trail patch or design-style files patch to a turn's lane branch. Provide exactly one non-empty edit source: edits or files.",
+            "description": "Apply a native Trail patch or design-style files patch to a turn's lane branch. Explicitly provide exactly one source, edits or files; an empty array records a genuine zero-change patch operation.",
             "inputSchema": apply_patch_schema()
         },
         {

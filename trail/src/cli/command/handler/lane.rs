@@ -17,7 +17,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.workdir.is_some(),
                 &args.paths,
             )?;
-            let report = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            let report = db.spawn_lane_with_deferred_initial_ledger(
                 &args.name,
                 args.from.as_deref(),
                 workdir_mode,
@@ -27,6 +27,17 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 &args.paths,
                 args.include_neighbors,
             )?;
+            let report = if report.workdir.is_some() && !report.workdir_mode.is_transparent_cow() {
+                drop(db);
+                let mut reopened = open_db(ctx)?;
+                let report = reopened.resume_deferred_initial_lane_ledger(&args.name)?;
+                let workspace = reopened.workspace_root().to_path_buf();
+                drop(reopened);
+                daemon_start::retire_workspace_daemon_after_external_generation_change(&workspace)?;
+                report
+            } else {
+                report
+            };
             render_lane_spawn(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::List => {

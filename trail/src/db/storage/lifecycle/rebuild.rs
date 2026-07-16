@@ -1282,7 +1282,7 @@ mod path_index_rebuild_tests {
     }
 
     #[test]
-    fn equivalent_repaired_root_reuses_cross_process_clean_daemon_snapshot_but_not_dirty_state() {
+    fn equivalent_repaired_root_reuses_process_local_clean_daemon_snapshot_but_not_dirty_state() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("README.md"), "hello\n").unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -1291,10 +1291,10 @@ mod path_index_rebuild_tests {
         let modern = daemon_db.resolve_branch_ref("main").unwrap();
         let (legacy_root, _) = publish_legacy_root(&daemon_db, &modern);
         daemon_db.enable_daemon_worktree_cache().unwrap();
-        // This regression exercises persisted snapshot reuse across handles,
-        // not asynchronous OS event delivery. Stop the watcher after warmup
-        // so delayed backend events cannot turn the fixed baseline fixture
-        // dirty while the index-repair assertions are running.
+        // This regression exercises process-local snapshot reuse, not
+        // asynchronous OS event delivery. Stop the watcher after warmup so
+        // delayed backend events cannot turn the fixed baseline fixture dirty
+        // while the index-repair assertions are running.
         drop(
             daemon_db
                 .daemon_worktree_cache
@@ -1303,22 +1303,14 @@ mod path_index_rebuild_tests {
                 .watcher
                 .take(),
         );
-        let persisted_reader = Trail::open(workspace.path()).unwrap();
-        let persisted_snapshot = persisted_reader.daemon_worktree_snapshot();
-        assert!(
-            matches!(
-                persisted_snapshot,
-                Some(DaemonWorktreeSnapshot::Clean { root_id: Some(ref root), .. }) if root == &legacy_root
-            ),
-            "unexpected persisted daemon snapshot: {persisted_snapshot:?}"
-        );
-        drop(persisted_reader);
+        let isolated_reader = Trail::open(workspace.path()).unwrap();
+        assert!(isolated_reader.daemon_worktree_snapshot().is_none());
+        drop(isolated_reader);
 
-        let mut repair_db = Trail::open(workspace.path()).unwrap();
-        repair_db.rebuild_indexes().unwrap();
-        let repaired = repair_db.resolve_branch_ref("main").unwrap();
+        daemon_db.rebuild_indexes().unwrap();
+        let repaired = daemon_db.resolve_branch_ref("main").unwrap();
         assert_ne!(repaired.root_id, legacy_root);
-        let repaired_snapshot = repair_db.daemon_worktree_snapshot();
+        let repaired_snapshot = daemon_db.daemon_worktree_snapshot();
         assert!(
             matches!(
                 repaired_snapshot,
@@ -1326,16 +1318,16 @@ mod path_index_rebuild_tests {
             ),
             "unexpected repaired daemon snapshot: {repaired_snapshot:?}"
         );
-        repair_db
+        daemon_db
             .conn
             .execute("DELETE FROM worktree_file_index", [])
             .unwrap();
 
-        let clean = repair_db.status(None).unwrap();
+        let clean = daemon_db.status(None).unwrap();
 
         assert_eq!(clean.worktree_state, WorktreeState::Clean);
         assert_eq!(
-            repair_db
+            daemon_db
                 .conn
                 .query_row("SELECT COUNT(*) FROM worktree_file_index", [], |row| {
                     row.get::<_, i64>(0)

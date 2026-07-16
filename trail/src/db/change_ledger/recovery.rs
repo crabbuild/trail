@@ -2320,6 +2320,10 @@ mod harness {
 
     use super::*;
     use crate::db::change_ledger::intent::install_sidecar_ancestor_substitution_hook;
+    #[cfg(test)]
+    use crate::db::change_ledger::intent::{
+        install_sidecar_post_validation_hook, install_sidecar_retry_hook,
+    };
     use crate::db::change_ledger::{
         mark_filesystem_applied, prepare_intent, publish_intent, BaselineIdentity, DirtyPrefix,
         DurableCut, EvidenceCut, EvidenceFlags, EvidenceSource, FilesystemIdentity, IntentEvidence,
@@ -2476,10 +2480,11 @@ mod harness {
             self.insert_observer_event(path, sequence)?;
             self.db.conn.execute(
                 "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,
-                     folded_offset=?2 WHERE scope_id=?3",
+                     folded_offset=?2,observer_owner_token=?3 WHERE scope_id=?4",
                 params![
                     end_cursor,
                     sql_u64(durable.durable_end_offset, "fixture durable offset")?,
+                    owner_token,
                     self.expected.scope_id.to_text()
                 ],
             )?;
@@ -2526,11 +2531,13 @@ mod harness {
                     provider_identity: self.expected.provider_identity.clone(),
                     observer_owner_token: owner_token,
                     owner_fence_nonce: Some(fence_nonce),
-                    durable_segment_id: durable.segment_id,
+                    durable_segment_id: durable.segment_id.clone(),
                     durable_segment_hash: segment_hash,
                     segment_directory: relative_directory,
                     segment_path: segment.1,
                     start_cursor: Some(b"cursor-1".to_vec()),
+                    publication_segment_id: durable.segment_id.clone(),
+                    publication_cursor: end_cursor.clone(),
                     end_cursor,
                     start_sequence: 1,
                     end_cut: EvidenceCut {
@@ -2666,6 +2673,8 @@ mod harness {
                 segment_path: segment.1,
                 start_cursor: Some(start_cursor),
                 end_cursor: durable.provider_cursor.clone(),
+                publication_segment_id: durable.segment_id.clone(),
+                publication_cursor: durable.provider_cursor.clone(),
                 start_sequence,
                 end_cut: EvidenceCut {
                     source: EvidenceSource::Observer,
@@ -2736,6 +2745,53 @@ mod harness {
         Ok(())
     }
 
+    pub(super) fn empty_rotation_anchor_authenticates_publication_cut() -> Result<()> {
+        let fixture = Fixture::new(0x80)?;
+        let target = fixture.target(
+            "empty-publication-anchor",
+            fixture.expected.baseline_root.clone(),
+        );
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("empty-publication-anchor.rs"),
+        )?;
+        let (mut proof, mut writer) =
+            fixture.qualified_proof_with_writer(1, "empty-publication-anchor.rs")?;
+        let publication = writer.flush_durable()?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), publication.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                publication.provider_cursor,
+                sql_u64(
+                    publication.durable_end_offset,
+                    "empty publication durable offset"
+                )?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        proof.publication_segment_id = publication.segment_id;
+        proof.publication_cursor = publication.provider_cursor;
+        proof.publication_cut = EvidenceCut {
+            source: EvidenceSource::Observer,
+            sequence: publication.last_sequence,
+            durable_offset: publication.durable_end_offset,
+            folded_offset: publication.durable_end_offset,
+        };
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+        drop(writer);
+        Ok(())
+    }
+
     pub(super) fn authenticated_prefix_survives_later_observer_advance() -> Result<()> {
         let fixture = Fixture::new(0x81)?;
         let target = fixture.target("advanced-prefix", fixture.expected.baseline_root.clone());
@@ -2747,8 +2803,8 @@ mod harness {
             &target,
             &Fixture::evidence("advanced-prefix.rs"),
         )?;
-        let (proof, mut writer) = fixture.qualified_proof_with_writer(1, "advanced-prefix.rs")?;
-        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+        let (mut proof, mut writer) =
+            fixture.qualified_proof_with_writer(1, "advanced-prefix.rs")?;
 
         writer.append(&[super::super::ObserverRecord {
             sequence: 2,
@@ -2756,6 +2812,39 @@ mod harness {
             path: LedgerPath::parse("advanced-prefix.rs")?,
             flags: EvidenceFlags::CONTENT,
             provider_cursor: b"cursor-3".to_vec(),
+        }])?;
+        let publication = writer.flush_durable()?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), publication.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                publication.provider_cursor,
+                sql_u64(publication.durable_end_offset, "publication durable offset")?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        fixture.insert_observer_event("advanced-prefix.rs", 2)?;
+        proof.publication_cursor = publication.provider_cursor;
+        proof.publication_segment_id = publication.segment_id;
+        proof.publication_cut = EvidenceCut {
+            source: EvidenceSource::Observer,
+            sequence: 2,
+            durable_offset: publication.durable_end_offset,
+            folded_offset: publication.durable_end_offset,
+        };
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 3,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse("advanced-prefix.rs")?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"cursor-4".to_vec(),
         }])?;
         let advanced = writer.flush_durable()?;
         writer.rotate()?;
@@ -2774,7 +2863,7 @@ mod harness {
                 fixture.expected.scope_id.to_text(),
             ],
         )?;
-        fixture.insert_observer_event("advanced-prefix.rs", 2)?;
+        fixture.insert_observer_event("advanced-prefix.rs", 3)?;
         durable_intent_barrier(&fixture.db.conn)?;
         fixture.advance_ref_to(&target)?;
         publish_intent(&ledger, &fixture.expected, &intent)?;
@@ -2791,7 +2880,7 @@ mod harness {
             [fixture.expected.scope_id.to_text()],
             |row| row.get(0),
         )?;
-        if later_sequence != 2 {
+        if later_sequence != 3 {
             return Err(Error::Corrupt(
                 "later observer evidence was cleared with the intent prefix".into(),
             ));
@@ -3024,11 +3113,12 @@ mod harness {
             ],
         )?;
         fixture.db.conn.execute(
-            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
-             WHERE scope_id=?3",
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2,
+                 observer_owner_token=?3 WHERE scope_id=?4",
             params![
                 proof_cut.provider_cursor,
                 sql_u64(proof_cut.durable_end_offset, "prefix proof durable offset")?,
+                hex::encode(owner_token),
                 fixture.expected.scope_id.to_text(),
             ],
         )?;
@@ -5130,12 +5220,14 @@ mod harness {
             provider_identity: expected.provider_identity.clone(),
             observer_owner_token: hex::encode(owner_token),
             owner_fence_nonce: Some(b"crash-fence".to_vec()),
-            durable_segment_id: segment.0,
+            durable_segment_id: segment.0.clone(),
             durable_segment_hash: hash,
             segment_directory: format!("observer-segments/{}", expected.scope_id.to_text()),
             segment_path: segment.2,
             start_cursor: Some(b"cursor-1".to_vec()),
             end_cursor: b"cursor-end".to_vec(),
+            publication_segment_id: segment.0.clone(),
+            publication_cursor: b"cursor-end".to_vec(),
             start_sequence: 1,
             end_cut: EvidenceCut {
                 source: EvidenceSource::Observer,
@@ -5299,6 +5391,168 @@ mod harness {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn append_unpublished_proof_suffix(
+        writer: &mut super::super::SegmentWriter,
+        sequence: u64,
+        path: &str,
+    ) {
+        writer
+            .append(&[super::super::ObserverRecord {
+                sequence,
+                source: EvidenceSource::Observer,
+                path: LedgerPath::parse(path).unwrap(),
+                flags: EvidenceFlags::CONTENT,
+                provider_cursor: format!("cursor-{}", sequence + 1).into_bytes(),
+            }])
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn proof_validation_waits_for_authenticated_open_tail_publication() {
+        let fixture = Fixture::new(0x91).unwrap();
+        let target = fixture.target("transient-tail", fixture.expected.baseline_root.clone());
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("transient-tail.rs"),
+        )
+        .unwrap();
+        let (proof, mut writer) = fixture
+            .qualified_proof_with_writer(1, "transient-tail.rs")
+            .unwrap();
+        append_unpublished_proof_suffix(&mut writer, 2, "later-tail.rs");
+        install_sidecar_retry_hook(move || {
+            writer.flush_durable().unwrap();
+        });
+
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof).unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn static_unpublished_open_tail_fails_after_idle_bound() {
+        let fixture = Fixture::new(0x92).unwrap();
+        let target = fixture.target("static-tail", fixture.expected.baseline_root.clone());
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("static-tail.rs"),
+        )
+        .unwrap();
+        let (proof, mut writer) = fixture
+            .qualified_proof_with_writer(1, "static-tail.rs")
+            .unwrap();
+        append_unpublished_proof_suffix(&mut writer, 2, "unpublished-tail.rs");
+        let started = Instant::now();
+
+        let error = mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)
+            .expect_err("static unpublished tail unexpectedly authorized the proof");
+
+        assert!(started.elapsed() >= crate::db::change_ledger::intent::SIDECAR_RECOVERY_IDLE_LIMIT);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error
+            .to_string()
+            .contains("observer sidecar chain is incomplete or contains unpublished entries"));
+        drop(writer);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn scope_owner_token_swap_during_sidecar_retry_fails_closed() {
+        let fixture = Fixture::new(0x93).unwrap();
+        let target = fixture.target("owner-swap", fixture.expected.baseline_root.clone());
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("owner-swap.rs"),
+        )
+        .unwrap();
+        let (proof, mut writer) = fixture
+            .qualified_proof_with_writer(1, "owner-swap.rs")
+            .unwrap();
+        append_unpublished_proof_suffix(&mut writer, 2, "owner-swap-tail.rs");
+        let database_path = fixture.db.sqlite_path.clone();
+        let scope_id = fixture.expected.scope_id.to_text();
+        install_sidecar_retry_hook(move || {
+            let conn = Connection::open(database_path).unwrap();
+            conn.execute(
+                "UPDATE changed_path_scopes SET observer_owner_token=?1 WHERE scope_id=?2",
+                params![hex::encode([0xee; 32]), scope_id],
+            )
+            .unwrap();
+        });
+        let started = Instant::now();
+
+        let error = mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)
+            .expect_err("scope owner-token swap unexpectedly authorized the proof");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error
+            .to_string()
+            .contains("owner, fence, or sealed segment changed during sidecar verification"));
+        drop(writer);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn scope_owner_token_swap_after_read_validation_loses_final_publication_cas() {
+        let fixture = Fixture::new(0x94).unwrap();
+        let target = fixture.target(
+            "post-validation-owner-swap",
+            fixture.expected.baseline_root.clone(),
+        );
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("post-validation-owner-swap.rs"),
+        )
+        .unwrap();
+        let proof = fixture
+            .qualified_proof(1, "post-validation-owner-swap.rs")
+            .unwrap();
+        let database_path = fixture.db.sqlite_path.clone();
+        let scope_id = fixture.expected.scope_id.to_text();
+        install_sidecar_post_validation_hook(move || {
+            let conn = Connection::open(database_path).unwrap();
+            conn.execute(
+                "UPDATE changed_path_scopes SET observer_owner_token=?1 WHERE scope_id=?2",
+                params![hex::encode([0xef; 32]), scope_id],
+            )
+            .unwrap();
+        });
+
+        let error = mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)
+            .expect_err("post-validation owner-token swap unexpectedly won final intent CAS");
+
+        assert!(error
+            .to_string()
+            .contains("filesystem proof authority changed before intent publication"));
+        let state: String = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT lifecycle_state FROM changed_path_intents WHERE intent_id=?1",
+                [&intent.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "prepared");
     }
 
     pub(super) fn ambiguous_recovery_blocks_next_intent() -> Result<()> {
@@ -5534,7 +5788,8 @@ pub(crate) fn run_missing_sidecar_rejection() -> std::result::Result<(), String>
 
 #[cfg(debug_assertions)]
 pub(crate) fn run_advanced_prefix_recovery() -> std::result::Result<(), String> {
-    harness::authenticated_prefix_survives_later_observer_advance()
+    harness::empty_rotation_anchor_authenticates_publication_cut()
+        .and_then(|()| harness::authenticated_prefix_survives_later_observer_advance())
         .map_err(|error| error.to_string())
 }
 

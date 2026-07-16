@@ -52,6 +52,7 @@ jobs:
           python3 -m unittest
           scripts/test_cli_scale_bench_source.py
           scripts/test_check_cli_scale_thresholds.py
+          scripts/test_check_changed_path_ledger_thresholds.py
           scripts/test_extract_agent_git_performance.py
           scripts/test_extract_path_index_performance.py
       - name: Scale Benchmark Smoke
@@ -128,6 +129,28 @@ jobs:
           record_path_index_mode=indexed
           empty_root_patch_path_index_mode=indexed
           rename_patch_path_index_mode=indexed
+      - name: Changed-path Ledger 1k Benchmark
+        run: scripts/cli-scale-bench.sh changed-path-ledger
+        env:
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: changed-path-ci-${{ github.run_id }}
+          TRAIL_SCALE_FILES: "1000"
+          TRAIL_CHANGED_PATH_COW: "0"
+      - name: Changed-path Ledger 1k Thresholds
+        run: >-
+          python3 scripts/check-changed-path-ledger-thresholds.py
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/results.tsv"
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/structural-metrics.jsonl"
+          --oracle
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/oracle-results.tsv"
+          --max-seconds workspace_status=15
+          --max-seconds workspace_diff=20
+          --max-seconds workspace_record=30
+          --max-seconds materialized_lane_record=60
+          --max-seconds structured_patch=30
+          --max-rss-bytes workspace_status=2147483648
+          --max-rss-bytes workspace_diff=2147483648
+          --max-rss-bytes workspace_record=2147483648
 
   prolly:
     name: Prolly core

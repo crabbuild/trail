@@ -2,6 +2,9 @@ use clap::error::ErrorKind as ClapErrorKind;
 
 use super::*;
 
+const CLI_PARSE_ERROR_FALLBACK: &str = r#"{"error":{"code":"INVALID_INPUT","status":400,"exit":2,"message":"invalid CLI input","scope":null,"state":null,"reason":null,"recovery":{"command":"trail --help"}}}"#;
+const STRUCTURED_ERROR_FALLBACK: &str = r#"{"error":{"code":"SERIALIZATION_ERROR","status":500,"exit":1,"message":"failed to serialize structured error","scope":null,"state":null,"reason":null,"recovery":null}}"#;
+
 pub(super) fn args_request_json_errors<I>(args: I) -> bool
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -59,33 +62,34 @@ fn render_cli_parse_error(err: &clap::Error, exit_code: i32) {
     let value = serde_json::json!({
         "error": {
             "code": "INVALID_INPUT",
+            "status": 400,
+            "exit": exit_code,
             "message": message.trim(),
-            "exit_code": exit_code
+            "scope": null,
+            "state": null,
+            "reason": null,
+            "recovery": { "command": "trail --help" }
         }
     });
-    let rendered = serde_json::to_string(&value).unwrap_or_else(|_| {
-        r#"{"error":{"code":"INVALID_INPUT","message":"invalid CLI input","exit_code":2}}"#
-            .to_string()
-    });
+    let rendered =
+        serde_json::to_string(&value).unwrap_or_else(|_| CLI_PARSE_ERROR_FALLBACK.to_string());
     let _ = render_structured_error(&rendered);
 }
 
 pub(super) fn render_error(err: &Error, json: bool) {
     if json {
-        let value = serde_json::json!({
-            "error": {
-                "code": err.code(),
-                "message": err.to_string(),
-                "exit_code": err.exit_code()
-            }
-        });
+        let value = StructuredErrorEnvelope::from_error(err);
         let rendered = serde_json::to_string(&value)
-            .unwrap_or_else(|_| format!(r#"{{"error":{{"message":"{err}"}}}}"#));
+            .unwrap_or_else(|_| structured_error_fallback(err).to_string());
         let _ = render_structured_error(&rendered);
         return;
     }
     let document = TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic_for_error(err)));
     let _ = render_error_document(&document, &default_error_options());
+}
+
+fn structured_error_fallback(_err: &Error) -> &'static str {
+    STRUCTURED_ERROR_FALLBACK
 }
 
 fn default_error_options() -> RenderOptions {
@@ -365,6 +369,24 @@ mod tests {
             std::ffi::OsString::from("--format"),
             std::ffi::OsString::from("json"),
         ]));
+    }
+
+    #[test]
+    fn cli_parse_error_fallback_is_valid_structured_json() {
+        let value: serde_json::Value = serde_json::from_str(CLI_PARSE_ERROR_FALLBACK).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_INPUT");
+        assert_eq!(value["error"]["recovery"]["command"], "trail --help");
+    }
+
+    #[test]
+    fn general_error_fallback_is_valid_json_with_hostile_error_text() {
+        let hostile = Error::Serialization("quote: \" backslash: \\ newline:\n tab:\t".into());
+        let rendered = structured_error_fallback(&hostile);
+        let value: serde_json::Value = serde_json::from_str(rendered).unwrap();
+        assert_eq!(value["error"]["code"], "SERIALIZATION_ERROR");
+        assert_eq!(value["error"]["status"], 500);
+        assert_eq!(value["error"]["exit"], 1);
+        assert!(!rendered.contains("quote:"));
     }
 
     #[test]

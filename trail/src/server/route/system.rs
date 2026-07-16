@@ -36,16 +36,20 @@ pub(super) fn handle_system_route(
     }
 
     if request.method == "GET" && path == "/v1/status" {
-        let report = match if crate::db::command_authority_enabled() {
-            db.status_from_changed_path_ledger()
+        // Public status performs the authority dispatch. Never turn a missing
+        // structural dependency into a legacy full-scan success: qualification
+        // failures must remain fail-closed.
+        let report = db.status(None)?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST" && path == "/v1/index/reconcile" {
+        let body: crate::server::request_types::IndexReconcileRequest = if request.body.is_empty() {
+            Default::default()
         } else {
-            db.status(None)
-        } {
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                db.status(None)?
-            }
-            result => result?,
+            serde_json::from_slice(&request.body)?
         };
+        let report = super::super::reconcile_changed_path_ledger(db, body.lane.as_deref())?;
         return Ok(Some(utils::json_response(200, "OK", &report)?));
     }
 
@@ -104,6 +108,7 @@ pub(super) fn handle_system_route(
                 "workspace_identity": body.workspace_identity,
                 "scope_id": proof.scope_id,
                 "epoch": proof.epoch,
+                "daemon_launch_nonce": proof.daemon_launch_nonce,
                 "live_fence_sequence": proof.sequence,
                 "durable_offset": proof.durable_offset,
                 "folded_offset": proof.folded_offset,
@@ -152,11 +157,7 @@ pub(super) fn handle_system_route(
                     "diff accepts only one of `range`, `root`, or `dirty`".to_string(),
                 ));
             }
-            if crate::db::command_authority_enabled() {
-                db.diff_dirty_from_changed_path_ledger(patch, line_ids)?
-            } else {
-                db.diff_dirty(patch, line_ids)?
-            }
+            db.diff_dirty(patch, line_ids)?
         } else if let Some(root) = utils::query_value(query, "root") {
             if utils::query_value(query, "range").is_some() {
                 return Err(Error::InvalidInput(

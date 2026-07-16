@@ -8,12 +8,14 @@
 //! commit by the caller.
 
 use rusqlite::{params, Transaction, TransactionBehavior};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::intent::{
     authoritative_ref_matches_target, exact_scope_guard, load_intent, stage_intent_evidence,
     IntentEvidence, IntentId, IntentProducer, IntentState, IntentTarget,
 };
+use super::types::{trail_atomic_temp_target, trail_case_probe_token};
 use super::{
     BaselineIdentity, EvidenceSource, ExpectedScope, ObservedRecordCut, QualifiedFilesystemProof,
 };
@@ -27,6 +29,15 @@ use crate::{ChangeId, ObjectId};
 pub(crate) struct ProjectionPublication {
     pub(crate) operation_id: ObjectId,
     pub(crate) baseline: BaselineIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceViewCheckpointPublication {
+    pub(crate) view_id: String,
+    pub(crate) expected_generation: u64,
+    pub(crate) journal_sequence: u64,
+    pub(crate) next_generation: u64,
+    pub(crate) journal_qualified: bool,
 }
 
 fn acquire_projection_publication_lock(db: &crate::Trail) -> Result<crate::db::WorkspaceLock> {
@@ -120,9 +131,9 @@ where
     let _write_lock = acquire_projection_publication_lock(db)?;
     super::mark_filesystem_applied(&db.changed_path_ledger(), expected, &intent, &proof)?;
     if retain_dirty {
-        publish_dirty_alignment_in_transaction(&db.conn, expected, &intent)?;
+        publish_dirty_alignment_in_transaction(db, expected, &intent)?;
     } else {
-        publish_alignment_in_transaction(&db.conn, expected, &intent)?;
+        publish_alignment_in_transaction(db, expected, &intent)?;
     }
     repair_marker_after_commit(db).map_err(|error| Error::CommittedRepairRequired {
         operation: intent.0.clone(),
@@ -133,10 +144,11 @@ where
 }
 
 fn publish_dirty_alignment_in_transaction(
-    conn: &rusqlite::Connection,
+    db: &crate::Trail,
     expected: &ExpectedScope,
     intent_id: &IntentId,
 ) -> Result<()> {
+    let conn = &db.conn;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     exact_scope_guard(&tx, expected, true)?;
     let intent = load_intent(&tx, intent_id)?.ok_or_else(|| {
@@ -163,7 +175,7 @@ fn publish_dirty_alignment_in_transaction(
         &intent,
         proof,
     )?;
-    acknowledge_controlled_observer_evidence_in_transaction(&tx, expected, &intent, proof)?;
+    acknowledge_controlled_observer_evidence_in_transaction(db, &tx, expected, &intent, proof)?;
     // Restage intent evidence after removing only the verified controlled
     // observer rows. These rows deliberately remain pending against the
     // unchanged baseline, making checkout-to-another-root dirty.
@@ -419,6 +431,7 @@ pub(crate) fn commit_lane_operation_atomic(
     expected_ref: &RefRecord,
     lane_id: &str,
     operation: &Operation,
+    workspace_checkpoint: Option<&WorkspaceViewCheckpointPublication>,
 ) -> Result<ObjectId> {
     if operation.before_root.as_ref() != Some(&expected_ref.root_id)
         || operation.parents.first() != Some(&expected_ref.change_id)
@@ -451,6 +464,25 @@ pub(crate) fn commit_lane_operation_atomic(
     if changed != 1 {
         return Err(Error::StaleBranch(expected_ref.name.clone()));
     }
+    if let Some(checkpoint) = workspace_checkpoint {
+        let view_changed = tx.execute(
+            "UPDATE workspace_views
+             SET checkpoint_seq=?1,checkpoint_root=?2,generation=?3,updated_at=?4
+             WHERE view_id=?5 AND lane_id=?6 AND generation=?7",
+            params![
+                sql_u64(checkpoint.journal_sequence, "workspace journal sequence")?,
+                operation.after_root.0,
+                sql_u64(checkpoint.next_generation, "workspace view generation")?,
+                now_ts(),
+                checkpoint.view_id,
+                lane_id,
+                sql_u64(checkpoint.expected_generation, "workspace view generation")?,
+            ],
+        )?;
+        if view_changed != 1 {
+            return Err(Error::StaleBranch(expected_ref.name.clone()));
+        }
+    }
     tx.commit()?;
     db.repair_ref_mirror(
         expected_ref,
@@ -471,10 +503,11 @@ pub(crate) fn commit_lane_operation_atomic(
 /// materialization, hydration, and sync. The target must be the exact current
 /// authoritative ref/root; projection-only work never fabricates history.
 pub(crate) fn publish_alignment_in_transaction(
-    conn: &rusqlite::Connection,
+    db: &crate::Trail,
     expected: &ExpectedScope,
     intent_id: &IntentId,
 ) -> Result<()> {
+    let conn = &db.conn;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     exact_scope_guard(&tx, expected, true)?;
     let intent = load_intent(&tx, intent_id)?.ok_or_else(|| {
@@ -536,7 +569,7 @@ pub(crate) fn publish_alignment_in_transaction(
             command: "trail status".into(),
         });
     }
-    acknowledge_controlled_observer_evidence_in_transaction(&tx, expected, &intent, proof)?;
+    acknowledge_controlled_observer_evidence_in_transaction(db, &tx, expected, &intent, proof)?;
     stage_intent_evidence(&tx, &intent)?;
     acknowledge_intent_owned_evidence_in_transaction(&tx, expected, &intent, proof)?;
     terminal_intent(&tx, intent_id)?;
@@ -624,7 +657,7 @@ pub(crate) fn publish_ref_advancing_projection(
     if !authoritative_ref_matches_target(&tx, &intent)? {
         return Err(Error::StaleBranch(expected_ref.name.clone()));
     }
-    acknowledge_controlled_observer_evidence_in_transaction(&tx, expected, &intent, proof)?;
+    acknowledge_controlled_observer_evidence_in_transaction(db, &tx, expected, &intent, proof)?;
     stage_intent_evidence(&tx, &intent)?;
     acknowledge_intent_owned_evidence_in_transaction(&tx, expected, &intent, proof)?;
     let next_generation = expected_ref
@@ -683,6 +716,7 @@ pub(crate) fn publish_ref_advancing_projection(
 /// entire row falls inside the authenticated controlled interval. Pre-existing,
 /// mixed-source, and post-c1 rows remain pending.
 fn acknowledge_controlled_observer_evidence_in_transaction(
+    db: &crate::Trail,
     tx: &rusqlite::Connection,
     expected: &ExpectedScope,
     intent: &super::intent::PersistedIntent,
@@ -740,6 +774,57 @@ fn acknowledge_controlled_observer_evidence_in_transaction(
     )?;
     tokens.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
     drop(prefixes);
+    let intended = tx
+        .prepare(
+            "SELECT normalized_path FROM changed_path_intent_paths
+             WHERE intent_id=?1 ORDER BY normalized_path COLLATE BINARY",
+        )?
+        .query_map([&intent.id.0], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let mut internal = tx.prepare(
+        "SELECT normalized_path,event_flags,source_mask,first_sequence,last_sequence,
+                provider_id,provider_sequence,intent_id
+         FROM changed_path_entries
+         WHERE scope_id=?1 AND source_mask=?2 AND intent_id IS NULL
+           AND first_sequence>=?3 AND last_sequence<=?4
+           AND provider_sequence IS NOT NULL
+         ORDER BY normalized_path COLLATE BINARY",
+    )?;
+    let rows = internal.query_map(
+        params![
+            expected.scope_id.to_text(),
+            EvidenceSource::Observer.mask(),
+            sql_u64(proof.start_sequence, "controlled start sequence")?,
+            sql_u64(proof.end_cut.sequence, "controlled end sequence")?,
+        ],
+        |row| acknowledgement_token(row, EvidenceRowKind::Exact),
+    )?;
+    let mut internal_tokens = Vec::new();
+    for token in rows {
+        let token = token?;
+        if trail_case_probe_token(&token)
+            || trail_atomic_temp_target(&token)
+                .as_ref()
+                .is_some_and(|target| intended.contains(target))
+        {
+            internal_tokens.push(token);
+        }
+    }
+    drop(internal);
+    let baseline_internal = db.load_root_files_for_paths(
+        &expected.baseline_root,
+        &internal_tokens
+            .iter()
+            .map(|token| token.path.as_str().to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    tokens.extend(
+        internal_tokens
+            .into_iter()
+            .filter(|token| !baseline_internal.contains_key(token.path.as_str())),
+    );
+    tokens.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+    tokens.dedup();
     super::ChangedPathLedger::acknowledge_immutable_tokens_in_transaction(
         tx,
         expected,

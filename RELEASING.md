@@ -17,7 +17,8 @@ GitHub attestations, and the Homebrew formula.
 3. Allow GitHub Actions to create pull requests under repository Settings,
    Actions, General.
 4. Protect `main` and require the normal CI, Release plan, and Release Readiness
-   checks before merging.
+   checks before merging. Also require both Linux/ext4 and macOS/APFS jobs from
+   `Changed-path Ledger Native Gates` for the exact merge SHA.
 5. Keep GitHub Actions workflow permissions able to create releases and artifact
    attestations.
 
@@ -47,10 +48,13 @@ updates one release pull request containing the Cargo version bump, lockfile,
 changelog, and release manifest. Merge that pull request after its required
 checks pass.
 
-The merge changes `.release-please-manifest.json`, so the same workflow creates
-and pushes the matching annotated `vX.Y.Z` tag. That tag starts the generated
-`release.yml` cargo-dist workflow. Cargo-dist builds and attests all platform
-artifacts, then publishes the GitHub Release. Publishing the stable release
+The merge changes `.release-please-manifest.json`. Before the same workflow can
+create the matching annotated `vX.Y.Z` tag, its reusable exact-SHA native gate
+must pass on Linux/ext4 and macOS/APFS. That tag starts the generated
+`release.yml` cargo-dist workflow, whose configured custom plan job runs the
+same two gates against the tag SHA. Every build, host, and publish job depends
+on that generated gate. Cargo-dist then builds and attests all platform
+artifacts and publishes the GitHub Release. Publishing the stable release
 completes the generated Release workflow, whose `workflow_run` event starts
 `publish-homebrew.yml` and updates `Formula/trail.rb` in the shared tap.
 

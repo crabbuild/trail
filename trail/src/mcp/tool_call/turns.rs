@@ -102,9 +102,13 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
 }
 
 fn patch_document_from_args(args: ApplyPatchArgs) -> Result<PatchDocument> {
-    validate_external_patch_edit_sources("patch request", args.edits.len(), args.files.len())?;
-    let mut edits = args.edits;
-    for file in args.files {
+    validate_external_patch_edit_sources(
+        "patch request",
+        args.edits.is_some(),
+        args.files.is_some(),
+    )?;
+    let mut edits = args.edits.unwrap_or_default();
+    for file in args.files.unwrap_or_default() {
         match file {
             ApiPatchFile::AddText {
                 path,
@@ -162,16 +166,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn apply_patch_args_reject_empty_or_ambiguous_edit_sources() {
+    fn apply_patch_args_accept_explicit_empty_source_and_reject_missing_or_ambiguous_sources() {
         let empty: ApplyPatchArgs = serde_json::from_value(serde_json::json!({
             "turn_id": "turn_1",
-            "message": "empty"
+            "message": "empty",
+            "edits": []
         }))
         .unwrap();
-        let empty_err = patch_document_from_args(empty).unwrap_err();
-        assert!(empty_err
+        assert!(patch_document_from_args(empty).unwrap().edits.is_empty());
+
+        let missing: ApplyPatchArgs = serde_json::from_value(serde_json::json!({
+            "turn_id": "turn_1",
+            "message": "missing"
+        }))
+        .unwrap();
+        let missing_err = patch_document_from_args(missing).unwrap_err();
+        assert!(missing_err
             .to_string()
-            .contains("requires at least one edit in `edits` or `files`"));
+            .contains("requires exactly one explicit edit source"));
 
         let ambiguous: ApplyPatchArgs = serde_json::from_value(serde_json::json!({
             "turn_id": "turn_1",

@@ -99,6 +99,7 @@ fn mount_dokan_cow_for_lane_with_view(
     };
     let mountpoint = PathBuf::from(workdir);
     prepare_overlay_mountpoint(&mountpoint, false)?;
+    let mut lease = db.acquire_workspace_mount_lease(lane, "dokan")?;
     let head = db.get_ref(&branch.ref_name)?;
     let (upperdir, source_root, bindings) = match ephemeral {
         Some((upperdir, source_root, bindings)) => (upperdir, source_root, Some(bindings)),
@@ -120,7 +121,6 @@ fn mount_dokan_cow_for_lane_with_view(
         source_root,
         bindings,
     )?;
-    let mut lease = db.acquire_workspace_mount_lease(lane, "dokan")?;
     let thread_mount_name = mount_name.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
@@ -164,16 +164,11 @@ fn mount_dokan_cow_for_lane_with_view(
     })
 }
 
-pub(crate) fn dokan_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+pub(crate) fn dokan_candidate_paths(db: &Trail, lane: &str) -> Result<ViewCheckpointCandidates> {
     let upper = overlay_upperdir(db, lane)?;
     let branch = db.lane_branch(lane)?;
     let head = db.get_ref(&branch.ref_name)?;
-    Ok(
-        recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
-            .paths
-            .into_iter()
-            .collect(),
-    )
+    recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)
 }
 
 impl Trail {
@@ -206,7 +201,10 @@ impl Trail {
         )
     }
 
-    pub(crate) fn dokan_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn dokan_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+    ) -> Result<ViewCheckpointCandidates> {
         dokan_candidate_paths(self, lane)
     }
 

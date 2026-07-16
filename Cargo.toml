@@ -51,6 +51,9 @@ dist = false
 publish-prereleases = false
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# Block every cargo-dist release phase on Linux and macOS native ledger gates
+# executed against the exact tag SHA.
+plan-jobs = ["./changed-path-ledger-native"]
 # Checksums to generate for each App
 checksum = "sha256"
 # Whether to enable GitHub Attestations

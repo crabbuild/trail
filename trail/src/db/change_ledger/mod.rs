@@ -2,6 +2,7 @@
 // authoritative readers and native producers to it.
 #![allow(dead_code)]
 
+mod activation;
 mod daemon;
 mod intent;
 mod log;
@@ -16,28 +17,35 @@ mod store;
 mod types;
 
 #[allow(unused_imports)]
+pub(crate) use activation::{ledger_authority_enabled_for, ActivationEvidence};
+
+#[allow(unused_imports)]
 pub(crate) use snapshot::{
     command_authority_enabled, CandidateComparison, CandidateMaterialization,
-    FencedCandidateSnapshot, ObservedRecordCut,
+    FencedCandidateSnapshot, ObservedRecordCut, LEDGER_AUTHORITY_ENABLED,
 };
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
-    run_command_flow, run_command_long_lock_flow, run_materialized_lane_snapshot_flow,
-    set_command_authority_override,
+    run_command_flow, run_command_long_lock_flow, run_materialized_candidate_lifecycle_flow,
+    run_materialized_lane_snapshot_flow, set_command_authority_override,
 };
 
 #[allow(unused_imports)]
 pub(crate) use daemon::{
     accept_materialized_lane_daemon_baseline, materialized_lane_daemon_expected_scope,
-    materialized_lane_daemon_fence, materialized_lane_daemon_marker_cut,
-    materialized_lane_daemon_matches_target, materialized_lane_daemon_ready_proof,
-    materialized_lane_daemon_reconcile, materialized_lane_scope_id,
+    materialized_lane_daemon_fence, materialized_lane_daemon_full_reconcile,
+    materialized_lane_daemon_marker_cut, materialized_lane_daemon_matches_target,
+    materialized_lane_daemon_ready_proof, materialized_lane_daemon_reconcile,
+    materialized_lane_scope_id, policy_runtime_restart_required,
     prepare_materialized_lane_controlled_projection, prepare_materialized_lane_daemon,
     prepare_workspace_controlled_projection, prepare_workspace_daemon,
-    with_materialized_lane_controlled_interval, with_workspace_controlled_interval,
-    workspace_daemon_fence, workspace_daemon_ready_proof, workspace_daemon_reconcile,
-    ChangedPathDaemonRegistry, WorkspaceDaemonProof, WorkspaceDaemonRuntime,
+    prepare_workspace_daemon_launch, prepare_workspace_daemon_verified_replacement,
+    verified_stale_workspace_owner_for_launch, with_materialized_lane_controlled_interval,
+    with_workspace_controlled_interval, workspace_daemon_fence, workspace_daemon_full_reconcile,
+    workspace_daemon_ready_proof, workspace_daemon_reconcile, ChangedPathDaemonRegistry,
+    VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,
+    WorkspaceDaemonRuntime,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{
@@ -49,22 +57,24 @@ pub(crate) use projection::{
     commit_lane_operation_atomic, publish_alignment_in_transaction,
     publish_ref_advancing_projection, run_projection_alignment, run_ref_advancing_projection,
     ProjectionAlignmentMode, ProjectionPublication, RefAdvancingProjectionMode,
+    WorkspaceViewCheckpointPublication,
 };
 
 #[allow(unused_imports)]
 pub(crate) use log::{
-    recover_segments_from_directory, AuthenticatedSegment, DurableCut, ObserverRecord,
-    ObserverWriterBinding, PersistedLogLimits, RecoveredTail, RecoveryError, RecoveryScope,
-    SegmentWriter,
+    recover_segments_from_connection, recover_segments_from_directory, AuthenticatedSegment,
+    DaemonLaunchBinding, DurableCut, ObserverRecord, ObserverWriterBinding, PersistedLogLimits,
+    RecoveredTail, RecoveryError, RecoveryScope, SegmentWriter,
 };
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub(crate) use observer::linux::{
     run_authenticated_fence_rejections, run_complete_prefix_publication_races,
-    run_content_mode_create_delete, run_delayed_backlog, run_fault_revocation_matrix,
-    run_fence_ordering, run_owner_death_and_root_replacement, run_policy_dependency_observation,
-    run_process_owner_child, run_raw_decoder_faults, run_reconciliation_interval_qualification,
-    run_recursive_coverage, run_rename_matrix, run_rename_storm_and_cookie_expiry,
-    run_segment_writer_reconcile_publication,
+    run_content_mode_create_delete, run_controlled_fence_queue_ordering, run_delayed_backlog,
+    run_fault_revocation_matrix, run_fence_ordering, run_owner_death_and_root_replacement,
+    run_policy_dependency_observation, run_process_owner_child, run_raw_decoder_faults,
+    run_reconciliation_interval_qualification, run_recursive_coverage, run_rename_matrix,
+    run_rename_storm_and_cookie_expiry, run_segment_writer_reconcile_publication,
+    run_unsupported_filesystem_rejection,
 };
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub(crate) use observer::macos::{
@@ -78,18 +88,23 @@ pub(crate) use observer::macos::{
     run_real_apfs_file_events as run_macos_real_apfs_file_events,
     run_root_revalidation_failures as run_macos_root_revalidation_failures,
     run_startup_cancellation as run_macos_startup_cancellation,
+    run_unsupported_filesystem_rejection as run_macos_unsupported_filesystem_rejection,
     run_uuid_revalidation as run_macos_uuid_revalidation,
 };
 #[allow(unused_imports)]
 pub(crate) use observer::{select_observer, ObserverFence, ObserverLease, QualifiedObserver};
 #[allow(unused_imports)]
 pub(crate) use policy::{
-    compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
+    capture_policy_dependency_fence_identity,
+    capture_policy_dependency_fence_identity_at_observed_path, compile_policy,
+    raw_event_invalidates_policy, raw_path_may_invalidate_policy, revalidate_compiled_policy,
     validate_policy_manifest, AdapterEquivalence, CompiledPolicy, CompiledRecordingMatcher,
-    PolicyCompileContext, PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics,
-    PolicyInvalidationIndex, PolicyManifest, PolicyManifestValidation, RecordingPolicySnapshot,
+    PolicyCompileContext, PolicyDependency, PolicyDependencyFenceIdentity, PolicyDependencyKind,
+    PolicyDependencyMetrics, PolicyInvalidationIndex, PolicyManifest, PolicyManifestValidation,
+    RecordingPolicySnapshot,
 };
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[allow(unused_imports)]
 pub(crate) use reconcile::install_initial_scan_hook;
 #[allow(unused_imports)]
 pub(crate) use reconcile::{
@@ -136,7 +151,8 @@ pub(crate) use store::ChangedPathLedger;
 #[allow(unused_imports)]
 pub(crate) use types::{
     BaselineIdentity, CandidateSnapshot, DirtyPrefix, EvidenceAcknowledgementToken, EvidenceCut,
-    EvidenceFlags, EvidenceRowKind, EvidenceSource, ExpectedScope, FilesystemIdentity, LedgerPath,
-    OwnedEvidence, PolicyIdentity, ProviderCapabilities, ProviderIdentity, ScopeId, ScopeIdentity,
+    EvidenceFlags, EvidenceRowKind, EvidenceSource, ExpectedScope, FilesystemIdentity,
+    GitEvidenceQualification, GitStructuralMetrics, LedgerPath, OwnedEvidence, PolicyIdentity,
+    ProviderCapabilities, ProviderIdentity, QualifiedGitCandidates, ScopeId, ScopeIdentity,
     ScopeKind, TrustState,
 };

@@ -6,29 +6,53 @@ impl Trail {
         patches: bool,
         line_changes: bool,
     ) -> Result<DiffSummary> {
-        if patches || line_changes {
-            return Err(Error::InvalidInput(
-                "authoritative dirty patch materialization is not enabled before ledger activation"
-                    .into(),
-            ));
-        }
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;
-        let (comparison, _fenced) =
-            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
-                db.compare_authoritative_candidates(
+        let materialization = if patches || line_changes {
+            crate::db::change_ledger::CandidateMaterialization::RecordBytes
+        } else {
+            crate::db::change_ledger::CandidateMaterialization::ManifestOnly
+        };
+        let branch_for_diff = branch.clone();
+        let (summary, _fenced) =
+            self.with_workspace_authoritative_command_snapshot(|db, policy, candidates, _git| {
+                let comparison = db.compare_authoritative_candidates(
                     policy,
                     candidates,
                     &head.root_id,
-                    crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                    materialization,
+                )?;
+                if !patches && !line_changes {
+                    debug_assert!(comparison.disk_files.is_none());
+                    return Ok(DiffSummary {
+                        from: branch_for_diff.clone(),
+                        to: "dirty".into(),
+                        files: comparison.summaries,
+                    });
+                }
+                let disk_files = comparison.disk_files.as_ref().ok_or_else(|| {
+                    Error::Corrupt(
+                        "authoritative dirty diff omitted pinned candidate contents".into(),
+                    )
+                })?;
+                let change_id = db.allocate_change_id("trail", "dirty-diff")?;
+                let built = db.build_root_for_selected_disk_files_incremental(
+                    &head.root_id,
+                    &comparison.baseline_files,
+                    disk_files,
+                    &comparison.selections,
+                    &change_id,
+                )?;
+                db.diff_files(
+                    branch_for_diff.clone(),
+                    "dirty".into(),
+                    &comparison.baseline_files,
+                    &built.files,
+                    patches,
+                    line_changes,
                 )
             })?;
-        debug_assert!(comparison.disk_files.is_none());
-        Ok(DiffSummary {
-            from: branch,
-            to: "dirty".into(),
-            files: comparison.summaries,
-        })
+        Ok(summary)
     }
 
     pub fn diff_range(&self, spec: &str, patches: bool) -> Result<DiffSummary> {
@@ -117,7 +141,15 @@ impl Trail {
         let metrics = self.operation_metrics.clone();
         let result_metrics = metrics.clone();
         profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
-            let result = self.diff_dirty_profiled(patches, line_changes);
+            let result = if crate::db::command_authority_enabled() {
+                self.note_operation_metrics(OperationMetricsDelta {
+                    selected_worktree_index_sqlite_not_applicable_count: 1,
+                    ..OperationMetricsDelta::default()
+                });
+                self.diff_dirty_from_changed_path_ledger(patches, line_changes)
+            } else {
+                self.diff_dirty_profiled(patches, line_changes)
+            };
             if let (Some(metrics), Ok(summary)) = (&result_metrics, &result) {
                 metrics.add(OperationMetricsDelta {
                     final_path_count: saturating_u64_from_usize(summary.files.len()),

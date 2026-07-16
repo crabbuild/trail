@@ -557,7 +557,17 @@ impl Trail {
     }
 
     pub(crate) fn acquire_write_lock(&self) -> Result<WorkspaceLock> {
-        acquire_workspace_lock(&self.db_dir)
+        // Every in-process Trail mutation is an authorized handoff against
+        // native observer durability. Register before waiting so no new
+        // observer append/heartbeat can enter, then retain the exclusion for
+        // the complete workspace-lock lifetime. A writer in another process
+        // cannot publish this process-local authority and remains terminal to
+        // observer continuity.
+        let exclusion = begin_authorized_observer_write_exclusion(&self.db_dir);
+        wait_for_observer_workspace_lock(&self.db_dir);
+        let mut lock = acquire_workspace_lock(&self.db_dir)?;
+        lock.observer_write_exclusion = Some(exclusion);
+        Ok(lock)
     }
 }
 
@@ -1362,6 +1372,58 @@ mod schema_handoff_tests {
     }
 
     #[test]
+    fn same_process_observer_writers_serialize_without_weakening_external_lock_failure() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_dir = root.path().join(".trail");
+        let database = db_dir.join(DB_RELATIVE_PATH);
+
+        let first = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let (acquired, received) = std::sync::mpsc::sync_channel(1);
+        let other_db_dir = db_dir.clone();
+        let other_database = database.clone();
+        let waiter = std::thread::spawn(move || {
+            let second =
+                acquire_workspace_lock_for_observer(&other_db_dir, &other_database).unwrap();
+            acquired.send(()).unwrap();
+            drop(second);
+        });
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+
+        let observer = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let (mutated, mutation_received) = std::sync::mpsc::sync_channel(1);
+        let workspace = root.path().to_path_buf();
+        let mutation = std::thread::spawn(move || {
+            let db = Trail::open(workspace).unwrap();
+            let lock = db.acquire_write_lock().unwrap();
+            mutated.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(mutation_received
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(observer);
+        mutation_received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        mutation.join().unwrap();
+
+        let external = acquire_workspace_lock(&db_dir).unwrap();
+        assert!(matches!(
+            acquire_workspace_lock_for_observer(&db_dir, &database),
+            Err(Error::WorkspaceLocked(_))
+        ));
+        drop(external);
+    }
+
+    #[test]
     fn one_hundred_ordinary_opens_share_one_unchanged_generation_validation() {
         let root = tempfile::tempdir().unwrap();
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
@@ -1398,6 +1460,179 @@ mod schema_handoff_tests {
             "100 shared schema opens exceeded the five second budget"
         );
         drop(writer);
+    }
+
+    #[test]
+    fn live_wal_advance_during_schema_snapshot_retries_without_reinitialize_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        // Retain the writer across the generation recapture. Dropping the last
+        // writer here can checkpoint and remove the WAL/SHM files, which is a
+        // main-database rewrite rather than the in-place WAL churn this test
+        // is meant to model.
+        let writer = Arc::new(Mutex::new(Some(Connection::open(&db_path).unwrap())));
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let hook_writer = writer.clone();
+        install_schema_snapshot_generation_hook(&db_path, move |_path| {
+            hook_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "UPDATE schema_meta SET value='live-wal-retry' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer.lock().unwrap().take());
+    }
+
+    #[test]
+    fn low_level_snapshot_failure_retries_only_when_same_wal_advanced() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='snapshot-error-baseline' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        fail_next_schema_validation(&db_path);
+        let advancing_path = db_path.clone();
+        let advancing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let connection = Connection::open(advancing_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE schema_meta SET value='snapshot-error-retry' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        Trail::open(root.path()).unwrap();
+        advancing.join().unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_wal_advance_during_digest_retries_without_reinitialize_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Arc::new(Mutex::new(Some(Connection::open(&db_path).unwrap())));
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE schema_meta SET value='digest-baseline' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let hook_writer = writer.clone();
+        install_schema_wal_digest_hook(
+            &wal,
+            Box::new(move |_path| {
+                hook_writer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .execute(
+                        "UPDATE schema_meta SET value='live-digest-retry' WHERE key='app.version'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+        );
+
+        Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer.lock().unwrap().take());
+    }
+
+    #[test]
+    fn snapshot_retry_rejects_main_wal_and_shm_pathname_substitution() {
+        for suffix in ["", "-wal", "-shm"] {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_path =
+                canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value='snapshot-substitution' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+            let suffix = suffix.to_string();
+            install_schema_snapshot_generation_hook(&db_path, move |path| {
+                let mut selected = path.as_os_str().to_os_string();
+                selected.push(&suffix);
+                let selected = PathBuf::from(selected);
+                assert!(
+                    selected.exists(),
+                    "missing schema file `{}`",
+                    selected.display()
+                );
+                let replacement = selected.with_extension(format!(
+                    "{}snapshot-replacement",
+                    selected
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| format!("{value}."))
+                        .unwrap_or_default()
+                ));
+                fs::copy(&selected, &replacement).unwrap();
+                fs::rename(&replacement, &selected).unwrap();
+            });
+
+            let error = match Trail::open(root.path()) {
+                Ok(_) => panic!("schema pathname substitution unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+            assert!(error
+                .to_string()
+                .contains("generation changed during snapshot validation"));
+            drop(writer);
+        }
     }
 
     #[test]

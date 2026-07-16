@@ -92,6 +92,8 @@ mod fuse_overlay {
         };
         let mountpoint = PathBuf::from(workdir);
         prepare_overlay_mountpoint(&mountpoint, false)?;
+        ensure_platform_fuse_ready()?;
+        let mut lease = db.acquire_workspace_mount_lease(lane, "fuse")?;
         let head = db.get_ref(&branch.ref_name)?;
         let (upperdir, source_root, bindings) = match ephemeral {
             Some((upperdir, source_root, bindings)) => (upperdir, source_root, Some(bindings)),
@@ -116,8 +118,6 @@ mod fuse_overlay {
             options.push(MountOption::RW);
             options.push(MountOption::NoAtime);
         }
-        ensure_platform_fuse_ready()?;
-        let mut lease = db.acquire_workspace_mount_lease(lane, "fuse")?;
         let session = fuser::spawn_mount2(fs, &mountpoint, &options)
             .map_err(|err| overlay_mount_error(&mountpoint, err))?;
         lease.mark_mounted()?;
@@ -129,16 +129,11 @@ mod fuse_overlay {
         })
     }
 
-    pub(crate) fn fuse_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn fuse_candidate_paths(db: &Trail, lane: &str) -> Result<ViewCheckpointCandidates> {
         let upper = overlay_upperdir(db, lane)?;
         let branch = db.lane_branch(lane)?;
         let head = db.get_ref(&branch.ref_name)?;
-        Ok(
-            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
-                .paths
-                .into_iter()
-                .collect(),
-        )
+        recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)
     }
 
     fn overlay_mount_error(mountpoint: &Path, err: std::io::Error) -> Error {
@@ -1249,7 +1244,7 @@ pub(crate) fn mount_fuse_cow_for_lane_with_ephemeral_bindings(
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
-pub(crate) fn fuse_candidate_paths(_db: &Trail, lane: &str) -> Result<Vec<String>> {
+pub(crate) fn fuse_candidate_paths(_db: &Trail, lane: &str) -> Result<ViewCheckpointCandidates> {
     Err(Error::InvalidInput(format!(
         "fuse-cow lane `{lane}` cannot be inspected on this platform"
     )))
@@ -1285,7 +1280,10 @@ impl Trail {
         )
     }
 
-    pub(crate) fn fuse_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn fuse_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+    ) -> Result<ViewCheckpointCandidates> {
         fuse_candidate_paths(self, lane)
     }
 

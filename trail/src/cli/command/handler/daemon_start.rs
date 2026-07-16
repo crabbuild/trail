@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +47,7 @@ pub(super) struct WorkspaceDaemonEndpoint {
     pub(super) live_fence_sequence: u64,
     pub(super) scope_id: String,
     pub(super) epoch: u64,
+    pub(super) daemon_launch_nonce: String,
     pub(super) durable_offset: u64,
     pub(super) folded_offset: u64,
 }
@@ -61,6 +63,18 @@ struct WorkspaceDaemonStarting {
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
+    #[serde(default)]
+    scope_id: Option<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+    daemon_launch_nonce: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct VerifiedStaleOwnerHandoff {
+    stale_pid: u32,
+    process_start_identity: String,
+    daemon_launch_nonce: String,
 }
 
 #[derive(Clone, Debug)]
@@ -83,18 +97,18 @@ pub(super) fn ensure_workspace_daemon_ready(
     {
         return Ok(ready);
     }
-    let mut replace_verified_stale_owner = false;
+    let mut verified_stale_owner = None;
     if let Some(endpoint) = read_secure_endpoint(&authority)? {
         match classify_endpoint(&workspace, &authority, &endpoint, requested_token)? {
             EndpointState::Ready(ready) => return Ok(ready),
-            EndpointState::Stale => {
+            EndpointState::Stale(verified) => {
                 remove_stale_publication(&authority, &endpoint)?;
-                replace_verified_stale_owner = true;
+                merge_verified_stale_owner(&mut verified_stale_owner, verified)?;
             }
         }
     }
-    if recover_stale_starting_publication(&workspace, &authority)? {
-        replace_verified_stale_owner = true;
+    if let Some(verified) = recover_stale_starting_publication(&workspace, &authority)? {
+        merge_verified_stale_owner(&mut verified_stale_owner, verified)?;
     }
 
     let token = match requested_token {
@@ -106,41 +120,95 @@ pub(super) fn ensure_workspace_daemon_ready(
         }
         None => random_hex(32)?,
     };
-    if let Err(error) = spawn_workspace_daemon(&workspace, &token, replace_verified_stale_owner) {
-        if error
-            .to_string()
-            .contains("recording policy changed during observer startup")
-        {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                match recover_stale_starting_publication(&workspace, &authority) {
-                    Ok(true) => break,
-                    Ok(false) => return Err(error),
-                    Err(_) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => return Err(error),
-                }
-            }
-            spawn_workspace_daemon(&workspace, &token, true)?;
-        } else {
-            return Err(error);
-        }
-    }
+    #[cfg(debug_assertions)]
+    test_after_stale_verification_boundary(verified_stale_owner.as_ref())?;
+    spawn_workspace_daemon(&workspace, &token, verified_stale_owner.as_ref())?;
     let endpoint = read_secure_endpoint(&authority)?.ok_or_else(|| {
         Error::DaemonUnavailable("workspace daemon became ready without an endpoint".into())
     })?;
     match classify_endpoint(&workspace, &authority, &endpoint, Some(&token))? {
         EndpointState::Ready(ready) => Ok(ready),
-        EndpointState::Stale => Err(Error::DaemonUnavailable(
+        EndpointState::Stale(_) => Err(Error::DaemonUnavailable(
             "workspace daemon exited before readiness could be authenticated".into(),
         )),
     }
 }
 
+pub(super) fn existing_workspace_daemon_ready(
+    workspace: &Path,
+    requested_token: Option<&str>,
+) -> Result<Option<DaemonReady>> {
+    let workspace = workspace.canonicalize()?;
+    let db_dir = workspace.join(".trail");
+    let authority = secure_authority_directory(&db_dir)?;
+    authority.verify_trail_identity(&db_dir)?;
+    let lock = secure_open_lock(&authority)?;
+    if let Some(ready) =
+        acquire_or_observe_published_daemon(&lock, &authority, &workspace, requested_token)?
+    {
+        return Ok(Some(ready));
+    }
+    if let Some(endpoint) = read_secure_endpoint(&authority)? {
+        return match classify_endpoint(&workspace, &authority, &endpoint, requested_token)? {
+            EndpointState::Ready(ready) => Ok(Some(ready)),
+            EndpointState::Stale(_) => Err(Error::DaemonUnavailable(
+                "workspace auto-daemon publication is stale; refusing local split-brain fallback"
+                    .into(),
+            )),
+        };
+    }
+    if read_secure_starting(&authority)?.is_some() {
+        return Err(Error::DaemonUnavailable(
+            "workspace auto-daemon publication exists but is not ready; refusing local split-brain fallback"
+                .into(),
+        ));
+    }
+    Ok(None)
+}
+
+pub(super) fn retire_workspace_daemon_after_external_generation_change(
+    workspace: &Path,
+) -> Result<()> {
+    let workspace = workspace.canonicalize()?;
+    let db_dir = workspace.join(".trail");
+    let authority = secure_authority_directory(&db_dir)?;
+    authority.verify_trail_identity(&db_dir)?;
+    let Some(endpoint) = read_secure_endpoint(&authority)? else {
+        return Ok(());
+    };
+    match classify_endpoint(&workspace, &authority, &endpoint, None)? {
+        EndpointState::Stale(_) => return Ok(()),
+        EndpointState::Ready(_) => {}
+    }
+    let actual_start = process_start_identity(endpoint.pid).ok_or_else(|| {
+        Error::DaemonUnavailable(
+            "workspace daemon process identity disappeared before retirement".into(),
+        )
+    })?;
+    if actual_start != endpoint.process_start_identity {
+        return Err(Error::DaemonUnavailable(
+            "workspace daemon PID was reused before retirement; refusing to signal it".into(),
+        ));
+    }
+    let result = unsafe { libc::kill(endpoint.pid as i32, libc::SIGTERM) };
+    if result != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_alive(endpoint.pid) {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "workspace daemon did not retire after its database generation changed".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 enum EndpointState {
     Ready(DaemonReady),
-    Stale,
+    Stale(VerifiedStaleOwnerHandoff),
 }
 
 fn classify_endpoint(
@@ -162,17 +230,6 @@ fn classify_endpoint(
                 .into(),
         ));
     }
-    let alive = process_is_alive(endpoint.pid);
-    let actual_start = process_start_identity(endpoint.pid);
-    if !alive {
-        return Ok(EndpointState::Stale);
-    }
-    let Some(actual_start) = actual_start else {
-        return Err(Error::DaemonUnavailable(format!(
-            "live workspace daemon PID {} cannot be identity-verified; refusing replacement",
-            endpoint.pid
-        )));
-    };
     let mut invalid = Vec::new();
     if endpoint.protocol_version != PROTOCOL_VERSION {
         invalid.push("protocol");
@@ -213,18 +270,29 @@ fn classify_endpoint(
     if endpoint.epoch == 0 {
         invalid.push("epoch");
     }
+    if endpoint.daemon_launch_nonce.len() != 64 {
+        invalid.push("daemon_launch_nonce");
+    }
     if endpoint.folded_offset > endpoint.durable_offset {
         invalid.push("offsets");
     }
     if !invalid.is_empty() {
-        if actual_start != endpoint.process_start_identity {
-            return Ok(EndpointState::Stale);
-        }
         return Err(Error::DaemonUnavailable(format!(
             "workspace daemon endpoint identity is unverifiable ({}) ; refusing replacement",
             invalid.join(",")
         )));
     }
+    let alive = process_is_alive(endpoint.pid);
+    let actual_start = process_start_identity(endpoint.pid);
+    if !alive {
+        return Ok(EndpointState::Stale(verified_stale_handoff(endpoint)?));
+    }
+    let Some(actual_start) = actual_start else {
+        return Err(Error::DaemonUnavailable(format!(
+            "live workspace daemon PID {} cannot be identity-verified; refusing replacement",
+            endpoint.pid
+        )));
+    };
     let published_token = read_secure_owner_text(authority, TOKEN_FILE, 4096)?;
     if published_token.trim_end() != endpoint.auth_token {
         return Err(Error::DaemonUnavailable(
@@ -240,7 +308,7 @@ fn classify_endpoint(
     let proof = match daemon_rpc::authenticated_ledger_fence(endpoint) {
         Ok(proof) => proof,
         Err(_) if actual_start != endpoint.process_start_identity => {
-            return Ok(EndpointState::Stale)
+            return Ok(EndpointState::Stale(verified_stale_handoff(endpoint)?))
         }
         Err(error)
             if error
@@ -253,7 +321,7 @@ fn classify_endpoint(
                     || process_start_identity(endpoint.pid).as_deref()
                         != Some(endpoint.process_start_identity.as_str())
                 {
-                    return Ok(EndpointState::Stale);
+                    return Ok(EndpointState::Stale(verified_stale_handoff(endpoint)?));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -283,6 +351,7 @@ fn classify_endpoint(
         || proof.workspace_identity != endpoint.workspace_identity
         || proof.scope_id != endpoint.scope_id
         || proof.epoch != endpoint.epoch
+        || proof.daemon_launch_nonce != endpoint.daemon_launch_nonce
         || proof.live_fence_sequence < endpoint.live_fence_sequence
         || proof.durable_offset < endpoint.durable_offset
         || proof.folded_offset > proof.durable_offset
@@ -297,69 +366,85 @@ fn classify_endpoint(
     }))
 }
 
+fn verified_stale_handoff(endpoint: &WorkspaceDaemonEndpoint) -> Result<VerifiedStaleOwnerHandoff> {
+    if endpoint.daemon_launch_nonce.len() != 64 {
+        return Err(Error::DaemonUnavailable(
+            "stale workspace daemon endpoint lacks an exact ledger owner binding".into(),
+        ));
+    }
+    Ok(VerifiedStaleOwnerHandoff {
+        stale_pid: endpoint.pid,
+        process_start_identity: endpoint.process_start_identity.clone(),
+        daemon_launch_nonce: endpoint.daemon_launch_nonce.clone(),
+    })
+}
+
+fn merge_verified_stale_owner(
+    target: &mut Option<VerifiedStaleOwnerHandoff>,
+    additional: VerifiedStaleOwnerHandoff,
+) -> Result<()> {
+    match target {
+        Some(existing) if *existing != additional => Err(Error::DaemonUnavailable(
+            "workspace daemon stale publications disagree on the exact ledger owner binding".into(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *target = Some(additional);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_after_stale_verification_boundary(
+    verified: Option<&VerifiedStaleOwnerHandoff>,
+) -> Result<()> {
+    let Some(barrier) =
+        std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_AFTER_STALE_VERIFICATION_BARRIER")
+    else {
+        return Ok(());
+    };
+    let Some(verified) = verified else {
+        return Err(Error::DaemonUnavailable(
+            "stale-verification test boundary had no verified stale owner".into(),
+        ));
+    };
+    let barrier = PathBuf::from(barrier);
+    fs::write(barrier.join("verified"), serde_json::to_vec(verified)?)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("continue").exists() {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "stale-verification test boundary timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 fn spawn_workspace_daemon(
     workspace: &Path,
     token: &str,
-    replace_verified_stale_owner: bool,
+    verified_stale_owner: Option<&VerifiedStaleOwnerHandoff>,
 ) -> Result<()> {
-    let mut pipe = [0_i32; 2];
-    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    let read_fd = pipe[0];
-    let write_fd = pipe[1];
-    let mut token_pipe = [0_i32; 2];
-    if unsafe { libc::pipe(token_pipe.as_mut_ptr()) } != 0 {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-        }
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    let token_read_fd = token_pipe[0];
-    let token_write_fd = token_pipe[1];
-    if let Err(error) = seal_daemon_exec_descriptors() {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-            libc::close(token_read_fd);
-            libc::close(token_write_fd);
-        }
-        return Err(error);
-    }
-    let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFD) };
-    let token_read_flags = unsafe { libc::fcntl(token_read_fd, libc::F_GETFD) };
-    let token_write_flags = unsafe { libc::fcntl(token_write_fd, libc::F_GETFD) };
-    if flags < 0
-        || token_read_flags < 0
-        || token_write_flags < 0
-        || unsafe { libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
-        || unsafe {
-            libc::fcntl(
-                token_read_fd,
-                libc::F_SETFD,
-                token_read_flags & !libc::FD_CLOEXEC,
-            )
-        } < 0
-        || unsafe {
-            libc::fcntl(
-                token_write_fd,
-                libc::F_SETFD,
-                token_write_flags | libc::FD_CLOEXEC,
-            )
-        } < 0
-    {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-            libc::close(token_read_fd);
-            libc::close(token_write_fd);
-        }
+    // std::io::pipe creates close-on-exec descriptors while holding the
+    // standard library's process-spawn lock on platforms that need it. Keep
+    // every parent descriptor sealed; only the intended child clears its two
+    // inherited ends in pre_exec.
+    let (mut ready_reader, ready_writer) = std::io::pipe()?;
+    let (token_reader, mut token_writer) = std::io::pipe()?;
+    let write_fd = ready_writer.as_raw_fd();
+    let token_read_fd = token_reader.as_raw_fd();
+    let maximum_fd = unsafe { libc::getdtablesize() };
+    if maximum_fd < 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
 
     let owner_nonce = random_hex(32)?;
-    let child = ProcessCommand::new(std::env::current_exe()?)
+    let daemon_launch_nonce = random_hex(32)?;
+    let mut command = ProcessCommand::new(std::env::current_exe()?);
+    command
         .arg("--workspace")
         .arg(workspace)
         .arg("--quiet")
@@ -370,38 +455,34 @@ fn spawn_workspace_daemon(
         .env("TRAIL_WORKSPACE_DAEMON_READY_FD", write_fd.to_string())
         .env("TRAIL_WORKSPACE_DAEMON_TOKEN_FD", token_read_fd.to_string())
         .env("TRAIL_WORKSPACE_DAEMON_OWNER_NONCE", owner_nonce)
-        .env(
-            "TRAIL_WORKSPACE_DAEMON_REPLACE_STALE",
-            if replace_verified_stale_owner {
-                "1"
-            } else {
-                "0"
-            },
-        )
+        .env("TRAIL_WORKSPACE_DAEMON_LAUNCH_NONCE", daemon_launch_nonce)
+        .env_remove("TRAIL_WORKSPACE_DAEMON_VERIFIED_STALE_OWNER")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    if let Some(verified) = verified_stale_owner {
+        command.env(
+            "TRAIL_WORKSPACE_DAEMON_VERIFIED_STALE_OWNER",
+            serde_json::to_string(verified)?,
+        );
+    }
+    unsafe {
+        command.pre_exec(move || {
+            seal_daemon_exec_descriptors(maximum_fd)?;
+            clear_descriptor_cloexec(write_fd)?;
+            clear_descriptor_cloexec(token_read_fd)?;
+            Ok(())
+        });
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(child) => child,
-        Err(error) => {
-            unsafe {
-                libc::close(read_fd);
-                libc::close(write_fd);
-                libc::close(token_read_fd);
-                libc::close(token_write_fd);
-            }
-            return Err(Error::Io(error));
-        }
+        Err(error) => return Err(Error::Io(error)),
     };
-    unsafe {
-        libc::close(write_fd);
-        libc::close(token_read_fd);
-    }
-    let mut token_writer = unsafe { File::from_raw_fd(token_write_fd) };
+    drop(ready_writer);
+    drop(token_reader);
     token_writer.write_all(token.as_bytes())?;
     drop(token_writer);
-    let mut read = unsafe { File::from_raw_fd(read_fd) };
     let deadline = Instant::now() + ready_timeout();
     let mut byte = [0_u8; 1];
     loop {
@@ -414,7 +495,7 @@ fn spawn_workspace_daemon(
             ));
         }
         let mut poll_fd = libc::pollfd {
-            fd: read.as_raw_fd(),
+            fd: ready_reader.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -427,7 +508,7 @@ fn spawn_workspace_daemon(
         if polled == 0 {
             continue;
         }
-        match read.read(&mut byte) {
+        match ready_reader.read(&mut byte) {
             Ok(1) if byte[0] == 1 => return Ok(()),
             Ok(_) => {
                 let status = child.try_wait()?.map(|status| status.to_string());
@@ -452,7 +533,7 @@ fn spawn_workspace_daemon(
     }
 }
 
-fn seal_daemon_exec_descriptors() -> Result<()> {
+fn seal_daemon_exec_descriptors(maximum_fd: RawFd) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let closed = unsafe {
@@ -471,46 +552,32 @@ fn seal_daemon_exec_descriptors() -> Result<()> {
             error.raw_os_error(),
             Some(libc::ENOSYS) | Some(libc::EINVAL)
         ) {
-            return Err(Error::Io(error));
+            return Err(error);
         }
-        return mark_open_descriptors_cloexec("/proc/self/fd");
+        for fd in 3..maximum_fd {
+            mark_descriptor_cloexec_if_open(fd)?;
+        }
+        return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        mark_open_descriptors_cloexec("/dev/fd")
+        for fd in 3..maximum_fd {
+            mark_descriptor_cloexec_if_open(fd)?;
+        }
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let limit = unsafe { libc::getdtablesize() };
-        if limit < 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
-        }
-        for fd in 3..limit {
+        for fd in 3..maximum_fd {
             mark_descriptor_cloexec_if_open(fd)?;
         }
         Ok(())
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn mark_open_descriptors_cloexec(directory: &str) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let Some(fd) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<RawFd>().ok())
-        else {
-            continue;
-        };
-        mark_descriptor_cloexec_if_open(fd)?;
-    }
-    Ok(())
-}
-
-fn mark_descriptor_cloexec_if_open(fd: RawFd) -> Result<()> {
+fn mark_descriptor_cloexec_if_open(fd: RawFd) -> std::io::Result<()> {
     if fd < 3 {
         return Ok(());
     }
@@ -520,15 +587,23 @@ fn mark_descriptor_cloexec_if_open(fd: RawFd) -> Result<()> {
         if error.raw_os_error() == Some(libc::EBADF) {
             return Ok(());
         }
-        return Err(Error::Io(error));
+        return Err(error);
     }
     if flags & libc::FD_CLOEXEC == 0
         && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
     {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EBADF) {
-            return Err(Error::Io(error));
+            return Err(error);
         }
+    }
+    Ok(())
+}
+
+fn clear_descriptor_cloexec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -548,7 +623,8 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     (&mut token_reader).take(65).read_to_string(&mut token)?;
     drop(token_reader);
     let owner_nonce = required_env("TRAIL_WORKSPACE_DAEMON_OWNER_NONCE")?;
-    if token.len() != 64 || owner_nonce.len() != 64 {
+    let daemon_launch_nonce = required_env("TRAIL_WORKSPACE_DAEMON_LAUNCH_NONCE")?;
+    if token.len() != 64 || owner_nonce.len() != 64 || daemon_launch_nonce.len() != 64 {
         return Err(Error::InvalidInput(
             "workspace daemon received malformed authentication identity".into(),
         ));
@@ -608,7 +684,7 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         socket_identity.0,
         socket_identity.1,
     )?;
-    let starting = WorkspaceDaemonStarting {
+    let mut starting = WorkspaceDaemonStarting {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
         process_start_identity: process_start_identity(std::process::id()).ok_or_else(|| {
@@ -620,6 +696,9 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         socket_path: socket_path.clone(),
         socket_device: socket_metadata.0,
         socket_inode: socket_metadata.1,
+        scope_id: None,
+        epoch: None,
+        daemon_launch_nonce: daemon_launch_nonce.clone(),
     };
     publish_owner_file(
         &authority,
@@ -634,11 +713,21 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         }
     }
 
-    let replace_verified_stale_owner =
-        std::env::var("TRAIL_WORKSPACE_DAEMON_REPLACE_STALE").as_deref() == Ok("1");
-    let ledger_ready = trail::server::prepare_workspace_changed_path_daemon(
-        &mut db,
-        replace_verified_stale_owner,
+    let ledger_ready = trail::server::prepare_workspace_changed_path_daemon(&mut db)?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os(
+        "TRAIL_TEST_WORKSPACE_DAEMON_EXIT_AFTER_OWNER_ACQUIRE_BEFORE_BOUND_PUBLICATION",
+    )
+    .is_some()
+    {
+        std::process::exit(87);
+    }
+    starting.scope_id = Some(ledger_ready.scope_id.clone());
+    starting.epoch = Some(ledger_ready.epoch);
+    publish_owner_file(
+        &authority,
+        STARTING_FILE,
+        &serde_json::to_vec_pretty(&starting)?,
     )?;
     #[cfg(debug_assertions)]
     if std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_EXIT_AFTER_PREPARE").is_some() {
@@ -669,6 +758,7 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         live_fence_sequence: ledger_ready.sequence,
         scope_id: ledger_ready.scope_id,
         epoch: ledger_ready.epoch,
+        daemon_launch_nonce: ledger_ready.daemon_launch_nonce,
         durable_offset: ledger_ready.durable_offset,
         folded_offset: ledger_ready.folded_offset,
     };
@@ -1037,22 +1127,41 @@ fn read_secure_starting(authority: &SecureAuthority) -> Result<Option<WorkspaceD
 fn recover_stale_starting_publication(
     workspace: &Path,
     authority: &SecureAuthority,
-) -> Result<bool> {
+) -> Result<Option<VerifiedStaleOwnerHandoff>> {
     let Some(starting) = read_secure_starting(authority)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let expected_socket = workspace.join(".trail/changed-path.sock");
-    if starting.protocol_version != PROTOCOL_VERSION
-        || starting.pid == 0
-        || starting.process_start_identity.is_empty()
-        || starting.executable_identity != executable_identity(&std::env::current_exe()?)?
-        || starting.workspace_identity != workspace_identity(workspace)?
-        || starting.owner_nonce.len() != 64
-        || starting.socket_path != expected_socket
-    {
-        return Err(Error::DaemonUnavailable(
-            "workspace daemon startup identity is unverifiable; refusing replacement".into(),
-        ));
+    let mut invalid = Vec::new();
+    if starting.protocol_version != PROTOCOL_VERSION {
+        invalid.push("protocol");
+    }
+    if starting.pid == 0 {
+        invalid.push("pid");
+    }
+    if starting.process_start_identity.is_empty() {
+        invalid.push("process_start_identity");
+    }
+    if starting.executable_identity != executable_identity(&std::env::current_exe()?)? {
+        invalid.push("executable");
+    }
+    if starting.workspace_identity != workspace_identity(workspace)? {
+        invalid.push("workspace");
+    }
+    if starting.owner_nonce.len() != 64 {
+        invalid.push("owner_nonce");
+    }
+    if starting.daemon_launch_nonce.len() != 64 {
+        invalid.push("daemon_launch_nonce");
+    }
+    if starting.socket_path != expected_socket {
+        invalid.push("socket_path");
+    }
+    if !invalid.is_empty() {
+        return Err(Error::DaemonUnavailable(format!(
+            "workspace daemon startup identity is unverifiable ({}); refusing replacement",
+            invalid.join(", ")
+        )));
     }
     if process_is_alive(starting.pid) {
         match process_start_identity(starting.pid) {
@@ -1070,6 +1179,21 @@ fn recover_stale_starting_publication(
             }
         }
     }
+    match (starting.scope_id.as_ref(), starting.epoch) {
+        (Some(scope_id), Some(epoch)) if scope_id.len() == 64 && epoch != 0 => {}
+        (None, None) => {}
+        _ => {
+            return Err(Error::DaemonUnavailable(
+                "workspace daemon startup publication has an incomplete ledger scope binding"
+                    .into(),
+            ))
+        }
+    }
+    let handoff = VerifiedStaleOwnerHandoff {
+        stale_pid: starting.pid,
+        process_start_identity: starting.process_start_identity.clone(),
+        daemon_launch_nonce: starting.daemon_launch_nonce.clone(),
+    };
     remove_socket_leaf_if_identity(
         authority,
         SOCKET_FILE,
@@ -1080,7 +1204,7 @@ fn recover_stale_starting_publication(
     )?;
     unlink_authority_file(authority, STARTING_FILE)?;
     authority.directory.sync_all()?;
-    Ok(true)
+    Ok(Some(handoff))
 }
 
 fn read_secure_owner_text(authority: &SecureAuthority, name: &str, limit: u64) -> Result<String> {

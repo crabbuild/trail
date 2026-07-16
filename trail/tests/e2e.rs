@@ -1803,7 +1803,7 @@ fn cli_json_errors_are_machine_readable() {
     assert!(parse_output.stdout.is_empty());
     let parse_stderr: serde_json::Value = serde_json::from_slice(&parse_output.stderr).unwrap();
     assert_eq!(parse_stderr["error"]["code"], "INVALID_INPUT");
-    assert_eq!(parse_stderr["error"]["exit_code"], 2);
+    assert_eq!(parse_stderr["error"]["exit"], 2);
     assert!(parse_stderr["error"]["message"]
         .as_str()
         .unwrap()
@@ -1821,7 +1821,7 @@ fn cli_json_errors_are_machine_readable() {
     assert!(output.stdout.is_empty());
     let stderr: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(stderr["error"]["code"], "WORKSPACE_NOT_FOUND");
-    assert_eq!(stderr["error"]["exit_code"], 3);
+    assert_eq!(stderr["error"]["exit"], 3);
     assert!(stderr["error"]["message"]
         .as_str()
         .unwrap()
@@ -1896,7 +1896,7 @@ fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
     assert!(json.stdout.is_empty());
     let json_error: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
     assert_eq!(json_error["error"]["code"], "PATH_INDEX_REQUIRED");
-    assert_eq!(json_error["error"]["exit_code"], 9);
+    assert_eq!(json_error["error"]["exit"], 9);
     assert!(json_error["error"]["message"]
         .as_str()
         .unwrap()
@@ -9601,7 +9601,7 @@ fn mutation_json_payloads_reject_unknown_fields() {
 }
 
 #[test]
-fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
+fn external_patch_payloads_accept_explicit_empty_and_reject_missing_or_ambiguous_sources() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -9621,22 +9621,37 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
     assert_eq!(http_turn.status, 201);
     let http_turn: LaneTurnStartReport = http_turn.body_json().unwrap();
 
+    let http_missing_patch = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            &format!("/v1/lane/turns/{}/patches", http_turn.turn.turn_id),
+            serde_json::json!({
+                "message": "missing patch source"
+            }),
+        ),
+    );
+    assert_eq!(http_missing_patch.status, 400);
+    let body: serde_json::Value = http_missing_patch.body_json().unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("requires exactly one explicit edit source"));
+
     let http_empty_patch = trail::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
             &format!("/v1/lane/turns/{}/patches", http_turn.turn.turn_id),
             serde_json::json!({
-                "message": "empty patch"
+                "message": "empty patch",
+                "edits": []
             }),
         ),
     );
-    assert_eq!(http_empty_patch.status, 400);
-    let body: serde_json::Value = http_empty_patch.body_json().unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("requires at least one edit"));
+    assert_eq!(http_empty_patch.status, 200);
+    let http_empty_report: LanePatchReport = http_empty_patch.body_json().unwrap();
+    assert!(http_empty_report.changed_paths.is_empty());
 
     let http_ambiguous_patch = trail::server::handle_http_request(
         &mut db,
@@ -9711,7 +9726,7 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
         .unwrap()
         .to_string();
 
-    let mcp_empty_patch = trail::mcp::handle_json_rpc(
+    let mcp_missing_patch = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -9721,17 +9736,40 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
                 "name": "trail.apply_patch",
                 "arguments": {
                     "turn_id": mcp_turn_id.clone(),
-                    "message": "empty patch"
+                    "message": "missing patch source"
                 }
             }
         }),
     )
     .unwrap();
-    assert_eq!(mcp_empty_patch["result"]["isError"], true);
-    assert!(mcp_empty_patch["result"]["content"][0]["text"]
+    assert_eq!(mcp_missing_patch["result"]["isError"], true);
+    assert!(mcp_missing_patch["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("requires at least one edit"));
+        .contains("requires exactly one explicit edit source"));
+
+    let mcp_empty_patch = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.apply_patch",
+                "arguments": {
+                    "turn_id": mcp_turn_id.clone(),
+                    "message": "empty patch",
+                    "edits": []
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_empty_patch["result"]["isError"], false);
+    assert_eq!(
+        mcp_empty_patch["result"]["structuredContent"]["changed_paths"],
+        serde_json::json!([])
+    );
 
     let mcp_ambiguous_patch = trail::mcp::handle_json_rpc(
         &mut db,
@@ -9773,7 +9811,9 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
                 .summary
                 .as_ref()
                 .and_then(|summary| summary["error"].as_str())
-                .is_some_and(|message| message.contains("requires at least one edit"))
+                .is_some_and(|message| {
+                    message.contains("requires exactly one explicit edit source")
+                })
     }));
     assert!(audits.iter().any(|audit| {
         audit.surface == "http"
@@ -10375,14 +10415,12 @@ fn local_api_and_mcp_patch_payloads_respect_ignore_policy() {
         edit_source_modes[1]["not"]["required"],
         serde_json::json!(["edits"])
     );
-    assert_eq!(
-        apply_patch_schema["properties"]["edits"]["minItems"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        apply_patch_schema["properties"]["files"]["minItems"],
-        serde_json::json!(1)
-    );
+    assert!(apply_patch_schema["properties"]["edits"]
+        .get("minItems")
+        .is_none());
+    assert!(apply_patch_schema["properties"]["files"]
+        .get("minItems")
+        .is_none());
     let edit_variants = apply_patch_schema["properties"]["edits"]["items"]["oneOf"]
         .as_array()
         .unwrap();
@@ -13133,6 +13171,12 @@ fn local_api_and_cli_export_openapi_contract() {
     let cli = run_trail_json(temp.path(), &["api", "openapi"]);
     assert_eq!(cli["openapi"], "3.1.0");
     assert!(cli["paths"].get("/v1/openapi.json").is_some());
+    assert!(cli["paths"].get("/v1/index/reconcile").is_some());
+    assert_eq!(
+        cli["paths"]["/v1/index/reconcile"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ChangeLedgerReconcileReport"
+    );
     assert!(cli["paths"]["/v1/lanes"]["get"].is_object());
     assert!(cli["paths"]["/v1/lanes/{lane_or_id}"]["delete"].is_object());
     assert!(cli["paths"]
@@ -13244,14 +13288,12 @@ fn local_api_and_cli_export_openapi_contract() {
         patch_request_modes[1]["not"]["required"],
         serde_json::json!(["edits"])
     );
-    assert_eq!(
-        patch_request["properties"]["edits"]["minItems"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        patch_request["properties"]["files"]["minItems"],
-        serde_json::json!(1)
-    );
+    assert!(patch_request["properties"]["edits"]
+        .get("minItems")
+        .is_none());
+    assert!(patch_request["properties"]["files"]
+        .get("minItems")
+        .is_none());
     assert_eq!(
         patch_request["properties"]["edits"]["items"]["$ref"],
         "#/components/schemas/PatchEdit"
@@ -14239,8 +14281,9 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_bool()
             .unwrap()
     };
-    assert!(tool_annotation("trail.status", "readOnlyHint"));
+    assert!(!tool_annotation("trail.status", "readOnlyHint"));
     assert!(!tool_annotation("trail.status", "destructiveHint"));
+    assert!(tool_annotation("trail.status", "idempotentHint"));
     assert!(!tool_annotation("trail.apply_patch", "readOnlyHint"));
     assert!(tool_annotation("trail.apply_patch", "destructiveHint"));
     assert!(tool_annotation("trail.lane_rewind", "destructiveHint"));
@@ -18057,7 +18100,7 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
 }
 
 #[test]
-fn mcp_status_read_only_does_not_refresh_worktree_index() {
+fn mcp_status_refreshes_index_while_status_resource_remains_read_only() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("a.txt"), "a1\n").unwrap();
     fs::write(temp.path().join("b.txt"), "b1\n").unwrap();
@@ -18099,7 +18142,7 @@ fn mcp_status_read_only_does_not_refresh_worktree_index() {
     assert!(changed_paths.iter().any(|path| path["path"] == "a.txt"));
     assert!(changed_paths.iter().any(|path| path["path"] == "c.txt"));
 
-    assert_eq!(count_rows("worktree_file_index"), index_before);
+    assert_eq!(count_rows("worktree_file_index"), index_before + 1);
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
 
@@ -18123,9 +18166,24 @@ fn mcp_status_read_only_does_not_refresh_worktree_index() {
     assert!(resource_paths.iter().any(|path| path["path"] == "a.txt"));
     assert!(resource_paths.iter().any(|path| path["path"] == "c.txt"));
 
-    assert_eq!(count_rows("worktree_file_index"), index_before);
+    assert_eq!(count_rows("worktree_file_index"), index_before + 1);
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+}
+
+#[test]
+fn changed_path_activation_is_checked_and_linux_macos_only() {
+    let evidence = trail::test_support::changed_path_activation_evidence().unwrap();
+    assert!(evidence["schema_hard_cutover"].as_bool().unwrap());
+    assert!(evidence["producer_inventory_complete"].as_bool().unwrap());
+    assert!(evidence["crash_matrix"].as_bool().unwrap());
+    assert!(evidence["corruption_matrix"].as_bool().unwrap());
+    assert!(evidence["scale_gates"].as_bool().unwrap());
+    assert_eq!(
+        trail::test_support::changed_path_production_authority_default(),
+        cfg!(any(target_os = "linux", target_os = "macos"))
+    );
+    assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
 }
 
 #[test]
@@ -20423,7 +20481,8 @@ fn local_api_direct_merge_lane_conflict_records_conflict_set() {
     );
     assert_eq!(response.status, 409);
     let body: serde_json::Value = response.body_json().unwrap();
-    assert_eq!(body["error"]["code"], 6);
+    assert_eq!(body["error"]["code"], "MERGE_CONFLICT");
+    assert_eq!(body["error"]["exit"], 6);
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()

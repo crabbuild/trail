@@ -144,10 +144,8 @@ pub(crate) struct ApplyPatchArgs {
     pub(crate) allow_ignored: bool,
     #[serde(default)]
     pub(crate) allow_stale: bool,
-    #[serde(default)]
-    pub(crate) edits: Vec<PatchEdit>,
-    #[serde(default)]
-    pub(crate) files: Vec<ApiPatchFile>,
+    pub(crate) edits: Option<Vec<PatchEdit>>,
+    pub(crate) files: Option<Vec<ApiPatchFile>>,
 }
 
 #[derive(Debug, Deserialize)]

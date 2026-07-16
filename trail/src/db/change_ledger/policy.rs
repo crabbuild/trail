@@ -1143,6 +1143,241 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_policy_fence_detects_content_replacement_and_missing_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dependency = temp.path().canonicalize().unwrap().join("global.gitconfig");
+        let missing = capture_policy_dependency_fence_identity(&dependency).unwrap();
+        assert_eq!(
+            missing,
+            capture_policy_dependency_fence_identity(&dependency).unwrap()
+        );
+
+        fs::write(&dependency, b"[core]\n").unwrap();
+        let created = capture_policy_dependency_fence_identity(&dependency).unwrap();
+        assert_ne!(missing, created);
+
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"[core]\n").unwrap();
+        let replace_target = dependency.clone();
+        install_policy_fence_after_hash_hook(dependency.clone(), move || {
+            fs::rename(&replacement, &replace_target).unwrap();
+        });
+        let replaced = capture_policy_dependency_fence_identity(&dependency).unwrap();
+        assert_eq!(created.content_identity, replaced.content_identity);
+        assert_ne!(created.metadata_identity, replaced.metadata_identity);
+
+        fs::write(&dependency, b"[core]\n\texcludesFile = ignored\n").unwrap();
+        let changed = capture_policy_dependency_fence_identity(&dependency).unwrap();
+        assert_ne!(replaced.content_identity, changed.content_identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_alias_policy_manifest_binds_target_creation_and_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first_target = root.join("first-target");
+        let second_target = root.join("second-target");
+        fs::create_dir(&first_target).unwrap();
+        fs::create_dir(&second_target).unwrap();
+        let alias = root.join("alias");
+        symlink(&first_target, &alias).unwrap();
+        let dependency = alias.join("gitconfig");
+        let first_observed = first_target.join("gitconfig");
+        let included_dependency = alias.join("included.gitconfig");
+        let included_observed = first_target.join("included.gitconfig");
+
+        assert!(capture_policy_dependency_fence_identity(&dependency).is_err());
+        let alias_binding =
+            install_test_authenticated_alias(dependency.clone(), first_observed.clone());
+        let included_alias_binding = install_test_authenticated_alias(
+            included_dependency.clone(),
+            included_observed.clone(),
+        );
+        let missing =
+            capture_policy_dependency_fence_identity_at_observed_path(&dependency, &first_observed)
+                .unwrap();
+        assert!(missing
+            .metadata_identity
+            .starts_with(b"unsafe-component-v1:path="));
+        assert_eq!(missing.observed_metadata_identity, b"missing-v1");
+
+        let mut fixture = Fixture::new();
+        fixture.git_env.push((
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            dependency.clone().into(),
+        ));
+        let mut compile_metrics = PolicyDependencyMetrics::default();
+        let missing_policy = fixture.compile(&mut compile_metrics);
+        assert!(!missing_policy.reused_manifest);
+        let (missing_manifest, missing_bytes) = read_file_dependency(
+            &dependency,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(missing_bytes.is_empty());
+        assert_eq!(missing_manifest.content_identity, missing.content_identity);
+        assert_eq!(
+            missing_manifest.metadata_identity,
+            missing.metadata_identity
+        );
+
+        let excludes = first_target.join("global-ignore");
+        fs::write(&excludes, b"ignored-from-alias\n").unwrap();
+        let included_excludes = first_target.join("included-ignore");
+        fs::write(&included_excludes, b"ignored-from-include\n").unwrap();
+        fs::write(
+            &included_observed,
+            format!(
+                "[core]\n\texcludesFile = {}\n",
+                included_excludes.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let config_bytes = format!(
+            "[include]\n\tpath = included.gitconfig\n[core]\n\texcludesFile = {}\n",
+            excludes.to_string_lossy()
+        )
+        .into_bytes();
+        fs::write(&first_observed, &config_bytes).unwrap();
+        let created =
+            capture_policy_dependency_fence_identity_at_observed_path(&dependency, &first_observed)
+                .unwrap();
+        let pinned_before_observer = missing_policy
+            .dependencies
+            .iter()
+            .find(|candidate| {
+                dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(dependency.as_path())
+            })
+            .unwrap();
+        assert_ne!(
+            pinned_before_observer.content_identity,
+            created.content_identity
+        );
+        assert_ne!(
+            pinned_before_observer.metadata_identity,
+            created.metadata_identity
+        );
+        assert_ne!(missing.content_identity, created.content_identity);
+        assert_ne!(missing.metadata_identity, created.metadata_identity);
+        assert_ne!(
+            missing.observed_content_identity,
+            created.observed_content_identity
+        );
+        assert_ne!(
+            missing.observed_metadata_identity,
+            created.observed_metadata_identity
+        );
+        let (created_manifest, created_bytes) = read_file_dependency(
+            &dependency,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert_eq!(created_bytes, config_bytes);
+        assert_ne!(
+            missing_manifest.content_identity,
+            created_manifest.content_identity
+        );
+        assert_ne!(
+            missing_manifest.metadata_identity,
+            created_manifest.metadata_identity
+        );
+        let created_policy = fixture.compile(&mut compile_metrics);
+        assert!(!created_policy.reused_manifest);
+        assert_eq!(compile_metrics.policy_dependency_full_discovery, 2);
+        assert_ne!(missing_policy.fingerprint, created_policy.fingerprint);
+        assert!(created_policy.dependencies.iter().any(|candidate| {
+            candidate.kind == PolicyDependencyKind::GitExcludesFile
+                && dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(excludes.as_path())
+        }));
+        assert!(created_policy.dependencies.iter().any(|candidate| {
+            candidate.kind == PolicyDependencyKind::GitConfig
+                && dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(included_dependency.as_path())
+        }));
+        assert!(created_policy.dependencies.iter().any(|candidate| {
+            candidate.kind == PolicyDependencyKind::GitExcludesFile
+                && dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(included_excludes.as_path())
+        }));
+        assert!(created_policy.snapshot.rule_sources.iter().any(|source| {
+            source.kind == PolicyDependencyKind::GitExcludesFile
+                && source.path == excludes
+                && source.bytes == b"ignored-from-alias\n"
+        }));
+        assert!(created_policy.snapshot.rule_sources.iter().any(|source| {
+            source.kind == PolicyDependencyKind::GitExcludesFile
+                && source.path == included_excludes
+                && source.bytes == b"ignored-from-include\n"
+        }));
+
+        let race_a_excludes = first_target.join("race-a-ignore");
+        let race_b_excludes = first_target.join("race-b-ignore");
+        fs::write(&race_a_excludes, b"race-a\n").unwrap();
+        fs::write(&race_b_excludes, b"race-b\n").unwrap();
+        fs::write(
+            &first_observed,
+            format!("[core]\n\texcludesFile = {}\n", race_a_excludes.display()),
+        )
+        .unwrap();
+        let race_target = first_observed.clone();
+        let race_b_config = format!("[core]\n\texcludesFile = {}\n", race_b_excludes.display());
+        install_git_semantic_after_parse_hook(fixture.root().to_path_buf(), move || {
+            fs::write(race_target, race_b_config).unwrap();
+        });
+        let race_error = compile_policy(
+            &fixture.db.conn,
+            &fixture.expected,
+            &fixture.context(),
+            &mut compile_metrics,
+        )
+        .err()
+        .unwrap();
+        assert!(race_error
+            .to_string()
+            .contains("changed between semantic discovery and manifest capture"));
+
+        let retried_policy = fixture.compile(&mut compile_metrics);
+        assert!(!retried_policy.reused_manifest);
+        assert!(retried_policy.dependencies.iter().any(|candidate| {
+            candidate.kind == PolicyDependencyKind::GitExcludesFile
+                && dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(race_b_excludes.as_path())
+        }));
+        assert!(!retried_policy.dependencies.iter().any(|candidate| {
+            candidate.kind == PolicyDependencyKind::GitExcludesFile
+                && dependency_identity_path(&candidate.identity).as_deref()
+                    == Some(race_a_excludes.as_path())
+        }));
+
+        drop(alias_binding);
+        drop(included_alias_binding);
+        fs::remove_file(&alias).unwrap();
+        symlink(&second_target, &alias).unwrap();
+        let second_observed = second_target.join("gitconfig");
+        let _retargeted_binding =
+            install_test_authenticated_alias(dependency.clone(), second_observed.clone());
+        let retargeted = capture_policy_dependency_fence_identity_at_observed_path(
+            &dependency,
+            &second_observed,
+        )
+        .unwrap();
+        assert_ne!(created.metadata_identity, retargeted.metadata_identity);
+        assert_ne!(
+            created.observed_content_identity,
+            retargeted.observed_content_identity
+        );
+    }
+
     fn run_git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -1180,6 +1415,73 @@ use walkdir::WalkDir;
 const BUILTIN_POLICY_VERSION: &[u8] = b"trail-recording-policy-v1";
 const NORMALIZATION_POLICY: &[u8] = b"relative-forward-slash-unicode-nfc-v1";
 const MODE_POLICY: &[u8] = b"regular-files-only-no-follow-executable-bit-v1";
+const MAX_POLICY_DEPENDENCY_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(test)]
+type PolicyFenceAfterHashHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static POLICY_FENCE_AFTER_HASH_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, PolicyFenceAfterHashHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_policy_fence_after_hash_hook(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+    *POLICY_FENCE_AFTER_HASH_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some((path, Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_policy_fence_after_hash_hook(path: &Path) {
+    let hook = POLICY_FENCE_AFTER_HASH_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    match hook {
+        Some((expected, hook)) if expected == path => hook(),
+        Some(other) => {
+            *POLICY_FENCE_AFTER_HASH_HOOK
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(other);
+        }
+        None => {}
+    }
+}
+
+#[cfg(test)]
+type GitSemanticAfterParseHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static GIT_SEMANTIC_AFTER_PARSE_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, GitSemanticAfterParseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_git_semantic_after_parse_hook(
+    workspace_root: PathBuf,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    GIT_SEMANTIC_AFTER_PARSE_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(workspace_root, Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_git_semantic_after_parse_hook(workspace_root: &Path) {
+    let hook = GIT_SEMANTIC_AFTER_PARSE_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(workspace_root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PolicyDependencyKind {
@@ -1426,6 +1728,10 @@ impl CompiledPolicy {
         self.fingerprint
     }
 
+    pub(crate) fn case_sensitive(&self) -> bool {
+        self.snapshot.case_sensitive
+    }
+
     pub(crate) fn dependency_files(&self) -> &[PathBuf] {
         &self.snapshot.dependency_files
     }
@@ -1478,17 +1784,7 @@ impl CompiledPolicy {
         expected: &ExpectedScope,
         lease: &super::ObserverLease,
     ) -> Result<()> {
-        if self.fingerprint != expected.policy_fingerprint
-            || lease.root_identity != expected.filesystem_identity
-            || lease.provider_identity != expected.provider_identity
-            || lease.policy_dependencies != self.snapshot.dependency_files
-            || !lease.capabilities.durable_cursor
-            || !lease.capabilities.linearizable_fence
-            || !lease.capabilities.overflow_scope
-            || !lease.capabilities.filesystem_supported
-            || !lease.capabilities.clean_proof_allowed
-            || !lease.capabilities.power_loss_durability
-        {
+        if !self.observer_lease_matches(expected, lease) {
             return Err(Error::ChangeLedgerReconcileRequired {
                 scope: expected.scope_id.to_text(),
                 state: super::TrustState::StaleBaseline.as_str().into(),
@@ -1503,6 +1799,54 @@ impl CompiledPolicy {
             expected: expected.clone(),
         });
         Ok(())
+    }
+
+    pub(crate) fn observer_lease_matches(
+        &self,
+        expected: &ExpectedScope,
+        lease: &super::ObserverLease,
+    ) -> bool {
+        let mut covered_dependencies = lease.policy_dependencies.clone();
+        covered_dependencies.extend(
+            lease
+                .direct_policy_fences
+                .iter()
+                .map(|(path, _)| path.clone()),
+        );
+        covered_dependencies.sort();
+        covered_dependencies.dedup();
+        let mut observed_dependencies = lease.policy_dependencies.clone();
+        observed_dependencies.sort();
+        observed_dependencies.dedup();
+        let direct_paths = lease
+            .direct_policy_fences
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let direct_fences_match = lease.direct_policy_fences.iter().all(|(path, fence)| {
+            self.dependencies.iter().any(|dependency| {
+                dependency_identity_path(&dependency.identity).as_deref() == Some(path.as_path())
+                    && dependency.content_identity == fence.content_identity
+                    && dependency.metadata_identity == fence.metadata_identity
+            })
+        });
+        self.fingerprint == expected.policy_fingerprint
+            && lease.root_identity == expected.filesystem_identity
+            && lease.provider_identity == expected.provider_identity
+            && covered_dependencies == self.snapshot.dependency_files
+            && observed_dependencies.len() == lease.policy_dependencies.len()
+            && direct_paths.len() == lease.direct_policy_fences.len()
+            && !lease
+                .policy_dependencies
+                .iter()
+                .any(|path| direct_paths.contains(path))
+            && direct_fences_match
+            && lease.capabilities.durable_cursor
+            && lease.capabilities.linearizable_fence
+            && lease.capabilities.overflow_scope
+            && lease.capabilities.filesystem_supported
+            && lease.capabilities.clean_proof_allowed
+            && lease.capabilities.power_loss_durability
     }
 
     pub(crate) fn rebind_observed_baseline(
@@ -1641,6 +1985,25 @@ pub(crate) fn compile_policy(
             Err(err)
         }
     }
+}
+
+pub(crate) fn revalidate_compiled_policy(
+    policy: &CompiledPolicy,
+    context: &PolicyCompileContext<'_>,
+    metrics: &mut PolicyDependencyMetrics,
+) -> Result<CompiledPolicy> {
+    let mut manifest = policy.manifest();
+    metrics.policy_dependency_direct_checks = metrics
+        .policy_dependency_direct_checks
+        .saturating_add(manifest.dependencies.len() as u64);
+    let (validation, rule_sources) = validate_policy_manifest_and_pin(context, &manifest)?;
+    if validation == PolicyManifestValidation::Changed {
+        return Err(Error::InvalidInput(
+            "policy dependency changed during observer startup".into(),
+        ));
+    }
+    manifest.rule_sources = rule_sources;
+    finish_compiled_policy(context, manifest, true)
 }
 
 fn compile_policy_guarded(
@@ -2152,12 +2515,18 @@ fn discover_git_dependencies(
         .map(|(_, path)| path.clone())
         .collect::<Vec<_>>();
     let mut parsed = BTreeSet::new();
+    let mut semantic_evidence = BTreeMap::new();
     while let Some(config) = pending.pop() {
         let key = normalized_path_key(&config, context.case_sensitive);
         if !parsed.insert(key) {
             continue;
         }
-        let Some(bytes) = read_path_bytes_no_follow(&config)? else {
+        let read = read_policy_path_for_semantic_discovery(&config)?;
+        semantic_evidence.insert(
+            normalized_path_key(&config, context.case_sensitive),
+            read.identity,
+        );
+        let Some(bytes) = read.bytes else {
             continue;
         };
         for entry in git_config_entries_from_bytes(context, &bytes)? {
@@ -2189,9 +2558,31 @@ fn discover_git_dependencies(
         }
     }
 
+    #[cfg(test)]
+    run_git_semantic_after_parse_hook(context.workspace_root);
+
     paths
         .into_iter()
-        .map(|((kind, _), path)| file_dependency(&path, kind, generation, context))
+        .map(|((kind, key), path)| {
+            let dependency = file_dependency(&path, kind, generation, context)?;
+            if kind == PolicyDependencyKind::GitConfig {
+                let parsed = semantic_evidence.get(&key).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Git config `{}` was not pinned during semantic discovery",
+                        path.display()
+                    ))
+                })?;
+                if dependency.content_identity != parsed.content_identity
+                    || dependency.metadata_identity != parsed.metadata_identity
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "Git config `{}` changed between semantic discovery and manifest capture; retry reconciliation",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(dependency)
+        })
         .collect()
 }
 
@@ -2539,6 +2930,35 @@ fn read_file_dependency(
     _context: &PolicyCompileContext<'_>,
 ) -> Result<(PolicyDependency, Vec<u8>)> {
     let path = lexical_normalize(path);
+    if let Some(observed_path) = authenticated_system_alias_observed_path(&path)? {
+        let fence =
+            capture_policy_dependency_fence_identity_at_observed_path(&path, &observed_path)?;
+        let observed = read_file_state_no_follow(&observed_path)?;
+        if observed.unsafe_metadata_identity.is_some()
+            || observed
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file())
+            || digest(&observed.bytes) != fence.observed_content_identity
+            || metadata_identity(observed.metadata.as_ref(), &observed_path)?
+                != fence.observed_metadata_identity
+        {
+            return Err(Error::InvalidInput(format!(
+                "system policy dependency `{}` changed during authenticated alias discovery",
+                path.display()
+            )));
+        }
+        let dependency = PolicyDependency {
+            identity: dependency_path_identity(&path),
+            kind,
+            content_identity: fence.content_identity,
+            metadata_identity: fence.metadata_identity,
+            observable: false,
+            generation,
+            last_source_sequence: 0,
+        };
+        return Ok((dependency, observed.bytes));
+    }
     let state = read_file_state_no_follow(&path)?;
     // Task 4 has no native-observer handoff yet. Direct filesystem checks can
     // validate reuse, but they cannot establish observer continuity, so file
@@ -2560,18 +2980,271 @@ fn read_file_dependency(
     Ok((dependency, state.bytes))
 }
 
-fn read_path_bytes_no_follow(path: &Path) -> Result<Option<Vec<u8>>> {
-    let state = read_file_state_no_follow(path)?;
-    Ok(state
-        .metadata
-        .filter(|metadata| metadata.is_file())
-        .map(|_| state.bytes))
+struct PolicySemanticRead {
+    bytes: Option<Vec<u8>>,
+    identity: PolicyDependencyFenceIdentity,
+}
+
+fn read_policy_path_for_semantic_discovery(path: &Path) -> Result<PolicySemanticRead> {
+    let path = lexical_normalize(path);
+    if let Some(observed_path) = authenticated_system_alias_observed_path(&path)? {
+        let fence =
+            capture_policy_dependency_fence_identity_at_observed_path(&path, &observed_path)?;
+        let observed = read_file_state_no_follow(&observed_path)?;
+        if observed.unsafe_metadata_identity.is_some()
+            || observed
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file())
+            || digest(&observed.bytes) != fence.observed_content_identity
+            || metadata_identity(observed.metadata.as_ref(), &observed_path)?
+                != fence.observed_metadata_identity
+        {
+            return Err(Error::InvalidInput(format!(
+                "system policy dependency `{}` changed during authenticated semantic discovery",
+                path.display()
+            )));
+        }
+        return Ok(PolicySemanticRead {
+            bytes: observed.metadata.map(|_| observed.bytes),
+            identity: fence,
+        });
+    }
+    let fence = capture_policy_dependency_fence_identity(&path)?;
+    let state = read_file_state_no_follow(&path)?;
+    if state.unsafe_metadata_identity.is_some()
+        || state
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.is_file())
+        || digest(&state.bytes) != fence.content_identity
+        || metadata_identity(state.metadata.as_ref(), &path)? != fence.metadata_identity
+    {
+        return Err(Error::InvalidInput(format!(
+            "policy dependency `{}` changed during semantic discovery",
+            path.display()
+        )));
+    }
+    Ok(PolicySemanticRead {
+        bytes: state.metadata.map(|_| state.bytes),
+        identity: fence,
+    })
 }
 
 struct NoFollowFileState {
     metadata: Option<fs::Metadata>,
     bytes: Vec<u8>,
     unsafe_metadata_identity: Option<Vec<u8>>,
+}
+
+/// A bounded, authenticated identity for policy files that cannot share the
+/// workspace observer's native filesystem history (for example a global Git
+/// config in `$HOME` while the repository is on an external APFS volume).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PolicyDependencyFenceIdentity {
+    /// Identity of the dependency exactly as named by the compiled manifest.
+    pub(crate) content_identity: [u8; 32],
+    pub(crate) metadata_identity: Vec<u8>,
+    /// Identity of the canonical path whose bytes Git actually consumes.
+    /// These differ only for an authenticated platform alias such as the
+    /// macOS `/etc -> /private/etc` binding.
+    pub(crate) observed_content_identity: [u8; 32],
+    pub(crate) observed_metadata_identity: Vec<u8>,
+}
+
+pub(crate) fn capture_policy_dependency_fence_identity(
+    path: &Path,
+) -> Result<PolicyDependencyFenceIdentity> {
+    capture_policy_dependency_fence_identity_at_observed_path(path, path)
+}
+
+pub(crate) fn capture_policy_dependency_fence_identity_at_observed_path(
+    dependency: &Path,
+    observed_path: &Path,
+) -> Result<PolicyDependencyFenceIdentity> {
+    let dependency = lexical_normalize(dependency);
+    let observed_path = lexical_normalize(observed_path);
+    let alias_observed = if dependency == observed_path {
+        false
+    } else {
+        authenticated_system_alias_observed_path(&dependency)?.as_deref()
+            == Some(observed_path.as_path())
+    };
+    if dependency != observed_path && !alias_observed {
+        return Err(Error::InvalidInput(format!(
+            "policy dependency `{}` does not use an authenticated system alias for `{}`",
+            dependency.display(),
+            observed_path.display()
+        )));
+    }
+    let capture = || -> Result<PolicyDependencyFenceIdentity> {
+        let named = read_file_state_no_follow(&dependency)?;
+        let named_metadata_identity = match named.unsafe_metadata_identity {
+            Some(identity) if alias_observed => identity,
+            Some(_) => {
+                return Err(Error::InvalidInput(format!(
+                    "policy dependency `{}` is not a safely traversable regular file",
+                    dependency.display()
+                )))
+            }
+            None if named
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file()) =>
+            {
+                return Err(Error::InvalidInput(format!(
+                    "policy dependency `{}` is not a safely traversable regular file",
+                    dependency.display()
+                )))
+            }
+            None => metadata_identity(named.metadata.as_ref(), &dependency)?,
+        };
+        let observed = read_file_state_no_follow(&observed_path)?;
+        if observed.unsafe_metadata_identity.is_some()
+            || observed
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file())
+        {
+            return Err(Error::InvalidInput(format!(
+                "policy dependency `{}` is not a safely traversable regular file",
+                observed_path.display()
+            )));
+        }
+        let observed_content_identity = digest(&observed.bytes);
+        let observed_metadata_identity =
+            metadata_identity(observed.metadata.as_ref(), &observed_path)?;
+        let (content_identity, metadata_identity) = if alias_observed {
+            (
+                observed_content_identity,
+                authenticated_alias_metadata_identity(
+                    &named_metadata_identity,
+                    &observed_content_identity,
+                    &observed_metadata_identity,
+                ),
+            )
+        } else {
+            (digest(&named.bytes), named_metadata_identity)
+        };
+        Ok(PolicyDependencyFenceIdentity {
+            content_identity,
+            metadata_identity,
+            observed_content_identity,
+            observed_metadata_identity,
+        })
+    };
+    let first = capture()?;
+    let second = capture()?;
+    if first != second {
+        return Err(Error::InvalidInput(format!(
+            "policy dependency `{}` changed or was rebound while its direct fence was captured",
+            dependency.display()
+        )));
+    }
+    Ok(second)
+}
+
+fn authenticated_alias_metadata_identity(
+    named: &[u8],
+    observed_content: &[u8; 32],
+    observed_metadata: &[u8],
+) -> Vec<u8> {
+    let mut identity = named.to_vec();
+    identity.extend_from_slice(b"authenticated-alias-v1:observed-content=");
+    identity.extend_from_slice(hex::encode(observed_content).as_bytes());
+    identity.extend_from_slice(b";observed-metadata=");
+    identity.extend_from_slice(hex::encode(observed_metadata).as_bytes());
+    identity.push(b';');
+    identity
+}
+
+#[cfg(target_os = "macos")]
+fn authenticated_system_alias_observed_path(path: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(test)]
+    if let Some(observed) = test_authenticated_alias_observed_path(path) {
+        return Ok(Some(observed));
+    }
+
+    for (alias, target, link_target) in [
+        ("/etc", "/private/etc", "private/etc"),
+        ("/var", "/private/var", "private/var"),
+        ("/tmp", "/private/tmp", "private/tmp"),
+    ] {
+        let alias = Path::new(alias);
+        let Ok(relative) = path.strip_prefix(alias) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(alias).map_err(Error::Io)?;
+        let named_target = fs::read_link(alias).map_err(Error::Io)?;
+        let canonical_target = alias.canonicalize().map_err(Error::Io)?;
+        if !metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || named_target != Path::new(link_target)
+            || canonical_target != Path::new(target)
+        {
+            return Err(Error::InvalidInput(format!(
+                "system policy alias `{}` does not match its authenticated platform binding",
+                alias.display()
+            )));
+        }
+        return Ok(Some(lexical_normalize(&canonical_target.join(relative))));
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn authenticated_system_alias_observed_path(_path: &Path) -> Result<Option<PathBuf>> {
+    #[cfg(test)]
+    if let Some(observed) = test_authenticated_alias_observed_path(_path) {
+        return Ok(Some(observed));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+static TEST_AUTHENTICATED_ALIASES: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, PathBuf>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_authenticated_alias_observed_path(path: &Path) -> Option<PathBuf> {
+    TEST_AUTHENTICATED_ALIASES
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(path)
+        .cloned()
+}
+
+#[cfg(test)]
+struct TestAuthenticatedAlias {
+    dependency: PathBuf,
+}
+
+#[cfg(test)]
+fn install_test_authenticated_alias(
+    dependency: PathBuf,
+    observed: PathBuf,
+) -> TestAuthenticatedAlias {
+    TEST_AUTHENTICATED_ALIASES
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(dependency.clone(), observed);
+    TestAuthenticatedAlias { dependency }
+}
+
+#[cfg(test)]
+impl Drop for TestAuthenticatedAlias {
+    fn drop(&mut self) {
+        TEST_AUTHENTICATED_ALIASES
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.dependency);
+    }
 }
 
 impl NoFollowFileState {
@@ -2699,9 +3372,23 @@ fn read_file_state_openat(path: &Path) -> Result<NoFollowFileState> {
             });
         }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(Error::Io)?;
+        (&mut file)
+            .take(MAX_POLICY_DEPENDENCY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(Error::Io)?;
+        if bytes.len() as u64 > MAX_POLICY_DEPENDENCY_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "policy dependency `{}` exceeds the {} byte safety bound",
+                path.display(),
+                MAX_POLICY_DEPENDENCY_BYTES
+            )));
+        }
+        #[cfg(test)]
+        run_policy_fence_after_hash_hook(&path);
         let after = file.metadata().map_err(Error::Io)?;
-        if metadata_identity(Some(&before), &path)? == metadata_identity(Some(&after), &path)? {
+        if metadata_identity(Some(&before), &path)? == metadata_identity(Some(&after), &path)?
+            && revalidate_named_regular_file_no_follow(&path, &after)?
+        {
             return Ok(NoFollowFileState {
                 metadata: Some(after),
                 bytes,
@@ -2713,6 +3400,62 @@ fn read_file_state_openat(path: &Path) -> Result<NoFollowFileState> {
         "policy dependency `{}` changed while it was read",
         path.display()
     )))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn revalidate_named_regular_file_no_follow(path: &Path, expected: &fs::Metadata) -> Result<bool> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let components = path
+        .strip_prefix(Path::new("/"))
+        .ok()
+        .map(|relative| relative.components().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    let mut directory = match openat(
+        CWD,
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(_) => return Ok(false),
+    };
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(name) = component else {
+            return Ok(false);
+        };
+        directory = match openat(
+            &directory,
+            Path::new(name),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(_) => return Ok(false),
+        };
+    }
+    let Component::Normal(leaf) = components[components.len() - 1] else {
+        return Ok(false);
+    };
+    let named = match openat(
+        &directory,
+        Path::new(leaf),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(named) => fs::File::from(named),
+        Err(_) => return Ok(false),
+    };
+    let named = named.metadata().map_err(Error::Io)?;
+    Ok(named.is_file()
+        && metadata_identity(Some(&named), path)? == metadata_identity(Some(expected), path)?)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

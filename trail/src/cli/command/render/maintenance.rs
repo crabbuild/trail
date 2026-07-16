@@ -192,6 +192,40 @@ pub(crate) fn render_index_rebuild(
     render_document(&index_rebuild_document(report), options)
 }
 
+pub(crate) fn render_change_ledger_reconcile(
+    report: &ChangeLedgerReconcileReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    render_document(
+        &TerminalDocument::new("Reconciled changed-path ledger", UiTone::Success).block(
+            UiBlock::Metadata(vec![
+                ("Scope".to_string(), report.scope_id.clone()),
+                ("Scope kind".to_string(), report.scope_kind.clone()),
+                ("Previous state".to_string(), report.previous_state.clone()),
+                ("Reason".to_string(), report.reason.clone()),
+                (
+                    "Observed paths".to_string(),
+                    report.observed_paths.to_string(),
+                ),
+                ("Candidates".to_string(), report.candidates.to_string()),
+                (
+                    "Resulting epoch".to_string(),
+                    report.resulting_epoch.to_string(),
+                ),
+                (
+                    "Resulting state".to_string(),
+                    report.resulting_state.clone(),
+                ),
+            ]),
+        ),
+        options,
+    )
+}
+
 fn index_rebuild_document(report: &IndexRebuildReport) -> TerminalDocument {
     let mut document =
         TerminalDocument::new("Rebuilt indexes", UiTone::Success).block(UiBlock::Metadata(vec![

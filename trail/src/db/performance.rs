@@ -1,10 +1,15 @@
+use serde::Serialize;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 const PERFORMANCE_METRICS_ENV: &str = "TRAIL_PERFORMANCE_METRICS";
+const PERFORMANCE_METRICS_FILE_ENV: &str = "TRAIL_PERFORMANCE_METRICS_FILE";
+static PERFORMANCE_METRICS_FILE_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum OperationMetricsOutcome {
     Success,
     Error,
@@ -18,6 +23,9 @@ pub(crate) enum OperationMetricsKind {
     StatusReadOnly,
     Diff,
     Record,
+    MaterializedLaneRecord,
+    StructuredPatch,
+    CowCheckpoint,
 }
 
 impl OperationMetricsKind {
@@ -27,6 +35,9 @@ impl OperationMetricsKind {
             Self::StatusReadOnly => "status_read_only",
             Self::Diff => "diff",
             Self::Record => "record",
+            Self::MaterializedLaneRecord => "materialized_lane_record",
+            Self::StructuredPatch => "structured_patch",
+            Self::CowCheckpoint => "cow_checkpoint",
         }
     }
 }
@@ -92,6 +103,7 @@ define_operation_metric_counters!(
     prolly_tree_batch_call_count,
     prolly_tree_batch_mutation_count,
     selected_worktree_index_sqlite_envelope_count,
+    selected_worktree_index_sqlite_not_applicable_count,
     selected_worktree_index_sqlite_full_scan_count,
     selected_worktree_index_sqlite_row_read_count,
     selected_worktree_index_sqlite_row_delete_count,
@@ -100,10 +112,21 @@ define_operation_metric_counters!(
     selected_worktree_index_sqlite_transaction_count,
     selection_comparison_count,
     policy_build_count,
+    policy_dependency_full_discovery,
     policy_dependency_bytes,
     policy_dependency_file_count,
     git_subprocess_count,
     git_global_work_count,
+    git_index_refresh_count,
+    git_trace2_region_count,
+    git_trace2_bytes,
+    git_fsmonitor_qualification_count,
+    git_untracked_cache_qualification_count,
+    external_adapter_global_work,
+    git_index_read_count,
+    git_index_bytes,
+    git_shared_index_read_count,
+    git_shared_index_bytes,
     git_output_bytes,
     git_output_record_count,
     daemon_snapshot_bytes,
@@ -120,7 +143,7 @@ define_operation_metric_counters!(
     upper_work_count,
 );
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct OperationMetricsReport {
     pub(crate) generation: u64,
     pub(crate) operation: String,
@@ -158,7 +181,12 @@ pub(crate) struct OperationMetricsReport {
     /// envelope. It does not claim that every SQLite statement issued by the
     /// containing status/diff/record operation is instrumented.
     pub(crate) selected_worktree_index_sqlite_accounting_complete: bool,
+    /// Typed disposition for the selected worktree-index SQL surface. A
+    /// `not_applicable` report is emitted only when the authoritative command
+    /// path explicitly declares that it cannot access that index.
+    pub(crate) selected_worktree_index_sqlite_accounting_disposition: String,
     pub(crate) selected_worktree_index_sqlite_envelope_count: u64,
+    pub(crate) selected_worktree_index_sqlite_not_applicable_count: u64,
     /// Executions for which SQLite reported at least one FULLSCAN_STEP.
     pub(crate) selected_worktree_index_sqlite_full_scan_count: u64,
     /// Worktree-index rows decoded by exact/descendant candidate queries.
@@ -174,10 +202,21 @@ pub(crate) struct OperationMetricsReport {
     pub(crate) selected_worktree_index_sqlite_transaction_count: u64,
     pub(crate) selection_comparison_count: u64,
     pub(crate) policy_build_count: u64,
+    pub(crate) policy_dependency_full_discovery: u64,
     pub(crate) policy_dependency_bytes: u64,
     pub(crate) policy_dependency_file_count: u64,
     pub(crate) git_subprocess_count: u64,
     pub(crate) git_global_work_count: u64,
+    pub(crate) git_index_refresh_count: u64,
+    pub(crate) git_trace2_region_count: u64,
+    pub(crate) git_trace2_bytes: u64,
+    pub(crate) git_fsmonitor_qualification_count: u64,
+    pub(crate) git_untracked_cache_qualification_count: u64,
+    pub(crate) external_adapter_global_work: u64,
+    pub(crate) git_index_read_count: u64,
+    pub(crate) git_index_bytes: u64,
+    pub(crate) git_shared_index_read_count: u64,
+    pub(crate) git_shared_index_bytes: u64,
     pub(crate) git_output_bytes: u64,
     pub(crate) git_output_record_count: u64,
     /// Bytes physically read from the durable daemon snapshot. In-memory
@@ -348,7 +387,6 @@ impl OperationMetricsState {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn last_report(&self) -> OperationMetricsReport {
         lock_unpoisoned(&self.scope).last_report.clone()
     }
@@ -368,7 +406,7 @@ impl OperationMetricsState {
         let counters_end = self.snapshot();
         let delta = counters_end.saturating_sub(active.counters_start);
         let (rss_end_bytes, rss_lifetime_high_water_bytes) = process_rss_snapshot();
-        tracker.last_report = OperationMetricsReport::from_delta(
+        let report = OperationMetricsReport::from_delta(
             active,
             outcome,
             delta,
@@ -376,6 +414,9 @@ impl OperationMetricsState {
             rss_end_bytes,
             rss_lifetime_high_water_bytes,
         );
+        tracker.last_report = report.clone();
+        drop(tracker);
+        emit_operation_metrics_report(&report);
     }
 
     pub(crate) fn snapshot(&self) -> OperationMetricsDelta {
@@ -413,12 +454,29 @@ pub(crate) fn profile_operation_metrics<T, E>(
     operation: impl FnOnce() -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     match metrics {
-        Some(metrics) => metrics.profile(kind, operation),
+        Some(metrics) => metrics.profile(kind, || {
+            // Materialized-lane record and structured patch bypass the
+            // workspace worktree-index by design. They still cross this one
+            // audited empty envelope so request metrics prove that the SQL
+            // surface performed zero work instead of reporting an ambiguous
+            // absence of instrumentation. Any real selected-index entry point
+            // contributes its own envelope and SQL counters in addition.
+            if matches!(
+                kind,
+                OperationMetricsKind::MaterializedLaneRecord
+                    | OperationMetricsKind::StructuredPatch
+            ) {
+                metrics.add(OperationMetricsDelta {
+                    selected_worktree_index_sqlite_envelope_count: 1,
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            operation()
+        }),
         None => operation(),
     }
 }
 
-#[cfg(test)]
 pub(crate) fn operation_metrics_report(
     metrics: Option<&Arc<OperationMetricsState>>,
 ) -> Option<OperationMetricsReport> {
@@ -438,10 +496,54 @@ pub(crate) fn operation_metrics_are_enabled() -> bool {
     if cfg!(test) {
         return true;
     }
+    if std::env::var_os(PERFORMANCE_METRICS_FILE_ENV).is_some_and(|path| !path.is_empty()) {
+        return true;
+    }
     std::env::var_os(PERFORMANCE_METRICS_ENV)
         .and_then(|value| value.into_string().ok())
         .as_deref()
         .is_some_and(operation_metrics_env_value_is_truthy)
+}
+
+fn emit_operation_metrics_report(report: &OperationMetricsReport) {
+    // An auto-started daemon must return the report on the authenticated RPC
+    // response.  Its inherited sidecar path belongs to the command that first
+    // launched it and is not request-scoped; writing there would either lose a
+    // later command's report or duplicate the copy emitted by that command's
+    // CLI process.
+    if std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some() {
+        return;
+    }
+    let Some(path) = std::env::var_os(PERFORMANCE_METRICS_FILE_ENV).filter(|path| !path.is_empty())
+    else {
+        return;
+    };
+    let _guard = lock_unpoisoned(&PERFORMANCE_METRICS_FILE_LOCK);
+    // Metrics must never change the command result after its operation has
+    // completed. Emit one O_APPEND write so concurrent inherited daemon
+    // processes cannot interleave a JSON line. The scale gate treats a
+    // missing or malformed report as a hard failure.
+    let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut line = serde_json::to_vec(report)?;
+        line.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let written = file.write(&line)?;
+        if written != line.len() {
+            return Err(format!(
+                "short performance metrics append: wrote {written} of {} bytes",
+                line.len()
+            )
+            .into());
+        }
+        file.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("trail: failed to emit performance metrics JSONL: {error}");
+    }
 }
 
 impl super::Trail {
@@ -449,6 +551,17 @@ impl super::Trail {
         if let Some(metrics) = &self.operation_metrics {
             metrics.add(delta);
         }
+    }
+
+    pub(crate) fn operation_metrics_generation(&self) -> Option<u64> {
+        operation_metrics_report(self.operation_metrics.as_ref()).map(|report| report.generation)
+    }
+
+    pub(crate) fn operation_metrics_json_after(&self, generation: u64) -> Option<String> {
+        let report = operation_metrics_report(self.operation_metrics.as_ref())?;
+        (report.generation > generation)
+            .then(|| serde_json::to_string(&report).ok())
+            .flatten()
     }
 }
 
@@ -511,9 +624,21 @@ impl OperationMetricsReport {
             prolly_tree_batch_mutation_count: delta.prolly_tree_batch_mutation_count,
             selected_worktree_index_sqlite_accounting_complete: delta
                 .selected_worktree_index_sqlite_envelope_count
-                > 0,
+                > 0
+                && delta.selected_worktree_index_sqlite_not_applicable_count == 0,
+            selected_worktree_index_sqlite_accounting_disposition: match (
+                delta.selected_worktree_index_sqlite_envelope_count > 0,
+                delta.selected_worktree_index_sqlite_not_applicable_count > 0,
+            ) {
+                (true, false) => "complete",
+                (false, true) => "not_applicable",
+                _ => "ambiguous",
+            }
+            .to_string(),
             selected_worktree_index_sqlite_envelope_count: delta
                 .selected_worktree_index_sqlite_envelope_count,
+            selected_worktree_index_sqlite_not_applicable_count: delta
+                .selected_worktree_index_sqlite_not_applicable_count,
             selected_worktree_index_sqlite_full_scan_count: delta
                 .selected_worktree_index_sqlite_full_scan_count,
             selected_worktree_index_sqlite_row_read_count: delta
@@ -528,10 +653,21 @@ impl OperationMetricsReport {
                 .selected_worktree_index_sqlite_transaction_count,
             selection_comparison_count: delta.selection_comparison_count,
             policy_build_count: delta.policy_build_count,
+            policy_dependency_full_discovery: delta.policy_dependency_full_discovery,
             policy_dependency_bytes: delta.policy_dependency_bytes,
             policy_dependency_file_count: delta.policy_dependency_file_count,
             git_subprocess_count: delta.git_subprocess_count,
             git_global_work_count: delta.git_global_work_count,
+            git_index_refresh_count: delta.git_index_refresh_count,
+            git_trace2_region_count: delta.git_trace2_region_count,
+            git_trace2_bytes: delta.git_trace2_bytes,
+            git_fsmonitor_qualification_count: delta.git_fsmonitor_qualification_count,
+            git_untracked_cache_qualification_count: delta.git_untracked_cache_qualification_count,
+            external_adapter_global_work: delta.external_adapter_global_work,
+            git_index_read_count: delta.git_index_read_count,
+            git_index_bytes: delta.git_index_bytes,
+            git_shared_index_read_count: delta.git_shared_index_read_count,
+            git_shared_index_bytes: delta.git_shared_index_bytes,
             git_output_bytes: delta.git_output_bytes,
             git_output_record_count: delta.git_output_record_count,
             daemon_snapshot_bytes: delta.daemon_snapshot_bytes,
@@ -609,4 +745,29 @@ fn process_rss_snapshot() -> (u64, u64) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_rss_snapshot() -> (u64, u64) {
     (0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controlled_lane_scopes_prove_an_empty_selected_index_envelope() {
+        for kind in [
+            OperationMetricsKind::MaterializedLaneRecord,
+            OperationMetricsKind::StructuredPatch,
+        ] {
+            let metrics = Arc::new(OperationMetricsState::default());
+            profile_operation_metrics(Some(&metrics), kind, || Ok::<(), ()>(())).unwrap();
+            let report = metrics.last_report();
+            assert!(report.selected_worktree_index_sqlite_accounting_complete);
+            assert_eq!(
+                report.selected_worktree_index_sqlite_accounting_disposition,
+                "complete"
+            );
+            assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 1);
+            assert_eq!(report.selected_worktree_index_sqlite_statement_count, 0);
+            assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 0);
+        }
+    }
 }

@@ -126,19 +126,16 @@ impl ViewUpperLayout {
         }
     }
 
-    pub(crate) fn whiteouts_path(&self, class: ViewPathClass) -> PathBuf {
-        self.meta_dir
-            .join(format!("{}-whiteouts.json", class.as_str()))
-    }
-
-    pub(crate) fn legacy_whiteouts_path(&self) -> PathBuf {
-        self.source_upper
-            .join(".trail")
-            .join("overlay-whiteouts.json")
-    }
-
     pub(crate) fn journal_path(&self) -> PathBuf {
         self.meta_dir.join("mutation-journal.jsonl")
+    }
+
+    pub(crate) fn whiteout_journal_path(&self) -> PathBuf {
+        self.meta_dir.join("whiteout-journal.jsonl")
+    }
+
+    pub(crate) fn journal_state_path(&self) -> PathBuf {
+        self.meta_dir.join("journal-state.json")
     }
 }
 

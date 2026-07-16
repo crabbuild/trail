@@ -1,11 +1,11 @@
 use super::*;
 
 impl Trail {
-    pub(crate) fn status_from_changed_path_ledger(&mut self) -> Result<StatusReport> {
+    pub(crate) fn status_from_changed_path_ledger(&self) -> Result<StatusReport> {
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;
         let (comparison, _fenced) =
-            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
+            self.with_workspace_authoritative_command_snapshot(|db, policy, candidates, _git| {
                 db.compare_authoritative_candidates(
                     policy,
                     candidates,
@@ -30,7 +30,23 @@ impl Trail {
         let metrics = self.operation_metrics.clone();
         let result_metrics = metrics.clone();
         profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Status, || {
-            let result = self.status_profiled(branch);
+            let authoritative_current_branch = if crate::db::command_authority_enabled() {
+                match branch {
+                    None => true,
+                    Some(branch) => self.current_branch()? == branch,
+                }
+            } else {
+                false
+            };
+            let result = if authoritative_current_branch {
+                self.note_operation_metrics(OperationMetricsDelta {
+                    selected_worktree_index_sqlite_not_applicable_count: 1,
+                    ..OperationMetricsDelta::default()
+                });
+                self.status_from_changed_path_ledger()
+            } else {
+                self.status_profiled(branch)
+            };
             if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
                 metrics.add(OperationMetricsDelta {
                     final_path_count: saturating_u64_from_usize(report.changed_paths.len()),

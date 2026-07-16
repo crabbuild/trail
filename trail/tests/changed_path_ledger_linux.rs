@@ -31,6 +31,11 @@ fn delayed_backlog_is_drained_before_the_fence_returns() {
 }
 
 #[test]
+fn controlled_fence_seals_before_a_continuous_later_queue() {
+    trail::test_support::changed_path_linux_controlled_fence_queue_ordering().unwrap();
+}
+
+#[test]
 fn nonce_fence_orders_durable_create_before_durable_delete() {
     trail::test_support::changed_path_linux_fence_ordering().unwrap();
 }

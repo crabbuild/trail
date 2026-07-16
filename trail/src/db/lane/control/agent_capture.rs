@@ -1836,6 +1836,8 @@ impl Trail {
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
                 path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks: 0,
+                generated_dirty_paths: 0,
             });
         }
 
@@ -1865,6 +1867,8 @@ impl Trail {
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
                 path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks: 0,
+                generated_dirty_paths: 0,
             });
         }
         self.ensure_lane_record_file_size_policy(&built.files, &diff.summaries)?;
@@ -1919,6 +1923,8 @@ impl Trail {
             root_id: built.root_id,
             changed_paths: diff.summaries,
             path_index: self.case_fold_index_metrics_report(),
+            upper_recovery_walks: 0,
+            generated_dirty_paths: 0,
         })
     }
 

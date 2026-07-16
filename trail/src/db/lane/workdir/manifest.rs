@@ -169,6 +169,45 @@ impl Trail {
         })
     }
 
+    /// Verify a freshly written materialization manifest without changing the
+    /// workdir. The caller must pin case sensitivity before its durability
+    /// barrier; probing it here would create and unlink a file after the
+    /// barrier, and the ordinary cached-manifest path may retire an invalid
+    /// manifest while classifying it.
+    pub(crate) fn clean_workdir_manifest_matches_read_only(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        case_insensitive: bool,
+    ) -> Result<bool> {
+        let manifest_path = clean_workdir_manifest_path(dir);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let manifest = match serde_json::from_slice::<CleanWorkdirManifest>(&bytes) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(false),
+        };
+        if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION || manifest.root_id != root_id.0 {
+            return Ok(false);
+        }
+        let manifest_paths = manifest.files.keys().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+            dir,
+            &manifest_paths,
+            case_insensitive,
+        )?;
+        Ok(stamps.len() == manifest.files.len()
+            && stamps.iter().all(|(path, stamp)| {
+                manifest
+                    .files
+                    .get(path)
+                    .is_some_and(|cached| cached.stamp == *stamp)
+            }))
+    }
+
     pub(crate) fn write_clean_workdir_manifest<'a, I>(
         &self,
         dir: &Path,
@@ -720,12 +759,58 @@ impl Trail {
         pinned_paths: &[String],
     ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
         let root = root.canonicalize()?;
-        let case_insensitive = is_case_insensitive_filesystem(&root)?;
+        let case_insensitive = match self.persisted_materialized_case_insensitive(&root)? {
+            Some(case_insensitive) => case_insensitive,
+            None => is_case_insensitive_filesystem(&root)?,
+        };
         self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
             &root,
             pinned_paths,
             case_insensitive,
         )
+    }
+
+    fn persisted_materialized_case_insensitive(&self, root: &Path) -> Result<Option<bool>> {
+        if !crate::db::change_ledger::command_authority_enabled() {
+            return Ok(None);
+        }
+        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        let persisted = self
+            .conn
+            .query_row(
+                "SELECT scope.case_sensitive,scope.filesystem_identity
+                 FROM lane_branches branch
+                 JOIN changed_path_scopes scope
+                   ON scope.scope_kind='materialized_lane' AND scope.owner_id=branch.lane_id
+                 WHERE branch.workdir=?1 AND branch.status<>'removed'
+                   AND scope.trust_state='trusted' AND scope.retired_at IS NULL",
+                [normalized.to_string_lossy().as_ref()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((case_sensitive, persisted_identity)) = persisted else {
+            return Ok(None);
+        };
+        let persisted_identity = hex::decode(persisted_identity)
+            .map_err(|_| Error::Corrupt("invalid materialized filesystem identity".into()))?;
+        if self.pinned_worktree_identity_for_path(root)? != persisted_identity {
+            return Ok(None);
+        }
+        match case_sensitive {
+            0 => Ok(Some(true)),
+            1 => Ok(Some(false)),
+            _ => Err(Error::Corrupt(
+                "invalid materialized case-sensitivity metadata".into(),
+            )),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_persisted_materialized_case_insensitive(
+        &self,
+        root: &Path,
+    ) -> Result<Option<bool>> {
+        self.persisted_materialized_case_insensitive(root)
     }
 
     fn scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(

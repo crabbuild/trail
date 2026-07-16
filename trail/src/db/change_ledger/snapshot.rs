@@ -1,11 +1,12 @@
 //! Fenced changed-path command snapshots.
 //!
-//! Production command authority remains gated until Task 15.  This module
-//! owns the state machine and data types so status, diff, and record cannot
-//! accidentally assemble a partially-fenced result.
+//! This module owns the authoritative command state machine so status, diff,
+//! and record cannot accidentally assemble a partially-fenced result.
 
+use super::types::{trail_atomic_temp_target, trail_case_probe_token};
 use super::{
     BaselineIdentity, CandidateSnapshot, EvidenceAcknowledgementToken, EvidenceCut, ExpectedScope,
+    IntentEvidence,
 };
 use crate::db::storage::file_kind_from_index;
 use crate::db::{DiskFile, DiskManifest, OperationMetricsDelta};
@@ -15,14 +16,40 @@ use crate::{ObjectId, Result};
 use rusqlite::params;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 static COMMAND_AUTHORITY_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
-/// Task 15 replaces the hard-off production branch after platform
-/// qualification.  Debug tests may exercise the fully wired command path
-/// without silently activating it for users.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) const LEDGER_AUTHORITY_ENABLED: bool = true;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const LEDGER_AUTHORITY_ENABLED: bool = false;
+
+fn checked_activation_enabled() -> bool {
+    static CHECKED: OnceLock<bool> = OnceLock::new();
+    *CHECKED.get_or_init(|| {
+        let platform = if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "unsupported"
+        };
+        super::ActivationEvidence::from_checked_build().is_ok_and(|evidence| {
+            super::ledger_authority_enabled_for(platform, &evidence) && LEDGER_AUTHORITY_ENABLED
+        })
+    })
+}
+
+/// Release builds activate only on qualified native platforms. Debug builds
+/// remain explicitly opt-in so parallel tests cannot accidentally share
+/// production authority through process-global state.
 pub(crate) fn command_authority_enabled() -> bool {
-    cfg!(debug_assertions) && COMMAND_AUTHORITY_OVERRIDE.load(Ordering::Acquire)
+    if cfg!(debug_assertions) {
+        checked_activation_enabled() && COMMAND_AUTHORITY_OVERRIDE.load(Ordering::Acquire)
+    } else {
+        checked_activation_enabled()
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -78,6 +105,72 @@ fn sparse_selection_intersects(selection: &[String], candidate: &str) -> bool {
 }
 
 impl crate::Trail {
+    pub(crate) fn filter_controlled_internal_candidates(
+        &self,
+        policy: &super::CompiledPolicy,
+        snapshot: &mut CandidateSnapshot,
+        evidence: &IntentEvidence,
+    ) -> Result<()> {
+        let intended = evidence
+            .exact_paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<BTreeSet<_>>();
+        let internal = snapshot
+            .acknowledgement_tokens
+            .iter()
+            .filter_map(|token| {
+                if trail_case_probe_token(token)
+                    || trail_atomic_temp_target(token)
+                        .as_deref()
+                        .is_some_and(|target| intended.contains(target))
+                {
+                    Some(token.path.as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        if internal.is_empty() {
+            return Ok(());
+        }
+        let baseline_internal = self.load_root_files_for_paths(
+            &snapshot.expected.baseline_root,
+            &internal.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let pinned = self.open_pinned_worktree_root(policy)?;
+        if self.pinned_worktree_root_identity(&pinned) != snapshot.expected.filesystem_identity {
+            return Err(crate::Error::ChangeLedgerReconcileRequired {
+                scope: snapshot.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "pinned workspace root changed before internal candidate filtering".into(),
+                command: "trail status".into(),
+            });
+        }
+        let mut retained = Vec::with_capacity(snapshot.exact_paths.len());
+        for path in std::mem::take(&mut snapshot.exact_paths) {
+            if internal.contains(path.as_str())
+                && !baseline_internal.contains_key(path.as_str())
+                && self
+                    .read_pinned_candidate_path(&pinned, policy, path.as_str(), false)?
+                    .is_none()
+            {
+                continue;
+            }
+            retained.push(path);
+        }
+        snapshot.exact_paths = retained;
+        if !self.verify_pinned_worktree_root(&pinned)? {
+            return Err(crate::Error::ChangeLedgerReconcileRequired {
+                scope: snapshot.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "pinned workspace root changed during internal candidate filtering".into(),
+                command: "trail status".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn compare_controlled_projection_target(
         &self,
         policy: &super::CompiledPolicy,
@@ -124,17 +217,52 @@ impl crate::Trail {
                 command: "trail status".into(),
             });
         }
-        let mut exact = snapshot
-            .exact_paths
+        let matcher = policy.recording_matcher()?;
+        let pinned = self.open_pinned_worktree_root(policy)?;
+        if self.pinned_worktree_root_identity(&pinned) != snapshot.expected.filesystem_identity {
+            return Err(crate::Error::ChangeLedgerReconcileRequired {
+                scope: snapshot.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "pinned workspace root identity changed before candidate comparison".into(),
+                command: "trail status".into(),
+            });
+        }
+        let transient_case_probes = snapshot
+            .acknowledgement_tokens
             .iter()
-            .map(|path| path.as_str().to_string())
+            .filter(|token| trail_case_probe_token(token))
+            .map(|token| token.path.as_str().to_string())
             .collect::<BTreeSet<_>>();
+        let baseline_case_probes = self.load_root_files_for_paths(
+            root_id,
+            &transient_case_probes.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let mut exact = BTreeSet::new();
+        for path in &snapshot.exact_paths {
+            if matcher.is_ignored(path.as_str(), false)? {
+                continue;
+            }
+            if transient_case_probes.contains(path.as_str())
+                && !baseline_case_probes.contains_key(path.as_str())
+                && self
+                    .read_pinned_candidate_path(&pinned, policy, path.as_str(), false)?
+                    .is_none()
+            {
+                continue;
+            }
+            exact.insert(path.as_str().to_string());
+        }
         let prefixes = snapshot
             .prefixes
             .iter()
             .filter(|prefix| prefix.complete)
             .map(|prefix| prefix.path.as_str().to_string())
-            .collect::<Vec<_>>();
+            .filter_map(|prefix| match matcher.is_ignored(&prefix, false) {
+                Ok(false) => Some(Ok(prefix)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
         exact.retain(|path| {
             !prefixes.iter().any(|prefix| {
                 path == prefix
@@ -153,22 +281,20 @@ impl crate::Trail {
         });
         let baseline_files = self.load_root_files_for_selections(root_id, &selections)?;
         if selections.is_empty() {
+            if !self.verify_pinned_worktree_root(&pinned)? {
+                return Err(crate::Error::ChangeLedgerReconcileRequired {
+                    scope: snapshot.expected.scope_id.to_text(),
+                    state: "untrusted_gap".into(),
+                    reason: "workspace root identity changed during candidate comparison".into(),
+                    command: "trail status".into(),
+                });
+            }
             return Ok(CandidateComparison {
                 selections,
                 baseline_files,
                 disk_manifest: BTreeMap::new(),
                 disk_files: materialization.retains_bytes().then(Vec::new),
                 summaries: Vec::new(),
-            });
-        }
-        let matcher = policy.recording_matcher()?;
-        let pinned = self.open_pinned_worktree_root(policy)?;
-        if self.pinned_worktree_root_identity(&pinned) != snapshot.expected.filesystem_identity {
-            return Err(crate::Error::ChangeLedgerReconcileRequired {
-                scope: snapshot.expected.scope_id.to_text(),
-                state: "untrusted_gap".into(),
-                reason: "pinned workspace root identity changed before candidate comparison".into(),
-                command: "trail status".into(),
             });
         }
         let mut disk_manifest = BTreeMap::new();
@@ -353,6 +479,250 @@ pub(crate) fn run_materialized_lane_snapshot_flow() -> std::result::Result<(), S
         != Some(lane_hash.as_str())
     {
         return Err("replacement-root reconciliation used the retired watcher root".into());
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_materialized_candidate_lifecycle_flow() -> std::result::Result<(), String> {
+    use crate::db::OperationMetricsState;
+    use crate::{InitImportMode, PatchDocument, PatchEdit, Trail};
+    use std::fs;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static FLOW: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = FLOW
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct OverrideReset;
+    impl Drop for OverrideReset {
+        fn drop(&mut self) {
+            set_command_authority_override(false);
+        }
+    }
+
+    let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    for index in 0..100 {
+        let directory = temp.path().join(format!("pkg_{:05}", index / 100));
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        fs::write(
+            directory.join(format!("module_{:03}.rs", index % 100)),
+            format!("baseline {index}\n"),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        temp.path().join(".trail-case-probe-4242-a"),
+        "tracked probe-shaped file\n",
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        temp.path().join("pkg_00000/.module_000.rs.trail-tmp-4242"),
+        "tracked temp-shaped file\n",
+    )
+    .map_err(|error| error.to_string())?;
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)
+        .map_err(|error| error.to_string())?;
+    let mut db = Trail::open(temp.path()).map_err(|error| error.to_string())?;
+    let lane = db
+        .spawn_lane("candidate-lifecycle", Some("main"), true, None, None)
+        .map_err(|error| error.to_string())?;
+    let workdir = std::path::PathBuf::from(
+        lane.workdir
+            .ok_or_else(|| "candidate lifecycle lane was not materialized".to_string())?,
+    );
+    db.compare_materialized_lane_candidates(
+        "candidate-lifecycle",
+        CandidateMaterialization::ManifestOnly,
+    )
+    .map_err(|error| format!("warm materialized candidate runtime: {error}"))?;
+    set_command_authority_override(true);
+    let _reset = OverrideReset;
+    let metrics = Arc::new(OperationMetricsState::default());
+    db.operation_metrics = Some(Arc::clone(&metrics));
+
+    let scope_id: String = db
+        .conn
+        .query_row(
+            "SELECT scope_id FROM changed_path_scopes
+             WHERE scope_kind='materialized_lane' AND owner_id=?1",
+            [&lane.lane_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let assert_internal_residue = |db: &Trail, expected: i64, stage: &str| {
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM changed_path_entries
+                 WHERE scope_id=?1 AND (
+                   normalized_path GLOB '.trail-case-probe-[0-9]*-a'
+                   OR normalized_path GLOB '*.trail-tmp-[0-9]*'
+                 )",
+                [&scope_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if count != expected {
+            let rows: String = db
+                .conn
+                .query_row(
+                    "SELECT COALESCE(GROUP_CONCAT(
+                       normalized_path || ':' || first_sequence || '-' || last_sequence || ':' || event_flags,
+                       ','), '') FROM changed_path_entries WHERE scope_id=?1 AND (
+                       normalized_path GLOB '.trail-case-probe-[0-9]*-a'
+                       OR normalized_path GLOB '*.trail-tmp-[0-9]*'
+                     )",
+                    [&scope_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            return Err(format!(
+                "{stage}: expected {expected} internal candidate rows, found {count}: {rows}"
+            ));
+        }
+        Ok(())
+    };
+    let assert_candidates =
+        |metrics: &OperationMetricsState, operation: &str, expected: u64, stage: &str| {
+            let report = metrics.last_report();
+            if report.operation != operation || report.authoritative_candidate_count != expected {
+                return Err(format!(
+                    "{stage}: expected {} candidates for {}, got {} for {}",
+                    expected, operation, report.authoritative_candidate_count, report.operation,
+                ));
+            }
+            Ok(())
+        };
+
+    for count in [0usize, 1, 100] {
+        for index in 0..count {
+            let path = workdir.join(format!(
+                "pkg_{:05}/module_{:03}.rs",
+                index / 100,
+                index % 100
+            ));
+            use std::io::Write as _;
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| error.to_string())?,
+                "// record {count}:{index}"
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        db.record_lane_workdir(
+            "candidate-lifecycle",
+            Some(format!("candidate record {count}")),
+        )
+        .map_err(|error| format!("record k={count}: {error}"))?;
+        assert_candidates(
+            &metrics,
+            "materialized_lane_record",
+            count as u64,
+            &format!("record k={count}"),
+        )?;
+        assert_internal_residue(&db, 0, &format!("record k={count}"))?;
+    }
+
+    for count in [0usize, 1, 100] {
+        let edits = (0..count)
+            .map(|index| {
+                let relative = format!("pkg_{:05}/module_{:03}.rs", index / 100, index % 100);
+                let content = fs::read_to_string(workdir.join(&relative))?;
+                Ok(PatchEdit::Write {
+                    path: relative,
+                    content: format!("{content}// patch {count}:{index}\n"),
+                    executable: false,
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        db.apply_lane_patch(
+            "candidate-lifecycle",
+            PatchDocument {
+                base_change: None,
+                message: Some(format!("candidate patch {count}")),
+                session_id: None,
+                allow_ignored: false,
+                allow_stale: true,
+                edits,
+            },
+        )
+        .map_err(|error| format!("patch k={count}: {error}"))?;
+        assert_candidates(
+            &metrics,
+            "structured_patch",
+            count as u64,
+            &format!("patch k={count}"),
+        )?;
+        assert_internal_residue(&db, 0, &format!("patch k={count}"))?;
+    }
+
+    fs::remove_file(workdir.join(".trail-case-probe-4242-a")).map_err(|error| error.to_string())?;
+    fs::rename(
+        workdir.join("pkg_00000/.module_000.rs.trail-tmp-4242"),
+        workdir.join("pkg_00000/module_000.rs"),
+    )
+    .map_err(|error| error.to_string())?;
+    let adversarial = db.apply_lane_patch(
+        "candidate-lifecycle",
+        PatchDocument {
+            base_change: None,
+            message: Some("tracked control-shaped deletion must remain visible".into()),
+            session_id: None,
+            allow_ignored: false,
+            allow_stale: true,
+            edits: vec![PatchEdit::Write {
+                path: "pkg_00000/module_000.rs".into(),
+                content: "adversarial target\n".into(),
+                executable: false,
+            }],
+        },
+    );
+    if !matches!(
+        adversarial,
+        Err(crate::Error::ChangeLedgerReconcileRequired { .. })
+    ) {
+        return Err(format!(
+            "tracked control-shaped deletions were not rejected: {adversarial:?}"
+        ));
+    }
+    let retained: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1
+             AND normalized_path IN(
+               '.trail-case-probe-4242-a',
+               'pkg_00000/.module_000.rs.trail-tmp-4242'
+             )",
+            [&scope_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if retained != 2 {
+        return Err(format!(
+            "tracked control-shaped evidence was consumed; retained={retained}"
+        ));
+    }
+    if db
+        .debug_persisted_materialized_case_insensitive(&workdir)
+        .map_err(|error| format!("read persisted case sensitivity: {error}"))?
+        .is_none()
+    {
+        return Err("exact workdir identity did not reuse persisted case sensitivity".into());
+    }
+    let retired_workdir = workdir.with_extension("candidate-lifecycle-retired");
+    fs::rename(&workdir, &retired_workdir).map_err(|error| error.to_string())?;
+    fs::create_dir(&workdir).map_err(|error| error.to_string())?;
+    if db
+        .debug_persisted_materialized_case_insensitive(&workdir)
+        .map_err(|error| format!("check replacement workdir identity: {error}"))?
+        .is_some()
+    {
+        return Err("replacement workdir reused stale persisted case sensitivity".into());
     }
     Ok(())
 }
@@ -731,11 +1101,20 @@ impl crate::Trail {
 
     pub(crate) fn with_workspace_authoritative_snapshot<T, F>(
         &self,
-        consume: F,
+        mut consume: F,
     ) -> crate::Result<(T, FencedCandidateSnapshot)>
     where
         F: FnMut(&crate::Trail, &super::CompiledPolicy, &CandidateSnapshot) -> crate::Result<T>,
     {
+        let daemon_missing = self
+            .changed_path_daemon_registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .workspace
+            .is_none();
+        if daemon_missing {
+            super::prepare_workspace_daemon(self, true)?;
+        }
         let mut runtime = self
             .changed_path_daemon_registry
             .lock()
@@ -747,7 +1126,27 @@ impl crate::Trail {
                     "changed-path observer runtime is unavailable".into(),
                 )
             })?;
-        let result = runtime.with_authoritative_snapshot(self, consume);
+        let mut result = runtime.with_authoritative_snapshot(self, &mut consume);
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(super::policy_runtime_restart_required)
+        {
+            drop(runtime);
+            super::prepare_workspace_daemon(self, true)?;
+            runtime = self
+                .changed_path_daemon_registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .workspace
+                .take()
+                .ok_or_else(|| {
+                    crate::Error::DaemonUnavailable(
+                        "restarted changed-path observer runtime is unavailable".into(),
+                    )
+                })?;
+            result = runtime.with_authoritative_snapshot(self, &mut consume);
+        }
         self.changed_path_daemon_registry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -762,7 +1161,7 @@ impl crate::Trail {
     pub(crate) fn with_materialized_lane_authoritative_snapshot<T, F>(
         &self,
         lane: &str,
-        consume: F,
+        mut consume: F,
     ) -> crate::Result<(T, FencedCandidateSnapshot)>
     where
         F: FnMut(&crate::Trail, &super::CompiledPolicy, &CandidateSnapshot) -> crate::Result<T>,
@@ -789,7 +1188,27 @@ impl crate::Trail {
                     "changed-path observer runtime for materialized lane `{lane_id}` is unavailable"
                 ))
             })?;
-        let result = runtime.with_authoritative_snapshot(self, consume);
+        let mut result = runtime.with_authoritative_snapshot(self, &mut consume);
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(super::policy_runtime_restart_required)
+        {
+            drop(runtime);
+            super::prepare_materialized_lane_daemon(self, &lane_id, true)?;
+            runtime = self
+                .changed_path_daemon_registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .materialized_lanes
+                .remove(&lane_id)
+                .ok_or_else(|| {
+                    crate::Error::DaemonUnavailable(format!(
+                        "restarted changed-path observer runtime for lane `{lane_id}` is unavailable"
+                    ))
+                })?;
+            result = runtime.with_authoritative_snapshot(self, &mut consume);
+        }
         self.changed_path_daemon_registry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

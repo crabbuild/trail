@@ -9,8 +9,8 @@ mod writer;
 pub(crate) use codec::authenticate_segment_for_deletion;
 #[cfg(test)]
 pub(crate) use codec::recover_segments;
-pub(crate) use codec::recover_segments_from_directory;
-pub(crate) use writer::SegmentWriter;
+pub(crate) use codec::{recover_segments_from_connection, recover_segments_from_directory};
+pub(crate) use writer::{DaemonLaunchBinding, SegmentWriter};
 
 #[cfg(all(test, target_os = "linux"))]
 use codec::open_segment_no_follow;
@@ -19,7 +19,10 @@ use codec::{
     decode_header, encode_header, encode_record, encoded_segment, header_end, recover_bytes,
 };
 #[cfg(test)]
-use writer::{segment_filename, segment_id, sync_directory, FaultPoint, FaultScript};
+use writer::{
+    install_append_flush_boundary_hook, segment_filename, segment_id, sync_directory, FaultPoint,
+    FaultScript,
+};
 
 #[cfg(test)]
 mod tests;
@@ -116,6 +119,7 @@ pub(crate) struct AuthenticatedSegment {
     pub(crate) end_cursor: Vec<u8>,
     pub(crate) first_sequence: u64,
     pub(crate) last_sequence: u64,
+    pub(crate) header_end_offset: u64,
     pub(crate) durable_end_offset: u64,
     pub(crate) folded_end_offset: u64,
     pub(crate) segment_hash: [u8; 32],

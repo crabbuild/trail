@@ -5,6 +5,9 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -16,6 +19,9 @@ const MAX_HTTP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RATE_LIMIT_REQUESTS: usize = 600;
 const DEFAULT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+#[cfg(debug_assertions)]
+static TEST_DAEMON_RESPONSE_DELAY_USED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
@@ -252,7 +258,13 @@ fn handle_unix_connection(
             return Ok(());
         }
     };
+    #[cfg(debug_assertions)]
+    let request_method = request.method.clone();
+    #[cfg(debug_assertions)]
+    let request_path = request.path.clone();
     let response = route::route_request(db, request, auth);
+    #[cfg(debug_assertions)]
+    delay_daemon_response_for_test(&request_method, &request_path);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()?;
     Ok(())
@@ -299,10 +311,34 @@ fn handle_connection(
         stream.flush()?;
         return Ok(());
     }
+    #[cfg(debug_assertions)]
+    let request_method = request.method.clone();
+    #[cfg(debug_assertions)]
+    let request_path = request.path.clone();
     let response = route::route_request(db, request, auth);
+    #[cfg(debug_assertions)]
+    delay_daemon_response_for_test(&request_method, &request_path);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn delay_daemon_response_for_test(request_method: &str, request_path: &str) {
+    let Some(expected_path) = std::env::var_os("TRAIL_TEST_DAEMON_RESPONSE_DELAY_PATH") else {
+        return;
+    };
+    if request_method != "POST"
+        || request_path != expected_path
+        || TEST_DAEMON_RESPONSE_DELAY_USED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let millis = std::env::var("TRAIL_TEST_DAEMON_RESPONSE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(millis));
 }
 
 struct HttpRateLimiter {

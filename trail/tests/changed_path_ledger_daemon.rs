@@ -3,13 +3,14 @@
 use std::fs::{self, File};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rusqlite::params;
 use serde::Deserialize;
 use tempfile::TempDir;
 use trail::{InitImportMode, Trail};
@@ -31,6 +32,7 @@ struct Endpoint {
     reconciliation_complete: bool,
     live_fence_sequence: u64,
     epoch: u64,
+    daemon_launch_nonce: String,
 }
 
 struct Fixture {
@@ -131,14 +133,18 @@ impl Fixture {
 }
 
 fn assert_status_failed(output: &std::process::Output) {
+    assert_status_failed_for(output, "status");
+}
+
+fn assert_status_failed_for(output: &std::process::Output, context: &str) {
     assert!(
         !output.status.success(),
-        "status unexpectedly succeeded: {}",
+        "{context} unexpectedly succeeded: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("\"error\""),
-        "unexpected diagnostic: {}",
+        "unexpected {context} diagnostic: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -146,6 +152,23 @@ fn assert_status_failed(output: &std::process::Output) {
 fn write_owner_file(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn authenticated_post(endpoint: &Endpoint, path: &str, body: serde_json::Value) -> String {
+    let body = serde_json::to_vec(&body).unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        endpoint.auth_token,
+        body.len()
+    );
+    let mut stream = UnixStream::connect(&endpoint.socket_path).unwrap();
+    use std::io::{Read as _, Write as _};
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
 }
 
 fn spawn_status_waiting_after_daemon_authority_load(
@@ -183,6 +206,53 @@ fn spawn_status_waiting_after_daemon_authority_load(
             let output = child.wait_with_output().unwrap();
             panic!(
                 "daemon transition did not reach authority load barrier\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+fn spawn_status_waiting_after_stale_verification(
+    fixture: &Fixture,
+    barrier: &Path,
+) -> std::process::Child {
+    fs::create_dir(barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "TRAIL_TEST_WORKSPACE_DAEMON_AFTER_STALE_VERIFICATION_BARRIER",
+            barrier,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !barrier.join("verified").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon launcher exited before stale-verification barrier: status={status}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon launcher did not reach stale-verification barrier\nstdout={}\nstderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -361,6 +431,103 @@ fn first_status_publishes_a_ready_workspace_daemon() {
     assert!(!command_line.contains(&endpoint.owner_nonce));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn external_volume_repo_direct_fences_home_git_config_and_reconciles_on_drift() {
+    let policy_home = tempfile::tempdir().unwrap();
+    let policy_device = fs::metadata(policy_home.path()).unwrap().dev();
+    let workspace = fs::read_dir("/Volumes")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = fs::metadata(&path).ok()?;
+            (metadata.is_dir() && metadata.dev() != policy_device)
+                .then(|| {
+                    tempfile::Builder::new()
+                        .prefix("trail-external-policy-status-")
+                        .tempdir_in(path)
+                        .ok()
+                })
+                .flatten()
+        })
+        .next();
+    let Some(workspace) = workspace else {
+        // The native qualification runner may expose only one writable
+        // volume. The planner/fingerprint matrix still covers the partition;
+        // this end-to-end case runs whenever a real second volume is present.
+        return;
+    };
+
+    fs::write(workspace.path().join("tracked.txt"), b"baseline\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "trail@example.invalid"],
+        vec!["config", "user.name", "Trail Test"],
+        vec!["add", "tracked.txt"],
+        vec!["commit", "--quiet", "-m", "baseline"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Trail::init(workspace.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let fixture = Fixture { temp: workspace };
+    let global = policy_home
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("global.gitconfig");
+    fs::write(&global, b"[core]\n").unwrap();
+    let global_text = global.to_str().unwrap();
+    // Override Fixture's hermetic default so this also qualifies the normal
+    // macOS `/etc -> /private/etc` system-config alias across devices.
+    let daemon_env = [
+        ("GIT_CONFIG_GLOBAL", global_text),
+        ("GIT_CONFIG_NOSYSTEM", "0"),
+    ];
+
+    let first = fixture.status_with_env(&daemon_env);
+    assert!(
+        first.status.success(),
+        "external-volume first status failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_endpoint = fixture.endpoint();
+
+    let excludes = global.parent().unwrap().join("global-ignore");
+    fs::write(
+        &global,
+        format!("[core]\n\texcludesFile = {}\n", excludes.display()),
+    )
+    .unwrap();
+    let second = fixture.run_with_env(&["diff", "--dirty"], &daemon_env);
+    assert!(
+        second.status.success(),
+        "policy-drift diff did not reconcile automatically:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_endpoint = fixture.endpoint();
+    assert!(
+        second_endpoint.epoch > first_endpoint.epoch,
+        "policy drift did not establish a fresh reconciled authority epoch"
+    );
+    assert!(second_endpoint.reconciliation_complete);
+}
+
 #[test]
 fn concurrent_first_status_calls_converge_on_one_ready_owner() {
     let fixture = Arc::new(Fixture::new());
@@ -420,6 +587,23 @@ fn concurrent_first_status_calls_converge_on_one_ready_owner() {
 
 #[test]
 fn auto_started_daemon_does_not_retain_unrelated_inherited_file_descriptors() {
+    const ISOLATED: &str = "TRAIL_TEST_ISOLATED_INHERITED_FD";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("auto_started_daemon_does_not_retain_unrelated_inherited_file_descriptors")
+            .arg("--nocapture")
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated inherited-fd check failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let fixture = Fixture::new();
     let mut pipe = [0_i32; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -557,8 +741,17 @@ fn live_daemon_rejects_tampered_endpoint_and_token_identity() {
             &fixture.endpoint_path(),
             &serde_json::to_vec_pretty(&tampered).unwrap(),
         );
-        assert_status_failed(&fixture.status());
+        assert_status_failed_for(
+            &fixture.status(),
+            &format!("tampered endpoint field `{field}`"),
+        );
         write_owner_file(&fixture.endpoint_path(), &endpoint_bytes);
+        let keepalive = fixture.status();
+        assert!(
+            keepalive.status.success(),
+            "daemon did not remain live after rejecting tampered endpoint field `{field}`: {}",
+            String::from_utf8_lossy(&keepalive.stderr)
+        );
     }
 
     let mut unrelated_pid = endpoint.clone();
@@ -568,26 +761,29 @@ fn live_daemon_rejects_tampered_endpoint_and_token_identity() {
         &fixture.endpoint_path(),
         &serde_json::to_vec_pretty(&unrelated_pid).unwrap(),
     );
-    assert_status_failed(&fixture.status());
+    assert_status_failed_for(&fixture.status(), "endpoint with unrelated PID identity");
     write_owner_file(&fixture.endpoint_path(), &endpoint_bytes);
 
-    assert_status_failed(&fixture.status_with_env(&[(
-        "TRAIL_TEST_WORKSPACE_DAEMON_POST_CHALLENGE_START_IDENTITY",
-        "synthetic-reuse",
-    )]));
+    assert_status_failed_for(
+        &fixture.status_with_env(&[(
+            "TRAIL_TEST_WORKSPACE_DAEMON_POST_CHALLENGE_START_IDENTITY",
+            "synthetic-reuse",
+        )]),
+        "post-challenge PID identity drift",
+    );
 
     let token_bytes = fs::read(fixture.token_path()).unwrap();
     let token_target = fixture.root().join("token-target");
     fs::write(&token_target, b"sentinel").unwrap();
     fs::remove_file(fixture.token_path()).unwrap();
     symlink(&token_target, fixture.token_path()).unwrap();
-    assert_status_failed(&fixture.status());
+    assert_status_failed_for(&fixture.status(), "symlinked token publication");
     assert_eq!(fs::read(&token_target).unwrap(), b"sentinel");
     fs::remove_file(fixture.token_path()).unwrap();
     write_owner_file(&fixture.token_path(), &token_bytes);
 
     fs::set_permissions(&fixture.socket_path(), fs::Permissions::from_mode(0o666)).unwrap();
-    assert_status_failed(&fixture.status());
+    assert_status_failed_for(&fixture.status(), "unsafe socket mode");
     fs::set_permissions(&fixture.socket_path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     let starting = serde_json::json!({
@@ -607,14 +803,39 @@ fn live_daemon_rejects_tampered_endpoint_and_token_identity() {
         &starting_path,
         &serde_json::to_vec_pretty(&starting).unwrap(),
     );
-    assert_status_failed(&fixture.status_with_env(&[(
-        "TRAIL_TEST_WORKSPACE_DAEMON_UNVERIFIABLE_PID",
-        &endpoint["pid"].as_u64().unwrap().to_string(),
-    )]));
+    assert_status_failed_for(
+        &fixture.status_with_env(&[(
+            "TRAIL_TEST_WORKSPACE_DAEMON_UNVERIFIABLE_PID",
+            &endpoint["pid"].as_u64().unwrap().to_string(),
+        )]),
+        "unverifiable live startup PID",
+    );
     assert!(starting_path.exists());
     assert!(fixture.socket_path().exists());
     fs::remove_file(starting_path).unwrap();
     write_owner_file(&fixture.endpoint_path(), &endpoint_bytes);
+}
+
+#[test]
+fn dead_daemon_does_not_replace_a_statically_invalid_endpoint() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let endpoint = fixture.endpoint();
+    kill_and_wait(endpoint.pid);
+
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.endpoint_path()).unwrap()).unwrap();
+    tampered["protocol_version"] = serde_json::json!(99);
+    write_owner_file(
+        &fixture.endpoint_path(),
+        &serde_json::to_vec_pretty(&tampered).unwrap(),
+    );
+
+    assert_status_failed_for(
+        &fixture.status(),
+        "dead daemon with a statically invalid endpoint",
+    );
+    assert!(fixture.endpoint_path().exists());
 }
 
 #[test]
@@ -650,20 +871,288 @@ fn killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change() {
 }
 
 #[test]
+fn external_materialized_spawn_retires_daemon_and_reconcile_starts_one_fresh_owner() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let daemon = fixture.endpoint();
+
+    let spawned = fixture.run(&[
+        "lane",
+        "spawn",
+        "daemon-materialized",
+        "--from",
+        "main",
+        "--materialize",
+    ]);
+    assert!(
+        spawned.status.success(),
+        "daemon-routed lane spawn failed: {}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+    let reconciled = fixture.run(&["index", "reconcile", "--lane", "daemon-materialized"]);
+    assert!(
+        reconciled.status.success(),
+        "daemon-routed lane reconcile failed: {}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let replacement = fixture.endpoint();
+    assert_ne!(replacement.pid, daemon.pid);
+    assert!(replacement.epoch > daemon.epoch);
+
+    let conn =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let active_lane_owners: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope ON scope.scope_id=owner.scope_id
+             WHERE scope.scope_kind='materialized_lane'
+               AND owner.lease_state='active' AND owner.error_state IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_lane_owners, 1);
+}
+
+#[test]
+fn external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback() {
+    let fixture = Fixture::new();
+    let started = fixture.status_with_env(&[
+        ("TRAIL_TEST_DAEMON_RESPONSE_DELAY_PATH", "/v1/lanes"),
+        ("TRAIL_TEST_DAEMON_RESPONSE_DELAY_MS", "31000"),
+    ]);
+    assert!(
+        started.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let daemon = fixture.endpoint();
+
+    let request_started = Instant::now();
+    let spawned = fixture.run(&[
+        "lane",
+        "spawn",
+        "slow-materialized",
+        "--from",
+        "main",
+        "--materialize",
+    ]);
+    assert!(
+        spawned.status.success(),
+        "delayed daemon-routed lane spawn failed: {}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+    assert!(request_started.elapsed() < Duration::from_secs(30));
+    assert_ne!(unsafe { libc::kill(daemon.pid as i32, 0) }, 0);
+
+    let conn =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let (lanes, spawn_events): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM lanes WHERE name='slow-materialized'),
+                (SELECT COUNT(*) FROM lane_events event
+                 JOIN lanes lane USING(lane_id)
+                 WHERE lane.name='slow-materialized' AND event.event_type='lane_spawned')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(lanes, 1);
+    assert_eq!(spawn_events, 1, "delayed spawn committed more than once");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_routed_lane_spawn_preserves_explicit_nfs_cow_mode() {
+    let fixture = Fixture::new();
+    let direct = fixture.run(&[
+        "lane",
+        "spawn",
+        "direct-nfs-cow",
+        "--from",
+        "main",
+        "--workdir-mode",
+        "nfs-cow",
+    ]);
+    assert!(
+        direct.status.success(),
+        "direct nfs-cow spawn failed: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct: serde_json::Value = serde_json::from_slice(&direct.stdout).unwrap();
+
+    assert!(fixture.status().status.success());
+    let daemon = fixture.endpoint();
+    let routed = fixture.run(&[
+        "lane",
+        "spawn",
+        "routed-nfs-cow",
+        "--from",
+        "main",
+        "--workdir-mode",
+        "nfs-cow",
+    ]);
+    assert!(
+        routed.status.success(),
+        "daemon-routed nfs-cow spawn failed: {}",
+        String::from_utf8_lossy(&routed.stderr)
+    );
+    let routed: serde_json::Value = serde_json::from_slice(&routed.stdout).unwrap();
+    assert_eq!(fixture.endpoint().pid, daemon.pid);
+
+    for report in [&direct, &routed] {
+        assert_eq!(report["requested_workdir_mode"], "nfs-cow");
+        assert_eq!(report["workdir_mode"], "nfs-cow");
+        assert_eq!(report["workdir_backend"], "nfs");
+        assert_eq!(report["transparent_cow_available"], true);
+        assert!(report["workdir"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()));
+    }
+    assert_eq!(
+        direct["requested_workdir_mode"],
+        routed["requested_workdir_mode"]
+    );
+    assert_eq!(direct["workdir_mode"], routed["workdir_mode"]);
+    assert_eq!(direct["workdir_backend"], routed["workdir_backend"]);
+    assert_eq!(
+        direct["transparent_cow_available"],
+        routed["transparent_cow_available"]
+    );
+}
+
+#[test]
+fn rejected_patch_audit_does_not_retire_daemon_and_explicit_empty_patch_is_routed() {
+    let fixture = Fixture::new();
+    let status = fixture.status_with_env(&[("TRAIL_TEST_EXTERNAL_AUDIT_HOLD_MS", "1500")]);
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let daemon = fixture.endpoint();
+    let spawned = fixture.run(&[
+        "lane",
+        "spawn",
+        "daemon-empty-patch",
+        "--from",
+        "main",
+        "--materialize",
+    ]);
+    assert!(
+        spawned.status.success(),
+        "lane spawn failed: {}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+    let spawn_report: serde_json::Value = serde_json::from_slice(&spawned.stdout).unwrap();
+    let workdir = PathBuf::from(spawn_report["workdir"].as_str().unwrap());
+
+    for k in [0_usize, 1, 100] {
+        for index in 0..k {
+            let parent = workdir.join(format!("record-{:03}", index / 10));
+            fs::create_dir_all(&parent).unwrap();
+            fs::write(
+                parent.join(format!("path-{:03}.txt", index)),
+                format!("record {k}:{index}\n"),
+            )
+            .unwrap();
+        }
+        let recorded = fixture.run(&[
+            "lane",
+            "record",
+            "daemon-empty-patch",
+            "-m",
+            &format!("multi-runtime record k={k}"),
+        ]);
+        assert!(
+            recorded.status.success(),
+            "record k={k} failed: {}",
+            String::from_utf8_lossy(&recorded.stderr)
+        );
+        if k == 0 {
+            let replacement = fixture.endpoint();
+            assert_ne!(replacement.pid, daemon.pid, "record k={k}");
+        }
+    }
+
+    let daemon = fixture.endpoint();
+
+    let rejected = authenticated_post(
+        &daemon,
+        "/v1/lanes/daemon-empty-patch/patches",
+        serde_json::json!({"message": "missing explicit patch source"}),
+    );
+    assert!(rejected.starts_with("HTTP/1.1 400 "), "{rejected}");
+    assert_eq!(fixture.endpoint().pid, daemon.pid);
+
+    for k in [0_usize, 1, 100] {
+        let edits = (0..k)
+            .map(|index| {
+                serde_json::json!({
+                    "op": "write",
+                    "path": format!("patch/path-{index:03}.txt"),
+                    "content": format!("patch {k}:{index}\n")
+                })
+            })
+            .collect::<Vec<_>>();
+        let patch_path = fixture.root().join(format!("patch-{k}.json"));
+        fs::write(
+            &patch_path,
+            serde_json::to_vec(&serde_json::json!({
+                "allow_stale": true,
+                "message": format!("genuine patch k={k}"),
+                "edits": edits
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let applied = fixture.run(&[
+            "lane",
+            "apply-patch",
+            "daemon-empty-patch",
+            "--patch",
+            patch_path.to_str().unwrap(),
+        ]);
+        assert!(
+            applied.status.success(),
+            "patch k={k} failed: {}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+        assert_eq!(
+            report["changed_paths"].as_array().unwrap().len(),
+            k,
+            "patch k={k}"
+        );
+        assert_eq!(fixture.endpoint().pid, daemon.pid, "patch k={k}");
+    }
+
+    let cow = fixture.run(&[
+        "lane",
+        "spawn",
+        "daemon-cow-after-patches",
+        "--from",
+        "main",
+        "--workdir-mode",
+        "native-cow",
+    ]);
+    assert!(
+        cow.status.success(),
+        "COW spawn failed: {}",
+        String::from_utf8_lossy(&cow.stderr)
+    );
+    assert_eq!(fixture.endpoint().pid, daemon.pid, "COW spawn");
+}
+
+#[test]
 fn dead_endpoint_with_missing_socket_restarts_safely() {
     let fixture = Fixture::new();
     assert!(fixture.status().status.success());
     let first = fixture.endpoint();
     kill_and_wait(first.pid);
     fs::remove_file(&first.socket_path).unwrap();
-    let mut stale: serde_json::Value =
-        serde_json::from_slice(&fs::read(fixture.endpoint_path()).unwrap()).unwrap();
-    stale["protocol_version"] = serde_json::json!(1);
-    stale["executable_identity"] = serde_json::json!("old-executable-identity");
-    write_owner_file(
-        &fixture.endpoint_path(),
-        &serde_json::to_vec_pretty(&stale).unwrap(),
-    );
     let restarted = fixture.status();
     assert!(
         restarted.status.success(),
@@ -1218,6 +1707,115 @@ fn crash_after_persisting_ledger_owner_is_automatically_recovered() {
 }
 
 #[test]
+fn crash_after_owner_acquisition_before_bound_starting_publication_recovers() {
+    let fixture = Fixture::new();
+    let crashed = fixture.status_with_env(&[(
+        "TRAIL_TEST_WORKSPACE_DAEMON_EXIT_AFTER_OWNER_ACQUIRE_BEFORE_BOUND_PUBLICATION",
+        "1",
+    )]);
+    assert_status_failed(&crashed);
+
+    let starting: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.authority().join("daemon.starting.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(starting["daemon_launch_nonce"].as_str().unwrap().len(), 64);
+    assert!(starting["scope_id"].is_null());
+    assert!(starting["epoch"].is_null());
+
+    let conn =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let persisted: (String, i64, String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT owner.daemon_launch_nonce,owner.daemon_pid,
+                    owner.daemon_process_start_identity,scope.epoch,
+                    scope.observer_owner_token
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope ON scope.scope_id=owner.scope_id",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        persisted.0,
+        starting["daemon_launch_nonce"].as_str().unwrap()
+    );
+    assert_eq!(persisted.1, starting["pid"].as_i64().unwrap());
+    assert_eq!(
+        persisted.2,
+        starting["process_start_identity"].as_str().unwrap()
+    );
+    let owner_epoch_and_token: (i64, String) = conn
+        .query_row(
+            "SELECT epoch,owner_token FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (persisted.3, persisted.4.as_deref()),
+        (
+            owner_epoch_and_token.0,
+            Some(owner_epoch_and_token.1.as_str())
+        ),
+        "crashed startup must leave scope authority exactly bound to its persisted owner"
+    );
+    drop(conn);
+
+    let recovered = fixture.status();
+    assert!(
+        recovered.status.success(),
+        "pre-publication crash recovery failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+}
+
+#[test]
+fn forged_dead_process_identity_cannot_replace_a_live_observer_owner() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let before: (String, i64, String) = conn
+        .query_row(
+            "SELECT owner_token,epoch,lease_state FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    drop(conn);
+
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.endpoint_path()).unwrap()).unwrap();
+    forged["pid"] = serde_json::json!(999_999_999_u32);
+    forged["process_start_identity"] = serde_json::json!("forged-dead-process");
+    write_owner_file(
+        &fixture.endpoint_path(),
+        &serde_json::to_vec_pretty(&forged).unwrap(),
+    );
+    assert_status_failed_for(&fixture.status(), "forged dead process stale-owner handoff");
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let after: (String, i64, String) = conn
+        .query_row(
+            "SELECT owner_token,epoch,lease_state FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.2, "active");
+}
+
+#[test]
 fn ordinary_error_after_persisting_owner_preserves_recovery_identity() {
     let fixture = Fixture::new();
     let failed =
@@ -1444,6 +2042,81 @@ fn verified_stale_persisted_identity_drift_rotates_epoch_and_reconciles() {
         assert_eq!(recovered_authority.2, recovered_authority.3);
         kill_and_wait(second.pid);
     }
+}
+
+#[test]
+fn owner_acquired_after_stale_process_verification_is_not_replaced() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    assert_eq!(first.daemon_launch_nonce.len(), 64);
+    kill_and_wait(first.pid);
+
+    let barrier = fixture.root().join("stale-process-owner-race");
+    let child = spawn_status_waiting_after_stale_verification(&fixture, &barrier);
+    let replacement_token = "cd".repeat(32);
+    let replacement_launch_nonce = "ef".repeat(32);
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET owner_token=?1,lease_state='active',error_state=NULL,error_at=NULL,
+                 daemon_launch_nonce=?2,daemon_pid=?3,
+                 daemon_process_start_identity='replacement-owner-start',
+                 heartbeat_at=strftime('%s','now'),expires_at=strftime('%s','now')+30,
+                 updated_at=strftime('%s','now')
+             WHERE scope_id=(SELECT scope_id FROM changed_path_scopes)",
+            params![
+                &replacement_token,
+                &replacement_launch_nonce,
+                i64::from(std::process::id())
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_scopes SET observer_owner_token=?1",
+            [&replacement_token],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let owner: (String, String, String) = conn
+        .query_row(
+            "SELECT owner.owner_token,owner.lease_state,owner.daemon_launch_nonce
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope
+               ON scope.scope_id=owner.scope_id AND scope.epoch=owner.epoch",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        owner,
+        (
+            replacement_token.clone(),
+            "active".into(),
+            replacement_launch_nonce
+        )
+    );
+    let scope_owner: String = conn
+        .query_row(
+            "SELECT observer_owner_token FROM changed_path_scopes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(scope_owner, replacement_token);
 }
 
 fn assert_loaded_scope_authority_race_is_rejected(

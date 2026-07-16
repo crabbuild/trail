@@ -228,10 +228,15 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              expires_at INTEGER NOT NULL,
              error_state TEXT,
              error_at INTEGER,
+             daemon_launch_nonce TEXT UNIQUE,
+             daemon_pid INTEGER,
+             daemon_process_start_identity TEXT,
              updated_at INTEGER NOT NULL,
              CHECK (acquired_at <= heartbeat_at AND heartbeat_at <= expires_at),
              CHECK ((error_state IS NULL AND error_at IS NULL)
-                    OR (error_state IS NOT NULL AND error_at IS NOT NULL))
+                    OR (error_state IS NOT NULL AND error_at IS NOT NULL)),
+             CHECK ((daemon_launch_nonce IS NULL AND daemon_pid IS NULL AND daemon_process_start_identity IS NULL)
+                    OR (length(daemon_launch_nonce) = 64 AND daemon_pid > 0 AND length(daemon_process_start_identity) > 0))
          );
          CREATE TRIGGER changed_path_observer_owner_fail_closed
          AFTER UPDATE OF lease_state ON changed_path_observer_owners
@@ -704,6 +709,9 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("expires_at", "INTEGER", true, None, 0),
                 ("error_state", "TEXT", false, None, 0),
                 ("error_at", "INTEGER", false, None, 0),
+                ("daemon_launch_nonce", "TEXT", false, None, 0),
+                ("daemon_pid", "INTEGER", false, None, 0),
+                ("daemon_process_start_identity", "TEXT", false, None, 0),
                 ("updated_at", "INTEGER", true, None, 0),
             ],
         ),
@@ -924,7 +932,9 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (lease_state IN ('active', 'revoked', 'expired', 'error'))",
                 "CHECK (acquired_at <= heartbeat_at AND heartbeat_at <= expires_at)",
                 "CHECK ((error_state IS NULL AND error_at IS NULL) OR (error_state IS NOT NULL AND error_at IS NOT NULL))",
+                "CHECK ((daemon_launch_nonce IS NULL AND daemon_pid IS NULL AND daemon_process_start_identity IS NULL) OR (length(daemon_launch_nonce) = 64 AND daemon_pid > 0 AND length(daemon_process_start_identity) > 0))",
                 "owner_token TEXT NOT NULL UNIQUE",
+                "daemon_launch_nonce TEXT UNIQUE",
             ],
         ),
         (
@@ -1013,13 +1023,17 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             "changed_path_observer_segments",
             &["scope_id", "epoch", "first_sequence"].as_slice(),
         ),
-        ("changed_path_observer_owners", &["owner_token"].as_slice()),
     ] {
         if !origin_index_matches(conn, table, "u", columns)? {
             return Ok(false);
         }
     }
     if !origin_indexes_match(
+        conn,
+        "changed_path_observer_owners",
+        "u",
+        &[&["owner_token"], &["daemon_launch_nonce"]],
+    )? || !origin_indexes_match(
         conn,
         "changed_path_segment_quarantine_allocations",
         "u",

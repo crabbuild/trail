@@ -1,6 +1,26 @@
 use super::*;
 
 impl Trail {
+    /// Return a clean Git mapping only when the mapped commit is the exact
+    /// commit being qualified. Callers must still bind the returned Trail
+    /// change/root to their fenced ledger baseline; a matching HEAD alone is
+    /// never sufficient evidence that the workspace is clean.
+    pub(crate) fn clean_git_mapping_for_evidence(
+        &self,
+        head_oid: &str,
+    ) -> Result<Option<(String, ObjectId)>> {
+        self.conn
+            .query_row(
+                "SELECT crab_change,crab_root FROM git_mappings
+                 WHERE git_head=?1 AND git_dirty=0
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                [head_oid],
+                |row| Ok((row.get(0)?, ObjectId(row.get(1)?))),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
     pub fn git_import_update(
         &mut self,
         branch: Option<&str>,

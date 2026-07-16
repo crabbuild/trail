@@ -229,6 +229,10 @@ impl Trail {
         let result = (|| {
             verify_same_native_filesystem(&source.root, &stage)?;
             probe_native_clone(&stage)?;
+            // Pin this while the stage is still allowed to change. Case
+            // sensitivity detection creates and unlinks a probe file and must
+            // never run during either post-barrier verification.
+            let case_insensitive = is_case_insensitive_filesystem(&stage)?;
 
             let mut stamps = BTreeMap::new();
             let mut report = MaterializationReport::default();
@@ -248,7 +252,7 @@ impl Trail {
                         path,
                         entry,
                         *source_stamp,
-                        true,
+                        false,
                     )?;
                     Ok((path.clone(), entry.size_bytes, status))
                 })
@@ -281,10 +285,22 @@ impl Trail {
                 files.keys(),
                 stamps,
             )?;
-            ensure_staged_manifest_is_clean(self, &stage, root_id)?;
+            // The stage is private and cannot be published until this batch
+            // durability barrier succeeds. Flush every source and cloned
+            // inode with ordinary fsync, every created directory ancestor
+            // bottom-up, and finally one full volume/filesystem barrier. The
+            // manifest is deliberately written first so `.trail`, its file,
+            // and the stage-parent binding are included in the same cut.
+            sync_native_materialization_stage(&source.root, &stage, files.keys())?;
+            ensure_staged_manifest_is_clean_read_only(self, &stage, root_id, case_insensitive)?;
             operation.set_state(MaterializationOperationState::Verified)?;
             operation.publish()?;
-            ensure_staged_manifest_is_clean(self, destination, root_id)?;
+            ensure_staged_manifest_is_clean_read_only(
+                self,
+                destination,
+                root_id,
+                case_insensitive,
+            )?;
             operation.set_state(MaterializationOperationState::Published)?;
             Ok(MaterializationOutcome {
                 resolved_mode: LaneWorkdirMode::NativeCow,
@@ -819,6 +835,87 @@ fn probe_native_clone(stage: &Path) -> std::result::Result<(), NativeAttemptErro
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NativeMaterializationDurabilityInventory {
+    source_files: BTreeSet<PathBuf>,
+    destination_files: BTreeSet<PathBuf>,
+    directories_bottom_up: Vec<PathBuf>,
+}
+
+fn native_materialization_durability_inventory<'a, I>(
+    source: &Path,
+    stage: &Path,
+    paths: I,
+) -> Result<NativeMaterializationDurabilityInventory>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut source_files = BTreeSet::new();
+    let mut destination_files = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let normalized = normalize_relative_path(path)?;
+        let relative = path_from_rel(&normalized);
+        source_files.insert(source.join(&relative));
+        destination_files.insert(stage.join(&relative));
+        let mut parent = relative.parent();
+        while let Some(relative_parent) = parent {
+            if relative_parent.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(stage.join(relative_parent));
+            parent = relative_parent.parent();
+        }
+    }
+    let manifest = stage.join(".trail/workdir-manifest.json");
+    destination_files.insert(manifest);
+    directories.insert(stage.join(".trail"));
+    directories.insert(stage.to_path_buf());
+    if let Some(parent) = stage.parent() {
+        directories.insert(parent.to_path_buf());
+    }
+    let mut directories_bottom_up = directories.into_iter().collect::<Vec<_>>();
+    directories_bottom_up.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    Ok(NativeMaterializationDurabilityInventory {
+        source_files,
+        destination_files,
+        directories_bottom_up,
+    })
+}
+
+fn sync_native_materialization_stage<'a, I>(source: &Path, stage: &Path, paths: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let inventory = native_materialization_durability_inventory(source, stage, paths)?;
+    let mut files = inventory.source_files.into_iter().collect::<Vec<_>>();
+    files.extend(inventory.destination_files);
+    files.par_iter().try_for_each(|path| -> Result<()> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        // Rust's File::sync_all maps to F_FULLFSYNC on Apple platforms.
+        // Use POSIX fsync for each inode, then one F_FULLFSYNC below.
+        rustix::fs::fsync(&file).map_err(|error| Error::Io(error.into()))
+    })?;
+    for directory in inventory.directories_bottom_up {
+        let directory = OpenOptions::new().read(true).open(directory)?;
+        rustix::fs::fsync(&directory).map_err(|error| Error::Io(error.into()))?;
+    }
+    let stage_authority = OpenOptions::new().read(true).open(stage)?;
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::syncfs(&stage_authority).map_err(|error| Error::Io(error.into()))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        rustix::fs::fcntl_fullfsync(&stage_authority).map_err(|error| Error::Io(error.into()))?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        stage_authority.sync_all()?;
+    }
+    Ok(())
+}
+
 fn ensure_staged_manifest_is_clean(trail: &Trail, stage: &Path, root_id: &ObjectId) -> Result<()> {
     if !matches!(
         trail.cached_workdir_manifest_status(stage, root_id)?,
@@ -826,6 +923,22 @@ fn ensure_staged_manifest_is_clean(trail: &Trail, stage: &Path, root_id: &Object
     ) {
         return Err(Error::Corrupt(format!(
             "staged lane workdir `{}` did not verify against root `{}`",
+            stage.display(),
+            root_id.0
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_staged_manifest_is_clean_read_only(
+    trail: &Trail,
+    stage: &Path,
+    root_id: &ObjectId,
+    case_insensitive: bool,
+) -> Result<()> {
+    if !trail.clean_workdir_manifest_matches_read_only(stage, root_id, case_insensitive)? {
+        return Err(Error::Corrupt(format!(
+            "staged lane workdir `{}` did not verify read-only against root `{}`",
             stage.display(),
             root_id.0
         )));
@@ -871,6 +984,133 @@ fn publish_materialization_stage(stage: &Path, destination: &Path) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadOnlyVerificationEntry {
+        is_dir: bool,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        contents: Option<Vec<u8>>,
+    }
+
+    fn read_only_verification_snapshot(
+        root: &Path,
+    ) -> BTreeMap<PathBuf, ReadOnlyVerificationEntry> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            snapshot: &mut BTreeMap<PathBuf, ReadOnlyVerificationEntry>,
+        ) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            snapshot.insert(
+                relative,
+                ReadOnlyVerificationEntry {
+                    is_dir: metadata.is_dir(),
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    contents: metadata.is_file().then(|| fs::read(path).unwrap()),
+                },
+            );
+            if metadata.is_dir() {
+                let mut children = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, snapshot);
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn batch_durability_inventory_covers_nested_inodes_manifest_and_all_ancestors() {
+        let source = Path::new("/source");
+        let stage = Path::new("/parent/stage");
+        let paths = ["nested/deeper/file.txt".to_string(), "top.txt".to_string()];
+
+        let inventory =
+            native_materialization_durability_inventory(source, stage, paths.iter()).unwrap();
+
+        assert_eq!(
+            inventory.source_files,
+            BTreeSet::from([
+                source.join("nested/deeper/file.txt"),
+                source.join("top.txt")
+            ])
+        );
+        assert_eq!(
+            inventory.destination_files,
+            BTreeSet::from([
+                stage.join("nested/deeper/file.txt"),
+                stage.join("top.txt"),
+                stage.join(".trail/workdir-manifest.json")
+            ])
+        );
+        let directories = inventory
+            .directories_bottom_up
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            directories,
+            BTreeSet::from([
+                stage.join("nested/deeper"),
+                stage.join("nested"),
+                stage.join(".trail"),
+                stage.to_path_buf(),
+                stage.parent().unwrap().to_path_buf(),
+            ])
+        );
+        assert!(inventory
+            .directories_bottom_up
+            .windows(2)
+            .all(|pair| pair[0].components().count() >= pair[1].components().count()));
+    }
+
+    #[test]
+    fn post_barrier_verifications_do_not_mutate_stage_or_published_destination() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root contents").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let root_id = db.resolve_branch_ref("main").unwrap().root_id;
+        let files = db.load_root_files(&root_id).unwrap();
+
+        let holder = tempfile::tempdir().unwrap();
+        let stage = holder.path().join("stage");
+        let destination = holder.path().join("destination");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("README.md"), "root contents").unwrap();
+
+        // This is the only case-sensitivity probe. It deliberately happens
+        // before the manifest/barrier cut represented by the first snapshot.
+        let case_insensitive = is_case_insensitive_filesystem(&stage).unwrap();
+        db.write_clean_workdir_manifest(&stage, &root_id, &files, files.keys())
+            .unwrap();
+
+        let before_stage_verification = read_only_verification_snapshot(&stage);
+        ensure_staged_manifest_is_clean_read_only(&db, &stage, &root_id, case_insensitive).unwrap();
+        assert_eq!(
+            read_only_verification_snapshot(&stage),
+            before_stage_verification
+        );
+
+        fs::rename(&stage, &destination).unwrap();
+        let before_destination_verification = read_only_verification_snapshot(&destination);
+        ensure_staged_manifest_is_clean_read_only(&db, &destination, &root_id, case_insensitive)
+            .unwrap();
+        assert_eq!(
+            read_only_verification_snapshot(&destination),
+            before_destination_verification
+        );
+    }
 
     #[test]
     fn publication_never_overwrites_a_concurrent_destination() {

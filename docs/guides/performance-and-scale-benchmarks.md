@@ -18,6 +18,37 @@ Structural string invariants use `--metric-equals key=value`. The Git handoff
 gate combines wall-time ceilings, numeric ceilings, and exact export-mode
 checks in one invocation.
 
+The `Changed-path Ledger Native Gates` workflow is a required merge and
+release gate. Branch protection and release automation must require both its
+Linux/ext4 and macOS/APFS matrix jobs for the exact commit being merged or
+released; scheduled artifacts are additional qualification evidence, not a
+substitute for those commit-specific checks.
+
+The workflow is reusable. `release-automation.yml` calls it before creating a
+tag, and cargo-dist declares it as a generated `plan-jobs` dependency so a tag
+push cannot build, host, or publish until both native jobs pass for that tag's
+exact SHA. The compiled activation manifest names those dependencies, but its
+self-hash is only a declaration of the build contract; it is not evidence that
+a workflow ran.
+
+Changed-path structural reports are closed schemas: missing and unknown work
+counters fail the gate. Every repository-size-sensitive counter is either
+required to be zero or capped by an explicit affine O(k) bound. Selected
+worktree-index SQLite work additionally has a typed disposition:
+
+- workspace status, diff, and record report `not_applicable`, one independent
+  N/A proof, and zero selected-index work;
+- materialized lane record, structured patch, and COW checkpoint report
+  `complete`, at least one accounting envelope (including k=0), and no N/A
+  claim;
+- absent, mixed, or ambiguous accounting fails even when every numeric SQLite
+  counter is zero.
+
+COW checkpoint reports must also declare
+`generated_path_accounting=journal_interval`. This proves generated dirty paths
+come from the bounded journal interval rather than a recursive upper-directory
+inventory.
+
 ## Local and Large Runs
 
 ```sh

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::reconcile::{ObserverEvent, ObserverQualification};
-use super::{ExpectedScope, ProviderCapabilities};
+use super::{ExpectedScope, PolicyDependencyFenceIdentity, ProviderCapabilities};
 use crate::error::Result;
 
 #[cfg(target_os = "linux")]
@@ -28,7 +28,11 @@ pub(crate) struct ObserverLease {
     pub(crate) owner_token: String,
     pub(crate) root_identity: Vec<u8>,
     pub(crate) provider_identity: Vec<u8>,
+    /// Dependencies continuously covered by the native observer.
     pub(crate) policy_dependencies: Vec<PathBuf>,
+    /// Dependencies on other filesystem-history authorities, covered by an
+    /// authenticated direct pre/post fingerprint fence instead.
+    pub(crate) direct_policy_fences: Vec<(PathBuf, PolicyDependencyFenceIdentity)>,
     pub(crate) capabilities: ProviderCapabilities,
 }
 
@@ -100,8 +104,9 @@ pub(crate) enum SelectedObserver {
     Advisory,
 }
 
-/// Platform selection does not activate ledger authority. Task 15 owns that
-/// decision after both native qualification suites have passed.
+/// Platform selection and production authority share the same compile-time
+/// Linux/macOS boundary. Runtime capability, filesystem, owner, cursor, and
+/// fence qualification remain mandatory before any scope can become trusted.
 pub(crate) fn select_observer() -> SelectedObserver {
     #[cfg(target_os = "linux")]
     {

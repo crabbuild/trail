@@ -111,6 +111,11 @@ impl Trail {
             && root_descriptor_identity(&root.descriptor)? == root.identity)
     }
 
+    pub(crate) fn pinned_worktree_identity_for_path(&self, path: &Path) -> Result<Vec<u8>> {
+        let descriptor = open_absolute_directory_no_follow(path)?;
+        root_descriptor_identity(&descriptor)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn pinned_worktree_path_is_visible(
         &self,
@@ -711,17 +716,28 @@ impl Trail {
         files: &BTreeMap<String, FileEntry>,
     ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
         let indexed_manifest = self.scan_worktree_manifest_indexed_with_stamps()?;
-        let manifest = indexed_manifest
-            .iter()
-            .map(|(path, indexed)| (path.clone(), indexed.manifest.clone()))
+        // A native source only needs every immutable-root file to be present
+        // and exact. Unrelated untracked files are never cloned and therefore
+        // do not make an otherwise complete source unsafe.
+        let manifest = files
+            .keys()
+            .filter_map(|path| {
+                indexed_manifest
+                    .get(path)
+                    .map(|indexed| (path.clone(), indexed.manifest.clone()))
+            })
             .collect::<BTreeMap<_, _>>();
         if !self.diff_file_maps_to_manifest(files, &manifest).is_empty() {
             return Ok(None);
         }
         Ok(Some(
-            indexed_manifest
-                .into_iter()
-                .map(|(path, indexed)| (path, indexed.stamp))
+            files
+                .keys()
+                .filter_map(|path| {
+                    indexed_manifest
+                        .get(path)
+                        .map(|indexed| (path.clone(), indexed.stamp))
+                })
                 .collect(),
         ))
     }
@@ -952,10 +968,6 @@ impl Trail {
         paths: &[String],
         manifests: &BTreeMap<String, DiskManifest>,
     ) -> Result<()> {
-        if selections.is_empty() && paths.is_empty() {
-            return Ok(());
-        }
-
         let mut sqlite_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),
             OperationMetricsDelta {
@@ -963,6 +975,13 @@ impl Trail {
                 ..OperationMetricsDelta::default()
             },
         );
+        // Even a true empty selection crosses the single audited entry point.
+        // Recording that empty envelope distinguishes "proved zero SQL work"
+        // from an operation that never established accounting at all.
+        if selections.is_empty() && paths.is_empty() {
+            return Ok(());
+        }
+
         note_selected_index_statement(&mut sqlite_metrics);
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         sqlite_metrics
@@ -2263,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_worktree_index_true_empty_input_preserves_baseline_without_an_envelope() {
+    fn selected_worktree_index_true_empty_input_records_a_complete_empty_envelope() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "hello\n").unwrap();
         Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2274,8 +2293,16 @@ mod tests {
         let report = profile_selected_worktree_index_sync(&db, &[], &[], &BTreeMap::new()).unwrap();
 
         assert_eq!(db.worktree_index_baseline_root().unwrap(), Some(baseline));
-        assert!(!report.selected_worktree_index_sqlite_accounting_complete);
-        assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 0);
+        assert!(report.selected_worktree_index_sqlite_accounting_complete);
+        assert_eq!(
+            report.selected_worktree_index_sqlite_accounting_disposition,
+            "complete"
+        );
+        assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 1);
+        assert_eq!(
+            report.selected_worktree_index_sqlite_not_applicable_count,
+            0
+        );
         assert_eq!(report.selected_worktree_index_sqlite_statement_count, 0);
         assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 0);
     }

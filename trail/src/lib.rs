@@ -35,6 +35,15 @@ pub mod test_support {
         crate::db::run_materialized_lane_snapshot_flow()
     }
 
+    pub fn changed_path_materialized_candidate_lifecycle_flow() -> std::result::Result<(), String> {
+        crate::db::run_materialized_candidate_lifecycle_flow()
+    }
+
+    #[cfg(unix)]
+    pub fn changed_path_view_flow() -> std::result::Result<(), String> {
+        crate::db::run_changed_path_view_flow()
+    }
+
     pub fn set_sparse_selection_write_failure_for_current_thread(enabled: bool) {
         crate::db::set_sparse_selection_write_failure_for_current_thread(enabled);
     }
@@ -52,6 +61,82 @@ pub mod test_support {
 
     pub fn set_changed_path_authority_override(enabled: bool) {
         crate::db::set_command_authority_override(enabled);
+    }
+
+    pub fn changed_path_activation_evidence() -> std::result::Result<serde_json::Value, String> {
+        let evidence = crate::db::ActivationEvidence::from_checked_build()?;
+        serde_json::to_value(evidence).map_err(|error| error.to_string())
+    }
+
+    pub fn changed_path_authority_enabled_for(platform: &str) -> std::result::Result<bool, String> {
+        let evidence = crate::db::ActivationEvidence::from_checked_build()?;
+        Ok(crate::db::ledger_authority_enabled_for(platform, &evidence))
+    }
+
+    pub fn changed_path_production_authority_default() -> bool {
+        crate::db::LEDGER_AUTHORITY_ENABLED
+    }
+
+    pub fn changed_path_git_qualification(
+        db: &crate::Trail,
+        force_policy_mismatch: bool,
+    ) -> std::result::Result<serde_json::Value, String> {
+        crate::db::prepare_workspace_daemon(db, true).map_err(|error| error.to_string())?;
+        let qualified = db
+            .qualified_git_candidates_for_test(force_policy_mismatch)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(qualified).map_err(|error| error.to_string())
+    }
+
+    pub fn changed_path_git_full_scan_oracle(
+        db: &crate::Trail,
+    ) -> std::result::Result<Vec<String>, String> {
+        db.git_qualification_full_scan_oracle_for_test()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn changed_path_git_command_flow(
+        db: &mut crate::Trail,
+    ) -> std::result::Result<serde_json::Value, String> {
+        crate::db::prepare_workspace_daemon(db, true).map_err(|error| error.to_string())?;
+        crate::db::set_command_authority_override(true);
+        let result = (|| {
+            let status = db.status(None).map_err(|error| error.to_string())?;
+            let diff = db
+                .diff_dirty(false, false)
+                .map_err(|error| error.to_string())?;
+            let record = db
+                .record(
+                    Some("main"),
+                    Some("qualified Git evidence command flow".to_string()),
+                    crate::Actor::human(),
+                    false,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({
+                "status": status.changed_paths.into_iter().map(|change| change.path).collect::<Vec<_>>(),
+                "diff": diff.files.into_iter().map(|change| change.path).collect::<Vec<_>>(),
+                "record": record.changed_paths.into_iter().map(|change| change.path).collect::<Vec<_>>()
+            }))
+        })();
+        crate::db::set_command_authority_override(false);
+        result
+    }
+
+    pub fn install_git_qualification_after_porcelain_hook(
+        hook: impl FnOnce() -> std::result::Result<(), String> + Send + 'static,
+    ) {
+        crate::db::install_git_qualification_after_porcelain_hook(move || {
+            hook().map_err(crate::Error::InvalidInput)
+        });
+    }
+
+    pub fn install_git_qualification_after_c2_hook(
+        hook: impl FnOnce() -> std::result::Result<(), String> + Send + 'static,
+    ) {
+        crate::db::install_git_qualification_after_c2_hook(move || {
+            hook().map_err(crate::Error::InvalidInput)
+        });
     }
     #[cfg(target_os = "macos")]
     fn run_macos_integration(
@@ -154,6 +239,11 @@ pub mod test_support {
     }
 
     #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_controlled_fence_queue_ordering() -> std::result::Result<(), String> {
+        crate::db::run_controlled_fence_queue_ordering()
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn changed_path_linux_fence_ordering() -> std::result::Result<(), String> {
         crate::db::run_fence_ordering()
     }
@@ -199,6 +289,18 @@ pub mod test_support {
     #[cfg(target_os = "linux")]
     pub fn changed_path_linux_policy_dependency_observation() -> std::result::Result<(), String> {
         crate::db::run_policy_dependency_observation()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_unsupported_filesystem_rejection() -> std::result::Result<(), String>
+    {
+        crate::db::run_unsupported_filesystem_rejection()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_unsupported_filesystem_rejection() -> std::result::Result<(), String>
+    {
+        run_macos_integration(crate::db::run_macos_unsupported_filesystem_rejection)
     }
 
     pub fn changed_path_reconciliation_oracle() -> std::result::Result<(), String> {

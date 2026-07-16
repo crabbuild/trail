@@ -162,16 +162,28 @@ impl Trail {
         lane: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
-        self.reset_case_fold_index_metrics();
-        if crate::db::change_ledger::command_authority_enabled() {
-            crate::db::change_ledger::materialized_lane_daemon_expected_scope(self, lane)?;
-        }
-        let _lock = if crate::db::change_ledger::command_authority_enabled() {
-            None
-        } else {
-            Some(self.acquire_write_lock()?)
-        };
-        self.record_lane_workdir_locked(lane, message, None)
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::MaterializedLaneRecord,
+            || {
+                self.reset_case_fold_index_metrics();
+                let _lock = if crate::db::change_ledger::command_authority_enabled() {
+                    None
+                } else {
+                    Some(self.acquire_write_lock()?)
+                };
+                let result = self.record_lane_workdir_locked(lane, message, None);
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
     }
 
     pub fn record_lane_workdir_for_turn(
@@ -180,16 +192,28 @@ impl Trail {
         turn_id: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
-        self.reset_case_fold_index_metrics();
-        if crate::db::change_ledger::command_authority_enabled() {
-            crate::db::change_ledger::materialized_lane_daemon_expected_scope(self, lane)?;
-        }
-        let _lock = if crate::db::change_ledger::command_authority_enabled() {
-            None
-        } else {
-            Some(self.acquire_write_lock()?)
-        };
-        self.record_lane_workdir_locked(lane, message, Some(turn_id))
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::MaterializedLaneRecord,
+            || {
+                self.reset_case_fold_index_metrics();
+                let _lock = if crate::db::change_ledger::command_authority_enabled() {
+                    None
+                } else {
+                    Some(self.acquire_write_lock()?)
+                };
+                let result = self.record_lane_workdir_locked(lane, message, Some(turn_id));
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
     }
 
     fn record_lane_workdir_locked(
@@ -234,25 +258,50 @@ impl Trail {
         let is_sparse = sparse_paths.is_some();
         let workdir_mode =
             self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
-        let _mutation_barrier = if workdir_mode.is_transparent_cow() {
-            let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        // Layered COW lanes are authorized by their persistent view mutation
+        // journal and exclusive view barrier. Their mountpoint is intentionally
+        // empty after unmount, so starting a filesystem observer there would
+        // both inspect the wrong authority and fail closed on absent `.trail`
+        // storage. Ordinary materialized lanes retain the native observer
+        // handoff before candidate comparison.
+        if crate::db::change_ledger::command_authority_enabled()
+            && !workdir_mode.is_transparent_cow()
+        {
+            crate::db::change_ledger::materialized_lane_daemon_expected_scope(self, lane)?;
+        }
+        // Authority-on mounted views still take the workspace writer lock
+        // before the view barrier. Materialized observer-backed lanes retain
+        // their explicit daemon handoff instead of deadlocking that observer
+        // behind a lock held by its caller.
+        let _view_workspace_lock = if workdir_mode.is_transparent_cow()
+            && crate::db::change_ledger::command_authority_enabled()
+        {
+            Some(self.acquire_write_lock()?)
+        } else {
+            None
+        };
+        let workspace_view = if workdir_mode.is_transparent_cow() {
+            Some(self.lane_workspace_view(lane)?.ok_or_else(|| {
                 Error::Corrupt(format!(
                     "layered lane `{lane}` has no persisted workspace view"
                 ))
-            })?;
-            Some(ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?)
+            })?)
         } else {
             None
         };
-        let source_upper = if workdir_mode.is_transparent_cow() {
-            Some(self.workspace_view_paths_for_lane(lane)?.source_upper)
-        } else {
-            None
-        };
+        let mut mutation_barrier = workspace_view
+            .as_ref()
+            .map(|view| ViewMutationBarrier::exclusive(Path::new(&view.meta_dir)))
+            .transpose()?;
+        let source_upper = workspace_view
+            .as_ref()
+            .map(|view| PathBuf::from(&view.source_upper));
         let record_scan_root = source_upper.as_deref().unwrap_or(&workdir_path);
         let layered_manifest_path = self.lane_layered_clean_manifest_path(&branch)?;
         let mut observed_record_cut = None;
         let mut observed_record_files = None;
+        let mut upper_recovery_walks = 0_u64;
+        let mut generated_dirty_paths = 0_u64;
         let cached_status = if crate::db::change_ledger::command_authority_enabled()
             && !workdir_mode.is_transparent_cow()
         {
@@ -287,11 +336,27 @@ impl Trail {
         } else if workdir_mode.is_transparent_cow() {
             // Derive the delta from the persistent upper layer instead of an
             // FUSE/NFS READDIR result or a scan of the composed repository.
-            let candidate_paths =
-                self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
+            let candidates = self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
+            upper_recovery_walks = candidates.upper_recovery_walks;
+            generated_dirty_paths = candidates
+                .generated_paths
+                .len()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let candidate_paths = candidates.paths.into_iter().collect::<Vec<_>>();
+            self.note_operation_metrics(OperationMetricsDelta {
+                authoritative_candidate_count: candidate_paths.len().try_into().unwrap_or(u64::MAX),
+                ..OperationMetricsDelta::default()
+            });
             let disk_files = self.scan_files_under_for_paths(record_scan_root, &candidate_paths)?;
+            let disk_manifest = self.disk_manifest(&disk_files);
+            // The exclusive view mutation barrier pins the qualified journal
+            // and its source upper for this checkpoint. Reuse these selected
+            // bytes when building the root instead of reading every candidate
+            // a second time under the same barrier.
+            observed_record_files = Some(disk_files);
             CachedWorkdirManifestStatus::Dirty {
-                disk_manifest: self.disk_manifest(&disk_files),
+                disk_manifest,
                 candidate_paths: Some(candidate_paths),
             }
         } else {
@@ -310,7 +375,14 @@ impl Trail {
         };
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
             if workdir_mode.is_transparent_cow() {
-                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                self.complete_workspace_checkpoint(
+                    lane,
+                    &head.root_id,
+                    None,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint lost its mutation barrier".into())
+                    })?,
+                )?;
             }
             self.publish_lane_marker_if_materialized(lane)?;
             return Ok(LaneRecordReport {
@@ -319,6 +391,8 @@ impl Trail {
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
                 path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks,
+                generated_dirty_paths,
             });
         }
         if let Some(session_id) = &branch.session_id {
@@ -403,7 +477,16 @@ impl Trail {
                         )?;
                     }
                     if workdir_mode.is_transparent_cow() {
-                        self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                        self.complete_workspace_checkpoint(
+                            lane,
+                            &head.root_id,
+                            None,
+                            mutation_barrier.as_mut().ok_or_else(|| {
+                                Error::Corrupt(
+                                    "layered checkpoint lost its mutation barrier".into(),
+                                )
+                            })?,
+                        )?;
                     }
                     self.publish_lane_marker_if_materialized(lane)?;
                     return Ok(LaneRecordReport {
@@ -412,6 +495,8 @@ impl Trail {
                         root_id: head.root_id,
                         changed_paths: Vec::new(),
                         path_index: self.case_fold_index_metrics_report(),
+                        upper_recovery_walks,
+                        generated_dirty_paths,
                     });
                 }
                 let selected_paths = summaries
@@ -520,6 +605,8 @@ impl Trail {
                             root_id: head.root_id,
                             changed_paths: Vec::new(),
                             path_index: self.case_fold_index_metrics_report(),
+                            upper_recovery_walks,
+                            generated_dirty_paths,
                         });
                     }
                     let selected_paths = summaries
@@ -567,7 +654,14 @@ impl Trail {
                 )?;
             }
             if workdir_mode.is_transparent_cow() {
-                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                self.complete_workspace_checkpoint(
+                    lane,
+                    &head.root_id,
+                    None,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint lost its mutation barrier".into())
+                    })?,
+                )?;
             }
             self.publish_lane_marker_if_materialized(lane)?;
             return Ok(LaneRecordReport {
@@ -576,6 +670,8 @@ impl Trail {
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
                 path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks,
+                generated_dirty_paths,
             });
         }
         self.ensure_lane_record_policy(&branch, &diff.summaries)?;
@@ -612,6 +708,27 @@ impl Trail {
             changes: diff.changes,
             created_at: now_ts(),
         };
+        let workspace_checkpoint = workspace_view
+            .as_ref()
+            .map(|view| -> Result<_> {
+                let cut = ViewMutationJournal::open(Path::new(&view.source_upper))?.cut();
+                if !cut.recovery_qualified {
+                    return Err(Error::ChangeLedgerReconcileRequired {
+                        scope: view.view_id.clone(),
+                        state: "unqualified_view_journal".into(),
+                        reason: "workspace checkpoint cannot qualify either changed-path or whiteout evidence".into(),
+                        command: "trail ledger reconcile".into(),
+                    });
+                }
+                Ok(crate::db::change_ledger::WorkspaceViewCheckpointPublication {
+                    view_id: view.view_id.clone(),
+                    expected_generation: view.generation,
+                    journal_sequence: cut.sequence,
+                    next_generation: cut.generation.saturating_add(1),
+                    journal_qualified: cut.qualified,
+                })
+            })
+            .transpose()?;
         self.invalidate_lane_marker_if_materialized(&branch)?;
         let committed_operation_id = if let Some(observed) = observed_record_cut.as_ref() {
             let evidence = crate::db::change_ledger::IntentEvidence {
@@ -651,6 +768,7 @@ impl Trail {
                 &head,
                 &branch.lane_id,
                 &operation,
+                workspace_checkpoint.as_ref(),
             )?
         };
         test_crash_point("checkpoint_after_ref_advance");
@@ -745,8 +863,18 @@ impl Trail {
         })?;
         (|| {
             fail_lane_record_postcommit_if_requested("checkpoint")?;
-            if workdir_mode.is_transparent_cow() {
-                self.complete_workspace_checkpoint(lane, &built.root_id, Some(&change_id))?;
+            if let Some(checkpoint) = &workspace_checkpoint {
+                self.repair_workspace_checkpoint_mirror(
+                    lane,
+                    &built.root_id,
+                    Some(&change_id),
+                    checkpoint.journal_sequence,
+                    checkpoint.next_generation,
+                    checkpoint.journal_qualified,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint repair lost its mutation barrier".into())
+                    })?,
+                )?;
             }
             Ok(())
         })()
@@ -770,6 +898,8 @@ impl Trail {
             root_id: built.root_id,
             changed_paths: diff.summaries,
             path_index: self.case_fold_index_metrics_report(),
+            upper_recovery_walks,
+            generated_dirty_paths,
         })
     }
 
@@ -795,7 +925,7 @@ impl Trail {
         &self,
         lane: &str,
         mode: &LaneWorkdirMode,
-    ) -> Result<Vec<String>> {
+    ) -> Result<ViewCheckpointCandidates> {
         match mode {
             LaneWorkdirMode::FuseCow => self.fuse_cow_candidate_paths_for_lane(lane),
             LaneWorkdirMode::NfsCow => self.nfs_cow_candidate_paths_for_lane(lane),
@@ -904,8 +1034,11 @@ impl Trail {
         let lane_record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
         if workdir_mode.is_transparent_cow() {
-            let candidate_paths =
-                self.transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?;
+            let candidate_paths = self
+                .transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?
+                .paths
+                .into_iter()
+                .collect::<Vec<_>>();
             let source_upper = self
                 .workspace_view_paths_for_lane(&lane_record.name)?
                 .source_upper;

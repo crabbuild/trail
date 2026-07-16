@@ -29,6 +29,65 @@ const ENOTEMPTY: i32 = 39;
 
 pub(crate) const VIEW_ROOT_INO: u64 = 1;
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_RENAME_AFTER_INTENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RENAME_BEFORE_DURABILITY_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NAMESPACE_BEFORE_DURABILITY_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_rename_after_intent_for_current_thread() {
+    FAIL_RENAME_AFTER_INTENT.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn fail_rename_after_intent_if_requested() -> std::result::Result<(), i32> {
+    if FAIL_RENAME_AFTER_INTENT.with(|fail| fail.replace(false)) {
+        Err(EIO)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn fail_rename_before_durability_fence_for_current_thread() {
+    FAIL_RENAME_BEFORE_DURABILITY_FENCE.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn fail_rename_before_durability_fence_if_requested() -> std::result::Result<(), i32> {
+    if FAIL_RENAME_BEFORE_DURABILITY_FENCE.with(|fail| fail.replace(false)) {
+        Err(EIO)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn fail_rename_before_durability_fence_if_requested() -> std::result::Result<(), i32> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn fail_namespace_before_durability_fence_for_current_thread() {
+    FAIL_NAMESPACE_BEFORE_DURABILITY_FENCE.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn fail_namespace_before_durability_fence_if_requested() -> std::result::Result<(), i32> {
+    if FAIL_NAMESPACE_BEFORE_DURABILITY_FENCE.with(|fail| fail.replace(false)) {
+        Err(EIO)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn fail_namespace_before_durability_fence_if_requested() -> std::result::Result<(), i32> {
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewNodeKind {
     File,
@@ -61,6 +120,7 @@ pub(crate) struct ViewCore {
     dir_epoch: SystemTime,
     next_ino: u64,
     journal: ViewMutationJournal,
+    generation_lease: ViewGenerationLease,
 }
 
 const LAYER_MOUNT_RESET_INTENT_VERSION: u16 = 2;
@@ -94,6 +154,7 @@ pub(crate) struct PreparedLayerMountReset {
 }
 
 struct RecoveredLayerMountReset {
+    mount_path: String,
     intent_path: PathBuf,
     backup_path: PathBuf,
     removed_whiteouts: Vec<String>,
@@ -149,7 +210,15 @@ impl ViewCore {
         let dir_epoch = SystemTime::now();
         let layout = ViewUpperLayout::from_source_upper(upperdir);
         layout.ensure()?;
-        let journal = ViewMutationJournal::open(&layout.source_upper)?;
+        ViewMutationJournal::initialize_storage(&layout.source_upper)?;
+        let _barrier = ViewMutationBarrier::shared(&layout.meta_dir)?;
+        let mut journal = ViewMutationJournal::open(&layout.source_upper)?;
+        journal.observe_checkpoint(
+            _barrier.checkpoint_sequence(),
+            _barrier.checkpoint_generation(),
+        )?;
+        let generation_lease =
+            ViewGenerationLease::acquire(&layout.source_upper, journal.generation())?;
         let ephemeral = ephemeral_layers.is_some();
         let layers = match ephemeral_layers {
             Some(layers) => layers,
@@ -172,14 +241,31 @@ impl ViewCore {
             dir_epoch,
             next_ino: VIEW_ROOT_INO + 1,
             journal,
+            generation_lease,
         };
-        core.whiteouts = core.load_whiteouts()?;
+        core.whiteouts = core.journal.whiteouts().clone();
         if !recovered_resets.is_empty() {
             for recovered in &recovered_resets {
+                if !recovered.removed_whiteouts.is_empty() {
+                    let class = core.path_class(&recovered.mount_path);
+                    let sequence = core.journal.append_classified_with_whiteouts(
+                        ViewMutationKind::Metadata,
+                        recovered.mount_path.clone(),
+                        class,
+                        None,
+                        None,
+                        recovered
+                            .removed_whiteouts
+                            .iter()
+                            .cloned()
+                            .map(ViewWhiteoutChange::Insert)
+                            .collect(),
+                    )?;
+                    core.journal.commit_whiteouts(sequence)?;
+                }
                 core.whiteouts
                     .extend(recovered.removed_whiteouts.iter().cloned());
             }
-            core.save_whiteouts()?;
             for recovered in recovered_resets {
                 finish_layer_mount_reset_recovery(&recovered)?;
             }
@@ -810,8 +896,22 @@ impl ViewCore {
     fn begin_mutation(&mut self) -> std::result::Result<ViewMutationBarrier, i32> {
         let barrier = ViewMutationBarrier::shared(&self.layout.meta_dir).map_err(|_| EIO)?;
         self.journal
-            .observe_checkpoint(barrier.checkpoint_sequence());
+            .observe_checkpoint(
+                barrier.checkpoint_sequence(),
+                barrier.checkpoint_generation(),
+            )
+            .map_err(|_| EIO)?;
+        self.generation_lease
+            .advance(&self.layout.source_upper, self.journal.generation())
+            .map_err(|_| EIO)?;
+        if !self.journal.is_qualified() {
+            return Err(EIO);
+        }
         Ok(barrier)
+    }
+
+    fn begin_qualified_view_mutation(&mut self) -> std::result::Result<ViewMutationBarrier, i32> {
+        self.begin_mutation()
     }
 
     #[allow(dead_code)]
@@ -820,8 +920,11 @@ impl ViewCore {
         path: &str,
         truncate: bool,
     ) -> std::result::Result<File, i32> {
-        let _barrier = self.begin_mutation()?;
-        self.ensure_upper_file_under_barrier(path, truncate)
+        // TRAIL_FS_PRODUCER: mounted_cow_copy_up CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
+        let file = self.ensure_upper_file_under_barrier(path, truncate)?;
+        barrier.validate().map_err(|_| EIO)?;
+        Ok(file)
     }
 
     fn ensure_upper_file_under_barrier(
@@ -832,9 +935,28 @@ impl ViewCore {
         if self.node_kind(path)? == Some(ViewNodeKind::Directory) {
             return Err(EISDIR);
         }
-        self.ensure_upper_parent(path)?;
         let upper = self.upper_path(path)?;
-        if !upper.exists() {
+        let created_upper = !upper.exists();
+        let class = self.path_class(path);
+        let whiteout_changes = if self.whiteouts.contains(path) {
+            vec![ViewWhiteoutChange::Remove(path.to_string())]
+        } else {
+            Vec::new()
+        };
+        let has_whiteout_changes = !whiteout_changes.is_empty();
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Write,
+                path.to_string(),
+                class,
+                None,
+                None,
+                whiteout_changes,
+            )
+            .map_err(|_| EIO)?;
+        self.ensure_upper_parent(path)?;
+        if created_upper {
             let visible_size = if truncate {
                 0
             } else if let Some(layer_path) = self.layer_path(path)? {
@@ -872,12 +994,6 @@ impl ViewCore {
                 File::create(&upper).map_err(io_errno)?;
             }
         }
-        self.whiteouts.remove(path);
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let class = self.path_class(path);
-        self.journal
-            .append_classified(ViewMutationKind::Write, path.to_string(), class, None, None)
-            .map_err(|_| EIO)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -887,6 +1003,15 @@ impl ViewCore {
         if truncate {
             file.sync_data().map_err(io_errno)?;
         }
+        if created_upper || has_whiteout_changes {
+            self.sync_namespace_publication(path)?;
+        }
+        if has_whiteout_changes {
+            self.journal
+                .commit_whiteouts(intent_sequence)
+                .map_err(|_| EIO)?;
+        }
+        self.whiteouts.remove(path);
         Ok(file)
     }
 
@@ -896,7 +1021,8 @@ impl ViewCore {
         offset: u64,
         data: &[u8],
     ) -> std::result::Result<ViewNodeAttr, i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_write CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let path = self.path_for_ino(ino)?;
         let visible_size = self.attr(&path)?.size;
         let proposed_size = visible_size.max(offset.saturating_add(data.len() as u64));
@@ -905,6 +1031,7 @@ impl ViewCore {
         write_all_file_at(&file, data, offset).map_err(io_errno)?;
         file.sync_data().map_err(io_errno)?;
         test_crash_point("checkpoint_after_source_sync");
+        barrier.validate().map_err(|_| EIO)?;
         self.attr(&path)
     }
 
@@ -915,12 +1042,25 @@ impl ViewCore {
         mode: u32,
         exclusive: bool,
     ) -> std::result::Result<ViewNodeAttr, i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_create CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
         if exclusive && self.node_kind(&path)?.is_some() {
             return Err(EEXIST);
         }
         self.enforce_mutation_quota(&path, Some(0), self.upper_metadata(&path).is_none())?;
+        let class = self.path_class(&path);
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Create,
+                path.clone(),
+                class,
+                None,
+                None,
+                vec![ViewWhiteoutChange::Remove(path.clone())],
+            )
+            .map_err(|_| EIO)?;
         self.ensure_upper_parent(&path)?;
         let file = OpenOptions::new()
             .read(true)
@@ -932,13 +1072,13 @@ impl ViewCore {
             .map_err(io_errno)?;
         set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
         file.sync_data().map_err(io_errno)?;
-        self.whiteouts.remove(&path);
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let class = self.path_class(&path);
+        self.sync_namespace_publication(&path)?;
         self.journal
-            .append_classified(ViewMutationKind::Create, path.clone(), class, None, None)
+            .commit_whiteouts(intent_sequence)
             .map_err(|_| EIO)?;
+        self.whiteouts.remove(&path);
         self.touch_parent(&path);
+        barrier.validate().map_err(|_| EIO)?;
         self.attr(&path)
     }
 
@@ -948,22 +1088,35 @@ impl ViewCore {
         name: &str,
         mode: u32,
     ) -> std::result::Result<ViewNodeAttr, i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_mkdir CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
         if self.node_kind(&path)?.is_some() {
             return Err(EEXIST);
         }
         self.enforce_mutation_quota(&path, None, false)?;
+        let class = self.path_class(&path);
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Mkdir,
+                path.clone(),
+                class,
+                None,
+                None,
+                vec![ViewWhiteoutChange::Remove(path.clone())],
+            )
+            .map_err(|_| EIO)?;
         fs::create_dir_all(self.upper_path(&path)?).map_err(io_errno)?;
         set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
-        self.whiteouts.remove(&path);
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let class = self.path_class(&path);
+        self.sync_namespace_publication(&path)?;
         self.journal
-            .append_classified(ViewMutationKind::Mkdir, path.clone(), class, None, None)
+            .commit_whiteouts(intent_sequence)
             .map_err(|_| EIO)?;
+        self.whiteouts.remove(&path);
         self.touch_parent(&path);
         self.touch_dir(path.clone());
+        barrier.validate().map_err(|_| EIO)?;
         self.attr(&path)
     }
 
@@ -974,22 +1127,35 @@ impl ViewCore {
         name: &str,
         target: &Path,
     ) -> std::result::Result<ViewNodeAttr, i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_symlink CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
         if self.node_kind(&path)?.is_some() {
             return Err(EEXIST);
         }
         validate_view_symlink_target(&path, target)?;
         self.enforce_mutation_quota(&path, Some(target.to_string_lossy().len() as u64), true)?;
+        let class = self.path_class(&path);
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Create,
+                path.clone(),
+                class,
+                None,
+                None,
+                vec![ViewWhiteoutChange::Remove(path.clone())],
+            )
+            .map_err(|_| EIO)?;
         self.ensure_upper_parent(&path)?;
         std::os::unix::fs::symlink(target, self.upper_path(&path)?).map_err(io_errno)?;
-        self.whiteouts.remove(&path);
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let class = self.path_class(&path);
+        self.sync_namespace_publication(&path)?;
         self.journal
-            .append_classified(ViewMutationKind::Create, path.clone(), class, None, None)
+            .commit_whiteouts(intent_sequence)
             .map_err(|_| EIO)?;
+        self.whiteouts.remove(&path);
         self.touch_parent(&path);
+        barrier.validate().map_err(|_| EIO)?;
         self.attr(&path)
     }
 
@@ -1003,7 +1169,12 @@ impl ViewCore {
         if size.is_none() && mode.is_none() {
             return self.attr(&path);
         }
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_setattr CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
+        let class = self.path_class(&path);
+        self.journal
+            .append_classified(ViewMutationKind::Metadata, path.clone(), class, None, None)
+            .map_err(|_| EIO)?;
         if let Some(size) = size {
             self.enforce_mutation_quota(&path, Some(size), false)?;
             let file = self.ensure_upper_file_under_barrier(&path, false)?;
@@ -1020,15 +1191,13 @@ impl ViewCore {
                 set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
             }
         }
-        let class = self.path_class(&path);
-        self.journal
-            .append_classified(ViewMutationKind::Metadata, path.clone(), class, None, None)
-            .map_err(|_| EIO)?;
+        barrier.validate().map_err(|_| EIO)?;
         self.attr(&path)
     }
 
     pub(crate) fn remove(&mut self, parent: u64, name: &str) -> std::result::Result<(), i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_remove CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
         self.enforce_mutation_quota(&path, None, false)?;
         let kind = self.node_kind(&path)?.ok_or(ENOENT)?;
@@ -1036,6 +1205,27 @@ impl ViewCore {
         if kind == ViewNodeKind::Directory && !self.children(ino)?.is_empty() {
             return Err(ENOTEMPTY);
         }
+        let hides_lower = self.layer_path(&path)?.is_some()
+            || self.layer_directory_exists(&path)?
+            || self.lower_file(&path)?.is_some()
+            || self.lower_directory_exists(&path)?;
+        let whiteout_changes = if hides_lower {
+            vec![ViewWhiteoutChange::Insert(path.clone())]
+        } else {
+            Vec::new()
+        };
+        let class = self.path_class(&path);
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Delete,
+                path.clone(),
+                class,
+                None,
+                None,
+                whiteout_changes,
+            )
+            .map_err(|_| EIO)?;
         if let Some(metadata) = self.upper_metadata(&path) {
             if metadata.is_dir() {
                 fs::remove_dir(self.upper_path(&path)?).map_err(io_errno)?;
@@ -1043,19 +1233,17 @@ impl ViewCore {
                 fs::remove_file(self.upper_path_with_leaf_symlink(&path)?).map_err(io_errno)?;
             }
         }
-        if self.layer_path(&path)?.is_some()
-            || self.layer_directory_exists(&path)?
-            || self.lower_file(&path)?.is_some()
-            || self.lower_directory_exists(&path)?
-        {
+        self.sync_namespace_publication(&path)?;
+        if hides_lower {
+            self.journal
+                .commit_whiteouts(intent_sequence)
+                .map_err(|_| EIO)?;
+        }
+        if hides_lower {
             self.whiteouts.insert(path.clone());
         }
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let class = self.path_class(&path);
-        self.journal
-            .append_classified(ViewMutationKind::Delete, path.clone(), class, None, None)
-            .map_err(|_| EIO)?;
         self.touch_parent(&path);
+        barrier.validate().map_err(|_| EIO)?;
         Ok(())
     }
 
@@ -1132,6 +1320,14 @@ impl ViewCore {
         let _barrier = self
             .begin_mutation()
             .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        let intent_sequence = self.journal.append_classified_with_whiteouts(
+            ViewMutationKind::Mkdir,
+            path.clone(),
+            class,
+            None,
+            None,
+            vec![ViewWhiteoutChange::RemoveTree(path.clone())],
+        )?;
         match fs::symlink_metadata(&upper) {
             Ok(metadata) if metadata.is_dir() => Ok(()),
             Ok(_) => Err(Error::InvalidInput(format!(
@@ -1143,10 +1339,12 @@ impl ViewCore {
             }
             Err(err) => Err(Error::Io(err)),
         }?;
+        self.sync_namespace_publication(&path)
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        self.journal.commit_whiteouts(intent_sequence)?;
         let prefix = format!("{path}/");
         self.whiteouts
             .retain(|whiteout| whiteout != &path && !whiteout.starts_with(&prefix));
-        self.save_whiteouts()?;
         self.touch_parent(&path);
         Ok(())
     }
@@ -1239,6 +1437,14 @@ impl ViewCore {
             removed_whiteouts: removed_whiteouts.clone(),
         };
         write_file_atomic(&intent_path, &serde_json::to_vec_pretty(&intent)?, true)?;
+        let intent_sequence = self.journal.append_classified_with_whiteouts(
+            ViewMutationKind::Metadata,
+            path.to_string(),
+            class,
+            None,
+            None,
+            vec![ViewWhiteoutChange::RemoveTree(path.to_string())],
+        )?;
 
         let reset = (|| -> Result<()> {
             match fs::symlink_metadata(&upper) {
@@ -1256,7 +1462,6 @@ impl ViewCore {
             }
             self.whiteouts
                 .retain(|whiteout| whiteout != path && !whiteout.starts_with(&prefix));
-            self.save_whiteouts()?;
             Ok(())
         })();
         let prepared = PreparedLayerMountReset {
@@ -1271,6 +1476,9 @@ impl ViewCore {
             let _ = prepared.rollback(self);
             return Err(err);
         }
+        self.sync_namespace_publication(path)
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        self.journal.commit_whiteouts(intent_sequence)?;
         self.touch_parent(path);
         Ok(prepared)
     }
@@ -1282,7 +1490,8 @@ impl ViewCore {
         to_parent: u64,
         to_name: &str,
     ) -> std::result::Result<(), i32> {
-        let _barrier = self.begin_mutation()?;
+        // TRAIL_FS_PRODUCER: mounted_cow_rename CowPublication controlled
+        let barrier = self.begin_qualified_view_mutation()?;
         let old = self.child_path(from_parent, from_name)?;
         let new = self.child_path(to_parent, to_name)?;
         if old == new {
@@ -1293,7 +1502,6 @@ impl ViewCore {
         if kind == ViewNodeKind::Directory && new.starts_with(&format!("{old}/")) {
             return Err(EINVAL);
         }
-        self.ensure_upper_parent(&new)?;
         if let Some(target_kind) = self.node_kind(&new)? {
             if kind == ViewNodeKind::File && target_kind == ViewNodeKind::Directory {
                 return Err(EISDIR);
@@ -1308,6 +1516,25 @@ impl ViewCore {
                 }
             }
         }
+        let old_class = self.path_class(&old);
+        let new_class = self.path_class(&new);
+        let intent_sequence = self
+            .journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Rename,
+                old.clone(),
+                old_class,
+                Some(new.clone()),
+                Some(new_class),
+                vec![
+                    ViewWhiteoutChange::Insert(old.clone()),
+                    ViewWhiteoutChange::RemoveTree(new.clone()),
+                ],
+            )
+            .map_err(|_| EIO)?;
+        #[cfg(test)]
+        fail_rename_after_intent_if_requested()?;
+        self.ensure_upper_parent(&new)?;
         if self.upper_metadata(&new).is_some() {
             let metadata = self.upper_metadata(&new).unwrap();
             if metadata.is_dir() {
@@ -1333,23 +1560,17 @@ impl ViewCore {
             validate_view_symlink_target(&new, &target)?;
             create_view_symlink(&target, &self.upper_path(&new)?).map_err(io_errno)?;
         }
-        self.whiteouts.insert(old.clone());
-        self.whiteouts.remove(&new);
-        self.save_whiteouts().map_err(|_| EIO)?;
-        let old_class = self.path_class(&old);
-        let new_class = self.path_class(&new);
+        fail_rename_before_durability_fence_if_requested()?;
+        self.sync_rename_publication(&old, &new)?;
         self.journal
-            .append_classified(
-                ViewMutationKind::Rename,
-                old.clone(),
-                old_class,
-                Some(new.clone()),
-                Some(new_class),
-            )
+            .commit_whiteouts(intent_sequence)
             .map_err(|_| EIO)?;
+        self.whiteouts.insert(old.clone());
+        let new_prefix = format!("{new}/");
+        self.whiteouts
+            .retain(|path| path != &new && !path.starts_with(&new_prefix));
         self.touch_parent(&old);
         self.touch_parent(&new);
-        let new_prefix = format!("{new}/");
         let replaced_inodes = self
             .ino_by_path
             .keys()
@@ -1375,13 +1596,13 @@ impl ViewCore {
             self.ino_by_path.insert(moved.clone(), ino);
             self.path_by_ino.insert(ino, moved);
         }
+        barrier.validate().map_err(|_| EIO)?;
         Ok(())
     }
 
     /// Returns the checkpoint candidate set without walking the composed view.
     /// The journal is the fast path; upper and whiteout scans make recovery
     /// correct after an interrupted append.
-    #[cfg(test)]
     pub(crate) fn checkpoint_candidates(&self) -> Result<ViewCheckpointCandidates> {
         match &self.lower {
             #[cfg(test)]
@@ -1402,7 +1623,9 @@ impl ViewCore {
             let target_path = self.upper_path(target)?;
             clone_or_copy_projected_file(&layer_path, &target_path).map_err(|_| EIO)?;
             let metadata = fs::metadata(layer_path).map_err(io_errno)?;
-            return set_file_mode(&target_path, copy_up_mode(&metadata)).map_err(io_errno);
+            set_file_mode(&target_path, copy_up_mode(&metadata)).map_err(io_errno)?;
+            self.sync_copied_file(&target_path)?;
+            return Ok(());
         }
         let entry = self.lower_file(source)?.ok_or(ENOENT)?;
         self.ensure_upper_parent(target)?;
@@ -1417,7 +1640,96 @@ impl ViewCore {
                 entry.mode & 0o777
             },
         )
-        .map_err(io_errno)
+        .map_err(io_errno)?;
+        self.sync_copied_file(&target_path)
+    }
+
+    fn sync_copied_file(&self, path: &Path) -> std::result::Result<(), i32> {
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(io_errno)?;
+        if let Some(parent) = path.parent() {
+            sync_directory_strict(parent).map_err(|_| EIO)?;
+        }
+        Ok(())
+    }
+
+    fn sync_namespace_publication(&self, path: &str) -> std::result::Result<(), i32> {
+        fail_namespace_before_durability_fence_if_requested()?;
+        let upper = self.upper_path_with_leaf_symlink(path)?;
+        match fs::symlink_metadata(&upper) {
+            Ok(metadata) if metadata.is_file() => {
+                OpenOptions::new()
+                    .read(true)
+                    .open(&upper)
+                    .and_then(|file| file.sync_all())
+                    .map_err(io_errno)?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                sync_directory_strict(&upper).map_err(|_| EIO)?;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_errno(err)),
+        }
+
+        let root = self.layout.upper_for_class(self.path_class(path));
+        let mut cursor = upper.parent();
+        while let Some(directory) = cursor {
+            if directory.is_dir() {
+                sync_directory_strict(directory).map_err(|_| EIO)?;
+            }
+            if directory == root {
+                break;
+            }
+            cursor = directory.parent();
+        }
+        Ok(())
+    }
+
+    fn sync_rename_publication(&self, old: &str, new: &str) -> std::result::Result<(), i32> {
+        let mut directories = BTreeSet::new();
+        for root in [
+            &self.layout.source_upper,
+            &self.layout.generated_upper,
+            &self.layout.scratch_upper,
+        ] {
+            let source = safe_join(root, old).map_err(|_| EINVAL)?;
+            if let Some(parent) = source.parent() {
+                insert_directory_ancestry(&mut directories, parent, root);
+            }
+            let destination = safe_join(root, new).map_err(|_| EINVAL)?;
+            if let Some(parent) = destination.parent() {
+                insert_directory_ancestry(&mut directories, parent, root);
+            }
+            let metadata = match fs::symlink_metadata(&destination) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_errno(err)),
+            };
+            if metadata.is_dir() {
+                for entry in walkdir::WalkDir::new(&destination).follow_links(false) {
+                    let entry = entry.map_err(|_| EIO)?;
+                    if entry.file_type().is_dir() {
+                        directories.insert(entry.path().to_path_buf());
+                    }
+                }
+            } else if metadata.is_file() {
+                OpenOptions::new()
+                    .read(true)
+                    .open(&destination)
+                    .and_then(|file| file.sync_all())
+                    .map_err(io_errno)?;
+            }
+        }
+        for directory in directories {
+            if directory.is_dir() {
+                sync_directory_strict(&directory).map_err(|_| EIO)?;
+            }
+        }
+        Ok(())
     }
 
     fn merge_lower_subtree_into_upper(&self, root: &str) -> std::result::Result<(), i32> {
@@ -1512,56 +1824,108 @@ impl ViewCore {
         }
         Ok(())
     }
+}
 
-    fn load_whiteouts(&self) -> Result<BTreeSet<String>> {
-        let mut whiteouts = BTreeSet::new();
-        let classes = [
-            ViewPathClass::Source,
-            ViewPathClass::Dependency,
-            ViewPathClass::Generated,
-            ViewPathClass::Scratch,
-            ViewPathClass::Secret,
-        ];
-        for path in classes
-            .into_iter()
-            .map(|class| self.layout.whiteouts_path(class))
-            .chain(std::iter::once(self.layout.legacy_whiteouts_path()))
-        {
-            match fs::read(path) {
-                Ok(bytes) => {
-                    for path in serde_json::from_slice::<Vec<String>>(&bytes)? {
-                        whiteouts.insert(normalize_relative_path(&path)?);
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(Error::Io(err)),
-            }
+fn insert_directory_ancestry(directories: &mut BTreeSet<PathBuf>, start: &Path, root: &Path) {
+    let mut cursor = Some(start);
+    while let Some(directory) = cursor {
+        if !directory.starts_with(root) {
+            break;
         }
-        Ok(whiteouts)
+        directories.insert(directory.to_path_buf());
+        if directory == root {
+            break;
+        }
+        cursor = directory.parent();
+    }
+}
+
+#[cfg(all(debug_assertions, unix))]
+pub(crate) fn run_changed_path_view_flow() -> std::result::Result<(), String> {
+    let temp = tempfile::tempdir().map_err(|err| err.to_string())?;
+    fs::write(temp.path().join("README.md"), b"baseline\n").map_err(|err| err.to_string())?;
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)
+        .map_err(|err| err.to_string())?;
+    let db = Trail::open(temp.path()).map_err(|err| err.to_string())?;
+    let root = db
+        .resolve_branch_ref("main")
+        .map_err(|err| err.to_string())?
+        .root_id;
+
+    let upper = temp.path().join("view/source-upper");
+    let mut view = ViewCore::new_lazy(
+        Trail::open(temp.path()).map_err(|err| err.to_string())?,
+        upper.clone(),
+        root.clone(),
+    )
+    .map_err(|err| err.to_string())?;
+    let readme = view
+        .lookup(VIEW_ROOT_INO, "README.md")
+        .map_err(|code| format!("lookup failed with errno {code}"))?;
+    fail_next_view_journal_sync_for_current_thread();
+    if view.write(readme, 0, b"new").is_ok() {
+        return Err("injected journal sync failure unexpectedly exposed a write".to_string());
+    }
+    if upper.join("README.md").exists() {
+        return Err("copy-up became visible before its intent was durable".to_string());
+    }
+    if fs::read(temp.path().join("README.md")).map_err(|err| err.to_string())? != b"baseline\n" {
+        return Err("journal sync failure changed the lower file".to_string());
     }
 
-    fn save_whiteouts(&self) -> Result<()> {
-        fs::create_dir_all(&self.layout.meta_dir)?;
-        for class in [
-            ViewPathClass::Source,
-            ViewPathClass::Dependency,
-            ViewPathClass::Generated,
-            ViewPathClass::Scratch,
-            ViewPathClass::Secret,
-        ] {
-            let paths = self
-                .whiteouts
-                .iter()
-                .filter(|path| self.path_class(path) == class)
-                .collect::<Vec<_>>();
-            write_file_atomic(
-                &self.layout.whiteouts_path(class),
-                &serde_json::to_vec(&paths)?,
-                false,
-            )?;
-        }
-        Ok(())
+    view.write(readme, 0, b"changed")
+        .map_err(|code| format!("write failed with errno {code}"))?;
+    let qualified = view
+        .checkpoint_candidates()
+        .map_err(|err| err.to_string())?;
+    if !qualified.qualified || qualified.upper_recovery_walks != 0 {
+        return Err("qualified view did not retain the zero-walk fast path".to_string());
     }
+    OpenOptions::new()
+        .append(true)
+        .open(ViewUpperLayout::from_source_upper(upper.clone()).journal_path())
+        .and_then(|mut file| file.write_all(b"corrupt-complete-record\n"))
+        .map_err(|err| err.to_string())?;
+    let recovered = view
+        .checkpoint_candidates()
+        .map_err(|err| err.to_string())?;
+    if recovered.qualified
+        || recovered.upper_recovery_walks == 0
+        || !recovered.paths.contains("README.md")
+    {
+        return Err("untrusted view did not reconcile its upper tree".to_string());
+    }
+
+    let whiteout_upper = temp.path().join("whiteout-view/source-upper");
+    let mut whiteout_view = ViewCore::new_lazy(
+        Trail::open(temp.path()).map_err(|err| err.to_string())?,
+        whiteout_upper.clone(),
+        root.clone(),
+    )
+    .map_err(|err| err.to_string())?;
+    whiteout_view
+        .remove(VIEW_ROOT_INO, "README.md")
+        .map_err(|code| format!("remove failed with errno {code}"))?;
+    drop(whiteout_view);
+    let reopened = ViewCore::new_lazy(
+        Trail::open(temp.path()).map_err(|err| err.to_string())?,
+        whiteout_upper,
+        root,
+    )
+    .map_err(|err| err.to_string())?;
+    if !reopened.is_whiteouted("README.md") {
+        return Err("incremental whiteout was not replayed".to_string());
+    }
+    let whiteout_candidates = reopened
+        .checkpoint_candidates()
+        .map_err(|err| err.to_string())?;
+    if !whiteout_candidates.qualified
+        || whiteout_candidates.upper_recovery_walks != 0
+        || !whiteout_candidates.paths.contains("README.md")
+    {
+        return Err("qualified incremental whiteout lost checkpoint authority".to_string());
+    }
+    Ok(())
 }
 
 impl PreparedLayerMountReset {
@@ -1603,6 +1967,24 @@ impl PreparedLayerMountReset {
     }
 
     pub(crate) fn rollback(self, core: &mut ViewCore) -> Result<()> {
+        let whiteout_sequence = if !self.removed_whiteouts.is_empty() {
+            let class = core.path_class(&self.mount_path);
+            let sequence = core.journal.append_classified_with_whiteouts(
+                ViewMutationKind::Metadata,
+                self.mount_path.clone(),
+                class,
+                None,
+                None,
+                self.removed_whiteouts
+                    .iter()
+                    .cloned()
+                    .map(ViewWhiteoutChange::Insert)
+                    .collect(),
+            )?;
+            Some(sequence)
+        } else {
+            None
+        };
         let upper = safe_join(
             self.layout.upper_for_class(self.upper_class),
             &self.mount_path,
@@ -1617,8 +1999,10 @@ impl PreparedLayerMountReset {
                 sync_directory(parent);
             }
         }
+        if let Some(sequence) = whiteout_sequence {
+            core.journal.commit_whiteouts(sequence)?;
+        }
         core.whiteouts.extend(self.removed_whiteouts);
-        core.save_whiteouts()?;
         remove_layer_mount_reset_path(&self.intent_path)?;
         if let Some(parent) = self.intent_path.parent() {
             sync_directory(parent);
@@ -1742,6 +2126,7 @@ fn recover_layer_mount_resets(
             }
         }
         recovered.push(RecoveredLayerMountReset {
+            mount_path,
             intent_path,
             backup_path,
             removed_whiteouts: intent.removed_whiteouts,
@@ -2019,7 +2404,6 @@ mod tests {
         let mut view = lazy_core(&db, &root, upper.clone());
         view.whiteouts
             .insert("node_modules/pkg/removed.js".to_string());
-        view.save_whiteouts().unwrap();
 
         let reset = view
             .prepare_declared_layer_mount_path("node_modules", "dependency", "layer-not-committed")
@@ -2101,7 +2485,6 @@ mod tests {
         let mut view = lazy_core(&db, &root, upper.clone());
         view.whiteouts
             .insert("generated/old/removed.txt".to_string());
-        view.save_whiteouts().unwrap();
 
         let reset = view
             .prepare_declared_layer_unmount_path("generated/old", "generated")
@@ -2142,6 +2525,293 @@ mod tests {
         assert!(view.lookup(VIEW_ROOT_INO, "README.md").is_err());
         let reopened = core(&db, &root, upper);
         assert!(reopened.is_whiteouted("README.md"));
+    }
+
+    #[test]
+    fn crash_after_rename_intent_does_not_publish_whiteout_state() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        view.journal
+            .append_classified_with_whiteouts(
+                ViewMutationKind::Rename,
+                "README.md".into(),
+                ViewPathClass::Source,
+                Some("renamed.md".into()),
+                Some(ViewPathClass::Source),
+                vec![
+                    ViewWhiteoutChange::Insert("README.md".into()),
+                    ViewWhiteoutChange::RemoveTree("renamed.md".into()),
+                ],
+            )
+            .unwrap();
+        drop(view); // crash before the filesystem rename and commit record
+
+        let mut reopened = core(&db, &root, upper);
+        assert!(reopened.lookup(VIEW_ROOT_INO, "README.md").is_ok());
+        assert!(reopened.lookup(VIEW_ROOT_INO, "renamed.md").is_err());
+        assert!(!reopened.is_whiteouted("README.md"));
+    }
+
+    #[test]
+    fn rename_io_failure_after_intent_does_not_publish_whiteout_state() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        fail_rename_after_intent_for_current_thread();
+        assert!(matches!(
+            view.rename(VIEW_ROOT_INO, "README.md", VIEW_ROOT_INO, "renamed.md"),
+            Err(code) if code == EIO
+        ));
+        drop(view);
+
+        let mut reopened = core(&db, &root, upper);
+        assert!(reopened.lookup(VIEW_ROOT_INO, "README.md").is_ok());
+        assert!(reopened.lookup(VIEW_ROOT_INO, "renamed.md").is_err());
+        assert!(!reopened.is_whiteouted("README.md"));
+    }
+
+    #[test]
+    fn rename_durability_fence_precedes_semantic_commit() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        view.write(readme, 0, b"changed\n").unwrap();
+        fail_rename_before_durability_fence_for_current_thread();
+
+        assert!(matches!(
+            view.rename(VIEW_ROOT_INO, "README.md", VIEW_ROOT_INO, "renamed.md"),
+            Err(code) if code == EIO
+        ));
+        assert!(upper.join("renamed.md").is_file());
+        drop(view);
+
+        let mut reopened = core(&db, &root, upper);
+        assert!(reopened.lookup(VIEW_ROOT_INO, "README.md").is_ok());
+        assert!(reopened.lookup(VIEW_ROOT_INO, "renamed.md").is_ok());
+        assert!(!reopened.is_whiteouted("README.md"));
+        let candidates = reopened.checkpoint_candidates().unwrap();
+        assert!(candidates.paths.contains("README.md"));
+        assert!(candidates.paths.contains("renamed.md"));
+    }
+
+    #[test]
+    fn namespace_durability_fence_precedes_remove_whiteout_commit() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        fail_namespace_before_durability_fence_for_current_thread();
+
+        assert!(matches!(
+            view.remove(VIEW_ROOT_INO, "README.md"),
+            Err(code) if code == EIO
+        ));
+        drop(view);
+
+        let mut reopened = core(&db, &root, upper);
+        assert!(reopened.lookup(VIEW_ROOT_INO, "README.md").is_ok());
+        assert!(!reopened.is_whiteouted("README.md"));
+        assert!(reopened
+            .checkpoint_candidates()
+            .unwrap()
+            .paths
+            .contains("README.md"));
+    }
+
+    #[test]
+    fn first_copy_up_requires_namespace_durability_before_write() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        fail_namespace_before_durability_fence_for_current_thread();
+
+        assert!(matches!(
+            view.write(readme, 0, b"changed\n"),
+            Err(code) if code == EIO
+        ));
+        assert_eq!(fs::read(upper.join("README.md")).unwrap(), b"baseline\n");
+        drop(view);
+
+        let mut reopened = core(&db, &root, upper);
+        let reopened_readme = reopened.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        assert_eq!(
+            reopened.read(reopened_readme, 0, 32).unwrap().0,
+            b"baseline\n"
+        );
+        assert!(reopened
+            .checkpoint_candidates()
+            .unwrap()
+            .paths
+            .contains("README.md"));
+    }
+
+    #[test]
+    fn semantic_upper_mutation_is_not_visible_before_intent_is_durable() {
+        let (temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        fail_next_view_journal_sync_for_current_thread();
+
+        assert!(matches!(view.write(readme, 0, b"new"), Err(code) if code == EIO));
+        assert!(!upper.join("README.md").exists());
+        assert_eq!(
+            fs::read(temp.path().join("README.md")).unwrap(),
+            b"baseline\n"
+        );
+        assert_eq!(view.read(readme, 0, 32).unwrap().0, b"baseline\n");
+    }
+
+    #[test]
+    fn live_handle_reloads_after_noop_checkpoint_rotates_generation() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        {
+            let mut checkpoint = ViewMutationBarrier::exclusive(&layout.meta_dir).unwrap();
+            ViewMutationJournal::rotate_after_checkpoint(&upper, 0, 1).unwrap();
+            checkpoint.record_checkpoint_cut(0, 1).unwrap();
+        }
+
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        view.write(readme, 0, b"changed\n").unwrap();
+
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(candidates.qualified);
+        assert_eq!(candidates.journal_sequence, 1);
+        assert!(candidates.paths.contains("README.md"));
+        let active = ViewMutationJournal::open(&upper).unwrap();
+        assert_eq!(active.generation(), 1);
+        assert!(active.dirty_source_paths().contains("README.md"));
+    }
+
+    #[test]
+    fn untrusted_view_scans_upper_instead_of_claiming_zero_recovery_walks() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        view.write(readme, 0, b"changed").unwrap();
+        let journal_path = ViewUpperLayout::from_source_upper(upper.clone()).journal_path();
+        OpenOptions::new()
+            .append(true)
+            .open(journal_path)
+            .unwrap()
+            .write_all(b"corrupt-complete-record\n")
+            .unwrap();
+
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(!candidates.qualified);
+        assert!(candidates.upper_recovery_walks > 0);
+        assert!(candidates.paths.contains("README.md"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum JournalDamage {
+        Missing,
+        Corrupt,
+        Gapped,
+        ValidPrefix,
+    }
+
+    fn damage_mutation_journal(upper: &Path, damage: JournalDamage) {
+        let path = ViewUpperLayout::from_source_upper(upper.to_path_buf()).journal_path();
+        match damage {
+            JournalDamage::Missing => fs::remove_file(path).unwrap(),
+            JournalDamage::Corrupt => OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"corrupt-complete-record\n")
+                .unwrap(),
+            JournalDamage::Gapped => fs::write(
+                path,
+                br#"{"sequence":99,"generation":0,"class":"source","kind":"delete","path":"README.md"}
+"#,
+            )
+            .unwrap(),
+            JournalDamage::ValidPrefix => fs::write(path, b"").unwrap(),
+        }
+    }
+
+    #[test]
+    fn damaged_path_journal_never_loses_deleted_lower_path() {
+        for damage in [
+            JournalDamage::Missing,
+            JournalDamage::Corrupt,
+            JournalDamage::Gapped,
+            JournalDamage::ValidPrefix,
+        ] {
+            let (_temp, db, root, upper) = fixture();
+            let mut view = core(&db, &root, upper.clone());
+            view.remove(VIEW_ROOT_INO, "README.md").unwrap();
+            damage_mutation_journal(&upper, damage);
+
+            let candidates = view.checkpoint_candidates().unwrap();
+            assert!(!candidates.qualified);
+            assert!(candidates.upper_recovery_walks > 0);
+            assert!(candidates.paths.contains("README.md"));
+        }
+    }
+
+    #[test]
+    fn damaged_path_journal_recovers_both_rename_sides() {
+        for damage in [
+            JournalDamage::Missing,
+            JournalDamage::Corrupt,
+            JournalDamage::Gapped,
+            JournalDamage::ValidPrefix,
+        ] {
+            let (_temp, db, root, upper) = fixture();
+            let mut view = core(&db, &root, upper.clone());
+            view.rename(VIEW_ROOT_INO, "README.md", VIEW_ROOT_INO, "RENAMED.md")
+                .unwrap();
+            damage_mutation_journal(&upper, damage);
+
+            let candidates = view.checkpoint_candidates().unwrap();
+            assert!(!candidates.qualified);
+            assert!(candidates.paths.contains("README.md"));
+            assert!(candidates.paths.contains("RENAMED.md"));
+        }
+    }
+
+    #[test]
+    fn valid_prefix_truncation_recovers_written_upper_path() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        view.write(readme, 0, b"changed\n").unwrap();
+        damage_mutation_journal(&upper, JournalDamage::ValidPrefix);
+
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(!candidates.qualified);
+        assert!(candidates.upper_recovery_walks > 0);
+        assert!(candidates.paths.contains("README.md"));
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_both_independent_journals_are_lost() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        view.remove(VIEW_ROOT_INO, "README.md").unwrap();
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        fs::remove_file(layout.journal_path()).unwrap();
+        fs::remove_file(layout.whiteout_journal_path()).unwrap();
+
+        assert!(matches!(
+            view.checkpoint_candidates(),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_view_replays_incremental_whiteouts_without_upper_walk() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        view.remove(VIEW_ROOT_INO, "README.md").unwrap();
+        drop(view);
+
+        let reopened = core(&db, &root, upper);
+        assert!(reopened.is_whiteouted("README.md"));
+        let candidates = reopened.checkpoint_candidates().unwrap();
+        assert!(candidates.qualified);
+        assert_eq!(candidates.upper_recovery_walks, 0);
+        assert!(candidates.paths.contains("README.md"));
     }
 
     #[test]

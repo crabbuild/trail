@@ -539,6 +539,15 @@ mod tests {
         assert_eq!(persisted.updated_at, -1);
 
         let paths = db.workspace_view_paths_for_lane("node-one").unwrap();
+        let mut intent =
+            super::super::workdir::ViewMutationJournal::open(&paths.source_upper).unwrap();
+        intent
+            .append(
+                super::super::workdir::ViewMutationKind::Write,
+                "package-lock.json",
+                None,
+            )
+            .unwrap();
         fs::write(
             paths.source_upper.join("package-lock.json"),
             r#"{"name":"trail-node-layer-test","version":"1.0.1","lockfileVersion":3,"requires":true,"packages":{"":{"name":"trail-node-layer-test","version":"1.0.1"}}}"#,

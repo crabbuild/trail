@@ -12,6 +12,11 @@ use trail::model::*;
 
 use super::*;
 
+const PERFORMANCE_METRICS_FILE_ENV: &str = "TRAIL_PERFORMANCE_METRICS_FILE";
+const OPERATION_METRICS_HEADER: &str = "x-trail-operation-metrics";
+const DAEMON_READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DAEMON_MUTATING_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 pub(super) fn try_handle_auto_daemon_command(
     ctx: &RuntimeContext,
     daemon_token: Option<String>,
@@ -22,9 +27,25 @@ pub(super) fn try_handle_auto_daemon_command(
     }
     if matches!(
         command,
-        Command::Status(_) | Command::Diff(_) | Command::Record(_)
+        Command::Status(_)
+            | Command::Diff(_)
+            | Command::Record(_)
+            | Command::Index(IndexCommand {
+                command: IndexSubcommand::Reconcile(_),
+            })
+    ) || matches!(
+        command,
+        Command::Lane(LaneCommand {
+            command: LaneSubcommand::Status(_)
+                | LaneSubcommand::Record(_)
+                | LaneSubcommand::ApplyPatch(_)
+                | LaneSubcommand::Diff(_),
+        })
     ) {
         let workspace = daemon_start::workspace_from_context(ctx)?;
+        if !workspace.join(".trail").is_dir() {
+            return Err(Error::WorkspaceNotFound(workspace));
+        }
         let ready =
             daemon_start::ensure_workspace_daemon_ready(&workspace, daemon_token.as_deref())?;
         let result = try_handle_daemon_command(
@@ -60,6 +81,19 @@ pub(super) fn try_handle_auto_daemon_command(
                 }
                 return Err(error);
             }
+        }
+    }
+    let workspace = daemon_start::workspace_from_context(ctx)?;
+    if workspace.join(".trail").is_dir() {
+        if let Some(ready) =
+            daemon_start::existing_workspace_daemon_ready(&workspace, daemon_token.as_deref())?
+        {
+            return try_handle_daemon_command(
+                ctx,
+                Some(ready.url),
+                Some(ready.auth_token),
+                command,
+            );
         }
     }
     let Some(daemon_url) = discover_daemon_url(ctx)? else {
@@ -130,6 +164,19 @@ pub(super) fn try_handle_daemon_command(
             render_record(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
+        Command::Index(IndexCommand {
+            command: IndexSubcommand::Reconcile(args),
+        }) => {
+            let body = serde_json::json!({ "lane": args.lane });
+            let report: ChangeLedgerReconcileReport =
+                client.post_json("/v1/index/reconcile", &body)?;
+            if matches!(ctx.format, OutputFormat::Ndjson) {
+                render_ndjson(&report)?;
+            } else {
+                render_change_ledger_reconcile(&report, ctx.json, &ctx.render)?;
+            }
+            Ok(true)
+        }
         Command::Timeline(args) => handle_timeline_command(ctx, &client, args),
         Command::Why(args) => handle_why_command(ctx, &client, args),
         Command::History(args) => handle_history_command(ctx, &client, args),
@@ -151,6 +198,9 @@ fn daemon_supports_command(command: &Command) -> bool {
     match command {
         Command::Status(args) => args.branch.is_none(),
         Command::Record(_)
+        | Command::Index(IndexCommand {
+            command: IndexSubcommand::Reconcile(_),
+        })
         | Command::Diff(_)
         | Command::Timeline(_)
         | Command::Why(_)
@@ -161,8 +211,7 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::Lease(_)
         | Command::Doctor => true,
         Command::Lane(lane) => match &lane.command {
-            LaneSubcommand::Spawn(_)
-            | LaneSubcommand::List
+            LaneSubcommand::List
             | LaneSubcommand::Show(_)
             | LaneSubcommand::Status(_)
             | LaneSubcommand::Review(_)
@@ -211,6 +260,12 @@ fn handle_lane_command(
                 body.insert("materialize".to_string(), Value::Bool(false));
             } else if let Some(materialize) = args.materialize {
                 body.insert("materialize".to_string(), Value::Bool(materialize));
+            }
+            if let Some(workdir_mode) = &args.workdir_mode {
+                body.insert(
+                    "workdir_mode".to_string(),
+                    Value::String(workdir_mode.clone()),
+                );
             }
             if let Some(workdir) = &args.workdir {
                 body.insert(
@@ -1034,14 +1089,37 @@ impl DaemonClient {
         if let Some(token) = &self.token {
             request.push_str(&format!("Authorization: Bearer {token}\r\n"));
         }
+        let metrics_file =
+            std::env::var_os(PERFORMANCE_METRICS_FILE_ENV).filter(|path| !path.is_empty());
+        if metrics_file.is_some() {
+            request.push_str("X-Trail-Operation-Metrics: 1\r\n");
+        }
         request.push_str("\r\n");
 
-        let response = self.endpoint.exchange(request.as_bytes(), &body_bytes)?;
-        let (status, response_body) = parse_http_response(&response)?;
+        let response = self.endpoint.exchange(
+            request.as_bytes(),
+            &body_bytes,
+            daemon_request_timeout(method, path),
+        )?;
+        let (status, operation_metrics, response_body) = parse_http_response(&response)?;
+        if let (Some(path), Some(report)) = (metrics_file.as_deref(), operation_metrics) {
+            emit_daemon_operation_metrics_report(Path::new(path), report)?;
+        }
         if !(200..300).contains(&status) {
             return Err(error_from_daemon_response(status, response_body));
         }
         serde_json::from_slice(response_body).map_err(Error::from)
+    }
+}
+
+fn daemon_request_timeout(method: &str, path: &str) -> Duration {
+    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        || path == "/v1/record"
+        || path == "/v1/ledger/challenge"
+    {
+        DAEMON_READ_REQUEST_TIMEOUT
+    } else {
+        DAEMON_MUTATING_REQUEST_TIMEOUT
     }
 }
 
@@ -1066,6 +1144,7 @@ pub(super) struct LedgerFenceProof {
     pub(super) live_fence_sequence: u64,
     pub(super) scope_id: String,
     pub(super) epoch: u64,
+    pub(super) daemon_launch_nonce: String,
     pub(super) durable_offset: u64,
     pub(super) folded_offset: u64,
 }
@@ -1121,7 +1200,7 @@ impl DaemonTransport {
         }
     }
 
-    fn exchange(&self, request: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+    fn exchange(&self, request: &[u8], body: &[u8], timeout: Duration) -> Result<Vec<u8>> {
         match self {
             Self::Tcp(endpoint) => {
                 let mut stream =
@@ -1131,8 +1210,10 @@ impl DaemonTransport {
                             endpoint.authority
                         ))
                     })?;
-                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
                 exchange_stream(&mut stream, request, body)
+                    .map_err(|error| map_daemon_exchange_error(error, timeout))
             }
             #[cfg(unix)]
             Self::Unix(path) => {
@@ -1142,10 +1223,24 @@ impl DaemonTransport {
                         path.display()
                     ))
                 })?;
-                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
                 exchange_stream(&mut stream, request, body)
+                    .map_err(|error| map_daemon_exchange_error(error, timeout))
             }
         }
+    }
+}
+
+fn map_daemon_exchange_error(error: Error, timeout: Duration) -> Error {
+    match error {
+        Error::Io(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            Error::DaemonUnavailable(format!(
+                "workspace daemon response timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        }
+        error => error,
     }
 }
 
@@ -1263,7 +1358,7 @@ fn discover_daemon_url(ctx: &RuntimeContext) -> Result<Option<String>> {
     Ok(Some(endpoint.url))
 }
 
-fn parse_http_response(response: &[u8]) -> Result<(u16, &[u8])> {
+fn parse_http_response(response: &[u8]) -> Result<(u16, Option<&str>, &[u8])> {
     let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         return Err(Error::DaemonUnavailable(
             "daemon returned a malformed HTTP response".to_string(),
@@ -1286,7 +1381,54 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, &[u8])> {
                 "daemon response has invalid status `{status_line}`"
             ))
         })?;
-    Ok((status, &response[header_end + 4..]))
+    let mut operation_metrics = None;
+    for line in header.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(Error::DaemonUnavailable(
+                "daemon response has a malformed HTTP header".into(),
+            ));
+        };
+        if name.eq_ignore_ascii_case(OPERATION_METRICS_HEADER) {
+            if operation_metrics.is_some() {
+                return Err(Error::DaemonUnavailable(
+                    "daemon response repeated its operation metrics report".into(),
+                ));
+            }
+            operation_metrics = Some(value.trim());
+        }
+    }
+    Ok((status, operation_metrics, &response[header_end + 4..]))
+}
+
+fn emit_daemon_operation_metrics_report(path: &Path, report: &str) -> Result<()> {
+    let report = serde_json::from_str::<Value>(report).map_err(|error| {
+        Error::DaemonUnavailable(format!(
+            "daemon returned malformed operation metrics JSON: {error}"
+        ))
+    })?;
+    if !report.is_object() {
+        return Err(Error::DaemonUnavailable(
+            "daemon returned a non-object operation metrics report".into(),
+        ));
+    }
+    let mut line = serde_json::to_vec(&report)?;
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let written = file.write(&line)?;
+    if written != line.len() {
+        return Err(Error::Io(std::io::Error::new(
+            ErrorKind::WriteZero,
+            format!(
+                "short performance metrics append: wrote {written} of {} bytes",
+                line.len()
+            ),
+        )));
+    }
+    file.flush()?;
+    Ok(())
 }
 
 fn error_from_daemon_response(status: u16, body: &[u8]) -> Error {
@@ -1294,9 +1436,36 @@ fn error_from_daemon_response(status: u16, body: &[u8]) -> Error {
         if status == 401 {
             return Error::DaemonUnavailable(error.error.message);
         }
+        if error.error.code.as_ref().and_then(DaemonErrorCode::as_text)
+            == Some("CHANGE_LEDGER_RECONCILE_REQUIRED")
+        {
+            return Error::ChangeLedgerReconcileRequired {
+                scope: error.error.scope.unwrap_or_default(),
+                state: error.error.state.unwrap_or_default(),
+                reason: error
+                    .error
+                    .reason
+                    .unwrap_or_else(|| error.error.message.clone()),
+                command: error
+                    .error
+                    .recovery
+                    .map(|recovery| recovery.command)
+                    .unwrap_or_else(|| "trail index reconcile".to_string()),
+            };
+        }
+        let numeric_code = error
+            .error
+            .code
+            .as_ref()
+            .and_then(DaemonErrorCode::as_numeric);
         return Error::DaemonError {
             message: error.error.message,
-            exit_code: error.error.code.unwrap_or(1),
+            exit_code: error
+                .error
+                .exit
+                .or(error.error.exit_code)
+                .or(numeric_code)
+                .unwrap_or(1),
         };
     }
     Error::DaemonError {
@@ -1313,8 +1482,48 @@ struct DaemonErrorBody {
 #[derive(Deserialize)]
 struct DaemonErrorDetails {
     message: String,
-    #[serde(default, alias = "exit_code")]
-    code: Option<i32>,
+    #[serde(default)]
+    code: Option<DaemonErrorCode>,
+    #[serde(default)]
+    exit: Option<i32>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    recovery: Option<DaemonErrorRecovery>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DaemonErrorCode {
+    Text(String),
+    Numeric(i32),
+}
+
+impl DaemonErrorCode {
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => Some(value),
+            Self::Numeric(_) => None,
+        }
+    }
+
+    fn as_numeric(&self) -> Option<i32> {
+        match self {
+            Self::Text(_) => None,
+            Self::Numeric(value) => Some(*value),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DaemonErrorRecovery {
+    command: String,
 }
 
 fn resolve_daemon_token(ctx: &RuntimeContext, explicit: Option<String>) -> Result<Option<String>> {
@@ -1351,6 +1560,96 @@ fn discover_db_dir(ctx: &RuntimeContext) -> Option<PathBuf> {
         }
         if !dir.pop() {
             return None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_response_carries_one_request_scoped_metrics_report() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Trail-Operation-Metrics: {\"generation\":7,\"operation\":\"status\"}\r\nContent-Length: 2\r\n\r\n{}";
+        let (status, metrics, body) = parse_http_response(response).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(metrics, Some("{\"generation\":7,\"operation\":\"status\"}"));
+        assert_eq!(body, b"{}");
+
+        let duplicate = b"HTTP/1.1 200 OK\r\nX-Trail-Operation-Metrics: {}\r\nx-trail-operation-metrics: {}\r\n\r\n{}";
+        assert!(matches!(
+            parse_http_response(duplicate),
+            Err(Error::DaemonUnavailable(message))
+                if message.contains("repeated")
+        ));
+    }
+
+    #[test]
+    fn daemon_timeout_allows_large_mutations_without_extending_read_requests_indefinitely() {
+        assert_eq!(
+            daemon_request_timeout("GET", "/v1/status"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            daemon_request_timeout("GET", "/v1/diff?dirty=1"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            daemon_request_timeout("POST", "/v1/record"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            daemon_request_timeout("POST", "/v1/lanes"),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            daemon_request_timeout("POST", "/v1/index/reconcile"),
+            Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[test]
+    fn daemon_metrics_emission_appends_exactly_one_json_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("metrics.jsonl");
+        emit_daemon_operation_metrics_report(
+            &path,
+            "{\"generation\":9,\"operation\":\"structured_patch\"}",
+        )
+        .unwrap();
+        let lines = std::fs::read_to_string(path).unwrap();
+        assert_eq!(lines.lines().count(), 1);
+        let value: Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(value["generation"], 9);
+        assert_eq!(value["operation"], "structured_patch");
+    }
+
+    #[test]
+    fn daemon_error_parser_accepts_legacy_numeric_transport_codes() {
+        let error = error_from_daemon_response(
+            429,
+            br#"{"error":{"message":"rate limit exceeded","code":2}}"#,
+        );
+        match error {
+            Error::DaemonError { message, exit_code } => {
+                assert_eq!(message, "rate limit exceeded");
+                assert_eq!(exit_code, 2);
+            }
+            error => panic!("unexpected daemon error: {error}"),
+        }
+    }
+
+    #[test]
+    fn daemon_error_parser_preserves_structured_lane_recovery() {
+        let error = error_from_daemon_response(
+            409,
+            br#"{"error":{"code":"CHANGE_LEDGER_RECONCILE_REQUIRED","status":409,"exit":16,"message":"reconcile","scope":"lane-scope","state":"untrusted_gap","reason":"overflow","recovery":{"command":"trail index reconcile --lane reconcile-bot"}}}"#,
+        );
+        match error {
+            Error::ChangeLedgerReconcileRequired { command, .. } => {
+                assert_eq!(command, "trail index reconcile --lane reconcile-bot");
+            }
+            error => panic!("unexpected daemon error: {error}"),
         }
     }
 }

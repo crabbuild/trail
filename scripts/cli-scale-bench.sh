@@ -2,13 +2,25 @@
 set -euo pipefail
 
 BIN="${TRAIL_BIN:-}"
-SCALES="${TRAIL_SCALE_FILES:-10000}"
+MODE="${1:-default}"
+if [ "$#" -gt 1 ]; then
+  printf 'usage: %s [changed-path-ledger]\n' "$0" >&2
+  exit 2
+fi
+if [ "$MODE" = "changed-path-ledger" ]; then
+  SCALES="${TRAIL_SCALE_FILES:-${REPO_FILES:-1000,100000,1000000}}"
+else
+  SCALES="${TRAIL_SCALE_FILES:-10000}"
+fi
 BASE_DIR="${TRAIL_SCALE_BASE:-/Volumes/Workspace}"
 RUN_LABEL="${TRAIL_SCALE_LABEL:-$(date +%Y%m%d-%H%M%S)}"
 RUN_MATERIALIZED="${TRAIL_SCALE_MATERIALIZED:-1}"
 RUN_BACKUP="${TRAIL_SCALE_BACKUP:-1}"
 RUN_DAEMON="${TRAIL_SCALE_DAEMON:-1}"
 RUN_GIT_IMPORT="${TRAIL_SCALE_GIT_IMPORT:-1}"
+LEDGER_K_VALUES="${TRAIL_CHANGED_PATH_K_VALUES:-0,1,100}"
+RUN_LEDGER_COW="${TRAIL_CHANGED_PATH_COW:-auto}"
+LEDGER_TAIL_BOUND="${TRAIL_CHANGED_PATH_TAIL_BOUND:-4096}"
 
 if [ -z "$BIN" ]; then
   cargo build -p trail --release >/dev/null
@@ -41,14 +53,34 @@ run_timed() {
   local code=$?
   set -e
   local real rss
-  real="$(awk '/^real / {v=$2} END {print v+0}' "$stderr")"
-  rss="$(awk '
-    /maximum resident set size kb/ {v=$NF * 1024}
-    /maximum resident set size/ && $0 !~ / kb / {
-      for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) v=$i
+  if ! real="$(awk '
+    $1 == "real" && $2 ~ /^[0-9]+([.][0-9]+)?$/ { value=$2; matches++ }
+    END { if (matches != 1) exit 1; print value }
+  ' "$stderr")"; then
+    printf '%s: missing or ambiguous /usr/bin/time real measurement\n' "$name" >&2
+    tail -80 "$stderr" >&2 || true
+    exit 1
+  fi
+  if ! rss="$(awk '
+    /maximum resident set size kb/ {
+      if ($NF !~ /^[0-9]+$/) exit 2
+      value=$NF * 1024
+      matches++
+      next
     }
-    END {print v+0}
-  ' "$stderr")"
+    /maximum resident set size/ {
+      found=""
+      for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) { found=$i; break }
+      if (found == "") exit 2
+      value=found
+      matches++
+    }
+    END { if (matches != 1 || value <= 0) exit 1; printf "%.0f\n", value }
+  ' "$stderr")"; then
+    printf '%s: missing, ambiguous, or zero /usr/bin/time RSS measurement\n' "$name" >&2
+    tail -80 "$stderr" >&2 || true
+    exit 1
+  fi
   printf '%s\t%s\t%s\t%s\n' "$name" "$real" "$rss" "$code" >> "$results"
   printf 'scale=%s %-36s %8ss rss=%s exit=%s\n' "$scale" "$name" "$real" "$rss" "$code"
   if [ "$code" -ne 0 ]; then
@@ -319,6 +351,620 @@ daemon_rss_bytes() {
     printf '0'
   fi
 }
+
+append_changed_path_structural_metrics() {
+  local scale="$1"
+  local k="$2"
+  local operation="$3"
+  local name="$4"
+  local source="$5"
+  local stdout="$6"
+  local repo="$7"
+  local destination="$8"
+  python3 - "$scale" "$k" "$operation" "$name" "$source" "$stdout" "$repo" "$destination" "$LEDGER_TAIL_BOUND" <<'PY'
+import json, pathlib, sqlite3, sys
+
+scale, k, operation, name = map(str, sys.argv[1:5])
+source = pathlib.Path(sys.argv[5])
+stdout = pathlib.Path(sys.argv[6])
+repo = pathlib.Path(sys.argv[7])
+destination = pathlib.Path(sys.argv[8])
+tail_bound = int(sys.argv[9])
+
+def load_json(path):
+    return json.loads(path.read_text())
+
+def changed_count(payload, operation):
+    key = {
+        "workspace_status": "changed_paths",
+        "workspace_diff": "files",
+        "workspace_record": "changed_paths",
+        "materialized_lane_record": "changed_paths",
+        "structured_patch": "changed_paths",
+        "cow_checkpoint": "source_paths",
+    }[operation]
+    value = payload.get(key)
+    if not isinstance(value, list):
+        raise SystemExit(f"{name}: command report omitted list field {key!r}")
+    return len(value)
+
+payload = load_json(stdout)
+reports = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+if len(reports) != 1:
+    raise SystemExit(f"{name}: expected exactly one operation metrics report, found {len(reports)}")
+report = reports[0]
+required = {
+    "generation", "operation", "outcome", "input_path_count",
+    "canonical_path_count", "expanded_path_count", "final_path_count",
+    "full_filesystem_walk_count", "bounded_filesystem_walk_count",
+    "filesystem_entry_count", "filesystem_stat_count", "filesystem_read_count",
+    "filesystem_read_bytes", "filesystem_hash_count", "filesystem_hash_bytes",
+    "full_root_range_count", "bounded_root_range_count", "root_range_row_count",
+    "root_point_key_count", "prolly_read_call_count", "prolly_read_key_count",
+    "prolly_read_value_count", "prolly_read_value_bytes", "prolly_write_call_count",
+    "prolly_write_key_count", "prolly_write_value_bytes",
+    "prolly_tree_batch_call_count", "prolly_tree_batch_mutation_count",
+    "selected_worktree_index_sqlite_accounting_complete",
+    "selected_worktree_index_sqlite_accounting_disposition",
+    "selected_worktree_index_sqlite_envelope_count",
+    "selected_worktree_index_sqlite_not_applicable_count",
+    "selected_worktree_index_sqlite_full_scan_count",
+    "selected_worktree_index_sqlite_row_read_count",
+    "selected_worktree_index_sqlite_row_delete_count",
+    "selected_worktree_index_sqlite_row_upsert_count",
+    "selected_worktree_index_sqlite_statement_count",
+    "selected_worktree_index_sqlite_transaction_count", "selection_comparison_count",
+    "policy_build_count", "policy_dependency_full_discovery", "policy_dependency_bytes",
+    "policy_dependency_file_count", "git_subprocess_count", "git_global_work_count",
+    "git_index_refresh_count", "git_trace2_region_count", "git_trace2_bytes",
+    "git_fsmonitor_qualification_count", "git_untracked_cache_qualification_count",
+    "external_adapter_global_work", "git_index_read_count", "git_index_bytes",
+    "git_shared_index_read_count", "git_shared_index_bytes", "git_output_bytes",
+    "git_output_record_count", "daemon_snapshot_bytes", "daemon_snapshot_path_count",
+    "daemon_cumulative_rewrite_count", "daemon_cumulative_rewrite_bytes",
+    "daemon_cumulative_rewrite_count_total", "daemon_cumulative_rewrite_bytes_total",
+    "authoritative_candidate_count", "ledger_row_touch_count",
+    "observer_tail_record_fold_count", "reconciliation_run_count", "manifest_bytes",
+    "manifest_key_comparison_count", "journal_bytes", "upper_work_count",
+    "wall_time_ns", "rss_start_bytes", "rss_end_bytes",
+    "rss_lifetime_high_water_bytes",
+}
+missing = sorted(required.difference(report))
+if missing:
+    raise SystemExit(f"{name}: operation metrics report omitted {', '.join(missing)}")
+report["metric_source"] = "operation_scope"
+if operation in {"materialized_lane_record", "cow_checkpoint"}:
+    if "upper_recovery_walks" not in payload:
+        raise SystemExit(f"{name}: command report omitted upper_recovery_walks")
+    report["upper_recovery_walks"] = int(payload["upper_recovery_walks"])
+if operation == "cow_checkpoint":
+    if payload.get("generated_path_accounting") != "journal_interval":
+        raise SystemExit(f"{name}: command report omitted journal_interval generated-path accounting")
+    report["generated_path_accounting"] = payload["generated_path_accounting"]
+if operation in {"materialized_lane_record", "structured_patch"}:
+    path_index = payload.get("path_index")
+    required_path_index = {
+        "mode", "lookup_count", "full_root_path_load_count",
+        "full_filesystem_path_scan_count",
+    }
+    if not isinstance(path_index, dict) or not required_path_index.issubset(path_index):
+        raise SystemExit(f"{name}: command report omitted complete path_index metrics")
+    report.update({
+        "path_index_full_root_path_load_count": int(path_index["full_root_path_load_count"]),
+        "path_index_full_filesystem_path_scan_count": int(path_index["full_filesystem_path_scan_count"]),
+        "path_index_lookup_count": int(path_index["lookup_count"]),
+        "path_index_mode": path_index["mode"],
+    })
+
+report.update({
+    "benchmark": name,
+    "benchmark_operation": operation,
+    "repo_files": int(scale),
+    "authoritative_input_k": int(k),
+    "final_changed_output": changed_count(payload, operation),
+    "configured_tail_bound": tail_bound,
+})
+
+db = repo / ".trail" / "index" / "trail.sqlite"
+report["scope_caps"] = []
+if db.is_file():
+    connection = sqlite3.connect(db)
+    try:
+        query = """
+            SELECT scope.scope_id,
+                   (SELECT COUNT(*) FROM changed_path_entries entry WHERE entry.scope_id=scope.scope_id),
+                   scope.max_candidate_rows,
+                   (SELECT COUNT(*) FROM changed_path_prefixes prefix WHERE prefix.scope_id=scope.scope_id),
+                   scope.max_prefix_rows,
+                   COALESCE((SELECT SUM(segment.durable_end_offset)
+                             FROM changed_path_observer_segments segment
+                             WHERE segment.scope_id=scope.scope_id AND segment.state!='retired'), 0),
+                   scope.max_observer_log_bytes,
+                   COALESCE((SELECT MAX(segment.durable_end_offset)
+                             FROM changed_path_observer_segments segment
+                             WHERE segment.scope_id=scope.scope_id AND segment.state!='retired'), 0),
+                   scope.max_segment_bytes
+            FROM changed_path_scopes scope
+            WHERE scope.retired_at IS NULL
+            ORDER BY scope.scope_id
+        """
+        report["scope_caps"] = [
+            {
+                "scope_id": row[0], "candidate_rows": row[1], "candidate_row_cap": row[2],
+                "prefix_rows": row[3], "prefix_row_cap": row[4],
+                "observer_log_bytes": row[5], "observer_log_byte_cap": row[6],
+                "largest_segment_bytes": row[7], "segment_byte_cap": row[8],
+            }
+            for row in connection.execute(query)
+        ]
+    finally:
+        connection.close()
+
+with destination.open("a") as handle:
+    handle.write(json.dumps(report, sort_keys=True) + "\n")
+PY
+}
+
+run_changed_path_scoped() {
+  local scale="$1"
+  local k="$2"
+  local operation="$3"
+  local name="ledger_${operation}_k${k}"
+  local repo="$4"
+  shift 4
+  local metrics="$RUN_ROOT/$scale/changed-path-operation-metrics.jsonl"
+  local segment="$RUN_ROOT/$scale/out/$name.metrics.jsonl"
+  local before after expected_operation
+  before="$(python3 - "$metrics" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+print(path.stat().st_size if path.exists() else 0)
+PY
+)"
+  run_timed "$scale" "$name" "$@"
+  after="$(python3 - "$metrics" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+print(path.stat().st_size if path.exists() else 0)
+PY
+)"
+  case "$operation" in
+    workspace_status) expected_operation=status ;;
+    workspace_diff) expected_operation=diff ;;
+    workspace_record) expected_operation=record ;;
+    materialized_lane_record) expected_operation=materialized_lane_record ;;
+    structured_patch) expected_operation=structured_patch ;;
+    cow_checkpoint) expected_operation=cow_checkpoint ;;
+    *) printf 'unsupported scoped operation: %s\n' "$operation" >&2; return 2 ;;
+  esac
+  python3 - "$metrics" "$before" "$after" "$expected_operation" "$segment" <<'PY'
+import json, pathlib, sys
+source, start, end, operation, destination = pathlib.Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], pathlib.Path(sys.argv[5])
+if end <= start:
+    raise SystemExit(f"{operation}: operation metrics sidecar did not grow")
+with source.open("rb") as handle:
+    handle.seek(start)
+    data = handle.read(end - start).decode()
+reports = [json.loads(line) for line in data.splitlines() if line.strip()]
+matches = [report for report in reports if report.get("operation") == operation]
+if len(matches) != 1:
+    raise SystemExit(f"{operation}: expected one new matching metrics report, found {len(matches)} among {len(reports)} new reports")
+destination.write_text(json.dumps(matches[0], sort_keys=True) + "\n")
+PY
+  append_changed_path_structural_metrics \
+    "$scale" "$k" "$operation" "$name" "$segment" \
+    "$RUN_ROOT/$scale/out/$name.stdout" "$repo" \
+    "$RUN_ROOT/$scale/structural-metrics.jsonl"
+}
+
+json_path_set() {
+  local operation="$1"
+  local path="$2"
+  python3 - "$operation" "$path" <<'PY'
+import json, pathlib, sys
+operation, filename = sys.argv[1:]
+payload = json.loads(pathlib.Path(filename).read_text())
+key = {
+    "workspace_status": "changed_paths",
+    "workspace_diff": "files",
+    "workspace_record": "changed_paths",
+    "materialized_lane_record": "changed_paths",
+    "structured_patch": "changed_paths",
+    "cow_checkpoint": "source_paths",
+}[operation]
+values = payload.get(key)
+if not isinstance(values, list):
+    raise SystemExit(f"oracle report omitted {key!r}")
+paths = []
+for value in values:
+    if isinstance(value, str):
+        paths.append(value)
+    elif isinstance(value, dict) and isinstance(value.get("path"), str):
+        paths.append(value["path"])
+    else:
+        raise SystemExit(f"oracle report has an invalid path entry: {value!r}")
+sys.stdout.write("".join(path + "\n" for path in sorted(set(paths))))
+PY
+}
+
+mutate_changed_path_fixture() {
+  local root="$1"
+  local k="$2"
+  local label="$3"
+  python3 - "$root" "$k" "$label" <<'PY'
+import pathlib, sys
+root, k, label = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+for i in range(k):
+    path = root / f"pkg_{i // 100:05d}" / f"module_{i % 100:03d}.rs"
+    with path.open("a") as handle:
+        handle.write(f"\n// changed-path-ledger {label} {i}\n")
+PY
+}
+
+write_changed_path_oracle_manifest() {
+  local root="$1"
+  local destination="$2"
+  python3 - "$root" "$destination" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+root, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+manifest = {}
+macos_storage_names = {
+    ".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd",
+    ".metadata_never_index", ".metadata_never_index_unless_rootfs",
+    ".metadata_direct_scope_only",
+}
+def is_platform_storage_noise(name):
+    # Match the native NFS-COW adapter's non-user platform metadata filter so
+    # AppleDouble/Finder/FSEvents artifacts cannot masquerade as source paths
+    # in the independent full-scan oracle.
+    return name.startswith("._") or name in macos_storage_names
+for directory, names, files in os.walk(root):
+    relative_directory = pathlib.Path(directory).relative_to(root)
+    names[:] = [
+        name for name in names
+        if name not in {".trail", ".git"} and not is_platform_storage_noise(name)
+    ]
+    for name in files:
+        if is_platform_storage_noise(name):
+            continue
+        path = pathlib.Path(directory) / name
+        relative = (relative_directory / name).as_posix()
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            manifest[relative] = {"kind": "symlink", "target": os.readlink(path)}
+        elif stat.S_ISREG(metadata.st_mode):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            manifest[relative] = {
+                "kind": "file",
+                "sha256": digest.hexdigest(),
+                "executable": bool(metadata.st_mode & 0o111),
+            }
+destination.write_text(json.dumps(manifest, sort_keys=True))
+PY
+}
+
+run_changed_path_external_oracle() {
+  local scale="$1"
+  local k="$2"
+  local benchmark="$3"
+  local operation="$4"
+  local measured="$5"
+  local root="$6"
+  local baseline="$7"
+  local update_baseline="${8:-0}"
+  local oracle_dir="$RUN_ROOT/$scale/oracle"
+  local measured_paths="$oracle_dir/$benchmark.measured.paths"
+  local oracle_paths="$oracle_dir/$benchmark.oracle.paths"
+  local current="$oracle_dir/$benchmark.current-manifest.json"
+  local started finished
+  started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  write_changed_path_oracle_manifest "$root" "$current"
+  python3 - "$baseline" "$current" "$oracle_paths" <<'PY'
+import json, pathlib, sys
+before = json.loads(pathlib.Path(sys.argv[1]).read_text())
+after = json.loads(pathlib.Path(sys.argv[2]).read_text())
+changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+pathlib.Path(sys.argv[3]).write_text("".join(path + "\n" for path in changed))
+PY
+  finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  json_path_set "$operation" "$measured" >"$measured_paths"
+  if ! cmp -s "$measured_paths" "$oracle_paths"; then
+    diff -u "$oracle_paths" "$measured_paths" >&2 || true
+    printf '%s: measured output differs from the external full-scan oracle\n' "$benchmark" >&2
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t0\n' \
+      "$benchmark" "$scale" "$k" "$((finished - started))" \
+      "$(wc -l < "$measured_paths" | tr -d ' ')" \
+      "$(wc -l < "$oracle_paths" | tr -d ' ')" \
+      >> "$RUN_ROOT/$scale/oracle-results.tsv"
+    return 1
+  fi
+  if [ "$update_baseline" = "1" ]; then
+    mv "$current" "$baseline"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t1\n' \
+    "$benchmark" "$scale" "$k" "$((finished - started))" \
+    "$(wc -l < "$measured_paths" | tr -d ' ')" \
+    "$(wc -l < "$oracle_paths" | tr -d ' ')" \
+    >> "$RUN_ROOT/$scale/oracle-results.tsv"
+}
+
+prepare_changed_path_external_oracle() {
+  local scale="$1"
+  local benchmark="$2"
+  local root="$3"
+  local baseline="$4"
+  local oracle_dir="$RUN_ROOT/$scale/oracle"
+  local current="$oracle_dir/$benchmark.current-manifest.json"
+  local started finished
+  started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  write_changed_path_oracle_manifest "$root" "$current"
+  python3 - "$baseline" "$current" "$oracle_dir/$benchmark.oracle.paths" <<'PY'
+import json, pathlib, sys
+before = json.loads(pathlib.Path(sys.argv[1]).read_text())
+after = json.loads(pathlib.Path(sys.argv[2]).read_text())
+changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+pathlib.Path(sys.argv[3]).write_text("".join(path + "\n" for path in changed))
+PY
+  finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  printf '%s\n' "$((finished - started))" >"$oracle_dir/$benchmark.oracle-time-ns"
+}
+
+# NFS/FUSE COW views inherit an already independently scanned main baseline.
+# Rewalking and rehashing every base file through the virtual mount would make
+# the benchmark oracle itself O(N) and obscure the checkpoint measurement. Read
+# the known benchmark mutations back through the mounted view and derive the
+# next external manifest from that baseline instead.
+prepare_cow_changed_path_external_oracle() {
+  local scale="$1"
+  local benchmark="$2"
+  local root="$3"
+  local baseline="$4"
+  local k="$5"
+  local oracle_dir="$RUN_ROOT/$scale/oracle"
+  local current="$oracle_dir/$benchmark.current-manifest.json"
+  local started finished
+  started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  python3 - "$baseline" "$root" "$k" "$current" \
+    "$oracle_dir/$benchmark.oracle.paths" <<'PY'
+import hashlib, json, pathlib, stat, sys
+baseline, root, k, current, changed_paths = (
+    pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3]),
+    pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[5]),
+)
+before = json.loads(baseline.read_text())
+after = dict(before)
+for index in range(k):
+    relative = f"cow-{k}-{index:03d}.txt"
+    path = root / relative
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"COW oracle mutation is not a regular file: {relative}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    after[relative] = {
+        "kind": "file",
+        "sha256": digest,
+        "executable": bool(metadata.st_mode & 0o111),
+    }
+current.write_text(json.dumps(after, sort_keys=True))
+changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+changed_paths.write_text("".join(path + "\n" for path in changed))
+PY
+  finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  printf '%s\n' "$((finished - started))" >"$oracle_dir/$benchmark.oracle-time-ns"
+}
+
+finish_changed_path_external_oracle() {
+  local scale="$1"
+  local k="$2"
+  local benchmark="$3"
+  local operation="$4"
+  local measured="$5"
+  local baseline="$6"
+  local oracle_dir="$RUN_ROOT/$scale/oracle"
+  local measured_paths="$oracle_dir/$benchmark.measured.paths"
+  local oracle_paths="$oracle_dir/$benchmark.oracle.paths"
+  json_path_set "$operation" "$measured" >"$measured_paths"
+  local equal=1
+  if ! cmp -s "$measured_paths" "$oracle_paths"; then
+    equal=0
+    diff -u "$oracle_paths" "$measured_paths" >&2 || true
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$benchmark" "$scale" "$k" "$(cat "$oracle_dir/$benchmark.oracle-time-ns")" \
+    "$(wc -l < "$measured_paths" | tr -d ' ')" \
+    "$(wc -l < "$oracle_paths" | tr -d ' ')" "$equal" \
+    >> "$RUN_ROOT/$scale/oracle-results.tsv"
+  if [ "$equal" != "1" ]; then
+    printf '%s: measured output differs from the external full-scan oracle\n' "$benchmark" >&2
+    return 1
+  fi
+  mv "$oracle_dir/$benchmark.current-manifest.json" "$baseline"
+}
+
+run_changed_path_ledger_mode() {
+  for scale in ${SCALES//,/ }; do
+    case "$scale" in
+      1000|100000|1000000) ;;
+      *)
+        printf 'changed-path-ledger mode supports scales 1000, 100000, and 1000000; got %s\n' "$scale" >&2
+        return 2
+        ;;
+    esac
+    local work="$RUN_ROOT/$scale"
+    local repo="$work/repo"
+    rm -rf "$work"
+    mkdir -p "$repo" "$work/out" "$work/oracle"
+    printf 'name\treal_seconds\tmax_rss_bytes\texit_code\n' >"$work/results.tsv"
+    printf 'benchmark\trepo_files\tauthoritative_input_k\toracle_time_ns\tmeasured_paths\toracle_paths\tequal\n' \
+      >"$work/oracle-results.tsv"
+    : >"$work/structural-metrics.jsonl"
+    export TRAIL_PERFORMANCE_METRICS=1
+    export TRAIL_PERFORMANCE_METRICS_FILE="$work/changed-path-operation-metrics.jsonl"
+    : >"$TRAIL_PERFORMANCE_METRICS_FILE"
+
+    run_timed "$scale" ledger_generate_repo python3 - "$repo" "$scale" <<'PY'
+import pathlib, sys
+root, files = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+for index in range(files):
+    path = root / f"pkg_{index // 100:05d}" / f"module_{index % 100:03d}.rs"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"pub fn value_{index:08d}() -> usize {{ {index} }}\n")
+(root / "README.md").write_text(f"# changed-path ledger scale {files}\n")
+(root / ".gitignore").write_text("target/\nnode_modules/\n.DS_Store\n")
+PY
+    git -C "$repo" init --quiet
+    git -C "$repo" config user.name "Trail Scale Benchmark"
+    git -C "$repo" config user.email "trail-scale@example.invalid"
+    run_timed "$scale" ledger_git_add git -C "$repo" add --all
+    run_timed "$scale" ledger_git_commit git -C "$repo" commit --quiet -m "changed-path ledger baseline"
+    run_timed "$scale" ledger_init "$BIN" --workspace "$repo" --json init --from-git
+    run_timed "$scale" ledger_cold_reconcile \
+      "$BIN" --workspace "$repo" --json index reconcile
+    cp "$work/out/ledger_cold_reconcile.stdout" \
+      "$work/oracle/ledger_workspace_warm.reconcile.json"
+    "$BIN" --workspace "$repo" --json status \
+      >"$work/oracle/ledger_workspace_warm.status.json"
+    local workspace_oracle_baseline="$work/oracle/workspace-baseline.json"
+    write_changed_path_oracle_manifest "$repo" "$workspace_oracle_baseline"
+
+    for k in ${LEDGER_K_VALUES//,/ }; do
+      case "$k" in
+        0|1|100) ;;
+        *) printf 'invalid changed-path candidate count: %s\n' "$k" >&2; return 2 ;;
+      esac
+      mutate_changed_path_fixture "$repo" "$k" "workspace-k$k"
+      run_changed_path_scoped "$scale" "$k" workspace_status "$repo" \
+        "$BIN" --workspace "$repo" --json status
+      run_changed_path_external_oracle "$scale" "$k" "ledger_workspace_status_k$k" \
+        workspace_status "$work/out/ledger_workspace_status_k$k.stdout" "$repo" \
+        "$workspace_oracle_baseline"
+      run_changed_path_scoped "$scale" "$k" workspace_diff "$repo" \
+        "$BIN" --workspace "$repo" --json diff --dirty
+      run_changed_path_external_oracle "$scale" "$k" "ledger_workspace_diff_k$k" \
+        workspace_diff "$work/out/ledger_workspace_diff_k$k.stdout" "$repo" \
+        "$workspace_oracle_baseline"
+      run_changed_path_scoped "$scale" "$k" workspace_record "$repo" \
+        "$BIN" --workspace "$repo" --json record -m "changed-path ledger workspace k=$k"
+      run_changed_path_external_oracle "$scale" "$k" "ledger_workspace_record_k$k" \
+        workspace_record "$work/out/ledger_workspace_record_k$k.stdout" "$repo" \
+        "$workspace_oracle_baseline" 1
+    done
+
+    run_timed "$scale" ledger_materialized_spawn \
+      "$BIN" --workspace "$repo" --json lane spawn ledger-materialized --from main --materialize
+    local materialized_workdir
+    materialized_workdir="$(python3 - "$work/out/ledger_materialized_spawn.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("workdir") or "")
+PY
+)"
+    if [ -z "$materialized_workdir" ]; then
+      printf 'changed-path materialized lane did not return a workdir\n' >&2
+      return 1
+    fi
+    "$BIN" --workspace "$repo" --json index reconcile --lane ledger-materialized \
+      >"$work/oracle/ledger_materialized_warm.reconcile.json"
+    local materialized_oracle_baseline="$work/oracle/materialized-baseline.json"
+    write_changed_path_oracle_manifest "$materialized_workdir" "$materialized_oracle_baseline"
+    for k in ${LEDGER_K_VALUES//,/ }; do
+      mutate_changed_path_fixture "$materialized_workdir" "$k" "materialized-k$k"
+      run_changed_path_scoped "$scale" "$k" materialized_lane_record "$repo" \
+        "$BIN" --workspace "$repo" --json lane record ledger-materialized \
+        -m "changed-path ledger materialized k=$k"
+      run_changed_path_external_oracle "$scale" "$k" "ledger_materialized_lane_record_k$k" \
+        materialized_lane_record "$work/out/ledger_materialized_lane_record_k$k.stdout" \
+        "$materialized_workdir" "$materialized_oracle_baseline" 1
+    done
+
+    for k in ${LEDGER_K_VALUES//,/ }; do
+      python3 - "$materialized_workdir" "$work/structured-patch-k$k.json" "$k" <<'PY'
+import json, pathlib, sys
+root, output, k = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3])
+edits = []
+for i in range(k):
+    relative = pathlib.Path(f"pkg_{i // 100:05d}") / f"module_{i % 100:03d}.rs"
+    edits.append({"op": "write", "path": str(relative), "content": (root / relative).read_text() + f"\n// structured patch {k}:{i}\n"})
+output.write_text(json.dumps({"allow_stale": True, "message": f"changed-path structured patch k={k}", "edits": edits}))
+PY
+      run_changed_path_scoped "$scale" "$k" structured_patch "$repo" \
+        "$BIN" --workspace "$repo" --json lane apply-patch ledger-materialized \
+        --patch "$work/structured-patch-k$k.json"
+      run_changed_path_external_oracle "$scale" "$k" "ledger_structured_patch_k$k" \
+        structured_patch "$work/out/ledger_structured_patch_k$k.stdout" \
+        "$materialized_workdir" "$materialized_oracle_baseline" 1
+    done
+
+    local cow_mode=""
+    if [ "$RUN_LEDGER_COW" = "1" ] || { [ "$RUN_LEDGER_COW" = "auto" ] && [ -e /dev/fuse ]; }; then
+      if [ "$(uname -s)" = "Darwin" ]; then cow_mode="nfs-cow"; else cow_mode="fuse-cow"; fi
+    elif [ "$RUN_LEDGER_COW" = "auto" ] && [ "$(uname -s)" = "Darwin" ]; then
+      cow_mode="nfs-cow"
+    elif [ "$RUN_LEDGER_COW" != "0" ] && [ "$RUN_LEDGER_COW" != "auto" ]; then
+      printf 'TRAIL_CHANGED_PATH_COW must be 0, 1, or auto\n' >&2
+      return 2
+    fi
+    if [ -n "$cow_mode" ]; then
+      run_timed "$scale" ledger_cow_spawn \
+        "$BIN" --workspace "$repo" --json lane spawn ledger-cow --from main --workdir-mode "$cow_mode"
+      local cow_workdir
+      cow_workdir="$(python3 - "$work/out/ledger_cow_spawn.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get("workdir") or "")
+PY
+      )"
+      local cow_oracle_baseline="$work/oracle/cow-baseline.json"
+      cp "$workspace_oracle_baseline" "$cow_oracle_baseline"
+      for k in ${LEDGER_K_VALUES//,/ }; do
+        "$BIN" --workspace "$repo" lane mount ledger-cow \
+          >"$work/out/ledger_cow_mount_k$k.stdout" 2>"$work/out/ledger_cow_mount_k$k.stderr" &
+        local mount_pid=$!
+        python3 - "$cow_workdir" <<'PY'
+import pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+deadline = time.time() + 120
+while time.time() < deadline:
+    if (root / "README.md").is_file():
+        raise SystemExit(0)
+    time.sleep(0.1)
+raise SystemExit("COW mount did not become ready")
+PY
+        python3 - "$cow_workdir" "$k" <<'PY'
+import pathlib, sys
+root, k = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+for i in range(k):
+    (root / f"cow-{k}-{i:03d}.txt").write_text(f"COW checkpoint {k}:{i}\n")
+PY
+        prepare_cow_changed_path_external_oracle "$scale" "ledger_cow_checkpoint_k$k" \
+          "$cow_workdir" "$cow_oracle_baseline" "$k"
+        "$BIN" --workspace "$repo" lane unmount ledger-cow >/dev/null
+        wait "$mount_pid"
+        run_changed_path_scoped "$scale" "$k" cow_checkpoint "$repo" \
+          "$BIN" --workspace "$repo" --json lane checkpoint ledger-cow \
+          -m "changed-path ledger COW k=$k"
+        finish_changed_path_external_oracle "$scale" "$k" "ledger_cow_checkpoint_k$k" \
+          cow_checkpoint "$work/out/ledger_cow_checkpoint_k$k.stdout" "$cow_oracle_baseline"
+      done
+    else
+      printf 'scale=%s changed-path COW checkpoint skipped (native mount unavailable)\n' "$scale"
+    fi
+
+    printf 'scale=%s results=%s structural=%s oracle=%s\n' \
+      "$scale" "$work/results.tsv" "$work/structural-metrics.jsonl" "$work/oracle-results.tsv"
+  done
+}
+
+if [ "$MODE" = "changed-path-ledger" ]; then
+  run_changed_path_ledger_mode
+  printf 'run_root=%s\n' "$RUN_ROOT"
+  exit 0
+fi
+if [ "$MODE" != "default" ]; then
+  printf 'unknown benchmark mode: %s\n' "$MODE" >&2
+  exit 2
+fi
 
 for scale in ${SCALES//,/ }; do
   case "$scale" in

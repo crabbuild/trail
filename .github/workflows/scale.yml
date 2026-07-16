@@ -25,6 +25,10 @@ on:
         description: "Run Git import/update benchmark cases"
         required: true
         default: "1"
+      changed_path_ledger_files:
+        description: "Changed-path ledger scale (1000, 100000, or 1000000)"
+        required: true
+        default: "1000"
 
 jobs:
   scale:
@@ -209,3 +213,48 @@ jobs:
         with:
           name: trail-cli-scale-results
           path: ${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}
+
+  changed-path-ledger:
+    name: Changed-path ledger scale gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build -p trail --release
+      - name: Run changed-path ledger benchmark
+        run: scripts/cli-scale-bench.sh changed-path-ledger
+        env:
+          TRAIL_BIN: ${{ github.workspace }}/target/release/trail
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: changed-path-${{ github.run_id }}
+          TRAIL_SCALE_FILES: ${{ github.event.inputs.changed_path_ledger_files || '1000' }}
+          TRAIL_CHANGED_PATH_COW: "0"
+      - name: Gate changed-path ledger structure and oracle equality
+        shell: bash
+        run: |
+          root="${{ runner.temp }}/trail-cli-scale-changed-path-${{ github.run_id }}"
+          for scale in ${{ github.event.inputs.changed_path_ledger_files || '1000' }}; do
+            python3 scripts/check-changed-path-ledger-thresholds.py \
+              "$root/$scale/results.tsv" \
+              "$root/$scale/structural-metrics.jsonl" \
+              --oracle "$root/$scale/oracle-results.tsv" \
+              --max-seconds workspace_status=15 \
+              --max-seconds workspace_diff=20 \
+              --max-seconds workspace_record=30 \
+              --max-seconds materialized_lane_record=120 \
+              --max-seconds structured_patch=30 \
+              --max-rss-bytes workspace_status=2147483648 \
+              --max-rss-bytes workspace_diff=2147483648 \
+              --max-rss-bytes workspace_record=2147483648
+          done
+      - name: Upload changed-path ledger artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: changed-path-ledger-scale-results
+          path: ${{ runner.temp }}/trail-cli-scale-changed-path-${{ github.run_id }}

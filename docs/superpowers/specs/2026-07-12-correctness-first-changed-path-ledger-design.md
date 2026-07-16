@@ -48,6 +48,13 @@ adapters, automatic daemon lifecycle, and read-path integration must land and
 pass together. There is no partially authoritative rollout and no feature mode
 that promotes trust before all activation gates pass.
 
+Activation and publication are exact-revision gates. The reusable native
+workflow must pass on Linux/ext4 and macOS/APFS for the exact SHA before release
+automation may create a tag, and the generated cargo-dist graph must run the
+same gate for the tag SHA before any build, host, or publish phase. A compiled
+manifest hash names this contract but cannot substitute for completed workflow
+jobs.
+
 ## Scope and filesystem identity
 
 Every evidence record binds to:
@@ -581,3 +588,71 @@ Activation is compiled on by default only after the controlled-producer
 inventory and both real Linux/macOS adapter suites pass. Other platforms use
 the direct full-observation command path and never persist trusted ledger
 proof.
+
+## Activation evidence
+
+Production authority is a compile-time Linux/macOS decision. It does not read
+workflow state, downloaded artifacts, environment variables, or mutable files
+at runtime. `ActivationEvidence::from_checked_build` authenticates the producer
+inventories compiled into the binary and the activation integration suite
+executes the recovery, corruption, platform, and metrics gates before release.
+The exact compiled audit manifest (schema version, suite and workflow names,
+inventory hashes, gate schema, and metrics schema) has SHA-256
+`c68c72d1ba07f777b88b8ed155717d377a75436fa578565a6a62bfdf47e65f54`.
+
+The approved inventory identities are:
+
+- `trail/tests/fixtures/changed_path_producers.v1`:
+  `67027c4bcfba0f3105833978637fe5e81c9cbdb43ba51cbd1a58026a2e067185`;
+- `trail/tests/fixtures/changed_path_raw_mutations.v1`:
+  `38a625a18d607383e865bcea9393792bfbf853ab0597904104cd76c719d6e65c`.
+
+The pull-request 1k gate is workflow `CLI Scale Benchmark`, job
+`changed-path-ledger` in `.github/workflows/scale.yml`. It uploads artifact
+`changed-path-ledger-scale-results`, containing `<scale>/results.tsv`,
+`<scale>/structural-metrics.jsonl`, and `<scale>/oracle-results.tsv`. The native
+scheduled gate is workflow `Changed-path Ledger Native Gates`, job
+`native`, in `.github/workflows/changed-path-ledger-native.yml`. That workflow
+also runs for pull requests targeting `main` and pushes to `main`. Both its
+Linux/ext4 and macOS/APFS matrix jobs are required merge and release checks for
+the exact commit being integrated; scheduled artifacts are additional evidence
+and cannot replace those commit-specific checks. The matrix runs the real
+adapter suites and uploads
+`changed-path-ledger-<runner-os>-<files>` with the same reports beneath the
+native scale root. The weekday schedule checks 100,000 files; the nightly
+schedule checks 1,000,000 files plus daemon restart, recovery, and crash
+sampling.
+
+`scripts/check-changed-path-ledger-thresholds.py` checks candidate counts
+`k=0,1,100`, separate full-scan oracle equality, persisted scope caps, and zero
+global-work structural counters. The 100k native budgets are 15/20/30 seconds
+for workspace status/diff/record, 120 seconds for materialized-lane record, and
+30 seconds for structured patch, with a 3 GiB RSS ceiling for workspace
+commands. The 1M budgets are 30/45/60/300/60 seconds with the same RSS ceiling.
+The 1k pull-request budgets are 15/20/30/120/30 seconds with a 2 GiB workspace
+RSS ceiling.
+
+`TRAIL_PERFORMANCE_METRICS_FILE` is inherited by the automatically started
+daemon. Each completed outer operation contributes exactly one append write
+and one JSON object line. Metrics emission is observational and cannot rewrite
+an already-completed command result, so an append error is diagnosed locally;
+the benchmark gate makes that condition fatal by rejecting a missing,
+malformed, duplicate, or incomplete operation report.
+
+The checked activation commands are:
+
+```text
+cargo test -p trail --test changed_path_ledger_activation -- --nocapture
+cargo test -p trail --test changed_path_ledger_linux -- --nocapture
+cargo test -p trail --test changed_path_ledger_macos -- --nocapture
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo test --workspace
+```
+
+Unsupported operating systems remain compile-time hard-off. The current native
+allowlist is the ext-family on Linux and APFS on macOS; every other filesystem
+returns a reconciliation-required error before a native lease can authorize
+trust. On allowlisted filesystems, every command still revalidates provider
+identity, root identity, capabilities, policy dependencies, cursor continuity,
+and the c1/c2 fence; platform support alone is never a clean proof.

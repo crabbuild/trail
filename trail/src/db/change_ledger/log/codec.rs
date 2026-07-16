@@ -388,29 +388,68 @@ pub(crate) fn recover_segments_from_directory(
     expected: &RecoveryScope,
     limits: PersistedLogLimits,
 ) -> std::result::Result<RecoveredTail, RecoveryError> {
-    let limits = limits.validate()?;
     let (connection, immutable_snapshot) = open_recovery_database(database_path)?;
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(|error| RecoveryError::new(format!("enable observer foreign keys: {error}")))?;
+    let immutable_wal = immutable_snapshot && database_header_uses_wal(database_path)?;
+    recover_segments_with_connection(
+        &connection,
+        segment_directory,
+        expected,
+        limits,
+        true,
+        immutable_wal,
+    )
+}
+
+/// Authenticate sidecars against the caller's already-current SQLite view.
+/// Controlled projections and intent publication use this path so a second
+/// connection can never select an older checkpoint while the writer's exact
+/// segment metadata is visible in the authoritative transaction.
+pub(crate) fn recover_segments_from_connection(
+    connection: &Connection,
+    segment_directory: &super::super::secure_fs::SecureDirectory,
+    expected: &RecoveryScope,
+    limits: PersistedLogLimits,
+) -> std::result::Result<RecoveredTail, RecoveryError> {
+    recover_segments_with_connection(
+        connection,
+        segment_directory,
+        expected,
+        limits,
+        false,
+        false,
+    )
+}
+
+fn recover_segments_with_connection(
+    connection: &Connection,
+    segment_directory: &super::super::secure_fs::SecureDirectory,
+    expected: &RecoveryScope,
+    limits: PersistedLogLimits,
+    manage_snapshot: bool,
+    immutable_wal: bool,
+) -> std::result::Result<RecoveredTail, RecoveryError> {
+    let limits = limits.validate()?;
     let journal_mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .map_err(|error| RecoveryError::new(format!("read observer journal mode: {error}")))?;
     let foreign_keys: i64 = connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
         .map_err(|error| RecoveryError::new(format!("read observer foreign keys: {error}")))?;
-    let wal_runtime = journal_mode.eq_ignore_ascii_case("wal")
-        || (immutable_snapshot && database_header_uses_wal(database_path)?);
-    if !wal_runtime || foreign_keys != 1 {
+    if !(journal_mode.eq_ignore_ascii_case("wal") || immutable_wal) || foreign_keys != 1 {
         return Err(RecoveryError::new(
             "observer recovery requires WAL journal mode and foreign keys",
         ));
     }
-    connection
-        .execute_batch("BEGIN DEFERRED")
-        .map_err(|error| {
-            RecoveryError::new(format!("begin observer recovery snapshot: {error}"))
-        })?;
+    if manage_snapshot {
+        connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(|error| {
+                RecoveryError::new(format!("begin observer recovery snapshot: {error}"))
+            })?;
+    }
     let epoch = sql_i64(expected.epoch, "observer epoch")
         .map_err(|error| RecoveryError::new(error.to_string()))?;
     validate_recovery_owner(&connection, expected, epoch)?;
@@ -430,9 +469,11 @@ pub(crate) fn recover_segments_from_directory(
         ));
     }
     if segment_count == 0 {
-        connection.execute_batch("COMMIT").map_err(|error| {
-            RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
-        })?;
+        if manage_snapshot {
+            connection.execute_batch("COMMIT").map_err(|error| {
+                RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
+            })?;
+        }
         validate_recovery_owner(&connection, expected, epoch)?;
         return Ok(RecoveredTail {
             records: Vec::new(),
@@ -558,7 +599,7 @@ pub(crate) fn recover_segments_from_directory(
                 "observer segment shortened during recovery",
             ));
         }
-        let (identity, _) = decode_header(&bytes)?;
+        let (identity, header_end_offset) = decode_header(&bytes)?;
         if identity.recovery_scope() != *expected {
             return Err(RecoveryError::new(
                 "observer segment identity does not match expected lease",
@@ -630,6 +671,11 @@ pub(crate) fn recover_segments_from_directory(
             .last()
             .map(|record| record.provider_cursor.clone())
             .unwrap_or_else(|| identity.provider_cursor.clone());
+        let authenticated_last_sequence = recovered
+            .records
+            .last()
+            .map(|record| record.sequence)
+            .unwrap_or_else(|| first_sequence.saturating_sub(1));
         authenticated_segments.push(super::AuthenticatedSegment {
             segment_id: row.segment_id.clone(),
             segment_path: row.segment_path.clone(),
@@ -637,7 +683,8 @@ pub(crate) fn recover_segments_from_directory(
             start_cursor: identity.provider_cursor.clone(),
             end_cursor,
             first_sequence,
-            last_sequence: recovered.last_sequence,
+            last_sequence: authenticated_last_sequence,
+            header_end_offset: header_end_offset as u64,
             durable_end_offset: durable,
             folded_end_offset: db_u64(row.folded_end_offset, "folded observer offset")?,
             segment_hash,
@@ -682,6 +729,20 @@ pub(crate) fn recover_segments_from_directory(
             if published {
                 continue;
             }
+            // A completed authoritative epoch advance permanently excludes
+            // every earlier epoch from the current chain. A crash may leave
+            // the newly-created header of an old rotation without a SQLite
+            // row. Once its canonical header proves that it belongs to a
+            // superseded epoch, it cannot create a gap in the current owner;
+            // continuing to treat it as current would make full
+            // reconciliation unable to recover automatically. Malformed,
+            // current-epoch, and future-epoch files still fail closed.
+            if filename.to_str().is_some_and(|filename| {
+                is_authenticated_superseded_epoch_file(segment_directory, filename, expected)
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
             requires_reconciliation = true;
         }
     }
@@ -696,11 +757,52 @@ pub(crate) fn recover_segments_from_directory(
     };
     drop(rows);
     drop(statement);
-    connection.execute_batch("COMMIT").map_err(|error| {
-        RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
-    })?;
+    if manage_snapshot {
+        connection.execute_batch("COMMIT").map_err(|error| {
+            RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
+        })?;
+    }
     validate_recovery_owner(&connection, expected, epoch)?;
     Ok(recovered)
+}
+
+fn is_authenticated_superseded_epoch_file(
+    directory: &super::super::secure_fs::SecureDirectory,
+    filename: &str,
+    current: &RecoveryScope,
+) -> std::result::Result<bool, RecoveryError> {
+    let Some(segment_id) = filename.strip_suffix(".cpl") else {
+        return Ok(false);
+    };
+    if super::writer::segment_filename(segment_id).ok().as_deref() != Some(filename) {
+        return Ok(false);
+    }
+    let bytes = segment_id.as_bytes();
+    let Some(epoch) = std::str::from_utf8(&bytes[..20])
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Ok(false);
+    };
+    if epoch >= current.epoch {
+        return Ok(false);
+    }
+    let owner_token: [u8; 32] = match hex::decode(&segment_id[42..]) {
+        Ok(bytes) => match bytes.try_into() {
+            Ok(token) => token,
+            Err(_) => return Ok(false),
+        },
+        Err(_) => return Ok(false),
+    };
+    published_header_matches(
+        directory,
+        filename,
+        &RecoveryScope {
+            scope_id: current.scope_id,
+            epoch,
+            owner_token,
+        },
+    )
 }
 
 pub(crate) fn authenticate_segment_for_deletion(

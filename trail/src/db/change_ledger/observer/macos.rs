@@ -12,6 +12,7 @@ use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(debug_assertions)]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -29,14 +30,16 @@ use sha2::{Digest, Sha256};
 use super::{ObserverFence, ObserverLease, QualifiedObserver};
 use crate::db::change_ledger::reconcile::{ObserverEvent, ObserverQualification};
 use crate::db::change_ledger::secure_fs::SecureDirectory;
+use crate::db::change_ledger::{
+    capture_policy_dependency_fence_identity,
+    capture_policy_dependency_fence_identity_at_observed_path, DurableCut, EvidenceFlags,
+    EvidenceSource, ExpectedScope, LedgerPath, ObserverRecord, ObserverWriterBinding,
+    PolicyDependencyFenceIdentity, ProviderCapabilities, SegmentWriter,
+};
 #[cfg(debug_assertions)]
 use crate::db::change_ledger::{
     BaselineIdentity, FilesystemIdentity, PolicyIdentity, ProviderIdentity, ScopeId, ScopeIdentity,
     ScopeKind,
-};
-use crate::db::change_ledger::{
-    DurableCut, EvidenceFlags, EvidenceSource, ExpectedScope, LedgerPath, ObserverRecord,
-    ObserverWriterBinding, ProviderCapabilities, SegmentWriter,
 };
 use crate::error::{Error, Result};
 #[cfg(debug_assertions)]
@@ -44,9 +47,10 @@ use crate::{InitImportMode, Trail};
 
 const MAX_PENDING_RECORDS: usize = 8_192;
 const MAX_RETAINED_EVENTS: usize = 65_536;
+const MAX_DIRECT_POLICY_DEPENDENCIES: usize = 1_024;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const CAPABILITY_VERSION: u16 = 3;
+const CAPABILITY_VERSION: u16 = 4;
 const STREAM_FLAGS: u32 = fs_events::kFSEventStreamCreateFlagFileEvents
     | fs_events::kFSEventStreamCreateFlagNoDefer
     | fs_events::kFSEventStreamCreateFlagWatchRoot;
@@ -98,10 +102,18 @@ struct CallbackCoverageRoot {
     device_relative_root: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PolicyWatch {
     observed_path: PathBuf,
     dependency: PathBuf,
+    identity: PolicyDependencyFenceIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ExternalPolicyFence {
+    dependency: PathBuf,
+    observed_path: PathBuf,
+    identity: PolicyDependencyFenceIdentity,
 }
 
 struct CoveragePlan {
@@ -110,11 +122,16 @@ struct CoveragePlan {
     system_aliases: Vec<SystemAliasBinding>,
     policy_dependencies: Vec<PathBuf>,
     policy_watches: Vec<PolicyWatch>,
+    external_policy_fences: Vec<ExternalPolicyFence>,
 }
 
 pub(crate) trait MacObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)>;
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>>;
     fn heartbeat(&mut self) -> Result<()> {
         Ok(())
@@ -144,8 +161,14 @@ impl MacObserverDurability for MacSegmentWriterDurability {
     }
 
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
-        self.writer.append(&[record])?;
-        self.writer.flush_durable()
+        self.writer.append_and_flush(&[record])
+    }
+
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)> {
+        self.writer.append_flush_and_rotate(&[record])
     }
 
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
@@ -171,6 +194,7 @@ pub(crate) struct MacOsProviderCursor {
     coverage_roots: Vec<CursorCoverageRoot>,
     system_aliases: Vec<SystemAliasBinding>,
     policy_dependencies: Vec<PathBuf>,
+    external_policy_fences: Vec<ExternalPolicyFence>,
     root_identity: Vec<u8>,
     lineage_identity: Vec<u8>,
     provider_identity: Vec<u8>,
@@ -203,6 +227,7 @@ impl MacOsProviderCursor {
             || self.coverage_roots != coverage_roots
             || self.system_aliases != coverage.system_aliases
             || self.policy_dependencies != coverage.policy_dependencies
+            || self.external_policy_fences != coverage.external_policy_fences
             || self.root_identity != root_identity
             || self.lineage_identity.len() < 16
             || self.provider_identity != provider_identity
@@ -310,10 +335,23 @@ enum DurabilityCommand {
         dependency: PathBuf,
         provider_event_id: u64,
     },
+    PolicyEvent {
+        watch: PolicyWatch,
+        provider_event_id: u64,
+    },
+    DirectPolicyInvalidation {
+        dependency: PathBuf,
+        response: SyncSender<Result<()>>,
+    },
     Fence {
         minimum_provider_event_id: u64,
         nonce: Vec<u8>,
         response: SyncSender<Result<(ObserverFence, DurableCut, u64)>>,
+    },
+    ControlledFence {
+        minimum_provider_event_id: u64,
+        nonce: Vec<u8>,
+        response: SyncSender<Result<(ObserverFence, DurableCut, DurableCut, u64)>>,
     },
     Rotate {
         expected: DurableCut,
@@ -373,6 +411,7 @@ pub(crate) struct MacOsFseventsObserver {
     owner_token: String,
     owner_fence_nonce: Vec<u8>,
     policy_dependencies: Vec<PathBuf>,
+    external_policy_fences: Vec<ExternalPolicyFence>,
     lineage_identity: Vec<u8>,
     history_authority: HistoryAuthority,
     coverage_roots: Vec<CoverageRoot>,
@@ -390,6 +429,8 @@ pub(crate) struct MacOsFseventsObserver {
     fail_next_root_descriptor: Mutex<bool>,
     #[cfg(debug_assertions)]
     fail_next_coverage_descriptor: Mutex<bool>,
+    #[cfg(test)]
+    fail_next_direct_policy_fence: Mutex<bool>,
     #[cfg(debug_assertions)]
     next_history_authority_override: Mutex<Option<HistoryAuthority>>,
 }
@@ -462,6 +503,89 @@ impl MacOsFseventsObserver {
         }
     }
 
+    /// End an authenticated native interval and seal its exact durable tail
+    /// in one durability-worker turn. Native records queued before the
+    /// controlled fence are included in the sealed segment; records queued
+    /// after it can only be appended to the linked rotation anchor.
+    pub(crate) fn controlled_end_fence(
+        &self,
+        expected: &ExpectedScope,
+        start: &ObserverFence,
+    ) -> Result<(ObserverFence, DurableCut, DurableCut)> {
+        let issued_start = self.issued_fence(expected, start)?;
+        if !matches!(
+            issued_start.kind,
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
+        ) {
+            self.shared
+                .revoke("fsevents_controlled_start_kind_mismatch");
+            return Err(reconcile_error("fsevents_controlled_start_kind_mismatch"));
+        }
+        let barrier = self.flush_fence(
+            expected,
+            IssuedFenceKind::End {
+                start_nonce: start.nonce.clone(),
+            },
+        )?;
+        let issued_barrier = self.issued_fence(expected, &barrier)?;
+        let mut nonce = vec![0_u8; 24];
+        getrandom::getrandom(&mut nonce).map_err(|error| {
+            Error::InvalidInput(format!("controlled FSEvents fence entropy failed: {error}"))
+        })?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(DurabilityCommand::ControlledFence {
+                minimum_provider_event_id: issued_barrier.provider_event_id,
+                nonce: nonce.clone(),
+                response: response_tx,
+            })
+            .map_err(|_| reconcile_error("fsevents_controlled_fence_worker_unavailable"))?;
+        let (public, sealed, anchor, provider_event_id) =
+            match response_rx.recv_timeout(FENCE_TIMEOUT) {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.shared.revoke("fsevents_controlled_fence_timeout");
+                    return Err(reconcile_error("fsevents_controlled_fence_timeout"));
+                }
+            };
+        if public.nonce != nonce
+            || public.sequence != sealed.last_sequence
+            || public.durable_offset != sealed.durable_end_offset
+            || sealed.last_sequence != anchor.last_sequence
+            || sealed.provider_cursor != anchor.provider_cursor
+        {
+            self.shared.revoke("fsevents_controlled_fence_cut_mismatch");
+            return Err(reconcile_error("fsevents_controlled_fence_cut_mismatch"));
+        }
+        self.ensure_history_authority()?;
+        self.root_identity()?;
+        let issued = IssuedFence {
+            public: public.clone(),
+            expected: expected.clone(),
+            root_identity: self.root_identity.clone(),
+            owner_token: self.owner_token.clone(),
+            owner_fence_nonce: self.owner_fence_nonce.clone(),
+            provider_event_id,
+            durable_cut: sealed.clone(),
+            kind: IssuedFenceKind::End {
+                start_nonce: start.nonce.clone(),
+            },
+        };
+        let mut state = self.shared.lock();
+        state.issued_fences.remove(&barrier.nonce);
+        state.issued_fences.insert(nonce, issued);
+        drop(state);
+        if public.sequence <= start.sequence
+            || (issued_start.durable_cut.segment_id == sealed.segment_id
+                && public.durable_offset < start.durable_offset)
+        {
+            self.shared
+                .revoke("fsevents_controlled_fence_non_monotonic");
+            return Err(reconcile_error("fsevents_controlled_fence_non_monotonic"));
+        }
+        Ok((public, sealed, anchor))
+    }
+
     fn rebind_tail_anchor(
         &self,
         previous: &ExpectedScope,
@@ -490,6 +614,7 @@ impl MacOsFseventsObserver {
         resume: Option<MacOsProviderCursor>,
         policy_dependencies: &[PathBuf],
     ) -> Result<Self> {
+        ensure_apfs(root_path)?;
         Self::start_inner(
             root_path,
             durability,
@@ -598,6 +723,7 @@ impl MacOsFseventsObserver {
             coverage_roots: cursor_coverage_roots(&coverage),
             system_aliases: coverage.system_aliases.clone(),
             policy_dependencies: coverage.policy_dependencies.clone(),
+            external_policy_fences: coverage.external_policy_fences.clone(),
             root_identity: root_identity.clone(),
             lineage_identity: lineage_identity.clone(),
             provider_identity: binding.provider_identity.clone(),
@@ -708,6 +834,7 @@ impl MacOsFseventsObserver {
             owner_token: binding.owner_token,
             owner_fence_nonce: binding.fence_nonce,
             policy_dependencies: lease_policy_dependencies,
+            external_policy_fences: coverage.external_policy_fences,
             lineage_identity,
             history_authority: authority,
             coverage_roots: coverage.roots,
@@ -736,6 +863,8 @@ impl MacOsFseventsObserver {
             fail_next_root_descriptor: Mutex::new(false),
             #[cfg(debug_assertions)]
             fail_next_coverage_descriptor: Mutex::new(false),
+            #[cfg(test)]
+            fail_next_direct_policy_fence: Mutex::new(false),
             #[cfg(debug_assertions)]
             next_history_authority_override: Mutex::new(None),
         };
@@ -752,11 +881,26 @@ impl MacOsFseventsObserver {
 
     pub(crate) fn lease(&self) -> Result<ObserverLease> {
         self.ensure_history_authority()?;
+        let direct_policy_fences = self
+            .external_policy_fences
+            .iter()
+            .map(|fence| (fence.dependency.clone(), fence.identity.clone()))
+            .collect::<Vec<_>>();
+        let direct_paths = direct_policy_fences
+            .iter()
+            .map(|(path, _)| path)
+            .collect::<std::collections::BTreeSet<_>>();
         Ok(ObserverLease {
             owner_token: self.owner_token.clone(),
             root_identity: self.root_identity()?,
             provider_identity: self.provider_identity.clone(),
-            policy_dependencies: self.policy_dependencies.clone(),
+            policy_dependencies: self
+                .policy_dependencies
+                .iter()
+                .filter(|path| !direct_paths.contains(path))
+                .cloned()
+                .collect(),
+            direct_policy_fences,
             capabilities: self.capabilities(),
         })
     }
@@ -827,6 +971,18 @@ impl MacOsFseventsObserver {
     }
 
     fn ensure_coverage_roots(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut fail = self
+                .fail_next_direct_policy_fence
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if *fail {
+                *fail = false;
+                drop(fail);
+                return self.revoke_direct_policy_dependency(Path::new("test-after-end-fence"));
+            }
+        }
         #[cfg(debug_assertions)]
         {
             let mut fail = self
@@ -894,7 +1050,42 @@ impl MacOsFseventsObserver {
                 return Err(reconcile_error("fsevents_policy_coverage_replaced"));
             }
         }
+        for pinned in &self.external_policy_fences {
+            let observed = match capture_policy_dependency_fence_identity_at_observed_path(
+                &pinned.dependency,
+                &pinned.observed_path,
+            ) {
+                Ok(observed) => observed,
+                Err(_) => return self.revoke_direct_policy_dependency(&pinned.dependency),
+            };
+            if observed != pinned.identity {
+                return self.revoke_direct_policy_dependency(&pinned.dependency);
+            }
+        }
         Ok(())
+    }
+
+    fn revoke_direct_policy_dependency(&self, dependency: &Path) -> Result<()> {
+        let reason = format!(
+            "fsevents_policy_dependency_invalidated:{}",
+            dependency.display()
+        );
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(DurabilityCommand::DirectPolicyInvalidation {
+                dependency: dependency.to_path_buf(),
+                response: response_tx,
+            })
+            .map_err(|_| reconcile_error("fsevents_durability_worker_disconnected"))?;
+        match response_rx.recv_timeout(FENCE_TIMEOUT) {
+            Ok(Ok(())) => Err(reconcile_error(&reason)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                self.shared
+                    .revoke("fsevents_direct_policy_revocation_timeout");
+                Err(reconcile_error("fsevents_direct_policy_revocation_timeout"))
+            }
+        }
     }
 
     fn wait_for_history(&self) -> Result<()> {
@@ -1282,6 +1473,14 @@ impl MacOsFseventsObserver {
             .unwrap_or_else(|poison| poison.into_inner()) = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_direct_policy_fence_for_test(&self) {
+        *self
+            .fail_next_direct_policy_fence
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = true;
+    }
+
     #[cfg(debug_assertions)]
     fn set_next_history_authority_for_test(&self, authority: HistoryAuthority) {
         *self
@@ -1504,13 +1703,11 @@ extern "C" fn callback(
         };
         let CallbackDisposition::Ledger(path) = disposition else {
             match disposition {
-                CallbackDisposition::PolicyDependency(dependency) => {
-                    match context
-                        .records
-                        .try_send(DurabilityCommand::PolicyInvalidation {
-                            dependency,
-                            provider_event_id: ids[index],
-                        }) {
+                CallbackDisposition::PolicyDependency(watch) => {
+                    match context.records.try_send(DurabilityCommand::PolicyEvent {
+                        watch,
+                        provider_event_id: ids[index],
+                    }) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             context
@@ -1568,7 +1765,7 @@ extern "C" fn callback(
 
 enum CallbackDisposition {
     Ledger(Option<LedgerPath>),
-    PolicyDependency(PathBuf),
+    PolicyDependency(PolicyWatch),
     Ignore,
 }
 
@@ -1596,14 +1793,12 @@ fn classify_callback_path(
         ));
     }
     for candidate in &candidates {
-        if let Some(dependency) = context
+        if let Some(watch) = context
             .policy_watches
             .iter()
             .find(|watch| dependency_triggered_by(candidate, &watch.observed_path, native_flags))
         {
-            return Ok(CallbackDisposition::PolicyDependency(
-                dependency.dependency.clone(),
-            ));
+            return Ok(CallbackDisposition::PolicyDependency(watch.clone()));
         }
     }
     if let Some(candidate) = candidates
@@ -1793,13 +1988,20 @@ fn build_coverage_plan(
     add_coverage_root(&mut roots, root, device)?;
     let mut system_aliases = BTreeMap::<PathBuf, SystemAliasBinding>::new();
     let mut policy_watches = Vec::with_capacity(dependencies.len());
+    let mut external_policy_fences = Vec::new();
     for dependency in dependencies {
         let dependency = normalize_absolute_dependency(requested_root, dependency)?;
         if let Ok(relative) = dependency.strip_prefix(requested_root) {
-            validate_policy_dependency_leaf(&dependency)?;
+            let observed_path = lexical_normalize_path(&root.join(relative));
+            let identity = capture_policy_dependency_fence_identity_at_observed_path(
+                &dependency,
+                &observed_path,
+            )
+            .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
             policy_watches.push(PolicyWatch {
-                observed_path: lexical_normalize_path(&root.join(relative)),
+                observed_path,
                 dependency,
+                identity,
             });
             continue;
         }
@@ -1809,29 +2011,59 @@ fn build_coverage_plan(
                 .entry(alias.alias_path.clone())
                 .or_insert(alias);
         }
+        // Validate every ordinary component from `/` to the final leaf with
+        // descriptor-relative O_NOFOLLOW traversal. The only symlink already
+        // removed from this observed path is an exact authenticated platform
+        // alias above.
+        capture_policy_dependency_fence_identity(&observed_dependency)
+            .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
         if observed_dependency.starts_with(root) {
             validate_policy_dependency_leaf(&observed_dependency)?;
+            let identity = capture_policy_dependency_fence_identity_at_observed_path(
+                &dependency,
+                &observed_dependency,
+            )
+            .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
             policy_watches.push(PolicyWatch {
                 observed_path: observed_dependency,
                 dependency,
+                identity,
             });
             continue;
         }
         let (named_root, canonical, coverage_root) = nearest_existing_parent(&observed_dependency)?;
         let metadata = coverage_root.metadata()?;
         if metadata.dev() != device {
-            return Err(reconcile_error(&format!(
-                "fsevents_policy_dependency_crosses_device:{}",
-                observed_dependency.display()
-            )));
+            let identity = capture_policy_dependency_fence_identity_at_observed_path(
+                &dependency,
+                &observed_dependency,
+            )
+            .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
+            external_policy_fences.push(ExternalPolicyFence {
+                dependency,
+                observed_path: observed_dependency,
+                identity,
+            });
+            if external_policy_fences.len() > MAX_DIRECT_POLICY_DEPENDENCIES {
+                return Err(reconcile_error(
+                    "fsevents_direct_policy_dependency_bound_exceeded",
+                ));
+            }
+            continue;
         }
         validate_policy_dependency_leaf(&observed_dependency)?;
         let relative = observed_dependency
             .strip_prefix(&named_root)
             .map_err(|_| reconcile_error("fsevents_policy_dependency_coverage_mapping_failure"))?;
+        let identity = capture_policy_dependency_fence_identity_at_observed_path(
+            &dependency,
+            &observed_dependency,
+        )
+        .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
         policy_watches.push(PolicyWatch {
             observed_path: lexical_normalize_path(&canonical.join(relative)),
             dependency,
+            identity,
         });
         add_open_coverage_root(&mut roots, canonical, coverage_root, device)?;
     }
@@ -1852,6 +2084,7 @@ fn build_coverage_plan(
         system_aliases: system_aliases.into_values().collect(),
         policy_dependencies: dependencies.to_vec(),
         policy_watches,
+        external_policy_fences,
     })
 }
 
@@ -2297,97 +2530,179 @@ fn run_durability_worker(
             shared.revoke("fsevents_durability_worker_stopped");
             return;
         }
-        let (path, flags, provider_event_id, internal, fence_nonce, response, revocation) =
-            match command {
-                DurabilityCommand::Record {
+        let command = match command {
+            DurabilityCommand::PolicyEvent {
+                watch,
+                provider_event_id,
+            } => {
+                let unchanged = capture_policy_dependency_fence_identity_at_observed_path(
+                    &watch.dependency,
+                    &watch.observed_path,
+                )
+                .is_ok_and(|identity| identity == watch.identity);
+                if unchanged {
+                    let mut state = shared.lock();
+                    state.last_provider_event_id =
+                        state.last_provider_event_id.max(provider_event_id);
+                    shared.changed.notify_all();
+                    continue;
+                }
+                DurabilityCommand::PolicyInvalidation {
+                    dependency: watch.dependency,
+                    provider_event_id,
+                }
+            }
+            command => command,
+        };
+        let (command, direct_response) = match command {
+            DurabilityCommand::DirectPolicyInvalidation {
+                dependency,
+                response,
+            } => (
+                DurabilityCommand::PolicyInvalidation {
+                    dependency,
+                    provider_event_id: shared.lock().last_provider_event_id,
+                },
+                Some(response),
+            ),
+            command => (command, None),
+        };
+        let (
+            path,
+            flags,
+            provider_event_id,
+            internal,
+            fence_nonce,
+            response,
+            controlled_response,
+            revocation,
+        ) = match command {
+            DurabilityCommand::Record {
+                path,
+                flags,
+                provider_event_id,
+            } => {
+                let internal = path.as_str().starts_with(".trail/observer-fences/");
+                (
                     path,
                     flags,
                     provider_event_id,
-                } => {
-                    let internal = path.as_str().starts_with(".trail/observer-fences/");
-                    (
-                        path,
-                        flags,
-                        provider_event_id,
-                        internal,
-                        Vec::new(),
-                        None,
-                        None,
-                    )
-                }
-                DurabilityCommand::PolicyInvalidation {
-                    dependency,
+                    internal,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            DurabilityCommand::PolicyInvalidation {
+                dependency,
+                provider_event_id,
+            } => {
+                let digest = Sha256::digest(dependency.as_os_str().as_bytes());
+                let path = match LedgerPath::parse(&format!(
+                    ".trail/policy-invalidations/{}",
+                    hex::encode(digest)
+                )) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        shared.revoke("fsevents_policy_invalidation_marker_failure");
+                        return;
+                    }
+                };
+                (
+                    path,
+                    EvidenceFlags::CONTENT,
                     provider_event_id,
-                } => {
-                    let digest = Sha256::digest(dependency.as_os_str().as_bytes());
-                    let path = match LedgerPath::parse(&format!(
-                        ".trail/policy-invalidations/{}",
-                        hex::encode(digest)
-                    )) {
-                        Ok(path) => path,
-                        Err(_) => {
-                            shared.revoke("fsevents_policy_invalidation_marker_failure");
-                            return;
-                        }
-                    };
-                    (
-                        path,
-                        EvidenceFlags::CONTENT,
-                        provider_event_id,
-                        true,
-                        Vec::new(),
-                        None,
-                        Some(format!(
-                            "fsevents_policy_dependency_invalidated:{}",
-                            dependency.display()
-                        )),
-                    )
+                    true,
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(format!(
+                        "fsevents_policy_dependency_invalidated:{}",
+                        dependency.display()
+                    )),
+                )
+            }
+            DurabilityCommand::Fence {
+                minimum_provider_event_id,
+                nonce,
+                response,
+            } => {
+                let provider_event_id = shared.lock().last_provider_event_id;
+                if provider_event_id < minimum_provider_event_id {
+                    let _ = response.send(Err(reconcile_error(
+                        "fsevents_fence_precedes_authenticated_sentinel",
+                    )));
+                    shared.revoke("fsevents_fence_precedes_authenticated_sentinel");
+                    return;
                 }
-                DurabilityCommand::Fence {
-                    minimum_provider_event_id,
+                let name = format!(".trail-fsevents-fence-{}", hex::encode(&nonce));
+                let Ok(path) = LedgerPath::parse(&name) else {
+                    let _ = response.send(Err(reconcile_error("fsevents_fence_path_failure")));
+                    shared.revoke("fsevents_fence_path_failure");
+                    return;
+                };
+                (
+                    path,
+                    EvidenceFlags::default(),
+                    provider_event_id,
+                    true,
                     nonce,
-                    response,
-                } => {
-                    let provider_event_id = shared.lock().last_provider_event_id;
-                    if provider_event_id < minimum_provider_event_id {
-                        let _ = response.send(Err(reconcile_error(
-                            "fsevents_fence_precedes_authenticated_sentinel",
-                        )));
-                        shared.revoke("fsevents_fence_precedes_authenticated_sentinel");
-                        return;
-                    }
-                    let name = format!(".trail-fsevents-fence-{}", hex::encode(&nonce));
-                    let Ok(path) = LedgerPath::parse(&name) else {
-                        let _ = response.send(Err(reconcile_error("fsevents_fence_path_failure")));
-                        shared.revoke("fsevents_fence_path_failure");
-                        return;
-                    };
-                    (
-                        path,
-                        EvidenceFlags::default(),
-                        provider_event_id,
-                        true,
-                        nonce,
-                        Some(response),
-                        None,
-                    )
+                    Some(response),
+                    None,
+                    None,
+                )
+            }
+            DurabilityCommand::ControlledFence {
+                minimum_provider_event_id,
+                nonce,
+                response,
+            } => {
+                let provider_event_id = shared.lock().last_provider_event_id;
+                if provider_event_id < minimum_provider_event_id {
+                    let _ = response.send(Err(reconcile_error(
+                        "fsevents_controlled_fence_precedes_authenticated_sentinel",
+                    )));
+                    shared.revoke("fsevents_controlled_fence_precedes_authenticated_sentinel");
+                    return;
                 }
-                DurabilityCommand::Rotate { expected, response } => {
-                    let result = durability.rotate_if_cut(&expected);
-                    if let Err(error) = &result {
-                        shared.revoke(format!("fsevents_rotation_failure:{error}"));
-                    }
-                    let failed = result.is_err();
-                    let _ = response.send(result);
-                    if failed {
-                        return;
-                    }
-                    continue;
+                let name = format!(".trail-fsevents-controlled-fence-{}", hex::encode(&nonce));
+                let Ok(path) = LedgerPath::parse(&name) else {
+                    let _ = response.send(Err(reconcile_error(
+                        "fsevents_controlled_fence_path_failure",
+                    )));
+                    shared.revoke("fsevents_controlled_fence_path_failure");
+                    return;
+                };
+                (
+                    path,
+                    EvidenceFlags::default(),
+                    provider_event_id,
+                    true,
+                    nonce,
+                    None,
+                    Some(response),
+                    None,
+                )
+            }
+            DurabilityCommand::Rotate { expected, response } => {
+                let result = durability.rotate_if_cut(&expected);
+                if let Err(error) = &result {
+                    shared.revoke(format!("fsevents_rotation_failure:{error}"));
                 }
-                #[cfg(debug_assertions)]
-                DurabilityCommand::StopForTest => unreachable!(),
-                DurabilityCommand::Shutdown => unreachable!(),
-            };
+                let failed = result.is_err();
+                let _ = response.send(result);
+                if failed {
+                    return;
+                }
+                continue;
+            }
+            DurabilityCommand::DirectPolicyInvalidation { .. } => unreachable!(),
+            DurabilityCommand::PolicyEvent { .. } => unreachable!(),
+            #[cfg(debug_assertions)]
+            DurabilityCommand::StopForTest => unreachable!(),
+            DurabilityCommand::Shutdown => unreachable!(),
+        };
         let sequence = shared.lock().next_sequence;
         // Device event IDs are global, but callbacks from separate one-root
         // streams are not promised to be delivered in global-ID order. The
@@ -2410,15 +2725,34 @@ fn run_durability_worker(
             flags,
             provider_cursor,
         };
-        let cut = match durability.append_and_flush(record) {
-            Ok(cut) => cut,
-            Err(error) => {
-                if let Some(response) = response {
-                    let _ = response.send(Err(reconcile_error("fsevents_durability_failure")));
+        let (cut, controlled_rotation) = match controlled_response.is_some() {
+            true => match durability.append_flush_and_rotate(record) {
+                Ok((sealed, anchor)) => (sealed.clone(), Some((sealed, anchor))),
+                Err(error) => {
+                    if let Some(response) = controlled_response {
+                        let _ = response.send(Err(reconcile_error(
+                            "fsevents_controlled_fence_durability_failure",
+                        )));
+                    }
+                    shared.revoke(format!(
+                        "fsevents_controlled_fence_durability_failure:{error}"
+                    ));
+                    return;
                 }
-                shared.revoke(format!("fsevents_durability_failure:{error}"));
-                return;
-            }
+            },
+            false => match durability.append_and_flush(record) {
+                Ok(cut) => (cut, None),
+                Err(error) => {
+                    if let Some(response) = response {
+                        let _ = response.send(Err(reconcile_error("fsevents_durability_failure")));
+                    }
+                    if let Some(response) = direct_response {
+                        let _ = response.send(Err(reconcile_error("fsevents_durability_failure")));
+                    }
+                    shared.revoke(format!("fsevents_durability_failure:{error}"));
+                    return;
+                }
+            },
         };
         let public = ObserverFence {
             sequence,
@@ -2448,13 +2782,27 @@ fn run_durability_worker(
             shared.changed.notify_all();
         }
         if let Some(response) = response {
-            let _ = response.send(Ok((public, cut, provider_event_id)));
+            let _ = response.send(Ok((public.clone(), cut.clone(), provider_event_id)));
+        }
+        if let (Some(response), Some((sealed, anchor))) = (controlled_response, controlled_rotation)
+        {
+            let _ = response.send(Ok((public, sealed, anchor, provider_event_id)));
         }
         if let Some(reason) = revocation {
             match durability.revoke_owner(&reason) {
-                Ok(()) => shared.revoke(reason),
+                Ok(()) => {
+                    shared.revoke(reason);
+                    if let Some(response) = direct_response {
+                        let _ = response.send(Ok(()));
+                    }
+                }
                 Err(error) => {
-                    shared.revoke(format!("fsevents_policy_owner_revocation_failure:{error}"))
+                    shared.revoke(format!("fsevents_policy_owner_revocation_failure:{error}"));
+                    if let Some(response) = direct_response {
+                        let _ = response.send(Err(reconcile_error(
+                            "fsevents_policy_owner_revocation_failure",
+                        )));
+                    }
                 }
             }
             return;
@@ -2574,21 +2922,42 @@ fn root_identity(file: &File) -> Result<Vec<u8>> {
     .into_bytes())
 }
 
-#[cfg(debug_assertions)]
 fn ensure_apfs(path: &Path) -> Result<()> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::InvalidInput("APFS fixture path contained NUL".into()))?;
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidInput("observer root contained NUL".into()))?;
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut stat) } != 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
     let filesystem = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }
         .to_str()
         .map_err(|_| Error::InvalidInput("filesystem type was not UTF-8".into()))?;
-    if filesystem != "apfs" {
-        return Err(Error::InvalidInput(format!(
-            "real macOS observer qualification requires APFS, found {filesystem}"
-        )));
+    if !macos_filesystem_is_supported(filesystem) {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: path.display().to_string(),
+            state: "stale_baseline".into(),
+            reason: format!("native macOS changed-path observer requires APFS, found {filesystem}"),
+            command: "trail index reconcile".into(),
+        });
+    }
+    Ok(())
+}
+
+fn macos_filesystem_is_supported(filesystem: &str) -> bool {
+    filesystem == "apfs"
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_unsupported_filesystem_rejection() -> std::result::Result<(), String> {
+    if !macos_filesystem_is_supported("apfs") {
+        return Err("APFS was rejected".into());
+    }
+    for unsupported in ["hfs", "nfs", "smbfs", "osxfuse"] {
+        if macos_filesystem_is_supported(unsupported) {
+            return Err(format!(
+                "unsupported macOS filesystem `{unsupported}` was qualified"
+            ));
+        }
     }
     Ok(())
 }
@@ -2638,6 +3007,14 @@ impl MacObserverDurability for MemoryDurability {
             last_hash: [0; 32],
             provider_cursor,
         })
+    }
+
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)> {
+        let sealed = self.append_and_flush(record)?;
+        Ok((sealed.clone(), sealed))
     }
 
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
@@ -3247,28 +3624,117 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
             )));
         }
 
-        let cross_device_dependency = PathBuf::from("/dev/null");
-        if std::fs::metadata(&cross_device_dependency)?.dev()
-            != std::fs::metadata(external_root.path())?.dev()
-        {
+        // When a writable second volume is available, prove that a repository
+        // there can use a home-volume Git policy dependency without claiming
+        // a second FSEvents history. The dependency is instead bound into the
+        // direct authenticated fence and any drift revokes the lease.
+        let policy_volume = tempfile::tempdir()?;
+        let cross_device_dependency = policy_volume.path().join("global.gitconfig");
+        std::fs::write(&cross_device_dependency, b"[core]\n")?;
+        let policy_device = std::fs::metadata(policy_volume.path())?.dev();
+        let mut cross_device_workspace = None;
+        if let Ok(volumes) = std::fs::read_dir("/Volumes") {
+            for volume in volumes.flatten() {
+                let path = volume.path();
+                if std::fs::metadata(&path)
+                    .ok()
+                    .is_none_or(|metadata| !metadata.is_dir() || metadata.dev() == policy_device)
+                {
+                    continue;
+                }
+                if let Ok(temp) = tempfile::Builder::new()
+                    .prefix("trail-cross-device-policy-")
+                    .tempdir_in(&path)
+                {
+                    cross_device_workspace = Some(temp);
+                    break;
+                }
+            }
+        }
+        if let Some(cross_device_workspace) = cross_device_workspace {
+            std::fs::create_dir(cross_device_workspace.path().join(".trail"))?;
             let provider = b"macos-fsevents-file-events-v1".to_vec();
             let (durability, _) = memory_durability(provider, Duration::ZERO);
-            let error = MacOsFseventsObserver::start(
-                external_root.path(),
+            let observer = MacOsFseventsObserver::start(
+                cross_device_workspace.path(),
                 Box::new(durability),
                 None,
-                &[cross_device_dependency],
-            )
-            .err()
-            .ok_or_else(|| Error::Corrupt("cross-device policy dependency was accepted".into()))?;
-            if !error
-                .to_string()
-                .contains("fsevents_policy_dependency_crosses_device")
+                std::slice::from_ref(&cross_device_dependency),
+            )?;
+            let lease = observer.lease()?;
+            if observer.stream.streams.len() != 1
+                || observer.coverage_roots.len() != 1
+                || !lease.policy_dependencies.is_empty()
+                || lease.direct_policy_fences.len() != 1
+                || lease.direct_policy_fences[0].0 != cross_device_dependency
             {
                 return Err(Error::Corrupt(
-                    "cross-device policy dependency did not fail closed explicitly".into(),
+                    "cross-device policy dependency was not exactly direct-fenced".into(),
                 ));
             }
+            std::fs::write(
+                &cross_device_dependency,
+                b"[core]\n\texcludesFile = ignored\n",
+            )?;
+            let error = observer
+                .lease()
+                .err()
+                .ok_or_else(|| Error::Corrupt("cross-device policy drift was accepted".into()))?;
+            if !error
+                .to_string()
+                .contains("fsevents_policy_dependency_invalidated")
+            {
+                return Err(Error::Corrupt(
+                    "cross-device policy drift did not revoke exact authority".into(),
+                ));
+            }
+
+            let nested_target = policy_volume.path().join("nested-target");
+            let nested_parent = policy_volume.path().join("nested-parent");
+            std::fs::create_dir_all(nested_target.join("existing"))?;
+            std::fs::create_dir(&nested_parent)?;
+            symlink(&nested_target, nested_parent.join("link"))?;
+            std::fs::write(nested_target.join("existing/global.gitconfig"), b"[core]\n")?;
+            let nested_dependency = nested_parent.join("link/existing/global.gitconfig");
+            let provider = b"macos-fsevents-file-events-v1".to_vec();
+            let (durability, _) = memory_durability(provider, Duration::ZERO);
+            let nested_error = MacOsFseventsObserver::start(
+                cross_device_workspace.path(),
+                Box::new(durability),
+                None,
+                std::slice::from_ref(&nested_dependency),
+            )
+            .err()
+            .ok_or_else(|| {
+                Error::Corrupt("cross-device nested policy symlink was accepted".into())
+            })?;
+            if !nested_error
+                .to_string()
+                .contains("fsevents_policy_dependency_leaf_is_symlink_or_unsafe")
+            {
+                return Err(Error::Corrupt(
+                    "cross-device nested policy symlink did not fail closed".into(),
+                ));
+            }
+        }
+
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let unsafe_error = MacOsFseventsObserver::start(
+            external_root.path(),
+            Box::new(durability),
+            None,
+            &[PathBuf::from("/dev/null")],
+        )
+        .err()
+        .ok_or_else(|| Error::Corrupt("unsafe cross-device policy leaf was accepted".into()))?;
+        if !unsafe_error
+            .to_string()
+            .contains("fsevents_policy_dependency_leaf_is_symlink_or_unsafe")
+        {
+            return Err(Error::Corrupt(
+                "unsafe cross-device policy leaf did not fail closed explicitly".into(),
+            ));
         }
 
         let provider = b"macos-fsevents-file-events-v1".to_vec();
@@ -3311,7 +3777,7 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
         .ok_or_else(|| Error::Corrupt("symlinked policy parent was accepted".into()))?;
         if !error
             .to_string()
-            .contains("fsevents_policy_dependency_parent_is_symlink_or_unsafe")
+            .contains("fsevents_policy_dependency_leaf_is_symlink_or_unsafe")
         {
             return Err(Error::Corrupt(
                 "symlinked policy parent did not fail closed explicitly".into(),
@@ -3329,6 +3795,23 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
             Box::new(durability),
             None,
             std::slice::from_ref(&in_root_symlink_dependency),
+        )
+        .err();
+
+        let nested_target = external_root.path().join("in-root-nested-target");
+        let nested_parent = external_root.path().join("in-root-nested-parent");
+        std::fs::create_dir_all(nested_target.join("existing"))?;
+        std::fs::create_dir(&nested_parent)?;
+        symlink(&nested_target, nested_parent.join("link"))?;
+        std::fs::write(nested_target.join("existing/config"), b"[core]\n")?;
+        let in_root_nested_dependency = nested_parent.join("link/existing/config");
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let in_root_nested_error = MacOsFseventsObserver::start(
+            external_root.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&in_root_nested_dependency),
         )
         .err();
 
@@ -3354,6 +3837,7 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
         };
         for (kind, error) in [
             ("in-root", in_root_error),
+            ("in-root nested-ancestor", in_root_nested_error),
             ("same-device external", external_error),
         ] {
             let error = error.ok_or_else(|| {
@@ -3785,6 +4269,7 @@ pub(crate) fn run_paused_callback_fence() -> std::result::Result<(), String> {
                     }],
                     system_aliases: Vec::new(),
                     policy_dependencies: Vec::new(),
+                    external_policy_fences: Vec::new(),
                     root_identity: b"root".to_vec(),
                     lineage_identity: vec![2; 24],
                     provider_identity: provider,
@@ -3855,6 +4340,102 @@ pub(crate) fn run_paused_callback_fence() -> std::result::Result<(), String> {
         Ok(())
     }
     run().map_err(|error| error.to_string())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn controlled_fence_seals_before_a_continuous_later_queue() {
+    let provider = b"macos-controlled-fence-v1".to_vec();
+    let (durability, _) = memory_durability(provider.clone(), Duration::ZERO);
+    let shared = test_shared(0);
+    let (commands, receiver) = mpsc::sync_channel(MAX_PENDING_RECORDS);
+    let worker_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || {
+        run_durability_worker(
+            receiver,
+            Box::new(durability),
+            worker_shared,
+            MacOsProviderCursor {
+                version: CAPABILITY_VERSION,
+                event_id: 0,
+                device: 1,
+                history_database_uuid: [1; 16],
+                device_relative_root: "tmp/workspace".into(),
+                coverage_roots: vec![CursorCoverageRoot {
+                    device_relative_root: "tmp/workspace".into(),
+                    root_identity: b"root".to_vec(),
+                }],
+                system_aliases: Vec::new(),
+                policy_dependencies: Vec::new(),
+                external_policy_fences: Vec::new(),
+                root_identity: b"root".to_vec(),
+                lineage_identity: vec![2; 24],
+                provider_identity: provider,
+                stream_flags: STREAM_FLAGS,
+                capabilities: native_capabilities(),
+            },
+        )
+    });
+    commands
+        .send(DurabilityCommand::Record {
+            path: LedgerPath::parse("before-controlled-fence").unwrap(),
+            flags: EvidenceFlags::CONTENT,
+            provider_event_id: 10,
+        })
+        .unwrap();
+    wait_for_test_events(&shared, 1).unwrap();
+
+    let nonce = vec![7; 24];
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    commands
+        .send(DurabilityCommand::ControlledFence {
+            minimum_provider_event_id: 10,
+            nonce: nonce.clone(),
+            response: response_tx,
+        })
+        .unwrap();
+    const LATER_RECORDS: usize = 256;
+    for index in 0..LATER_RECORDS {
+        commands
+            .send(DurabilityCommand::Record {
+                path: LedgerPath::parse(&format!("later/{index:03}")).unwrap(),
+                flags: EvidenceFlags::CONTENT,
+                provider_event_id: 20 + index as u64,
+            })
+            .unwrap();
+    }
+    let (public, sealed, anchor, _) = response_rx
+        .recv_timeout(FENCE_TIMEOUT)
+        .expect("controlled fence response")
+        .expect("controlled fence durability");
+    assert_eq!(public.nonce, nonce);
+    assert_eq!(public.sequence, sealed.last_sequence);
+    assert_eq!(public.durable_offset, sealed.durable_end_offset);
+    assert_eq!(anchor.last_sequence, sealed.last_sequence);
+    assert_eq!(anchor.provider_cursor, sealed.provider_cursor);
+
+    wait_for_test_events(&shared, LATER_RECORDS + 2).unwrap();
+    let state = shared.lock();
+    let boundary = state
+        .events
+        .iter()
+        .find(|event| event.event.sequence == public.sequence)
+        .expect("controlled boundary event");
+    assert!(boundary.internal_fence);
+    assert_eq!(boundary.cut, sealed);
+    let later = state
+        .events
+        .iter()
+        .filter(|event| event.event.path.as_str().starts_with("later/"))
+        .collect::<Vec<_>>();
+    assert_eq!(later.len(), LATER_RECORDS);
+    assert!(later
+        .iter()
+        .all(|event| event.event.sequence > public.sequence));
+    drop(state);
+    shared.shutdown.store(true, Ordering::Release);
+    let _ = commands.try_send(DurabilityCommand::Shutdown);
+    worker.join().expect("durability worker");
 }
 
 #[cfg(debug_assertions)]
@@ -4313,4 +4894,137 @@ pub(crate) fn run_uuid_revalidation() -> std::result::Result<(), String> {
         Ok(())
     }
     run().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod policy_event_tests {
+    use super::*;
+    use std::fs;
+
+    fn test_cursor(provider_identity: Vec<u8>) -> MacOsProviderCursor {
+        MacOsProviderCursor {
+            version: CAPABILITY_VERSION,
+            event_id: 0,
+            device: 1,
+            history_database_uuid: [1; 16],
+            device_relative_root: "tmp/workspace".into(),
+            coverage_roots: vec![CursorCoverageRoot {
+                device_relative_root: "tmp/workspace".into(),
+                root_identity: b"root".to_vec(),
+            }],
+            system_aliases: Vec::new(),
+            policy_dependencies: Vec::new(),
+            external_policy_fences: Vec::new(),
+            root_identity: b"root".to_vec(),
+            lineage_identity: vec![2; 24],
+            provider_identity,
+            stream_flags: STREAM_FLAGS,
+            capabilities: native_capabilities(),
+        }
+    }
+
+    fn policy_watch(path: &Path) -> PolicyWatch {
+        PolicyWatch {
+            dependency: path.to_path_buf(),
+            observed_path: path.to_path_buf(),
+            identity: capture_policy_dependency_fence_identity(path).unwrap(),
+        }
+    }
+
+    fn spawn_test_worker(shared: &Arc<Shared>) -> (SyncSender<DurabilityCommand>, JoinHandle<()>) {
+        let provider = b"macos-policy-event-revalidation-v1".to_vec();
+        let (durability, _) = memory_durability(provider.clone(), Duration::ZERO);
+        let (commands, receiver) = mpsc::sync_channel(MAX_PENDING_RECORDS);
+        let worker_shared = Arc::clone(shared);
+        let worker = thread::spawn(move || {
+            run_durability_worker(
+                receiver,
+                Box::new(durability),
+                worker_shared,
+                test_cursor(provider),
+            )
+        });
+        (commands, worker)
+    }
+
+    fn wait_for_revocation(shared: &Shared) -> String {
+        let deadline = Instant::now() + FENCE_TIMEOUT;
+        let mut state = shared.lock();
+        while state.revoked.is_none() && Instant::now() < deadline {
+            let waited = shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = waited.0;
+        }
+        state
+            .revoked
+            .clone()
+            .expect("policy identity mismatch did not revoke the observer")
+    }
+
+    #[test]
+    fn queued_policy_event_revalidates_exact_identity_before_durable_revocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().canonicalize().unwrap().join("config.toml");
+        fs::write(&config, b"[recording]\nmode = 'content'\n").unwrap();
+        let watch = policy_watch(&config);
+        let shared = test_shared(0);
+        let (commands, worker) = spawn_test_worker(&shared);
+
+        commands
+            .send(DurabilityCommand::PolicyEvent {
+                watch: watch.clone(),
+                provider_event_id: 10,
+            })
+            .unwrap();
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        commands
+            .send(DurabilityCommand::Fence {
+                minimum_provider_event_id: 10,
+                nonce: vec![3; 24],
+                response: response_tx,
+            })
+            .unwrap();
+        let (_, cut, provider_event_id) = response_rx
+            .recv_timeout(FENCE_TIMEOUT)
+            .expect("unchanged policy event blocked the fence")
+            .expect("unchanged policy event revoked the observer");
+        assert_eq!(provider_event_id, 10);
+        assert_eq!(
+            MacOsProviderCursor::decode(&cut.provider_cursor)
+                .unwrap()
+                .event_id,
+            10
+        );
+        assert!(shared.lock().revoked.is_none());
+
+        fs::write(&config, b"[recording]\nmode = 'metadata'\n").unwrap();
+        commands
+            .send(DurabilityCommand::PolicyEvent {
+                watch,
+                provider_event_id: 20,
+            })
+            .unwrap();
+        let reason = wait_for_revocation(&shared);
+        assert!(reason.contains("fsevents_policy_dependency_invalidated"));
+        worker.join().unwrap();
+
+        fs::remove_file(&config).unwrap();
+        fs::write(&config, b"[recording]\nmode = 'content'\n").unwrap();
+        let watch = policy_watch(&config);
+        let shared = test_shared(0);
+        let (commands, worker) = spawn_test_worker(&shared);
+        fs::remove_file(&config).unwrap();
+        fs::create_dir(&config).unwrap();
+        commands
+            .send(DurabilityCommand::PolicyEvent {
+                watch,
+                provider_event_id: 30,
+            })
+            .unwrap();
+        let reason = wait_for_revocation(&shared);
+        assert!(reason.contains("fsevents_policy_dependency_invalidated"));
+        worker.join().unwrap();
+    }
 }

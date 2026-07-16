@@ -37,25 +37,72 @@ fn lane_patch_committed_repair(operation: &ObjectId, error: Error) -> Error {
     }
 }
 
+fn retry_patch_after_full_reconciliation(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::ChangeLedgerReconcileRequired { reason, .. }
+            if reason == "controlled interval sidecar chain requires reconciliation"
+    )
+}
+
 impl Trail {
     pub fn apply_lane_patch(
         &mut self,
         lane: &str,
         patch: PatchDocument,
     ) -> Result<LanePatchReport> {
-        self.reset_case_fold_index_metrics();
-        if crate::db::change_ledger::command_authority_enabled() {
-            let branch = self.lane_branch(lane)?;
-            if self.lane_uses_native_materialized_ledger(&branch)? {
-                crate::db::change_ledger::materialized_lane_daemon_expected_scope(self, lane)?;
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::StructuredPatch,
+            || {
+                self.reset_case_fold_index_metrics();
+                if crate::db::change_ledger::command_authority_enabled() {
+                    let branch = self.lane_branch(lane)?;
+                    if self.lane_uses_native_materialized_ledger(&branch)? {
+                        crate::db::change_ledger::materialized_lane_daemon_expected_scope(
+                            self, lane,
+                        )?;
+                    }
+                }
+                let _lock = if crate::db::change_ledger::command_authority_enabled() {
+                    None
+                } else {
+                    Some(self.acquire_write_lock()?)
+                };
+                // A native observer may have durably advanced its sidecar while
+                // SQLite publication was momentarily unavailable. The
+                // controlled projection is target-based (not an incremental
+                // edit of workdir bytes), so after a full reconciliation it is
+                // safe to retry the exact patch once. Keeping this here makes
+                // CLI, HTTP, and MCP callers share the same recovery behavior.
+                let result = self.apply_lane_patch_with_reconciliation_retry(lane, patch, None);
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
+    }
+
+    pub(crate) fn apply_lane_patch_with_reconciliation_retry(
+        &mut self,
+        lane: &str,
+        patch: PatchDocument,
+        api_turn: Option<&LaneTurn>,
+    ) -> Result<LanePatchReport> {
+        let retry_patch = patch.clone();
+        match self.apply_lane_patch_locked(lane, patch, api_turn) {
+            Err(error) if retry_patch_after_full_reconciliation(&error) => {
+                crate::db::change_ledger::materialized_lane_daemon_full_reconcile(self, lane)?;
+                self.apply_lane_patch_locked(lane, retry_patch, api_turn)
             }
+            result => result,
         }
-        let _lock = if crate::db::change_ledger::command_authority_enabled() {
-            None
-        } else {
-            Some(self.acquire_write_lock()?)
-        };
-        self.apply_lane_patch_locked(lane, patch, None)
     }
 
     pub(crate) fn apply_lane_patch_locked(
@@ -101,6 +148,7 @@ impl Trail {
                 }
             }
         }
+        let empty_patch = patch.edits.is_empty();
         for edit in &patch.edits {
             self.ensure_patch_edit_allowed(edit, patch.allow_ignored)?;
         }
@@ -170,7 +218,7 @@ impl Trail {
                 }
             }
         }
-        if diff.changes.is_empty() {
+        if diff.changes.is_empty() && !empty_patch {
             return Err(Error::PatchRejected(
                 "patch produced no changes".to_string(),
             ));
@@ -304,6 +352,7 @@ impl Trail {
                 &head,
                 &lane_row.lane_id,
                 &operation,
+                None,
             )?
         };
         let post_commit = (|| -> Result<()> {
@@ -433,6 +482,14 @@ impl Trail {
             )?
         {
             (BTreeMap::new(), BTreeMap::new())
+        } else if !allow_legacy_manifest_shortcut {
+            // Controlled projection already holds exact changed-path evidence
+            // and verifies the projected bytes against the immutable target
+            // root before publication. Project only the touched maps: loading
+            // and materializing both complete roots here would turn a k-path
+            // patch (including genuine k=0) back into O(repository paths).
+            self.materialize_files_at(workdir_path, previous_touched, target_touched)?;
+            return Ok(());
         } else {
             (
                 self.load_root_files(&head.root_id)?,
@@ -474,6 +531,99 @@ impl Trail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_materialized_projection_never_loads_complete_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+        for index in 0..128 {
+            fs::write(
+                workspace.path().join(format!("untouched-{index:03}.txt")),
+                format!("untouched {index}\n"),
+            )
+            .unwrap();
+        }
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane("bounded-patch", Some("main"), true, None, None)
+            .unwrap();
+        let branch = db.lane_branch("bounded-patch").unwrap();
+        let head = db.get_ref(&branch.ref_name).unwrap();
+        let workdir = PathBuf::from(branch.workdir.as_deref().unwrap());
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &["README.md".to_string()])
+            .unwrap();
+
+        let metrics = Arc::new(OperationMetricsState::default());
+        db.operation_metrics = Some(Arc::clone(&metrics));
+        db.apply_lane_patch_workdir_projection(
+            &branch,
+            &head,
+            &head.root_id,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(workdir.join("README.md").is_file());
+        assert!(workdir.join("untouched-127.txt").is_file());
+
+        db.apply_lane_patch_workdir_projection(
+            &branch,
+            &head,
+            &head.root_id,
+            &[],
+            &previous,
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(!workdir.join("README.md").exists());
+        assert!(workdir.join("untouched-127.txt").is_file());
+        let counters = metrics.snapshot();
+        assert_eq!(counters.full_root_range_count, 0);
+        assert_eq!(counters.full_filesystem_walk_count, 0);
+    }
+
+    #[test]
+    fn empty_patch_records_a_successful_noop_operation() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let metrics = Arc::new(OperationMetricsState::default());
+        db.operation_metrics = Some(Arc::clone(&metrics));
+        db.spawn_lane("empty-patch", Some("main"), false, None, None)
+            .unwrap();
+        let before = db.get_ref("refs/lanes/empty-patch").unwrap();
+        let before_files = db.load_root_files(&before.root_id).unwrap();
+        let report = db
+            .apply_lane_patch(
+                "empty-patch",
+                PatchDocument {
+                    base_change: Some(before.change_id.0.clone()),
+                    message: Some("empty patch checkpoint".into()),
+                    session_id: None,
+                    allow_ignored: false,
+                    allow_stale: false,
+                    edits: Vec::new(),
+                },
+            )
+            .unwrap();
+        let after = db.get_ref("refs/lanes/empty-patch").unwrap();
+        let after_files = db.load_root_files(&after.root_id).unwrap();
+
+        assert!(report.changed_paths.is_empty());
+        assert_eq!(before_files, after_files);
+        assert_eq!(report.root_id, after.root_id);
+        assert_ne!(after.change_id, before.change_id);
+        assert_eq!(report.operation, after.change_id);
+        let operation_metrics = metrics.last_report();
+        assert_eq!(operation_metrics.operation, "structured_patch");
+        assert_eq!(operation_metrics.outcome, OperationMetricsOutcome::Success);
+        assert_eq!(operation_metrics.final_path_count, 0);
+    }
 
     #[test]
     fn post_commit_patch_failure_reports_repair_required_and_keeps_committed_head() {

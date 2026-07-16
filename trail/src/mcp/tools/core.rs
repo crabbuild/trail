@@ -11,6 +11,14 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({}), vec![])
         },
         {
+            "name": "trail.index_reconcile",
+            "title": "Reconcile Changed-Path Ledger",
+            "description": "Start the scope observer when necessary and run a complete workspace or materialized-lane filesystem reconciliation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string", "description": "Optional materialized lane name or id." }
+            }), vec![])
+        },
+        {
             "name": "trail.status",
             "title": "Trail Status",
             "description": "Read the current Trail branch status and changed paths.",

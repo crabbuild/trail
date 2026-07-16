@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +39,9 @@ const TEST_SCHEMA: &str = "
             expires_at INTEGER NOT NULL,
             error_state TEXT,
             error_at INTEGER,
+            daemon_launch_nonce TEXT,
+            daemon_pid INTEGER,
+            daemon_process_start_identity TEXT,
             updated_at INTEGER NOT NULL
         );
         CREATE TABLE changed_path_observer_segments (
@@ -76,6 +80,7 @@ impl Fixture {
         let segments = temp.path().join("observer");
         let scope = ScopeId([0x44; 32]);
         let connection = Connection::open(&database).unwrap();
+        crate::db::util::apply_sqlite_pragmas(&connection).unwrap();
         connection.execute_batch(TEST_SCHEMA).unwrap();
         connection
             .execute(
@@ -254,6 +259,380 @@ fn event(sequence: u64) -> ObserverRecord {
         flags: EvidenceFlags::CONTENT,
         provider_cursor: sequence.to_be_bytes().to_vec(),
     }
+}
+
+#[test]
+fn header_only_post_rotation_flush_keeps_database_last_sequence_null() {
+    let fixture = Fixture::full_v18();
+    let mut writer = fixture.acquire_epoch(1, [0xa1; 32]).unwrap();
+    writer.append(&[event(1)]).unwrap();
+    let sealed = writer.flush_durable().unwrap();
+    writer.rotate().unwrap();
+
+    let anchor = writer.flush_durable().unwrap();
+    assert_eq!(anchor.last_sequence, sealed.last_sequence);
+    assert_eq!(anchor.provider_cursor, sealed.provider_cursor);
+    assert_ne!(anchor.segment_id, sealed.segment_id);
+    let (empty_sealed, empty_anchor) = writer.rotate_and_cuts().unwrap();
+    assert_eq!(empty_sealed, anchor);
+    assert_eq!(empty_anchor, anchor);
+    assert_eq!(writer.flush_durable().unwrap(), anchor);
+
+    let stored: (i64, Option<i64>, i64) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT first_sequence,last_sequence,durable_end_offset
+             FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=1 AND segment_id=?2 AND state='open'",
+            params![fixture.scope.to_text(), anchor.segment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, 2);
+    assert_eq!(stored.1, None);
+    assert_eq!(u64::try_from(stored.2).unwrap(), anchor.durable_end_offset);
+
+    let recovered = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 1,
+            owner_token: [0xa1; 32],
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+    let open = recovered
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == anchor.segment_id)
+        .unwrap();
+    assert_eq!(open.first_sequence, 2);
+    assert_eq!(open.last_sequence, 1);
+    assert_eq!(open.header_end_offset, anchor.durable_end_offset);
+}
+
+#[test]
+fn append_flush_and_rotate_seals_the_boundary_and_opens_its_linked_anchor() {
+    let fixture = Fixture::full_v18();
+    let mut writer = fixture.acquire_epoch(1, [0xa2; 32]).unwrap();
+
+    let (sealed, anchor) = writer.append_flush_and_rotate(&[event(1)]).unwrap();
+
+    assert_eq!(sealed.last_sequence, 1);
+    assert_eq!(anchor.last_sequence, sealed.last_sequence);
+    assert_eq!(anchor.provider_cursor, sealed.provider_cursor);
+    assert_ne!(anchor.segment_id, sealed.segment_id);
+    let connection = Connection::open(&fixture.database).unwrap();
+    let stored = connection
+        .prepare(
+            "SELECT segment_id,state,last_sequence,durable_end_offset,previous_segment_id
+             FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=1 ORDER BY created_at,segment_id",
+        )
+        .unwrap()
+        .query_map([fixture.scope.to_text()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    let old = stored
+        .iter()
+        .find(|segment| segment.0 == sealed.segment_id)
+        .unwrap();
+    assert_eq!(old.1, "sealed");
+    assert_eq!(old.2, Some(1));
+    assert_eq!(u64::try_from(old.3).unwrap(), sealed.durable_end_offset);
+    let next = stored
+        .iter()
+        .find(|segment| segment.0 == anchor.segment_id)
+        .unwrap();
+    assert_eq!(next.1, "open");
+    assert_eq!(next.2, None);
+    assert_eq!(next.4.as_deref(), Some(sealed.segment_id.as_str()));
+
+    let later = writer.append_and_flush(&[event(2)]).unwrap();
+    assert_eq!(later.segment_id, anchor.segment_id);
+    assert_eq!(later.last_sequence, 2);
+}
+
+#[test]
+fn non_daemon_owner_replacement_clears_prior_daemon_launch_binding() {
+    let fixture = Fixture::full_v18();
+    let old_launch_nonce = "ab".repeat(32);
+    let old_pid = 4242;
+    let old_start = "old-daemon-start";
+    let first = SegmentWriter::acquire_for_daemon(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        1,
+        [0xb1; 32],
+        "test-provider",
+        Vec::new(),
+        Duration::from_secs(60),
+        DaemonLaunchBinding {
+            nonce: old_launch_nonce.clone(),
+            pid: old_pid,
+            process_start_identity: old_start.into(),
+        },
+    )
+    .unwrap();
+    drop(first);
+
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_scopes SET epoch=2 WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+        )
+        .unwrap();
+    let replacement_token = [0xb2; 32];
+    let replacement = fixture.acquire_epoch(2, replacement_token).unwrap();
+
+    let db = Trail::open(fixture._temp.path()).unwrap();
+    assert!(crate::db::verified_stale_workspace_owner_for_launch(
+        &db,
+        old_pid,
+        old_start,
+        &old_launch_nonce,
+    )
+    .unwrap()
+    .is_none());
+    let owner: (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = db
+        .conn
+        .query_row(
+            "SELECT epoch,owner_token,lease_state,daemon_launch_nonce,daemon_pid,
+                    daemon_process_start_identity
+             FROM changed_path_observer_owners WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(owner.0, 2);
+    assert_eq!(owner.1, hex::encode(replacement_token));
+    assert_eq!(owner.2, "active");
+    assert_eq!((owner.3, owner.4, owner.5), (None, None, None));
+    drop(replacement);
+}
+
+#[test]
+fn dropping_an_unbound_short_lived_writer_only_closes_its_file() {
+    let fixture = Fixture::full_v18();
+    let token = [0xb3; 32];
+    let writer = fixture.acquire_epoch(1, token).unwrap();
+    drop(writer);
+
+    let owner: (String, String, Option<String>) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT owner_token,lease_state,error_state
+             FROM changed_path_observer_owners WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(owner.0, hex::encode(token));
+    assert_eq!(owner.1, "active");
+    assert_eq!(owner.2, None);
+}
+
+#[test]
+fn dropping_a_native_bound_writer_revokes_its_exact_owner() {
+    let fixture = Fixture::full_v18();
+    let token = [0xb4; 32];
+    let connection = Connection::open(&fixture.database).unwrap();
+    let (provider_id, provider_identity): (String, String) = connection
+        .query_row(
+            "SELECT provider_id,provider_identity FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(connection);
+    let mut writer = SegmentWriter::acquire(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        1,
+        token,
+        &provider_id,
+        b"cursor-0".to_vec(),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    writer
+        .bind_native_observer(hex::decode(provider_identity).unwrap(), vec![0x55; 32])
+        .unwrap();
+    drop(writer);
+
+    let owner: (String, String, Option<String>) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT owner_token,lease_state,error_state
+             FROM changed_path_observer_owners WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(owner.0, hex::encode(token));
+    assert_eq!(owner.1, "error");
+    assert_eq!(owner.2.as_deref(), Some("observer_writer_dropped"));
+}
+
+#[test]
+fn append_and_flush_keeps_command_lock_out_until_sqlite_publication() {
+    let fixture = Fixture::full_v18();
+    let mut writer = fixture.acquire_epoch(1, [0xc5; 32]).unwrap();
+    let boundary_observed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&boundary_observed);
+    install_append_flush_boundary_hook(move |workspace_db_dir, database_path| {
+        let acquisition =
+            crate::db::acquire_workspace_lock_for_database(workspace_db_dir, database_path);
+        assert!(matches!(acquisition, Err(Error::WorkspaceLocked(_))));
+        let unpublished: Option<i64> = Connection::open(database_path)
+            .unwrap()
+            .query_row(
+                "SELECT last_sequence FROM changed_path_observer_segments WHERE state='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unpublished, None);
+        observed.store(true, Ordering::Release);
+    });
+
+    let cut = writer.append_and_flush(&[event(1)]).unwrap();
+
+    assert!(boundary_observed.load(Ordering::Acquire));
+    let database_parent = fixture.database.parent().unwrap();
+    let workspace_db_dir = if database_parent
+        .file_name()
+        .is_some_and(|name| name == "index")
+    {
+        database_parent.parent().unwrap()
+    } else {
+        database_parent
+    };
+    let command_lock =
+        crate::db::acquire_workspace_lock_for_database(workspace_db_dir, &fixture.database)
+            .unwrap();
+    drop(command_lock);
+    let published: (i64, i64) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT last_sequence,durable_end_offset
+             FROM changed_path_observer_segments WHERE state='open'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(published.0, 1);
+    assert_eq!(u64::try_from(published.1).unwrap(), cut.durable_end_offset);
+}
+
+#[test]
+fn heartbeat_remains_live_while_a_command_holds_the_workspace_lock() {
+    let fixture = Fixture::full_v18();
+    let token = [0xc6; 32];
+    let mut writer = fixture.acquire_epoch(1, token).unwrap();
+    let database_parent = fixture.database.parent().unwrap();
+    let workspace_db_dir = if database_parent
+        .file_name()
+        .is_some_and(|name| name == "index")
+    {
+        database_parent.parent().unwrap()
+    } else {
+        database_parent
+    };
+    let command_lock =
+        crate::db::acquire_workspace_lock_for_database(workspace_db_dir, &fixture.database)
+            .unwrap();
+
+    writer.heartbeat().unwrap();
+
+    let owner: (String, String, Option<String>) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT owner_token,lease_state,error_state
+             FROM changed_path_observer_owners WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(owner.0, hex::encode(token));
+    assert_eq!(owner.1, "active");
+    assert_eq!(owner.2, None);
+    drop(command_lock);
+}
+
+#[test]
+fn dropping_a_daemon_owned_writer_revokes_its_exact_owner() {
+    let fixture = Fixture::full_v18();
+    let token = [0xb5; 32];
+    let provider_id: String = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let writer = SegmentWriter::acquire_for_daemon(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        1,
+        token,
+        &provider_id,
+        b"cursor-0".to_vec(),
+        Duration::from_secs(60),
+        DaemonLaunchBinding {
+            nonce: "b6".repeat(32),
+            pid: std::process::id(),
+            process_start_identity: "daemon-drop-test".into(),
+        },
+    )
+    .unwrap();
+    drop(writer);
+
+    let owner: (String, String, Option<String>) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT owner_token,lease_state,error_state
+             FROM changed_path_observer_owners WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(owner.0, hex::encode(token));
+    assert_eq!(owner.1, "error");
+    assert_eq!(owner.2.as_deref(), Some("observer_writer_dropped"));
 }
 
 #[test]
@@ -472,6 +851,40 @@ fn invalid_other_epoch_filename_metadata_cannot_suppress_an_orphan() {
     )
     .unwrap();
     assert!(recovered.requires_reconciliation);
+    drop(writer);
+}
+
+#[test]
+fn authenticated_orphan_from_superseded_epoch_does_not_poison_current_epoch() {
+    let fixture = Fixture::new();
+    let current_token = [0x18; 32];
+    let writer = fixture.acquire(current_token);
+    let stale_token = [0x19; 32];
+    let stale_id = segment_id(2, 1, stale_token);
+    let stale_filename = segment_filename(&stale_id).unwrap();
+    let stale_header = encode_header(&SegmentIdentity {
+        scope_id: fixture.scope,
+        epoch: 2,
+        owner_token: stale_token,
+        provider_cursor: b"stale-cursor".to_vec(),
+        previous_segment_hash: [0; 32],
+    })
+    .unwrap();
+    fs::write(fixture.segments.join(stale_filename), stale_header).unwrap();
+
+    let recovered = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: current_token,
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+
+    assert!(!recovered.requires_reconciliation);
     drop(writer);
 }
 
@@ -1088,7 +1501,11 @@ fn recovery_rejects_segment_count_before_streaming_row_strings_or_records() {
 fn writer_applies_required_sqlite_runtime_pragmas() {
     let fixture = Fixture::new();
     let writer = fixture.acquire([0x74; 32]);
-    assert_eq!(writer.runtime_pragmas(), ("wal".into(), 1, 1, 2));
+    let (journal_mode, foreign_keys, synchronous, temp_store) = writer.runtime_pragmas();
+    assert_eq!(journal_mode, "wal");
+    assert_eq!(foreign_keys, 1);
+    assert!(synchronous >= 1, "runtime connection weakened durability");
+    assert_eq!(temp_store, 2);
 }
 
 #[test]

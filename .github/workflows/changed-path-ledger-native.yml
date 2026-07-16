@@ -1,0 +1,189 @@
+name: Changed-path Ledger Native Gates
+
+# Required release/merge gate: branch protection and release automation must
+# require both matrix jobs from this workflow for the commit being released.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "cargo-dist plan JSON (accepted for plan-job compatibility)"
+        required: false
+        type: string
+        default: ""
+      scale_files:
+        description: "Repository files (100000 or 1000000)"
+        required: false
+        type: string
+        default: "100000"
+      require_cow:
+        description: "Require the native COW checkpoint cases"
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1-5"
+    - cron: "47 8 * * *"
+  workflow_dispatch:
+    inputs:
+      scale_files:
+        description: "Repository files (100000 or 1000000)"
+        required: true
+        default: "100000"
+      require_cow:
+        description: "Require the native COW checkpoint cases"
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  native:
+    name: ${{ matrix.os }} native ledger
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Select scheduled scale
+        id: scale
+        shell: bash
+        run: |
+          requested_files="${{ inputs.scale_files }}"
+          if [ -n "$requested_files" ]; then
+            files="$requested_files"
+          elif [ "${{ github.event.schedule }}" = "47 8 * * *" ]; then
+            files=1000000
+          else
+            files=100000
+          fi
+          case "$files" in 100000|1000000) ;; *) exit 2 ;; esac
+          if [ -n "$requested_files" ]; then
+            require_cow="${{ inputs.require_cow }}"
+          else
+            require_cow=true
+          fi
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          echo "require_cow=$require_cow" >> "$GITHUB_OUTPUT"
+          if [ "$require_cow" = true ]; then
+            echo "cow_mode=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "cow_mode=auto" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prove native filesystem
+        id: filesystem
+        shell: bash
+        run: |
+          proof_root="${{ runner.temp }}/trail-cli-scale-native-${{ runner.os }}-${{ github.run_id }}"
+          mkdir -p "$proof_root"
+          device=""
+          case "${{ runner.os }}" in
+            Linux)
+              filesystem="$(findmnt --noheadings --output FSTYPE --target "${{ runner.temp }}" | tr -d '[:space:]')"
+              [ "$filesystem" = ext4 ] || {
+                echo "native Linux ledger gate requires ext4, found $filesystem" >&2
+                exit 1
+              }
+              ;;
+            macOS)
+              device="$(df -P "${{ runner.temp }}" | awk 'NR == 2 { print $1 }')"
+              [ -n "$device" ] || {
+                echo "could not resolve the device containing ${{ runner.temp }}" >&2
+                exit 1
+              }
+              filesystem="$(diskutil info "$device" | awk -F: '/File System Personality/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit}')"
+              [ "$filesystem" = apfs ] || {
+                echo "native macOS ledger gate requires APFS on $device, found $filesystem" >&2
+                exit 1
+              }
+              ;;
+            *) exit 2 ;;
+          esac
+          printf 'runner_os=%s\nfilesystem=%s\ndevice=%s\nroot=%s\n' \
+            "${{ runner.os }}" "$filesystem" "$device" "${{ runner.temp }}" \
+            >"$proof_root/native-filesystem.txt"
+          echo "type=$filesystem" >> "$GITHUB_OUTPUT"
+      - name: Run native qualification suite
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) cargo test -p trail --test changed_path_ledger_linux -- --nocapture ;;
+            macOS) cargo test -p trail --test changed_path_ledger_macos -- --nocapture ;;
+            *) exit 2 ;;
+          esac
+      - name: Nightly daemon restart and crash sampling
+        if: steps.scale.outputs.files == '1000000'
+        run: |
+          cargo test -p trail --test changed_path_ledger_daemon -- --nocapture
+          cargo test -p trail --test changed_path_ledger_recovery -- --nocapture
+      - name: Build release binary
+        run: cargo build -p trail --release
+      - name: Run native changed-path ledger scale
+        run: scripts/cli-scale-bench.sh changed-path-ledger
+        env:
+          TRAIL_BIN: ${{ github.workspace }}/target/release/trail
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: native-${{ runner.os }}-${{ github.run_id }}
+          TRAIL_SCALE_FILES: ${{ steps.scale.outputs.files }}
+          TRAIL_CHANGED_PATH_COW: ${{ steps.scale.outputs.cow_mode }}
+          TRAIL_EXPECTED_NATIVE_FILESYSTEM: ${{ steps.filesystem.outputs.type }}
+      - name: Enforce native thresholds
+        shell: bash
+        run: |
+          scale="${{ steps.scale.outputs.files }}"
+          root="${{ runner.temp }}/trail-cli-scale-native-${{ runner.os }}-${{ github.run_id }}/$scale"
+          case "${{ runner.os }}:$scale" in
+            Linux:1000000)
+              status=30 diff=45 record=60 materialized=300 patch=60 cow_seconds=600 cold=900 rss=3221225472 ;;
+            macOS:1000000)
+              status=45 diff=60 record=90 materialized=420 patch=90 cow_seconds=900 cold=1200 rss=4294967296 ;;
+            Linux:100000)
+              status=15 diff=20 record=30 materialized=120 patch=30 cow_seconds=240 cold=300 rss=3221225472 ;;
+            macOS:100000)
+              status=25 diff=35 record=45 materialized=180 patch=45 cow_seconds=360 cold=450 rss=4294967296 ;;
+            *) exit 2 ;;
+          esac
+          cow_args=()
+          if [ "${{ steps.scale.outputs.require_cow }}" = "true" ]; then
+            cow_args=(--require-cow)
+          fi
+          cold_args=()
+          if [ "$scale" = 1000000 ]; then
+            cold_args=(--require-cold-reconcile)
+          fi
+          python3 scripts/check-changed-path-ledger-thresholds.py \
+            "$root/results.tsv" \
+            "$root/structural-metrics.jsonl" \
+            --oracle "$root/oracle-results.tsv" \
+            "${cow_args[@]}" \
+            "${cold_args[@]}" \
+            --max-seconds "workspace_status=$status" \
+            --max-seconds "workspace_diff=$diff" \
+            --max-seconds "workspace_record=$record" \
+            --max-seconds "materialized_lane_record=$materialized" \
+            --max-seconds "structured_patch=$patch" \
+            --max-seconds "cow_checkpoint=$cow_seconds" \
+            --max-seconds "cold_reconcile=$cold" \
+            --max-rss-bytes "workspace_status=$rss" \
+            --max-rss-bytes "workspace_diff=$rss" \
+            --max-rss-bytes "workspace_record=$rss" \
+            --max-rss-bytes "materialized_lane_record=$rss" \
+            --max-rss-bytes "structured_patch=$rss" \
+            --max-rss-bytes "cow_checkpoint=$rss" \
+            --max-rss-bytes "cold_reconcile=$rss"
+      - name: Upload native changed-path ledger artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: changed-path-ledger-${{ runner.os }}-${{ steps.scale.outputs.files }}
+          path: ${{ runner.temp }}/trail-cli-scale-native-${{ runner.os }}-${{ github.run_id }}

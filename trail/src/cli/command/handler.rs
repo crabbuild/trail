@@ -6,7 +6,7 @@ use super::{render::*, *};
 
 use trail::{
     acp::AcpRelayOptions, Actor, Error, InitImportMode, LaneGateOptions, OperationKind,
-    PatchDocument, RecordOptions, Result, Trail,
+    PatchDocument, RecordOptions, Result, StructuredErrorEnvelope, Trail,
 };
 
 mod acp;
@@ -205,6 +205,9 @@ fn supports_ndjson(command: &Command) -> bool {
         Command::Watch(_) => true,
         Command::Index(IndexCommand {
             command: IndexSubcommand::Watch(_),
+        }) => true,
+        Command::Index(IndexCommand {
+            command: IndexSubcommand::Reconcile(_),
         }) => true,
         Command::Lane(LaneCommand {
             command: LaneSubcommand::Watch(args),

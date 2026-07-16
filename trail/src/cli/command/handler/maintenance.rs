@@ -316,6 +316,16 @@ pub(super) fn handle_fsck_command(ctx: &RuntimeContext) -> Result<()> {
 
 pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) -> Result<()> {
     match index.command {
+        IndexSubcommand::Reconcile(args) => {
+            let mut db = open_db(ctx)?;
+            let report =
+                trail::server::reconcile_changed_path_ledger(&mut db, args.lane.as_deref())?;
+            if matches!(ctx.format, OutputFormat::Ndjson) {
+                render_ndjson(&report)
+            } else {
+                render_change_ledger_reconcile(&report, ctx.json, &ctx.render)
+            }
+        }
         IndexSubcommand::Rebuild(args) => {
             let mut db = open_db(ctx)?;
             let report = if args.rich_text {

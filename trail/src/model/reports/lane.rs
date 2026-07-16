@@ -623,7 +623,12 @@ pub struct WorkspaceCheckpointReport {
     pub root_id: ObjectId,
     pub journal_sequence: u64,
     pub source_paths: Vec<String>,
+    /// Generated/dependency paths changed in this authenticated view-journal
+    /// interval. This is not a recursive inventory of the retained upper.
     pub generated_dirty_paths: u64,
+    pub generated_path_accounting: String,
+    #[serde(default)]
+    pub upper_recovery_walks: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -738,6 +743,10 @@ pub struct LaneRecordReport {
     pub changed_paths: Vec<FileDiffSummary>,
     #[serde(default)]
     pub path_index: PathIndexMetricsReport,
+    #[serde(default)]
+    pub upper_recovery_walks: u64,
+    #[serde(default)]
+    pub generated_dirty_paths: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,14 +1,17 @@
 //! Qualified Linux inotify observer.
 
-use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsStr;
+#[cfg(debug_assertions)]
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::fd::AsRawFd;
-#[cfg(debug_assertions)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -22,6 +25,8 @@ use sha2::{Digest, Sha256};
 use super::{ObserverFence, ObserverLease, QualifiedObserver};
 use crate::db::change_ledger::reconcile::{ObserverEvent, ObserverQualification};
 #[cfg(debug_assertions)]
+use crate::db::change_ledger::ScopeId;
+#[cfg(debug_assertions)]
 use crate::db::change_ledger::{
     begin_reconciliation, install_initial_scan_hook, reconcile_full, BaselineIdentity,
     CompiledPolicy, FilesystemIdentity, PolicyIdentity, ProviderIdentity, ReconcileMode,
@@ -29,7 +34,7 @@ use crate::db::change_ledger::{
 };
 use crate::db::change_ledger::{
     DurableCut, EvidenceFlags, EvidenceSource, ExpectedScope, LedgerPath, ObserverRecord,
-    ObserverWriterBinding, ProviderCapabilities, ScopeId, SegmentWriter,
+    ObserverWriterBinding, ProviderCapabilities, SegmentWriter,
 };
 use crate::error::{Error, Result};
 #[cfg(debug_assertions)]
@@ -58,6 +63,10 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
 pub(crate) trait ObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)>;
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>>;
     fn heartbeat(&mut self) -> Result<()> {
         Ok(())
@@ -92,8 +101,14 @@ impl ObserverDurability for SegmentWriterDurability {
     }
 
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
-        self.writer.append(&[record])?;
-        self.writer.flush_durable()
+        self.writer.append_and_flush(&[record])
+    }
+
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)> {
+        self.writer.append_flush_and_rotate(&[record])
     }
 
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
@@ -113,6 +128,7 @@ impl ObserverDurability for SegmentWriterDurability {
 struct DurableEvent {
     event: ObserverEvent,
     cut: DurableCut,
+    internal_fence: bool,
 }
 
 struct PendingRename {
@@ -128,6 +144,7 @@ struct State {
     next_sequence: u64,
     pending_renames: HashMap<u32, PendingRename>,
     issued_fences: HashMap<Vec<u8>, IssuedFence>,
+    internal_fence_paths: BTreeSet<LedgerPath>,
     fail_next_watch_add: bool,
     policy_invalidation_pending: bool,
 }
@@ -136,6 +153,7 @@ struct State {
 enum IssuedFenceKind {
     Start,
     TailAnchor,
+    ControlledTailAnchor,
     RotationAnchor,
     End { start_nonce: Vec<u8> },
 }
@@ -180,6 +198,29 @@ impl Shared {
     }
 }
 
+struct InternalFenceRegistration {
+    shared: Arc<Shared>,
+    path: LedgerPath,
+}
+
+impl InternalFenceRegistration {
+    fn new(shared: Arc<Shared>, path: LedgerPath) -> Result<Self> {
+        if !shared.lock().internal_fence_paths.insert(path.clone()) {
+            shared.revoke("inotify_internal_fence_registration_collision");
+            return Err(reconcile_error(
+                "inotify_internal_fence_registration_collision",
+            ));
+        }
+        Ok(Self { shared, path })
+    }
+}
+
+impl Drop for InternalFenceRegistration {
+    fn drop(&mut self) {
+        self.shared.lock().internal_fence_paths.remove(&self.path);
+    }
+}
+
 pub(crate) struct LinuxInotifyObserver {
     root_path: PathBuf,
     root: File,
@@ -198,10 +239,15 @@ pub(crate) struct LinuxInotifyObserver {
 struct PlannedRecord {
     path: LedgerPath,
     flags: EvidenceFlags,
+    internal_fence: bool,
 }
 
 enum DurabilityCommand {
     Record(PlannedRecord),
+    ControlledFence {
+        nonce: Vec<u8>,
+        response: SyncSender<Result<(ObserverFence, DurableCut, DurableCut)>>,
+    },
     Rotate {
         expected: DurableCut,
         response: SyncSender<Result<Option<(DurableCut, DurableCut)>>>,
@@ -311,6 +357,87 @@ impl LinuxInotifyObserver {
         }
     }
 
+    pub(crate) fn controlled_end_fence(
+        &self,
+        expected: &ExpectedScope,
+        start: &ObserverFence,
+    ) -> Result<(ObserverFence, DurableCut, DurableCut)> {
+        let issued_start = self.issued_fence(expected, start)?;
+        if !matches!(
+            issued_start.kind,
+            IssuedFenceKind::Start
+                | IssuedFenceKind::TailAnchor
+                | IssuedFenceKind::ControlledTailAnchor
+                | IssuedFenceKind::RotationAnchor
+        ) {
+            self.shared.revoke("inotify_controlled_start_kind_mismatch");
+            return Err(reconcile_error("inotify_controlled_start_kind_mismatch"));
+        }
+        let barrier = self.sentinel_fence(
+            expected,
+            IssuedFenceKind::End {
+                start_nonce: start.nonce.clone(),
+            },
+        )?;
+        let mut nonce = vec![0_u8; 24];
+        getrandom::getrandom(&mut nonce).map_err(|error| {
+            Error::InvalidInput(format!("controlled inotify fence entropy failed: {error}"))
+        })?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.records
+            .send(DurabilityCommand::ControlledFence {
+                nonce: nonce.clone(),
+                response: response_tx,
+            })
+            .map_err(|_| reconcile_error("inotify_controlled_fence_worker_unavailable"))?;
+        let (public, sealed, anchor) = match response_rx.recv_timeout(FENCE_TIMEOUT) {
+            Ok(result) => result?,
+            Err(_) => {
+                self.shared.revoke("inotify_controlled_fence_timeout");
+                return Err(reconcile_error("inotify_controlled_fence_timeout"));
+            }
+        };
+        if public.nonce != nonce
+            || public.sequence != sealed.last_sequence
+            || public.durable_offset != sealed.durable_end_offset
+            || sealed.last_sequence != anchor.last_sequence
+            || sealed.provider_cursor != anchor.provider_cursor
+        {
+            self.shared.revoke("inotify_controlled_fence_cut_mismatch");
+            return Err(reconcile_error("inotify_controlled_fence_cut_mismatch"));
+        }
+        let path = LedgerPath::parse(&format!(".trail-controlled-fence-{}", hex::encode(&nonce)))?;
+        let issued = IssuedFence {
+            public: public.clone(),
+            expected: expected.clone(),
+            root_identity: self.root_identity.clone(),
+            owner_token: self.owner_token.clone(),
+            provider_id: self.provider_id.clone(),
+            provider_identity: self.provider_identity.clone(),
+            owner_fence_nonce: self.owner_fence_nonce.clone(),
+            sentinel_path: path,
+            create_sequence: public.sequence,
+            delete_sequence: public.sequence,
+            segment_id: sealed.segment_id.clone(),
+            durable_cut: sealed.clone(),
+            kind: IssuedFenceKind::End {
+                start_nonce: start.nonce.clone(),
+            },
+        };
+        let mut state = self.shared.lock();
+        state.issued_fences.remove(&barrier.nonce);
+        state.issued_fences.insert(nonce, issued);
+        drop(state);
+        if public.sequence <= start.sequence
+            || (issued_start.durable_cut.segment_id == sealed.segment_id
+                && public.durable_offset < start.durable_offset)
+        {
+            self.shared.revoke("inotify_controlled_fence_non_monotonic");
+            return Err(reconcile_error("inotify_controlled_fence_non_monotonic"));
+        }
+        Ok((public, sealed, anchor))
+    }
+
     fn rebind_tail_anchor(
         &self,
         previous: &ExpectedScope,
@@ -324,7 +451,10 @@ impl LinuxInotifyObserver {
             .ok_or_else(|| reconcile_error("inotify_retained_tail_rebind_missing"))?;
         if retained.public != *anchor
             || retained.expected != *previous
-            || !matches!(retained.kind, IssuedFenceKind::TailAnchor)
+            || !matches!(
+                retained.kind,
+                IssuedFenceKind::TailAnchor | IssuedFenceKind::ControlledTailAnchor
+            )
             || !stable_observer_binding(previous, next)
         {
             return Err(reconcile_error("inotify_retained_tail_rebind_mismatch"));
@@ -338,6 +468,7 @@ impl LinuxInotifyObserver {
         durability: Box<dyn ObserverDurability>,
         policy_dependencies: &[PathBuf],
     ) -> Result<Self> {
+        ensure_supported_linux_filesystem(root_path)?;
         let root = open_root_no_follow(root_path)?;
         let root_identity = root_identity(&root)?;
         let lease_policy_dependencies = policy_dependencies.to_vec();
@@ -355,13 +486,8 @@ impl LinuxInotifyObserver {
         let mut inotify = Inotify::init()?;
         let mut watches = HashMap::new();
         add_tree(&mut inotify, root_path, Path::new(""), &mut watches, false)?;
-        let (policy_watches, policy_directories) = build_policy_coverage(
-            &mut inotify,
-            root_path,
-            &root,
-            policy_dependencies,
-            &mut watches,
-        )?;
+        let (policy_watches, policy_directories) =
+            build_policy_coverage(&mut inotify, root_path, policy_dependencies, &mut watches)?;
         let observer_policy_directories = policy_directories
             .iter()
             .map(|directory| directory.authority.try_clone())
@@ -379,6 +505,7 @@ impl LinuxInotifyObserver {
                 next_sequence: 1,
                 pending_renames: HashMap::new(),
                 issued_fences: HashMap::new(),
+                internal_fence_paths: BTreeSet::new(),
                 fail_next_watch_add: false,
                 policy_invalidation_pending: false,
             }),
@@ -469,6 +596,7 @@ impl LinuxInotifyObserver {
             root_identity: self.root_identity()?,
             provider_identity: self.provider_identity.clone(),
             policy_dependencies: self.policy_dependencies.clone(),
+            direct_policy_fences: Vec::new(),
             capabilities: self.capabilities(),
         })
     }
@@ -502,6 +630,11 @@ impl LinuxInotifyObserver {
         let nonce_hex = hex::encode(nonce);
         let name = format!(".trail-observer-fence-{nonce_hex}");
         let path = LedgerPath::parse(&name)?;
+        // Registration, not a filename pattern, authenticates observer-owned
+        // sentinel events. A user path that merely resembles a sentinel must
+        // remain an ordinary changed-path candidate.
+        let _internal_fence =
+            InternalFenceRegistration::new(Arc::clone(&self.shared), path.clone())?;
 
         let fd = openat(
             &self.root,
@@ -555,25 +688,70 @@ impl LinuxInotifyObserver {
             return Err(reconcile_error("inotify_fence_unknown_or_replayed"));
         };
         let rotation_anchor = matches!(issued.kind, IssuedFenceKind::RotationAnchor);
-        let exact = issued.public == *fence
-            && issued.expected == *expected
-            && issued.root_identity == self.root_identity
-            && issued.owner_token == self.owner_token
-            && issued.provider_id == self.provider_id
-            && issued.provider_identity == self.provider_identity
-            && issued.owner_fence_nonce == self.owner_fence_nonce
-            && issued.delete_sequence == fence.sequence
-            && issued.durable_cut.last_sequence == fence.sequence
-            && issued.durable_cut.durable_end_offset == fence.durable_offset
-            && issued.durable_cut.segment_id == issued.segment_id
-            && (rotation_anchor
-                || (issued.create_sequence < issued.delete_sequence
-                    && issued.sentinel_path.as_str()
-                        == format!(".trail-observer-fence-{}", hex::encode(&fence.nonce))));
-        if !exact {
+        let controlled_end = matches!(issued.kind, IssuedFenceKind::End { .. })
+            && issued.create_sequence == issued.delete_sequence
+            && issued
+                .sentinel_path
+                .as_str()
+                .starts_with(".trail-controlled-fence-");
+        let controlled_tail = matches!(issued.kind, IssuedFenceKind::ControlledTailAnchor)
+            && issued.create_sequence == issued.delete_sequence
+            && issued
+                .sentinel_path
+                .as_str()
+                .starts_with(".trail-controlled-fence-");
+        let mut mismatches = Vec::new();
+        if issued.public != *fence {
+            mismatches.push("public_fence");
+        }
+        if issued.expected != *expected {
+            mismatches.push("expected_scope");
+        }
+        if issued.root_identity != self.root_identity {
+            mismatches.push("root_identity");
+        }
+        if issued.owner_token != self.owner_token {
+            mismatches.push("owner_token");
+        }
+        if issued.provider_id != self.provider_id {
+            mismatches.push("provider_id");
+        }
+        if issued.provider_identity != self.provider_identity {
+            mismatches.push("provider_identity");
+        }
+        if issued.owner_fence_nonce != self.owner_fence_nonce {
+            mismatches.push("owner_fence_nonce");
+        }
+        if issued.delete_sequence != fence.sequence {
+            mismatches.push("delete_sequence");
+        }
+        if issued.durable_cut.last_sequence != fence.sequence {
+            mismatches.push("durable_sequence");
+        }
+        if issued.durable_cut.durable_end_offset != fence.durable_offset {
+            mismatches.push("durable_offset");
+        }
+        if issued.durable_cut.segment_id != issued.segment_id {
+            mismatches.push("segment_id");
+        }
+        if !rotation_anchor && !controlled_end && !controlled_tail {
+            if issued.create_sequence >= issued.delete_sequence {
+                mismatches.push("sentinel_order");
+            }
+            if issued.sentinel_path.as_str()
+                != format!(".trail-observer-fence-{}", hex::encode(&fence.nonce))
+            {
+                mismatches.push("sentinel_path");
+            }
+        }
+        if !mismatches.is_empty() {
             drop(state);
-            self.shared.revoke("inotify_fence_authentication_mismatch");
-            return Err(reconcile_error("inotify_fence_authentication_mismatch"));
+            let reason = format!(
+                "inotify_fence_authentication_mismatch:{}",
+                mismatches.join(",")
+            );
+            self.shared.revoke(reason.clone());
+            return Err(reconcile_error(&reason));
         }
         Ok(issued.clone())
     }
@@ -638,6 +816,66 @@ impl LinuxInotifyObserver {
     }
 }
 
+fn ensure_supported_linux_filesystem(path: &Path) -> Result<()> {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::InvalidInput("observer root contained NUL".into()))?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut stat) } != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    if !linux_filesystem_magic_is_supported(stat.f_type as u64) {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: path.display().to_string(),
+            state: "stale_baseline".into(),
+            reason: format!(
+                "native changed-path observer does not qualify filesystem type 0x{:x}",
+                stat.f_type
+            ),
+            command: "trail index reconcile".into(),
+        });
+    }
+    Ok(())
+}
+
+fn linux_filesystem_magic_is_supported(magic: u64) -> bool {
+    // Activation evidence currently covers the ext-family native gate. New
+    // filesystems must be added only with their own real observer gate; an
+    // unknown magic is never silently treated as qualified.
+    magic == 0x0000_ef53
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_unsupported_filesystem_rejection() -> std::result::Result<(), String> {
+    for unsupported in [
+        0x0000_6969,
+        0x0000_517b,
+        0xff53_4d42,
+        0x6573_5546,
+        0x0102_1997,
+        0x5346_414f,
+        0x7375_7245,
+        0x0000_564c,
+        0x00c3_6400,
+    ] {
+        if linux_filesystem_magic_is_supported(unsupported) {
+            return Err(format!(
+                "unsupported Linux filesystem magic 0x{unsupported:x} was qualified"
+            ));
+        }
+    }
+    if !linux_filesystem_magic_is_supported(0xef53) {
+        return Err("ext-family filesystem was rejected".into());
+    }
+    for unqualified_local in [0x9123_683e, 0x5846_5342, 0x2fc1_2fc1] {
+        if linux_filesystem_magic_is_supported(unqualified_local) {
+            return Err(format!(
+                "ungated Linux filesystem magic 0x{unqualified_local:x} was qualified"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl QualifiedObserver for LinuxInotifyObserver {
     fn begin_observation(&self, expected: &ExpectedScope) -> Result<ObserverFence> {
         self.sentinel_fence(expected, IssuedFenceKind::Start)
@@ -652,7 +890,10 @@ impl QualifiedObserver for LinuxInotifyObserver {
         let issued_start = self.issued_fence(expected, start)?;
         if !matches!(
             issued_start.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
+            IssuedFenceKind::Start
+                | IssuedFenceKind::TailAnchor
+                | IssuedFenceKind::ControlledTailAnchor
+                | IssuedFenceKind::RotationAnchor
         ) {
             self.shared
                 .revoke("inotify_reconciliation_start_not_qualified");
@@ -737,7 +978,10 @@ impl LinuxInotifyObserver {
         let issued_end = self.issued_fence(expected, end)?;
         if !matches!(
             issued_start.kind,
-            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor | IssuedFenceKind::RotationAnchor
+            IssuedFenceKind::Start
+                | IssuedFenceKind::TailAnchor
+                | IssuedFenceKind::ControlledTailAnchor
+                | IssuedFenceKind::RotationAnchor
         ) || !matches!(
             &issued_end.kind,
             IssuedFenceKind::End { start_nonce } if *start_nonce == start.nonce
@@ -753,8 +997,7 @@ impl LinuxInotifyObserver {
                 .filter(|item| {
                     item.event.sequence > start.sequence
                         && item.event.sequence <= end.sequence
-                        && item.event.path != issued_start.sentinel_path
-                        && item.event.path != issued_end.sentinel_path
+                        && !item.internal_fence
                 })
                 .map(|item| item.event.clone())
                 .collect::<Vec<_>>();
@@ -794,7 +1037,16 @@ impl LinuxInotifyObserver {
                 .issued_fences
                 .get_mut(&end.nonce)
                 .ok_or_else(|| reconcile_error("inotify_end_fence_not_retained_for_rotation"))?;
-            retained.kind = IssuedFenceKind::TailAnchor;
+            retained.kind = if retained.create_sequence == retained.delete_sequence
+                && retained
+                    .sentinel_path
+                    .as_str()
+                    .starts_with(".trail-controlled-fence-")
+            {
+                IssuedFenceKind::ControlledTailAnchor
+            } else {
+                IssuedFenceKind::TailAnchor
+            };
         } else {
             state.issued_fences.remove(&end.nonce);
         }
@@ -1067,7 +1319,19 @@ fn enqueue(
     path: LedgerPath,
     flags: EvidenceFlags,
 ) -> Result<()> {
-    match records.try_send(DurabilityCommand::Record(PlannedRecord { path, flags })) {
+    let internal_fence = {
+        let mut state = shared.lock();
+        let registered = state.internal_fence_paths.contains(&path);
+        if registered && flags.0 & EvidenceFlags::DELETE.0 != 0 {
+            state.internal_fence_paths.remove(&path);
+        }
+        registered
+    };
+    match records.try_send(DurabilityCommand::Record(PlannedRecord {
+        path,
+        flags,
+        internal_fence,
+    })) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => {
             shared.revoke("inotify_bounded_queue_overflow");
@@ -1138,7 +1402,24 @@ fn run_durability_worker(
         match records.recv_timeout(Duration::from_millis(10)) {
             Ok(command) => match command {
                 DurabilityCommand::Record(record) => {
-                    if persist(&shared, durability.as_mut(), record.path, record.flags).is_err() {
+                    if persist(&shared, durability.as_mut(), record).is_err() {
+                        break;
+                    }
+                }
+                DurabilityCommand::ControlledFence { nonce, response } => {
+                    let path = LedgerPath::parse(&format!(
+                        ".trail-controlled-fence-{}",
+                        hex::encode(&nonce)
+                    ));
+                    let result = path.and_then(|path| {
+                        persist_and_rotate(&shared, durability.as_mut(), path, nonce)
+                    });
+                    if let Err(error) = &result {
+                        shared.revoke(format!("inotify_controlled_fence_failure:{error}"));
+                    }
+                    let failed = result.is_err();
+                    let _ = response.send(result);
+                    if failed {
                         break;
                     }
                 }
@@ -1164,15 +1445,21 @@ fn run_durability_worker(
                         hex::encode(digest)
                     ));
                     let result = match marker {
-                        Ok(marker) => {
-                            persist(&shared, durability.as_mut(), marker, EvidenceFlags::CONTENT)
-                                .and_then(|()| {
-                                    let exact_reason = format!("{reason}:{}", dependency.display());
-                                    durability.revoke_owner(&exact_reason)?;
-                                    shared.revoke(exact_reason);
-                                    Ok(())
-                                })
-                        }
+                        Ok(marker) => persist(
+                            &shared,
+                            durability.as_mut(),
+                            PlannedRecord {
+                                path: marker,
+                                flags: EvidenceFlags::CONTENT,
+                                internal_fence: true,
+                            },
+                        )
+                        .and_then(|()| {
+                            let exact_reason = format!("{reason}:{}", dependency.display());
+                            durability.revoke_owner(&exact_reason)?;
+                            shared.revoke(exact_reason);
+                            Ok(())
+                        }),
                         Err(error) => Err(error),
                     };
                     if let Err(error) = &result {
@@ -1203,9 +1490,13 @@ fn run_durability_worker(
 fn persist(
     shared: &Shared,
     durability: &mut dyn ObserverDurability,
-    path: LedgerPath,
-    flags: EvidenceFlags,
+    record: PlannedRecord,
 ) -> Result<()> {
+    let PlannedRecord {
+        path,
+        flags,
+        internal_fence,
+    } = record;
     let sequence = {
         let mut state = shared.lock();
         if state.events.len() >= MAX_RETAINED_EVENTS {
@@ -1242,9 +1533,59 @@ fn persist(
             sequence,
         },
         cut,
+        internal_fence,
     });
     shared.changed.notify_all();
     Ok(())
+}
+
+fn persist_and_rotate(
+    shared: &Shared,
+    durability: &mut dyn ObserverDurability,
+    path: LedgerPath,
+    nonce: Vec<u8>,
+) -> Result<(ObserverFence, DurableCut, DurableCut)> {
+    let sequence = {
+        let mut state = shared.lock();
+        if state.events.len() >= MAX_RETAINED_EVENTS {
+            drop(state);
+            shared.revoke("inotify_bounded_queue_overflow");
+            return Err(reconcile_error("inotify_bounded_queue_overflow"));
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        sequence
+    };
+    let (sealed, anchor) = durability.append_flush_and_rotate(ObserverRecord {
+        sequence,
+        source: EvidenceSource::Observer,
+        path: path.clone(),
+        flags: EvidenceFlags::default(),
+        provider_cursor: sequence.to_be_bytes().to_vec(),
+    })?;
+    if sealed.last_sequence != sequence
+        || sealed.last_sequence != anchor.last_sequence
+        || sealed.provider_cursor != anchor.provider_cursor
+    {
+        return Err(reconcile_error("inotify_controlled_fence_cut_mismatch"));
+    }
+    let public = ObserverFence {
+        sequence,
+        durable_offset: sealed.durable_end_offset,
+        nonce,
+    };
+    let mut state = shared.lock();
+    state.events.push(DurableEvent {
+        event: ObserverEvent {
+            path,
+            flags: EvidenceFlags::default(),
+            sequence,
+        },
+        cut: sealed.clone(),
+        internal_fence: true,
+    });
+    shared.changed.notify_all();
+    Ok((public, sealed, anchor))
 }
 
 fn expire_rename_cookies(shared: &Shared, records: &SyncSender<DurabilityCommand>) -> Result<()> {
@@ -1313,27 +1654,16 @@ fn add_tree(
 fn build_policy_coverage(
     inotify: &mut Inotify,
     root: &Path,
-    root_directory: &File,
     dependencies: &[PathBuf],
     watches: &mut HashMap<WatchDescriptor, PathBuf>,
 ) -> Result<(Vec<PolicyDependencyWatch>, Vec<WorkerPolicyDirectory>)> {
     let root = root.canonicalize()?;
-    let root_device = fstat(root_directory)
-        .map_err(|error| Error::Io(error.into()))?
-        .st_dev;
     let mut policy_watches = Vec::with_capacity(dependencies.len());
     let mut authorities = Vec::<PolicyDirectoryAuthority>::new();
     for dependency in dependencies {
         let dependency = normalize_absolute_policy_dependency(&root, dependency)?;
         let (named_parent, canonical_parent, directory) =
             nearest_existing_policy_parent(&dependency)?;
-        let stat = fstat(&directory).map_err(|error| Error::Io(error.into()))?;
-        if stat.st_dev != root_device {
-            return Err(reconcile_error(&format!(
-                "inotify_policy_dependency_crosses_device:{}",
-                dependency.display()
-            )));
-        }
         let suffix = dependency
             .strip_prefix(&named_parent)
             .map_err(|_| reconcile_error("inotify_policy_dependency_coverage_mapping_failure"))?;
@@ -1656,6 +1986,14 @@ impl ObserverDurability for MemoryDurability {
         })
     }
 
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)> {
+        let sealed = self.append_and_flush(record)?;
+        Ok((sealed.clone(), sealed))
+    }
+
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
         let cut = DurableCut {
             segment_id: "linux-native-test".into(),
@@ -1708,8 +2046,22 @@ struct NativeFixture {
 }
 
 #[cfg(debug_assertions)]
+static NEXT_NATIVE_FIXTURE_SCOPE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(debug_assertions)]
 impl NativeFixture {
     fn new(setup: impl FnOnce(&Path) -> Result<()>) -> Result<Self> {
+        Self::new_with_scope(setup, ScopeId([0x91; 32]))
+    }
+
+    fn new_unique(setup: impl FnOnce(&Path) -> Result<()>) -> Result<Self> {
+        let sequence = NEXT_NATIVE_FIXTURE_SCOPE.fetch_add(1, Ordering::Relaxed);
+        let mut scope_id = [0x93_u8; 32];
+        scope_id[24..].copy_from_slice(&sequence.to_be_bytes());
+        Self::new_with_scope(setup, ScopeId(scope_id))
+    }
+
+    fn new_with_scope(setup: impl FnOnce(&Path) -> Result<()>, scope_id: ScopeId) -> Result<Self> {
         let temp = tempfile::tempdir()?;
         setup(temp.path())?;
         Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)?;
@@ -1728,7 +2080,7 @@ impl NativeFixture {
         let branch = db.current_branch()?;
         let head = db.resolve_branch_ref(&branch)?;
         let scope = ScopeIdentity {
-            scope_id: ScopeId([0x91; 32]),
+            scope_id,
             kind: ScopeKind::Workspace,
             owner_id: "linux-native-reconciliation".into(),
         };
@@ -1855,6 +2207,14 @@ impl ObserverDurability for SlowDurability {
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
         thread::sleep(Duration::from_millis(2));
         self.inner.append_and_flush(record)
+    }
+
+    fn append_flush_and_rotate(
+        &mut self,
+        record: ObserverRecord,
+    ) -> Result<(DurableCut, DurableCut)> {
+        thread::sleep(Duration::from_millis(2));
+        self.inner.append_flush_and_rotate(record)
     }
 
     fn rotate_if_cut(&mut self, expected: &DurableCut) -> Result<Option<(DurableCut, DurableCut)>> {
@@ -2083,6 +2443,110 @@ pub(crate) fn run_delayed_backlog() -> std::result::Result<(), String> {
 }
 
 #[cfg(debug_assertions)]
+pub(crate) fn run_controlled_fence_queue_ordering() -> std::result::Result<(), String> {
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            active: true,
+            revoked: None,
+            events: Vec::new(),
+            next_sequence: 1,
+            pending_renames: HashMap::new(),
+            issued_fences: HashMap::new(),
+            internal_fence_paths: BTreeSet::new(),
+            fail_next_watch_add: false,
+            policy_invalidation_pending: false,
+        }),
+        changed: Condvar::new(),
+        shutdown: AtomicBool::new(false),
+    });
+    let (commands, receiver) = mpsc::sync_channel(MAX_PENDING_RECORDS);
+    let worker_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || {
+        run_durability_worker(receiver, Box::new(memory_durability(None)), worker_shared)
+    });
+    commands
+        .send(DurabilityCommand::Record(PlannedRecord {
+            path: LedgerPath::parse("before-controlled-fence").map_err(|e| e.to_string())?,
+            flags: EvidenceFlags::CONTENT,
+            internal_fence: false,
+        }))
+        .map_err(|_| "linux durability worker rejected initial record".to_string())?;
+    let nonce = vec![7; 24];
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    commands
+        .send(DurabilityCommand::ControlledFence {
+            nonce: nonce.clone(),
+            response: response_tx,
+        })
+        .map_err(|_| "linux durability worker rejected controlled fence".to_string())?;
+    const LATER_RECORDS: usize = 256;
+    for index in 0..LATER_RECORDS {
+        commands
+            .send(DurabilityCommand::Record(PlannedRecord {
+                path: LedgerPath::parse(&format!("later/{index:03}")).map_err(|e| e.to_string())?,
+                flags: EvidenceFlags::CONTENT,
+                internal_fence: false,
+            }))
+            .map_err(|_| "linux durability worker rejected later record".to_string())?;
+    }
+    let (public, sealed, anchor) = response_rx
+        .recv_timeout(FENCE_TIMEOUT)
+        .map_err(|_| "linux controlled fence response timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    if public.nonce != nonce
+        || public.sequence != sealed.last_sequence
+        || public.durable_offset != sealed.durable_end_offset
+        || anchor.last_sequence != sealed.last_sequence
+        || anchor.provider_cursor != sealed.provider_cursor
+    {
+        return Err("linux controlled fence did not return its exact sealed cut".into());
+    }
+    let deadline = Instant::now() + FENCE_TIMEOUT;
+    loop {
+        let state = shared.lock();
+        if state.events.len() >= LATER_RECORDS + 2 {
+            let boundary = state
+                .events
+                .iter()
+                .find(|event| event.event.sequence == public.sequence)
+                .ok_or_else(|| "linux controlled boundary event is missing".to_string())?;
+            if !boundary.internal_fence || boundary.cut != sealed {
+                return Err("linux controlled boundary lost internal provenance or cut".into());
+            }
+            let later = state
+                .events
+                .iter()
+                .filter(|event| event.event.path.as_str().starts_with("later/"))
+                .collect::<Vec<_>>();
+            if later.len() != LATER_RECORDS
+                || later
+                    .iter()
+                    .any(|event| event.internal_fence || event.event.sequence <= public.sequence)
+            {
+                return Err(
+                    "linux post-boundary records were suppressed or entered the sealed cut".into(),
+                );
+            }
+            break;
+        }
+        if let Some(reason) = &state.revoked {
+            return Err(format!("linux controlled fence worker revoked: {reason}"));
+        }
+        drop(state);
+        if Instant::now() >= deadline {
+            return Err("linux later-record durability timed out".into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    shared.shutdown.store(true, Ordering::Release);
+    drop(commands);
+    worker
+        .join()
+        .map_err(|_| "linux controlled fence worker panicked".to_string())?;
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn run_fence_ordering() -> std::result::Result<(), String> {
     let (temp, observer) = fixture()?;
     fs::write(temp.path().join("before"), b"before").map_err(|error| error.to_string())?;
@@ -2126,6 +2590,42 @@ pub(crate) fn run_fence_ordering() -> std::result::Result<(), String> {
     {
         return Err("sentinel remained after the delete fence".into());
     }
+
+    // A controlled fence is a single synthetic durability record. Retaining
+    // it as the next continuous tail must preserve that provenance instead of
+    // relabeling it as an ordinary create/delete sentinel.
+    let (_temp, observer) = fixture()?;
+    let expected = expected_for(&observer, 3);
+    let start = observer
+        .begin_observation(&expected)
+        .map_err(|error| error.to_string())?;
+    let end = observer
+        .end_fence(&expected, &start)
+        .map_err(|error| error.to_string())?;
+    let lease = observer.lease().map_err(|error| error.to_string())?;
+    observer
+        .drain_through_retaining_end(&expected, &lease.root_identity, &start, &end, &mut |_| {
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    let (controlled, _, _) = observer
+        .controlled_end_fence(&expected, &end)
+        .map_err(|error| error.to_string())?;
+    observer
+        .drain_through_retaining_end(
+            &expected,
+            &lease.root_identity,
+            &end,
+            &controlled,
+            &mut |_| Ok(()),
+        )
+        .map_err(|error| error.to_string())?;
+    observer
+        .authenticated_cut(&expected, &controlled)
+        .map_err(|error| error.to_string())?;
+    observer
+        .controlled_end_fence(&expected, &controlled)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -2300,7 +2800,7 @@ pub(crate) fn run_owner_death_and_root_replacement() -> std::result::Result<(), 
 #[cfg(debug_assertions)]
 pub(crate) fn run_complete_prefix_publication_races() -> std::result::Result<(), String> {
     fn run() -> Result<()> {
-        let fixture = NativeFixture::new(|_| Ok(()))?;
+        let fixture = NativeFixture::new_unique(|_| Ok(()))?;
         let outside = tempfile::tempdir()?;
         fs::create_dir_all(outside.path().join("populated/deep"))?;
         fs::write(outside.path().join("populated/one"), b"one")?;
@@ -2353,7 +2853,7 @@ pub(crate) fn run_complete_prefix_publication_races() -> std::result::Result<(),
             )));
         }
 
-        let fixture = NativeFixture::new(|root| {
+        let fixture = NativeFixture::new_unique(|root| {
             fs::create_dir_all(root.join("old/deep"))?;
             fs::write(root.join("old/one"), b"one")?;
             fs::write(root.join("old/deep/two"), b"two")?;
@@ -2634,7 +3134,7 @@ pub(crate) fn run_policy_dependency_observation() -> std::result::Result<(), Str
         ".trailignore",
     ];
     for relative in dependency_paths {
-        let fixture = NativeFixture::new(|_| Ok(())).map_err(|error| error.to_string())?;
+        let fixture = NativeFixture::new_unique(|_| Ok(())).map_err(|error| error.to_string())?;
         let observer = fixture.observer().map_err(|error| error.to_string())?;
         let changed = fixture.db.workspace_root.join(relative);
         install_initial_scan_hook(fixture.expected.scope_id, move || {
@@ -2793,27 +3293,19 @@ pub(crate) fn run_policy_dependency_observation() -> std::result::Result<(), Str
     expect_revoked(&observer, "inotify_policy_dependency_invalidated")?;
 
     let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let cross_device = PathBuf::from("/dev/trail-policy-missing");
-    if fs::metadata(root.path())
-        .map_err(|error| error.to_string())?
-        .dev()
-        != fs::metadata("/dev")
-            .map_err(|error| error.to_string())?
-            .dev()
-    {
-        let error = LinuxInotifyObserver::start(
-            root.path(),
-            Box::new(memory_durability(None)),
-            &[cross_device],
-        )
-        .err()
-        .ok_or_else(|| "cross-device policy dependency was accepted".to_string())?;
-        if !error.to_string().contains("crosses_device") {
-            return Err(format!(
-                "cross-device policy dependency failed for the wrong reason: {error}"
-            ));
-        }
-    }
+    let external = tempfile::Builder::new()
+        .prefix("trail-cross-device-policy-")
+        .tempdir_in("/dev/shm")
+        .map_err(|error| format!("cross-device policy fixture unavailable: {error}"))?;
+    let dependency = external.path().join("policy");
+    let observer = LinuxInotifyObserver::start(
+        root.path(),
+        Box::new(memory_durability(None)),
+        std::slice::from_ref(&dependency),
+    )
+    .map_err(|error| format!("cross-device policy dependency was not observable: {error}"))?;
+    fs::write(&dependency, b"created").map_err(|error| error.to_string())?;
+    expect_revoked(&observer, "inotify_policy_dependency_invalidated")?;
 
     let root = tempfile::tempdir().map_err(|error| error.to_string())?;
     let external = tempfile::tempdir().map_err(|error| error.to_string())?;

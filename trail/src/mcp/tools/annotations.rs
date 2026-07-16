@@ -76,8 +76,6 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
 fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
     match name {
         "trail.doctor"
-        | "trail.status"
-        | "trail.diff"
         | "trail.timeline"
         | "trail.why"
         | "trail.history"
@@ -184,9 +182,13 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.ignore_list"
         | "trail.ignore_check"
         | "trail.guardrail_check" => Some(ToolRiskClass::ReadOnly),
-        "trail.config_set" | "trail.ignore_add" | "trail.ignore_remove" | "trail.lane_unmount" => {
-            Some(ToolRiskClass::IdempotentWrite)
-        }
+        "trail.status"
+        | "trail.diff"
+        | "trail.config_set"
+        | "trail.ignore_add"
+        | "trail.ignore_remove"
+        | "trail.lane_unmount"
+        | "trail.index_reconcile" => Some(ToolRiskClass::IdempotentWrite),
         "trail.session_start"
         | "trail.session_end"
         | "trail.agent_mark_reviewed"

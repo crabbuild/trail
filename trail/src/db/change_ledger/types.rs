@@ -155,6 +155,64 @@ pub(crate) struct ProviderIdentity {
     pub(crate) capabilities: ProviderCapabilities,
 }
 
+/// Exact structural binding for Git-sourced changed-path evidence. Git may
+/// contribute advisory dirty paths when this record is not fully equivalent,
+/// but only a completely qualified record may prove an empty candidate set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GitEvidenceQualification {
+    pub(crate) head_oid: String,
+    pub(crate) head_identity: Vec<u8>,
+    pub(crate) worktree_top_level: String,
+    pub(crate) worktree_identity: Vec<u8>,
+    pub(crate) index_identity: Vec<u8>,
+    pub(crate) split_index_identity: Option<Vec<u8>>,
+    pub(crate) shared_index_identity: Option<Vec<u8>>,
+    pub(crate) mapped_trail_root: ObjectId,
+    pub(crate) ledger_baseline_root: ObjectId,
+    pub(crate) filesystem_identity: Vec<u8>,
+    pub(crate) policy_fingerprint: [u8; 32],
+    pub(crate) filesystem_equivalent: bool,
+    pub(crate) worktree_equivalent: bool,
+    pub(crate) policy_equivalent: bool,
+    pub(crate) head_equivalent: bool,
+    pub(crate) index_equivalent: bool,
+    pub(crate) mode_equivalent: bool,
+    pub(crate) symlink_equivalent: bool,
+    pub(crate) sparse_equivalent: bool,
+    pub(crate) submodule_equivalent: bool,
+    pub(crate) ignore_equivalent: bool,
+    pub(crate) case_equivalent: bool,
+    pub(crate) fsmonitor_qualified: bool,
+    pub(crate) untracked_cache_qualified: bool,
+    pub(crate) clean_proof_allowed: bool,
+    pub(crate) advisory_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GitStructuralMetrics {
+    pub(crate) subprocess_count: u64,
+    pub(crate) index_refresh_count: u64,
+    pub(crate) trace2_region_count: u64,
+    pub(crate) trace2_bytes: u64,
+    pub(crate) output_bytes: u64,
+    pub(crate) output_record_count: u64,
+    pub(crate) index_read_count: u64,
+    pub(crate) index_bytes: u64,
+    pub(crate) shared_index_read_count: u64,
+    pub(crate) shared_index_bytes: u64,
+    pub(crate) fsmonitor_qualification_count: u64,
+    pub(crate) untracked_cache_qualification_count: u64,
+    pub(crate) external_adapter_global_work: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct QualifiedGitCandidates {
+    pub(crate) qualification: GitEvidenceQualification,
+    pub(crate) exact_paths: Vec<String>,
+    pub(crate) rename_pairs: Vec<(String, String)>,
+    pub(crate) metrics: GitStructuralMetrics,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EvidenceSource {
@@ -298,6 +356,70 @@ pub(crate) struct EvidenceAcknowledgementToken {
     pub(crate) intent_id: Option<String>,
 }
 
+pub(crate) fn trail_case_probe_token(token: &EvidenceAcknowledgementToken) -> bool {
+    let lifecycle = EvidenceFlags::CREATE.0 | EvidenceFlags::DELETE.0;
+    let allowed = lifecycle | EvidenceFlags::MODE.0;
+    if token.kind != EvidenceRowKind::Exact
+        || token.source_mask != EvidenceSource::Observer.mask()
+        || token.provider_sequence.is_none()
+        || token.intent_id.is_some()
+        || token.first_sequence > token.last_sequence
+        // Native providers may report create/delete separately or coalesce the
+        // short-lived probe to either endpoint. Accept only lifecycle/mode
+        // flags and require at least one endpoint; the exact random name plus
+        // pinned absence and baseline checks provide the state binding.
+        || token.flags.0 & lifecycle == 0
+        || token.flags.0 & !allowed != 0
+    {
+        return false;
+    }
+    let path = token.path.as_str();
+    let Some(nonce) = path
+        .strip_prefix(".trail-case-probe-")
+        .and_then(|path| path.strip_suffix("-a"))
+    else {
+        return false;
+    };
+    !nonce.is_empty() && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn trail_atomic_temp_target(token: &EvidenceAcknowledgementToken) -> Option<String> {
+    let required_flags =
+        EvidenceFlags::CREATE.0 | EvidenceFlags::CONTENT.0 | EvidenceFlags::RENAME_FROM.0;
+    if token.kind != EvidenceRowKind::Exact
+        || token.source_mask != EvidenceSource::Observer.mask()
+        || token.provider_sequence.is_none()
+        || token.intent_id.is_some()
+        || token.first_sequence > token.last_sequence
+        // Native rename streams attach RENAME_FROM to the temporary source
+        // and RENAME_TO to the intended destination; requiring both on the
+        // temporary row can never match a real atomic replacement. CREATE +
+        // CONTENT + RENAME_FROM, the exact numeric Trail temp name, a matching
+        // intended target, and the later pinned absence check together bind
+        // this row to the controlled projection without hiding persistent
+        // user files that merely resemble Trail's namespace.
+        || token.flags.0 & required_flags != required_flags
+    {
+        return None;
+    }
+    let path = token.path.as_str();
+    let (temporary, nonce) = path.rsplit_once(".trail-tmp-")?;
+    if nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (parent, temporary_leaf) = temporary
+        .rsplit_once('/')
+        .map_or((None, temporary), |(parent, leaf)| (Some(parent), leaf));
+    let target_leaf = temporary_leaf.strip_prefix('.')?;
+    if target_leaf.is_empty() {
+        return None;
+    }
+    Some(match parent {
+        Some(parent) => format!("{parent}/{target_leaf}"),
+        None => target_leaf.to_string(),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EvidenceRowKind {
     Exact,
@@ -324,4 +446,64 @@ pub(crate) struct ExactEvidence {
     pub(crate) source_mask: i64,
     pub(crate) first_sequence: u64,
     pub(crate) last_sequence: u64,
+}
+
+#[cfg(test)]
+mod internal_control_tests {
+    use super::*;
+
+    fn observer_token(path: &str, flags: i64) -> EvidenceAcknowledgementToken {
+        EvidenceAcknowledgementToken {
+            kind: EvidenceRowKind::Exact,
+            path: LedgerPath::parse(path).unwrap(),
+            flags: EvidenceFlags(flags),
+            source_mask: EvidenceSource::Observer.mask(),
+            first_sequence: 10,
+            last_sequence: 10,
+            provider_id: Some("native".into()),
+            provider_sequence: Some(10),
+            intent_id: None,
+        }
+    }
+
+    #[test]
+    fn internal_control_tokens_require_exact_names_and_lifecycles() {
+        let case_flags = EvidenceFlags::CREATE.0 | EvidenceFlags::DELETE.0;
+        assert!(trail_case_probe_token(&observer_token(
+            ".trail-case-probe-123-a",
+            case_flags,
+        )));
+        assert!(!trail_case_probe_token(&observer_token(
+            "src/.trail-case-probe-123-a",
+            case_flags,
+        )));
+        assert!(!trail_case_probe_token(&observer_token(
+            ".trail-case-probe-user-a",
+            case_flags,
+        )));
+        assert!(!trail_case_probe_token(&observer_token(
+            ".trail-case-probe-123-a",
+            EvidenceFlags::CONTENT.0,
+        )));
+
+        let rename_flags = EvidenceFlags::CREATE.0
+            | EvidenceFlags::CONTENT.0
+            | EvidenceFlags::MODE.0
+            | EvidenceFlags::RENAME_FROM.0;
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token("src/.lib.rs.trail-tmp-456", rename_flags,)),
+            Some("src/lib.rs".into())
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token("src/.lib.rs.trail-tmp-user", rename_flags,)),
+            None
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.unrelated.rs.trail-tmp-456",
+                EvidenceFlags::CREATE.0,
+            )),
+            None
+        );
+    }
 }

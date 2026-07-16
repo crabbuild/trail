@@ -38,15 +38,54 @@ pub(super) fn core_schemas() -> Value {
         "ErrorBody": {
             "type": "object",
             "required": ["error"],
+            "additionalProperties": false,
             "properties": {
                 "error": {
                     "type": "object",
-                    "required": ["message", "code"],
+                    "required": ["code", "status", "exit", "message", "scope", "state", "reason", "recovery"],
+                    "additionalProperties": false,
                     "properties": {
                         "message": { "type": "string" },
-                        "code": { "type": "integer" }
+                        "code": { "type": "string" },
+                        "status": { "type": "integer" },
+                        "exit": { "type": "integer" },
+                        "scope": { "type": ["string", "null"] },
+                        "state": { "type": ["string", "null"] },
+                        "reason": { "type": ["string", "null"] },
+                        "recovery": {
+                            "oneOf": [
+                                { "$ref": "#/components/schemas/StructuredRecovery" },
+                                { "type": "null" }
+                            ]
+                        }
                     }
                 }
+            }
+        },
+        "StructuredRecovery": {
+            "type": "object",
+            "required": ["command"],
+            "additionalProperties": false,
+            "properties": { "command": { "type": "string" } }
+        },
+        "IndexReconcileRequest": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "lane": { "type": ["string", "null"] } }
+        },
+        "ChangeLedgerReconcileReport": {
+            "type": "object",
+            "required": ["scope_id", "scope_kind", "previous_state", "reason", "observed_paths", "candidates", "resulting_epoch", "resulting_state"],
+            "additionalProperties": false,
+            "properties": {
+                "scope_id": { "type": "string" },
+                "scope_kind": { "type": "string", "enum": ["workspace", "materialized_lane"] },
+                "previous_state": { "type": "string" },
+                "reason": { "type": "string" },
+                "observed_paths": { "type": "integer", "minimum": 0 },
+                "candidates": { "type": "integer", "minimum": 0 },
+                "resulting_epoch": { "type": "integer", "minimum": 0 },
+                "resulting_state": { "type": "string" }
             }
         },
         "ConfigSetRequest": {

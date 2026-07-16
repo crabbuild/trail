@@ -206,6 +206,57 @@ impl Trail {
         sparse_paths: &[String],
         include_neighbors: bool,
     ) -> Result<LaneSpawnReport> {
+        self.spawn_lane_with_workdir_mode_paths_and_neighbors_inner(
+            name,
+            from,
+            workdir_mode,
+            provider,
+            model,
+            workdir,
+            sparse_paths,
+            include_neighbors,
+            false,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn spawn_lane_with_deferred_initial_ledger(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        workdir_mode: LaneWorkdirMode,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+    ) -> Result<LaneSpawnReport> {
+        self.spawn_lane_with_workdir_mode_paths_and_neighbors_inner(
+            name,
+            from,
+            workdir_mode,
+            provider,
+            model,
+            workdir,
+            sparse_paths,
+            include_neighbors,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_lane_with_workdir_mode_paths_and_neighbors_inner(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        workdir_mode: LaneWorkdirMode,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+        defer_initial_ledger: bool,
+    ) -> Result<LaneSpawnReport> {
         // TRAIL_FS_PRODUCER: lane_spawn_materialize Materialize controlled
         let ledger_authority = crate::db::change_ledger::command_authority_enabled();
         let _lock = if ledger_authority {
@@ -386,6 +437,24 @@ impl Trail {
             "initial lane post-association reconciliation",
             fail_lane_association_if_requested("spawn_after_commit"),
         )?;
+        if defer_initial_ledger
+            && ledger_authority
+            && materialized_workdir.is_some()
+            && !workdir_mode.is_transparent_cow()
+        {
+            return Ok(LaneSpawnReport {
+                lane_id,
+                ref_name,
+                base_change: source.change_id,
+                workdir: materialized_workdir,
+                requested_workdir_mode,
+                workdir_mode: resolved_workdir_mode,
+                workdir_backend: Some(workdir_backend),
+                materialization: materialization_report,
+                sparse_paths: sparse_policy_paths.unwrap_or_default(),
+                transparent_cow_available,
+            });
+        }
         if ledger_authority && materialized_workdir.is_some() && !workdir_mode.is_transparent_cow()
         {
             let expected =
@@ -512,6 +581,147 @@ impl Trail {
             workdir_backend: Some(workdir_backend),
             materialization: materialization_report,
             sparse_paths: sparse_policy_paths.unwrap_or_default(),
+            transparent_cow_available,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn resume_deferred_initial_lane_ledger(&mut self, lane: &str) -> Result<LaneSpawnReport> {
+        let details = self.lane_details(lane)?;
+        let metadata = details.record.metadata_json.as_deref().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "lane `{}` is missing its spawn metadata",
+                details.record.name
+            ))
+        })?;
+        let metadata: serde_json::Value = serde_json::from_str(metadata)?;
+        let metadata_field = |name: &str| {
+            metadata
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Corrupt(format!("lane spawn metadata is missing `{name}`")))
+        };
+        let requested_workdir_mode =
+            LaneWorkdirMode::parse(metadata_field("requested_workdir_mode")?)
+                .ok_or_else(|| Error::Corrupt("invalid requested lane workdir mode".into()))?;
+        let workdir_mode = LaneWorkdirMode::parse(metadata_field("workdir_mode")?)
+            .ok_or_else(|| Error::Corrupt("invalid resolved lane workdir mode".into()))?;
+        let workdir_backend = serde_json::from_value::<WorkdirBackend>(
+            metadata
+                .get("workdir_backend")
+                .cloned()
+                .ok_or_else(|| Error::Corrupt("lane spawn metadata is missing backend".into()))?,
+        )?;
+        let materialization = metadata
+            .get("materialization")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value::<MaterializationReport>)
+            .transpose()?;
+        let sparse_paths = metadata
+            .get("sparse_paths")
+            .cloned()
+            .map(serde_json::from_value::<Vec<String>>)
+            .transpose()?
+            .unwrap_or_default();
+        let include_neighbors = metadata
+            .get("include_neighbors")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let transparent_cow_available = metadata
+            .get("transparent_cow_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if details.branch.workdir.is_some() && !workdir_mode.is_transparent_cow() {
+            let expected =
+                crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+                    self,
+                    &details.branch.lane_id,
+                )?;
+            let evidence = crate::db::change_ledger::IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: Vec::new(),
+            };
+            crate::db::change_ledger::run_projection_alignment(
+                self,
+                &expected,
+                crate::db::change_ledger::IntentProducer::Materialize,
+                &evidence,
+                crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+                |db, intent| {
+                    crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                        db,
+                        &details.branch.lane_id,
+                        intent,
+                        &evidence,
+                        |_| Ok(()),
+                        |db, policy, candidates| {
+                            let comparison = db.compare_controlled_projection_target(
+                                policy,
+                                candidates,
+                                &details.branch.head_root,
+                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                            )?;
+                            if comparison.summaries.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(Error::ChangeLedgerReconcileRequired {
+                                    scope: expected.scope_id.to_text(),
+                                    state: "stale_baseline".into(),
+                                    reason: format!(
+                                        "initial lane materialization did not match its target root: {:?}",
+                                        comparison.summaries
+                                    ),
+                                    command: format!(
+                                        "trail lane status {}",
+                                        details.branch.lane_id
+                                    ),
+                                })
+                            }
+                        },
+                    )
+                },
+                |db| db.publish_lane_marker_if_materialized(&details.branch.lane_id),
+            )?;
+        }
+
+        let event_exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lane_events WHERE lane_id=?1 AND event_type='lane_spawned')",
+            [&details.branch.lane_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !event_exists {
+            self.insert_lane_event(
+                &details.branch.lane_id,
+                "lane_spawned",
+                Some(&details.branch.base_change),
+                None,
+                &serde_json::json!({
+                    "ref_name": details.branch.ref_name,
+                    "base_root": details.branch.base_root.0,
+                    "workdir": details.branch.workdir,
+                    "requested_workdir_mode": requested_workdir_mode.as_str(),
+                    "workdir_mode": workdir_mode.as_str(),
+                    "workdir_backend": workdir_backend.as_str(),
+                    "materialization": materialization,
+                    "sparse_paths": sparse_paths,
+                    "include_neighbors": include_neighbors,
+                    "transparent_cow_available": transparent_cow_available,
+                }),
+            )?;
+        }
+
+        Ok(LaneSpawnReport {
+            lane_id: details.branch.lane_id,
+            ref_name: details.branch.ref_name,
+            base_change: details.branch.base_change,
+            workdir: details.branch.workdir,
+            requested_workdir_mode,
+            workdir_mode,
+            workdir_backend: Some(workdir_backend),
+            materialization,
+            sparse_paths,
             transparent_cow_available,
         })
     }

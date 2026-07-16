@@ -166,6 +166,10 @@ impl Trail {
             && selected_paths.is_empty()
             && branch == self.current_branch()?
         {
+            self.note_operation_metrics(OperationMetricsDelta {
+                selected_worktree_index_sqlite_not_applicable_count: 1,
+                ..OperationMetricsDelta::default()
+            });
             return self.record_from_changed_path_ledger(
                 branch, head, message, actor, options, session_id,
             );
@@ -398,7 +402,7 @@ impl Trail {
         let session_for_build = session_id.clone();
         let kind = options.kind.unwrap_or(OperationKind::ManualRecord);
         let (built_record, fenced) =
-            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
+            self.with_workspace_authoritative_command_snapshot(|db, policy, candidates, _git| {
                 let comparison = db.compare_authoritative_candidates(
                     policy,
                     candidates,

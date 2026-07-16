@@ -33,7 +33,7 @@ pub(crate) use lifecycle::set_sparse_selection_write_failure_for_current_thread;
 pub(crate) use workdir::ViewMutationBarrier;
 #[cfg(debug_assertions)]
 pub(crate) use workdir::{
-    install_lane_record_after_c2_write_for_current_thread,
+    install_lane_record_after_c2_write_for_current_thread, run_changed_path_view_flow,
     set_lane_record_postcommit_failure_for_current_thread,
 };
 pub(crate) use workspace_layer::{

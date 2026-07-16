@@ -219,6 +219,7 @@ impl Trail {
                     &head,
                     &branch.lane_id,
                     &operation,
+                    None,
                 )?
             };
             let post_commit = (|| -> Result<()> {

@@ -27,10 +27,12 @@ pub(crate) fn tool_result<T: serde::Serialize>(value: T) -> Result<Value> {
 }
 
 pub(crate) fn tool_error_result(err: &Error) -> Value {
-    let structured = json!({
-        "message": err.to_string(),
-        "code": err.exit_code()
-    });
+    let mut structured =
+        serde_json::to_value(crate::model::StructuredErrorEnvelope::from_error(err))
+            .unwrap_or_else(|_| json!({ "error": { "message": err.to_string() } }));
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("message".to_string(), Value::String(err.to_string()));
+    }
     json!({
         "resultType": "complete",
         "content": [

@@ -271,6 +271,52 @@ mod macos {
         }
     }
 
+    struct PendingNfsMount {
+        mountpoint: PathBuf,
+        state_path: PathBuf,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        worker: Option<JoinHandle<()>>,
+        mounted: bool,
+        committed: bool,
+    }
+
+    impl PendingNfsMount {
+        fn commit(
+            mut self,
+        ) -> (
+            PathBuf,
+            PathBuf,
+            tokio::sync::oneshot::Sender<()>,
+            JoinHandle<()>,
+        ) {
+            self.committed = true;
+            (
+                std::mem::take(&mut self.mountpoint),
+                std::mem::take(&mut self.state_path),
+                self.shutdown.take().expect("pending NFS shutdown sender"),
+                self.worker.take().expect("pending NFS worker"),
+            )
+        }
+    }
+
+    impl Drop for PendingNfsMount {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            if self.mounted {
+                let _ = unmount(&self.mountpoint);
+            }
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            let _ = fs::remove_file(&self.state_path);
+        }
+    }
+
     pub(crate) fn prepare_nfs_cow_workdir(
         db: &Trail,
         lane: &str,
@@ -285,22 +331,19 @@ mod macos {
         Ok(upper)
     }
 
-    pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<ViewCheckpointCandidates> {
         let upper = nfs_upperdir(db, lane)?;
         let branch = db.lane_branch(lane)?;
         let head = db.get_ref(&branch.ref_name)?;
-        Ok(
-            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
-                .paths
-                .into_iter()
-                .filter(|path| {
-                    !Path::new(path)
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .is_some_and(is_macos_junk)
-                })
-                .collect(),
-        )
+        let mut candidates =
+            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?;
+        candidates.paths.retain(|path| {
+            !Path::new(path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(is_macos_junk)
+        });
+        Ok(candidates)
     }
 
     pub(crate) fn mount_nfs_cow_for_lane(db: &Trail, lane: &str) -> Result<NfsCowMount> {
@@ -395,9 +438,15 @@ mod macos {
                     "nfs-cow lane `{lane}` is already being mounted: {err}"
                 ))
             })?;
+        let process_start_token = current_process_start_token();
         serde_json::to_writer(
             &state_file,
-            &serde_json::json!({"pid": std::process::id(), "port": port, "mountpoint": mountpoint}),
+            &serde_json::json!({
+                "pid": std::process::id(),
+                "process_start_token": process_start_token,
+                "port": port,
+                "mountpoint": mountpoint,
+            }),
         )?;
         state_file.sync_all()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -406,6 +455,14 @@ mod macos {
                 tokio::select! { _ = listener.handle_forever() => {}, _ = shutdown_rx => {} }
             })
         });
+        let mut pending_mount = PendingNfsMount {
+            mountpoint: mountpoint.clone(),
+            state_path: state_path.clone(),
+            shutdown: Some(shutdown_tx),
+            worker: Some(worker),
+            mounted: false,
+            committed: false,
+        };
         // Directory mutations must be visible to the checkpoint scan that runs
         // immediately after the agent exits. Attribute caching can otherwise
         // retain a pre-create READDIR result and omit brand-new paths. macOS
@@ -421,24 +478,20 @@ mod macos {
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])
             .status()?;
         if !status.success() {
-            let _ = shutdown_tx.send(());
-            let _ = worker.join();
-            let _ = fs::remove_file(&state_path);
             return Err(Error::InvalidInput(format!(
                 "mount_nfs failed for `{}` with {status}",
                 mountpoint.display()
             )));
         }
         if !is_nfs_mount(&mountpoint) {
-            let _ = shutdown_tx.send(());
-            let _ = worker.join();
-            let _ = fs::remove_file(&state_path);
             return Err(Error::InvalidInput(format!(
                 "mount_nfs returned success, but `{}` is not an active NFS mount",
                 mountpoint.display()
             )));
         }
+        pending_mount.mounted = true;
         lease.mark_mounted()?;
+        let (mountpoint, state_path, shutdown_tx, worker) = pending_mount.commit();
         Ok(NfsCowMount {
             mountpoint,
             state_path,
@@ -458,9 +511,10 @@ mod macos {
         if let Ok(bytes) = fs::read(state) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) {
-                    let alive = unsafe { libc::kill(pid as i32, 0) } == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-                    if alive {
+                    let token = value
+                        .get("process_start_token")
+                        .and_then(serde_json::Value::as_str);
+                    if token.is_some_and(|token| process_matches_start_token(pid as u32, token)) {
                         return Err(Error::InvalidInput(format!(
                             "nfs-cow mount `{}` is already active in process {pid}",
                             mountpoint.display()
@@ -605,6 +659,9 @@ mod macos {
     mod tests {
         use super::*;
 
+        static COMMAND_AUTHORITY_TEST: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+
         #[test]
         fn cow_core_copies_up_writes_and_persists_whiteouts() {
             let temp = tempfile::tempdir().unwrap();
@@ -728,6 +785,68 @@ mod macos {
             recover_stale_mount(&mountpoint, &state).unwrap();
 
             assert!(!state.exists());
+        }
+
+        #[test]
+        fn stale_mount_state_uses_process_start_identity_not_pid_alone() {
+            let temp = tempfile::tempdir().unwrap();
+            let mountpoint = temp.path().join("mount");
+            fs::create_dir_all(&mountpoint).unwrap();
+            let state = temp.path().join(NFS_MOUNT_STATE_FILE);
+            fs::write(
+                &state,
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": std::process::id(),
+                    "process_start_token": "reused-pid",
+                    "port": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            recover_stale_mount(&mountpoint, &state).unwrap();
+            assert!(!state.exists());
+
+            fs::write(
+                &state,
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": std::process::id(),
+                    "process_start_token": current_process_start_token(),
+                    "port": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(recover_stale_mount(&mountpoint, &state).is_err());
+            assert!(state.exists());
+        }
+
+        #[test]
+        fn pending_nfs_mount_drop_cleans_state_and_worker_before_publication() {
+            let temp = tempfile::tempdir().unwrap();
+            let mountpoint = temp.path().join("mount");
+            fs::create_dir_all(&mountpoint).unwrap();
+            let state_path = temp.path().join(NFS_MOUNT_STATE_FILE);
+            fs::write(&state_path, b"pending").unwrap();
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            let worker = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _ = runtime.block_on(stopped);
+            });
+
+            drop(PendingNfsMount {
+                mountpoint,
+                state_path: state_path.clone(),
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+                mounted: false,
+                committed: false,
+            });
+
+            assert!(!state_path.exists());
         }
 
         #[test]
@@ -960,6 +1079,119 @@ mod macos {
             assert!(!is_nfs_mount(&workdir));
             let checkpoint = db.checkpoint_lane_workspace("daemon-nfs", None).unwrap();
             assert_eq!(checkpoint.source_paths, vec!["daemon.txt"]);
+        }
+
+        #[test]
+        fn command_authority_checkpoints_unmounted_nfs_view_from_qualified_journal() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let _serial = COMMAND_AUTHORITY_TEST
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            struct AuthorityReset;
+            impl Drop for AuthorityReset {
+                fn drop(&mut self) {
+                    crate::db::change_ledger::set_command_authority_override(false);
+                }
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            let spawned = db
+                .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    "authority-nfs",
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            let lane_id = spawned.lane_id;
+            let workdir = PathBuf::from(spawned.workdir.unwrap());
+            assert!(workdir.read_dir().unwrap().next().is_none());
+
+            crate::db::change_ledger::set_command_authority_override(true);
+            let _reset = AuthorityReset;
+            let empty = db
+                .checkpoint_lane_workspace("authority-nfs", Some("empty".into()))
+                .unwrap();
+            assert!(empty.source_paths.is_empty());
+
+            let mounted = db.start_lane_workspace_mount("authority-nfs").unwrap();
+            assert!(mounted.healthy);
+            fs::write(workdir.join("changed.txt"), "changed\n").unwrap();
+            db.request_lane_workspace_unmount("authority-nfs").unwrap();
+            assert!(workdir.read_dir().unwrap().next().is_none());
+            let changed = db
+                .checkpoint_lane_workspace("authority-nfs", Some("changed".into()))
+                .unwrap();
+            assert_eq!(changed.source_paths, vec!["changed.txt"]);
+
+            let observer_scopes: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM changed_path_scopes
+                     WHERE scope_kind='materialized_lane' AND owner_id=?1",
+                    [&lane_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(observer_scopes, 0);
+        }
+
+        #[test]
+        fn command_authority_nfs_checkpoint_rejects_missing_journal_pair() {
+            let _serial = COMMAND_AUTHORITY_TEST
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            struct AuthorityReset;
+            impl Drop for AuthorityReset {
+                fn drop(&mut self) {
+                    crate::db::change_ledger::set_command_authority_override(false);
+                }
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "authority-nfs-corrupt",
+                Some("main"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let view = db
+                .lane_workspace_view("authority-nfs-corrupt")
+                .unwrap()
+                .unwrap();
+            let layout = ViewUpperLayout::from_source_upper(PathBuf::from(view.source_upper));
+            fs::remove_file(layout.journal_path()).unwrap();
+            fs::remove_file(layout.whiteout_journal_path()).unwrap();
+
+            crate::db::change_ledger::set_command_authority_override(true);
+            let _reset = AuthorityReset;
+            let error = db
+                .checkpoint_lane_workspace("authority-nfs-corrupt", None)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::ChangeLedgerReconcileRequired { state, .. }
+                    if state == "unqualified_view_journal"
+            ));
         }
 
         #[test]
@@ -1974,7 +2206,7 @@ pub(crate) fn mount_nfs_cow_for_lane_with_ephemeral_bindings(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn nfs_candidate_paths(_db: &Trail, _lane: &str) -> Result<Vec<String>> {
+pub(crate) fn nfs_candidate_paths(_db: &Trail, _lane: &str) -> Result<ViewCheckpointCandidates> {
     Err(Error::InvalidInput(
         "nfs-cow workdirs are currently supported only on macOS".to_string(),
     ))
@@ -2010,7 +2242,10 @@ impl Trail {
         )
     }
 
-    pub(crate) fn nfs_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn nfs_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+    ) -> Result<ViewCheckpointCandidates> {
         nfs_candidate_paths(self, lane)
     }
 

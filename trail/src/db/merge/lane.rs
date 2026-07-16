@@ -130,11 +130,22 @@ impl Trail {
                 "lane update requires a layered workspace view; lane {lane} is not fuse-cow, nfs-cow, or dokan-cow"
             )));
         }
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        let view_hint = self.lane_workspace_view(lane)?.ok_or_else(|| {
             Error::Corrupt(format!(
                 "layered lane {lane} has no persisted workspace view"
             ))
         })?;
+        let mut barrier = ViewMutationBarrier::exclusive(Path::new(&view_hint.meta_dir))?;
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "layered lane {lane} lost its persisted workspace view while acquiring the mutation barrier"
+            ))
+        })?;
+        if view.view_id != view_hint.view_id || view.meta_dir != view_hint.meta_dir {
+            return Err(Error::InvalidInput(format!(
+                "workspace view for lane {lane} changed while acquiring its mutation barrier"
+            )));
+        }
         if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
             if process_matches_start_token(pid, token) {
                 return Err(Error::InvalidInput(format!(
@@ -143,7 +154,6 @@ impl Trail {
                 )));
             }
         }
-        let _barrier = ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?;
         let lane_head = self.get_ref(&lane_branch.ref_name)?;
         self.ensure_lane_workdir_clean(&lane_branch, &lane_head)?;
         let source_ref_name = branch_ref(source_branch);
@@ -244,6 +254,7 @@ impl Trail {
                 &lane_head,
                 &lane_branch.lane_id,
                 &operation,
+                None,
             )?
         };
         if !ledger_authority {
@@ -276,7 +287,7 @@ impl Trail {
         }
         (|| {
             fail_layered_update_postcommit_if_requested("checkpoint")?;
-            self.complete_workspace_checkpoint(lane, &root_id, Some(&change_id))
+            self.complete_workspace_checkpoint(lane, &root_id, Some(&change_id), &mut barrier)
         })()
         .map_err(|error| {
             layered_update_committed_repair(

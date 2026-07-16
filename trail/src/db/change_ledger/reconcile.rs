@@ -1,8 +1,8 @@
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -30,12 +30,12 @@ const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 // final CAS and SQLite commit.
 const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 type InitialScanHook = Box<dyn FnOnce() -> Result<()> + Send>;
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 static INITIAL_SCAN_HOOKS: OnceLock<Mutex<HashMap<ScopeId, InitialScanHook>>> = OnceLock::new();
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn install_initial_scan_hook<F>(scope_id: ScopeId, hook: F)
 where
     F: FnOnce() -> Result<()> + Send + 'static,
@@ -47,7 +47,7 @@ where
         .insert(scope_id, Box::new(hook));
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 fn run_initial_scan_hook(scope_id: ScopeId) -> Result<()> {
     let hook = INITIAL_SCAN_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -658,8 +658,10 @@ pub(crate) fn reconcile_full_with_tail(
             policy,
             ReconcileMode::Full,
             reason,
-        )?;
+        )
+        .map_err(|error| sqlite_reconciliation_stage(error, "begin"))?;
         if let Err(error) = attempt.observe(trail, ledger, observer, policy) {
+            let error = sqlite_reconciliation_stage(error, "observe");
             if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) {
                 retries += 1;
                 continue;
@@ -669,7 +671,10 @@ pub(crate) fn reconcile_full_with_tail(
         let retained_tail = attempt.end_fence.clone().ok_or_else(|| {
             Error::InvalidInput("reconciliation produced no retained observer tail".into())
         })?;
-        match attempt.publish(trail, ledger, policy) {
+        match attempt
+            .publish(trail, ledger, policy)
+            .map_err(|error| sqlite_reconciliation_stage(error, "publish"))
+        {
             Ok(mut report) => {
                 report.retries = retries;
                 return Ok((report, retained_tail));
@@ -681,6 +686,15 @@ pub(crate) fn reconcile_full_with_tail(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn sqlite_reconciliation_stage(error: Error, stage: &str) -> Error {
+    match error {
+        Error::Sqlite(_) => Error::DaemonUnavailable(format!(
+            "changed-path reconciliation {stage} stage failed: {error}"
+        )),
+        other => other,
     }
 }
 
@@ -969,7 +983,7 @@ impl ReconciliationAttempt {
         })?;
         writer.flush()?;
         self.validate_directory_guards(trail, ledger)?;
-        #[cfg(all(debug_assertions, target_os = "linux"))]
+        #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
         run_initial_scan_hook(self.expected.scope_id)?;
         trail.visit_root_file_entries(
             &self.expected.baseline_root,

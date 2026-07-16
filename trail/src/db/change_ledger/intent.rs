@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use getrandom::getrandom;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -18,6 +18,46 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static SIDECAR_RETRY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static SIDECAR_POST_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn install_sidecar_retry_hook(hook: impl FnOnce() + 'static) {
+    SIDECAR_RETRY_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_sidecar_retry_hook() {
+    SIDECAR_RETRY_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn install_sidecar_post_validation_hook(hook: impl FnOnce() + 'static) {
+    SIDECAR_POST_VALIDATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_sidecar_post_validation_hook() {
+    SIDECAR_POST_VALIDATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 #[cfg(debug_assertions)]
 pub(super) fn install_sidecar_ancestor_substitution_hook(hook: impl FnOnce() + 'static) {
     SIDECAR_ANCESTOR_SUBSTITUTION_HOOK.with(|slot| {
@@ -32,6 +72,75 @@ fn run_sidecar_ancestor_substitution_hook() {
             hook();
         }
     });
+}
+
+const SIDECAR_RECOVERY_HARD_LIMIT: Duration = Duration::from_secs(15);
+pub(super) const SIDECAR_RECOVERY_IDLE_LIMIT: Duration = Duration::from_secs(2);
+const SIDECAR_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+#[derive(Default)]
+struct SidecarRecoveryBudget {
+    last_progress_at: Duration,
+    last_progress: Option<SidecarRecoveryProgress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SidecarRecoveryProgress {
+    durable_end: u64,
+    last_sequence: u64,
+    last_hash: [u8; 32],
+    record_count: usize,
+    boundary_count: usize,
+    segment_count: usize,
+    tail_segment: Option<SidecarTailSegmentProgress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SidecarTailSegmentProgress {
+    segment_id: String,
+    state: String,
+    last_sequence: u64,
+    durable_end_offset: u64,
+    folded_end_offset: u64,
+    segment_hash: [u8; 32],
+}
+
+impl From<&super::RecoveredTail> for SidecarRecoveryProgress {
+    fn from(recovered: &super::RecoveredTail) -> Self {
+        Self {
+            durable_end: recovered.durable_end,
+            last_sequence: recovered.last_sequence,
+            last_hash: recovered.last_hash,
+            record_count: recovered.records.len(),
+            boundary_count: recovered.record_boundaries.len(),
+            segment_count: recovered.segments.len(),
+            tail_segment: recovered
+                .segments
+                .last()
+                .map(|segment| SidecarTailSegmentProgress {
+                    segment_id: segment.segment_id.clone(),
+                    state: segment.state.clone(),
+                    last_sequence: segment.last_sequence,
+                    durable_end_offset: segment.durable_end_offset,
+                    folded_end_offset: segment.folded_end_offset,
+                    segment_hash: segment.segment_hash,
+                }),
+        }
+    }
+}
+
+impl SidecarRecoveryBudget {
+    fn retry_after(&mut self, elapsed: Duration, recovered: &super::RecoveredTail) -> bool {
+        if elapsed >= SIDECAR_RECOVERY_HARD_LIMIT {
+            return false;
+        }
+        let progress = SidecarRecoveryProgress::from(recovered);
+        if self.last_progress.as_ref() != Some(&progress) {
+            self.last_progress = Some(progress);
+            self.last_progress_at = elapsed;
+        }
+        elapsed.saturating_sub(self.last_progress_at) < SIDECAR_RECOVERY_IDLE_LIMIT
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -130,6 +239,10 @@ pub(crate) struct QualifiedFilesystemProof {
     pub(crate) segment_path: String,
     pub(crate) start_cursor: Option<Vec<u8>>,
     pub(crate) end_cursor: Vec<u8>,
+    pub(crate) publication_segment_id: String,
+    /// Provider cursor at `publication_cut`. This can differ from
+    /// `end_cursor` when the observer advances after the verified c1 cut.
+    pub(crate) publication_cursor: Vec<u8>,
     pub(crate) start_sequence: u64,
     /// Cut through which the controlled apply was pinned and may be
     /// acknowledged. Events after this cut are never consumed by publication.
@@ -146,7 +259,7 @@ pub(crate) struct QualifiedFilesystemProof {
     pub(crate) persisted_evidence_through_end: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PersistedIntent {
     pub(super) id: IntentId,
     pub(super) scope_id: String,
@@ -245,9 +358,12 @@ pub(crate) fn mark_filesystem_applied(
     intent_id: &IntentId,
     proof: &QualifiedFilesystemProof,
 ) -> Result<()> {
-    let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
-    exact_scope_guard(&tx, expected, true)?;
-    let intent = load_intent(&tx, intent_id)?.ok_or_else(|| {
+    // Do not hold a SQLite writer reservation while authenticating the live
+    // sidecar. The observer publishes a just-fsynced open tail to SQLite; an
+    // IMMEDIATE transaction here would prevent that publication and turn the
+    // normal file-before-database window into a self-sustaining mismatch.
+    exact_scope_guard(ledger.conn, expected, true)?;
+    let intent = load_intent(ledger.conn, intent_id)?.ok_or_else(|| {
         Error::InvalidInput(format!("unknown changed-path intent `{}`", intent_id.0))
     })?;
     if intent.scope_id != expected.scope_id.to_text() || intent.state != IntentState::Prepared {
@@ -256,7 +372,38 @@ pub(crate) fn mark_filesystem_applied(
             intent_id.0
         )));
     }
-    validate_qualified_filesystem_proof(&tx, ledger.database_path()?, expected, &intent, proof)?;
+    validate_qualified_filesystem_proof(
+        ledger.conn,
+        ledger.database_path()?,
+        expected,
+        &intent,
+        proof,
+    )?;
+    #[cfg(test)]
+    run_sidecar_post_validation_hook();
+
+    let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
+    exact_scope_guard(&tx, expected, true)?;
+    let current = load_intent(&tx, intent_id)?.ok_or_else(|| {
+        Error::InvalidInput(format!("unknown changed-path intent `{}`", intent_id.0))
+    })?;
+    // Intent path/prefix evidence is insert-only during prepare_intent; no
+    // lifecycle path mutates those child rows. Reloading the full parent here
+    // therefore binds the same prepared intent whose ordered evidence was
+    // authenticated above, while the joined authority query binds its live
+    // scope/owner/fence/segment at the publication transaction boundary.
+    if current != intent
+        || current.scope_id != expected.scope_id.to_text()
+        || current.state != IntentState::Prepared
+        || !filesystem_proof_authority_matches(&tx, expected, proof)?
+    {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "filesystem proof authority changed before intent publication".into(),
+            command: "trail status".into(),
+        });
+    }
     let changed = tx.execute(
         "UPDATE changed_path_intents SET lifecycle_state='filesystem_applied',verified_cut=?1,
              updated_at=?2
@@ -415,6 +562,52 @@ pub(super) fn stage_intent_evidence(tx: &Transaction<'_>, intent: &PersistedInte
     Ok(())
 }
 
+fn filesystem_proof_authority_matches(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    proof: &QualifiedFilesystemProof,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM changed_path_scopes scope
+             JOIN changed_path_observer_owners owner
+               ON owner.scope_id=scope.scope_id AND owner.epoch=scope.epoch
+             JOIN changed_path_observer_segments segment
+               ON segment.scope_id=scope.scope_id AND segment.epoch=scope.epoch
+             WHERE scope.scope_id=?1 AND scope.epoch=?2
+               AND scope.observer_owner_token=?3 AND scope.trust_state='trusted'
+               AND owner.owner_token=?3 AND owner.provider_id=?4
+               AND owner.provider_identity=?5 AND owner.fence_nonce IS ?6
+               AND owner.lease_state='active' AND owner.error_state IS NULL
+               AND owner.error_at IS NULL AND owner.expires_at>?7
+               AND segment.segment_id=?8 AND segment.owner_token=?3
+               AND segment.provider_id=?4 AND segment.first_sequence<=?9
+               AND segment.last_sequence=?10 AND segment.durable_end_offset=?11
+               AND segment.folded_end_offset=?12 AND segment.segment_hash=?13
+               AND segment.segment_path=?14 AND segment.state='sealed'
+         )",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+            proof.observer_owner_token,
+            proof.provider_id,
+            hex::encode(&proof.provider_identity),
+            proof.owner_fence_nonce,
+            now_ts(),
+            proof.durable_segment_id,
+            sql_u64(proof.start_sequence, "proof start sequence")?,
+            sql_u64(proof.end_cut.sequence, "proof end sequence")?,
+            sql_u64(proof.segment_durable_offset, "segment durable offset")?,
+            sql_u64(proof.segment_folded_offset, "segment folded offset")?,
+            hex::encode(proof.durable_segment_hash),
+            proof.segment_path,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(Error::from)
+}
+
 pub(super) fn validate_qualified_filesystem_proof(
     conn: &rusqlite::Connection,
     database_path: &Path,
@@ -444,6 +637,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         || proof.observer_owner_token.is_empty()
         || proof.provider_id.is_empty()
         || proof.durable_segment_id.is_empty()
+        || proof.publication_segment_id.is_empty()
         || proof.segment_directory.is_empty()
         || proof.segment_path.is_empty()
         || !proof.complete_root_interval
@@ -488,7 +682,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         filesystem_identity,
         provider_id,
         provider_identity,
-        provider_cursor,
+        _provider_cursor,
         durable_offset,
         folded_offset,
         clean_proof_allowed,
@@ -515,52 +709,18 @@ pub(super) fn validate_qualified_filesystem_proof(
             .and_then(|identity| hex::decode(identity).ok())
             .as_deref()
             != Some(proof.provider_identity.as_slice())
-        || db_u64(durable_offset, "scope durable offset")? != proof.publication_cut.durable_offset
-        || db_u64(folded_offset, "scope folded offset")? != proof.publication_cut.folded_offset
+        // The verified intent cut may be an authenticated prefix of a newer
+        // observer suffix. Current scope offsets must contain that cut; exact
+        // boundary identity is checked against the recovered record below.
+        || db_u64(durable_offset, "scope durable offset")? < proof.publication_cut.durable_offset
+        || db_u64(folded_offset, "scope folded offset")? < proof.publication_cut.folded_offset
     {
         return Err(invalid(
             "filesystem proof no longer matches the trusted scope boundary",
         ));
     }
 
-    let owner_matches: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM changed_path_observer_owners
-         WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3 AND provider_id=?4
-           AND provider_identity=?5 AND fence_nonce IS ?6 AND lease_state='active'
-           AND error_state IS NULL AND error_at IS NULL AND expires_at>?7)",
-        params![
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?,
-            proof.observer_owner_token,
-            proof.provider_id,
-            hex::encode(&proof.provider_identity),
-            proof.owner_fence_nonce,
-            now_ts(),
-        ],
-        |row| row.get(0),
-    )?;
-    let segment_matches: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM changed_path_observer_segments
-         WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3 AND owner_token=?4
-           AND provider_id=?5 AND first_sequence<=?6 AND last_sequence=?7
-           AND durable_end_offset=?8 AND folded_end_offset=?9
-           AND segment_hash=?10 AND segment_path=?11 AND state='sealed')",
-        params![
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?,
-            proof.durable_segment_id,
-            proof.observer_owner_token,
-            proof.provider_id,
-            sql_u64(proof.start_sequence, "proof start sequence")?,
-            sql_u64(proof.end_cut.sequence, "proof end sequence")?,
-            sql_u64(proof.segment_durable_offset, "segment durable offset")?,
-            sql_u64(proof.segment_folded_offset, "segment folded offset")?,
-            hex::encode(proof.durable_segment_hash),
-            proof.segment_path,
-        ],
-        |row| row.get(0),
-    )?;
-    if !owner_matches || !segment_matches {
+    if !filesystem_proof_authority_matches(conn, expected, proof)? {
         return Err(invalid(
             "filesystem proof owner, fence, or sealed segment changed",
         ));
@@ -613,22 +773,36 @@ pub(super) fn validate_qualified_filesystem_proof(
         epoch: expected.epoch,
         owner_token,
     };
-    let mut recovered = None;
-    for attempt in 0..16 {
-        let candidate = super::recover_segments_from_directory(
-            database_path,
+    let started = Instant::now();
+    let mut budget = SidecarRecoveryBudget::default();
+    let recovered = loop {
+        if !filesystem_proof_authority_matches(conn, expected, proof)? {
+            return Err(invalid(
+                "filesystem proof owner, fence, or sealed segment changed during sidecar verification",
+            ));
+        }
+        let candidate = super::recover_segments_from_connection(
+            conn,
             &segment_directory,
             &recovery_scope,
             limits,
         )
         .map_err(|error| invalid(&format!("observer sidecar verification failed: {error}")))?;
-        if !candidate.requires_reconciliation || attempt == 15 {
-            recovered = Some(candidate);
-            break;
+        if !filesystem_proof_authority_matches(conn, expected, proof)? {
+            return Err(invalid(
+                "filesystem proof owner, fence, or sealed segment changed during sidecar verification",
+            ));
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let recovered = recovered.ok_or_else(|| invalid("observer sidecar verification vanished"))?;
+        if !candidate.requires_reconciliation {
+            break candidate;
+        }
+        if !budget.retry_after(started.elapsed(), &candidate) {
+            break candidate;
+        }
+        #[cfg(test)]
+        run_sidecar_retry_hook();
+        std::thread::sleep(SIDECAR_RECOVERY_RETRY_DELAY);
+    };
     if recovered.requires_reconciliation {
         return Err(invalid(
             "observer sidecar chain is incomplete or contains unpublished entries",
@@ -640,9 +814,10 @@ pub(super) fn validate_qualified_filesystem_proof(
         .find(|segment| segment.segment_id == proof.durable_segment_id)
         .ok_or_else(|| invalid("filesystem proof segment is absent from verified chain"))?;
     let publication_boundary = recovered.record_boundaries.iter().find(|boundary| {
-        boundary.sequence == proof.publication_cut.sequence
+        boundary.segment_id == proof.publication_segment_id
+            && boundary.sequence == proof.publication_cut.sequence
             && boundary.durable_end_offset == proof.publication_cut.durable_offset
-            && provider_cursor.as_deref() == Some(boundary.provider_cursor.as_slice())
+            && proof.publication_cursor == boundary.provider_cursor
     });
     let publication_authenticated = publication_boundary.is_some_and(|boundary| {
         recovered.segments.iter().any(|segment| {
@@ -651,9 +826,25 @@ pub(super) fn validate_qualified_filesystem_proof(
                 && segment.first_sequence <= boundary.sequence
                 && segment.last_sequence >= boundary.sequence
                 && segment.durable_end_offset >= boundary.durable_end_offset
-                && segment.folded_end_offset == proof.publication_cut.folded_offset
+                && segment.folded_end_offset >= proof.publication_cut.folded_offset
         })
     });
+    let publication_anchor_authenticated = proof
+        .publication_cut
+        .sequence
+        .checked_add(1)
+        .is_some_and(|next_sequence| {
+            recovered.segments.iter().any(|segment| {
+                segment.segment_id == proof.publication_segment_id
+                    && matches!(segment.state.as_str(), "open" | "sealed")
+                    && segment.start_cursor == proof.publication_cursor
+                    && segment.first_sequence == next_sequence
+                    && segment.last_sequence >= proof.publication_cut.sequence
+                    && segment.header_end_offset == proof.publication_cut.durable_offset
+                    && segment.durable_end_offset >= proof.publication_cut.durable_offset
+                    && segment.folded_end_offset >= proof.publication_cut.folded_offset
+            })
+        });
     if authenticated.state != "sealed"
         || authenticated.segment_path != proof.segment_path
         || authenticated.start_cursor != proof.start_cursor.clone().unwrap_or_default()
@@ -666,7 +857,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         || proof.end_cut.durable_offset != proof.segment_durable_offset
         || proof.end_cut.folded_offset != proof.segment_folded_offset
         || recovered.last_sequence < proof.publication_cut.sequence
-        || !publication_authenticated
+        || !(publication_authenticated || publication_anchor_authenticated)
     {
         return Err(invalid(
             "filesystem proof is not an authenticated prefix of the observer chain",
@@ -727,6 +918,11 @@ pub(super) fn validate_qualified_filesystem_proof(
     {
         return Err(invalid(
             "filesystem proof interval does not contain all authenticated intent evidence",
+        ));
+    }
+    if !filesystem_proof_authority_matches(conn, expected, proof)? {
+        return Err(invalid(
+            "filesystem proof owner, fence, or sealed segment changed after sidecar verification",
         ));
     }
     Ok(())
@@ -870,4 +1066,47 @@ pub(super) fn durable_intent_barrier(conn: &rusqlite::Connection) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recovered_progress(sequence: u64) -> super::super::RecoveredTail {
+        super::super::RecoveredTail {
+            records: Vec::new(),
+            record_boundaries: Vec::new(),
+            durable_end: sequence,
+            last_sequence: sequence,
+            last_hash: [sequence as u8; 32],
+            requires_reconciliation: true,
+            segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn static_unpublished_sidecar_tail_exhausts_idle_budget() {
+        let mut budget = SidecarRecoveryBudget::default();
+        let static_tail = recovered_progress(7);
+
+        assert!(budget.retry_after(Duration::ZERO, &static_tail));
+        assert!(budget.retry_after(Duration::from_millis(1_999), &static_tail));
+        assert!(!budget.retry_after(SIDECAR_RECOVERY_IDLE_LIMIT, &static_tail));
+    }
+
+    #[test]
+    fn authenticated_sidecar_progress_extends_idle_but_never_hard_budget() {
+        let mut budget = SidecarRecoveryBudget::default();
+
+        for (index, elapsed) in [0_u64, 1_900, 3_800, 5_700, 7_600, 9_500, 11_400, 13_300]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(budget.retry_after(
+                Duration::from_millis(elapsed),
+                &recovered_progress(index as u64 + 1),
+            ));
+        }
+        assert!(!budget.retry_after(SIDECAR_RECOVERY_HARD_LIMIT, &recovered_progress(9),));
+    }
 }
