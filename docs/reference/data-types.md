@@ -151,11 +151,10 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `AgentApplyReport`
 - `AgentFinishReport`
 - `AgentGitApplyPlan`
-- `AgentSetupReport`
 - `AgentRunReport`
 - `AgentContinueReport`
 - `AcpProviderProfile`
-- `AcpInstallReport`
+- `AcpSetupReport`
 - `AcpDoctorReport`
 - `AcpDoctorCheck`
 - `AcpSessionListReport`

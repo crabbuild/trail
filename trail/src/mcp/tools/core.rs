@@ -11,6 +11,14 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({}), vec![])
         },
         {
+            "name": "trail.index_reconcile",
+            "title": "Reconcile Changed-Path Ledger",
+            "description": "Start the scope observer when necessary and run a complete workspace or materialized-lane filesystem reconciliation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string", "description": "Optional materialized lane name or id." }
+            }), vec![])
+        },
+        {
             "name": "trail.status",
             "title": "Trail Status",
             "description": "Read the current Trail branch status and changed paths.",
@@ -23,8 +31,8 @@ pub(super) fn tools() -> Value {
             "title": "Trail Diff",
             "description": "Show a ref range, root range, or dirty worktree diff with optional patches and stable line ids.",
             "inputSchema": object_schema(json!({
-                "range": { "type": "string", "description": "Ref range such as main..feature or ch_a..ch_b." },
-                "root": { "type": "string", "description": "Root id range such as obj_a..obj_b." },
+                "range": { "type": "string", "description": "Ref range such as main..feature or change_a..change_b." },
+                "root": { "type": "string", "description": "Root id range such as object_a..object_b." },
                 "dirty": { "type": "boolean", "description": "Diff the current branch head against the materialized worktree." },
                 "patch": { "type": "boolean" },
                 "show_line_ids": { "type": "boolean" },

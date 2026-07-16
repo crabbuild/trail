@@ -54,6 +54,30 @@ provenance, and lane-coordination layer.
 Use Git for durable shared source-control history. Use Trail for the messy,
 high-frequency, local work that happens before a commit is ready.
 
+## Terminal output and automation
+
+Trail's default terminal output is designed for people: it leads with the
+outcome, shows changed paths/checks in responsive layouts, and ends with the
+safest next action when one exists. It deliberately is not a parsing API.
+
+```sh
+# Adaptive interactive output (the default).
+trail status
+trail diff --dirty --patch
+
+# Deterministic log-friendly text.
+trail --format plain lane readiness fix-login
+
+# Stable automation contracts.
+trail --format json status
+trail --format ndjson index watch --once
+```
+
+Use `--color auto|always|never` and `--pager auto|always|never` to control
+terminal behavior. The former `--no-color` option is intentionally removed;
+use `--color never`. See [the terminal output contract](docs/CLI_TERMINAL_OUTPUT.md)
+for the complete behavior matrix and the explicitly raw content modes.
+
 | Need | Git | Trail |
 | --- | --- | --- |
 | Shared project history | Excellent: commits, branches, remotes, tags, PR workflows | Complements Git and can import/export mappings |
@@ -142,7 +166,7 @@ trail lane spawn fix-login --from main --materialize=true
 # Work is isolated in the lane until it is reviewed and validated.
 trail lane record fix-login -m "Fix login validation"
 trail lane readiness fix-login
-trail merge-lane fix-login --into main --dry-run
+trail lane merge fix-login --into main --dry-run
 ```
 
 ## Why This Matters for AI Agents
@@ -435,7 +459,8 @@ The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
 macFUSE, and the Dokan driver are otherwise relevant only to their
 corresponding mounted-workspace modes.
 
-To build from source instead, install Rust 1.81 or newer and use the Makefile:
+To build from source instead, install Rust 1.89 or newer and use the Makefile.
+Trail's parent-owned crates use Rust edition 2024:
 
 ```sh
 # Build the debug binary at target/debug/trail.
@@ -460,9 +485,9 @@ For ACP coding-agent setup, keep installation simple and use the guided Trail
 commands after the binary is installed:
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent doctor --provider codex
-trail agent setup
+trail agent doctor claude-code
+trail agent doctor codex
+trail agent acp setup claude-code --editor vscode
 ```
 
 For a project-local install directory, override `PREFIX`:
@@ -531,7 +556,7 @@ trail lane workdir docs-lane
 trail lane record docs-lane -m "record docs update"
 trail lane diff docs-lane --patch
 trail lane readiness docs-lane
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 Example CLI output from a tiny workspace looks like this. IDs, object hashes,
@@ -541,12 +566,13 @@ workspace IDs, and actor names will differ on your machine.
 
 | Prefix | Meaning | Example use |
 | --- | --- | --- |
-| `wk_` | Workspace ID derived when `.trail/` is initialized | Identifies one local Trail workspace |
-| `ch_` | Change/operation ID allocated when Trail records an operation | Appears as `Head`, `Initial operation`, timeline entries, and `show` selectors |
-| `obj_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
-| `msg_` | Message ID | Used for durable operation, agent, or review messages |
-| `anc_` | Anchor ID | Used for durable labels tied to file and line identity |
-| `ch_...:<n>` | Stable file or line identity with an origin change and local sequence | Appears in `why` output as a `Line ID` |
+| `workspace_` | Workspace ID derived when `.trail/` is initialized | Identifies one local Trail workspace |
+| `change_` | Change/operation ID allocated when Trail records an operation | Appears as `Head`, `Initial operation`, timeline entries, checkpoints, and `show` selectors |
+| `object_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
+| `message_` | Message ID | Used for durable operation, agent, or review messages |
+| `anchor_` | Anchor ID | Used for durable labels tied to file and line identity |
+| `checkpoint_` | User-facing checkpoint alias | Resolves to the underlying `change_` operation and its resulting `object_` root |
+| `line_...:<n>` | User-facing stable line identity | Resolves to an origin `change_` plus its local sequence |
 
 ## Example output
 
@@ -557,9 +583,9 @@ workspace IDs, and actor names will differ on your machine.
 ```text
 $ trail init --working-tree
 Initialized Trail workspace
-Workspace: wk_24ec99f68d1db8716f4df8a87580e3da
+Workspace: workspace_24ec99f68d1db8716f4df8a87580e3da
 Branch: main
-Initial operation: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Initial operation: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 Imported: 1 files (1 text, 0 opaque, 0 binary)
 ```
 
@@ -569,8 +595,8 @@ Imported: 1 files (1 text, 0 opaque, 0 binary)
 ```text
 $ trail status
 Branch: main
-Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Head: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
 Worktree: clean
 ```
 
@@ -580,8 +606,8 @@ Worktree: clean
 ```text
 $ trail status
 Branch: main
-Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Head: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
 Worktree: dirty
   Modified README.md
 ```
@@ -591,7 +617,7 @@ Worktree: dirty
 
 ```text
 $ trail record -m "record current edit"
-Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Recorded change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
   Modified README.md
 ```
 
@@ -600,24 +626,24 @@ Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 
 ```text
 $ trail timeline --limit 10
-ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
-ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize Trail workspace
+change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
+change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize Trail workspace
 ```
 
 6. Inspect one operation from the timeline. `show` expands the operation kind,
    actor, message, parent, before/after roots, and path-level summary.
 
 ```text
-$ trail show ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
-Operation: ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+$ trail show change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Operation: change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 Kind: ManualRecord
 Branch: main
 Actor: demo
 Message: record current edit
 Parents:
-  ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Before root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
-After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
+  change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Before root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+After root: object_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
   Modified README.md (+1 -0)
 ```
 
@@ -628,9 +654,9 @@ After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
 ```text
 $ trail why README.md:2
 README.md:2 First recorded line
-Line ID: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
-Introduced by: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Line ID: line_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
+Introduced by: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Last content change: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 ```
 
 8. Show file history. `history` lists operations that affected the selected
@@ -639,8 +665,8 @@ Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f
 ```text
 $ trail history README.md
 README.md
-ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
-ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
+change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
+change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
 ```
 
 9. After making another edit without recording it, inspect the dirty diff. The
@@ -687,7 +713,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
 | `trail ignore check <path>` | Check whether ignore policy records or skips a path |
 | `trail guardrails check --action <action>` | Preflight a risky action against workspace policy |
-| `trail agent setup` | Print editor config for fresh Trail agent tasks |
+| `trail agent acp setup claude-code --editor vscode` | Print editor config for fresh Trail agent tasks |
 | `trail agent continue latest` | Start a fresh follow-up task from the latest task checkpoint |
 | `trail agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
 | `trail agent board` | Show a multi-agent board with low-noise columns and one next action |
@@ -777,24 +803,34 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
 | `trail agent undo-last latest` | Friendly alias for undoing the latest agent turn |
 | `trail lane spawn <name> --from <ref>` | Create an isolated lane branch |
-| `trail agent start --provider codex --workdir-mode nfs-cow` | Run a macOS terminal agent in a loopback NFS copy-on-write workdir |
+| `trail agent start codex --workdir-mode nfs-cow` | Run a macOS terminal agent in a loopback NFS copy-on-write workdir |
 | `trail lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
 | `trail lane review <name>` | Produce a compact review packet for a lane branch |
 | `trail lane readiness <name>` | Report blockers before merging a lane branch |
 | `trail lane handoff <name>` | Produce a review and continuation packet for a lane |
-| `trail merge-lane <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
-| `trail merge-queue run` | Run queued lane merges with readiness and conflict checks |
+| `trail lane merge <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
+| `trail lane merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `trail mcp` | Start the MCP stdio server for agent hosts |
-| `trail acp list` | List built-in aliases and current official ACP registry agents |
-| `trail acp install --agent claude-code` | Print an ACP relay command and editor snippet |
-| `trail acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
-| `trail acp doctor --agent claude-code` | Check ACP provider and relay readiness |
-| `trail acp sessions` | List captured ACP sessions |
+| `trail agent acp status` | List built-in aliases and current official ACP registry agents |
+| `trail agent acp setup claude-code --editor generic` | Print a generic Claude Code ACP entry |
+| `trail agent acp setup codex --editor zed` | Preview the Codex entry for Zed; add `--yes` to apply it |
+| `trail agent acp doctor claude-code` | Report provider readiness and verifiable ACP v1 compatibility evidence |
+| `trail agent acp sessions` | List captured ACP sessions |
 | `trail transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
 | `trail doctor` | Run workspace and integration diagnostics |
 | `trail backup create <output>` | Create a Trail workspace backup |
 | `trail fsck` | Verify repository integrity |
+
+Trail is a transparent ACP v1 stdio compatibility layer between an editor and
+an agent. It covers all 23 stable ACP v1 methods while adding isolated lanes,
+durable transcripts, provenance, and optional Trail MCP injection. Run
+`trail agent acp doctor <agent>` for the exact wire version, pinned schema
+digests, build-attestation status, capture-journal health, and path-mapping
+health. Editor setup and agent installation/authentication are reported
+separately from protocol conformance. See
+[ACP v1 compatibility](docs/acp-v1-compatibility.md) for the evidence, precise
+boundary, exclusions, and opt-in Zed/agent smoke procedures.
 
 ## Core Local Workflows
 
@@ -843,13 +879,12 @@ exact directory where the agent edited files.
 Configure an ACP editor once:
 
 ```sh
-trail agent setup
+trail agent acp setup claude-code --editor vscode
 ```
 
-`agent setup` defaults to Claude Code plus VS Code, and Codex is also available
-with `trail agent setup --provider codex`. Use `--editor zed` or
-`--editor generic` when you want another snippet. It prints the editor snippet
-plus the next verification and review commands.
+ACP setup requires a provider. Use `--editor zed` for Trail's exact Zed
+adapter, or `--editor vscode`/`generic` for a copyable entry. Setup previews by
+default; pass `--yes` to apply an exact supported adapter.
 Paste the printed snippet into the editor's ACP custom-agent settings. After one
 prompt, ask Trail what needs attention:
 
@@ -991,7 +1026,7 @@ For terminal-first work, create a fresh materialized lane and launch Claude Code
 inside it:
 
 ```sh
-trail agent start --provider claude-code --name docs-edit
+trail agent start claude-code --name docs-edit
 trail agent
 trail agent ask what should I do next
 trail agent todo
@@ -1254,9 +1289,9 @@ trail lane sync-workdir doc-bot
 Merge only after review and readiness checks:
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
-trail merge-queue add doc-bot --into main
-trail merge-queue run
+trail lane merge doc-bot --into main --dry-run
+trail lane merge-queue add doc-bot --into main
+trail lane merge-queue run
 ```
 
 If a merge opens conflicts, inspect and resolve them explicitly:

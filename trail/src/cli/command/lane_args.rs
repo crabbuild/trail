@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use super::LaneMergeQueueCommand;
+
 mod run;
 mod trace;
 mod turn;
@@ -9,6 +11,19 @@ mod turn;
 pub(super) use run::*;
 pub(super) use trace::*;
 pub(super) use turn::*;
+
+#[derive(Args)]
+pub(super) struct LaneMergeArgs {
+    pub(super) name: String,
+    #[arg(long, default_value = "main")]
+    pub(super) into: String,
+    #[arg(long)]
+    pub(super) strategy: Option<String>,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+    #[arg(long)]
+    pub(super) direct: bool,
+}
 
 #[derive(Subcommand)]
 pub(super) enum LaneSubcommand {
@@ -28,6 +43,10 @@ pub(super) enum LaneSubcommand {
     Gates(LaneGatesArgs),
     /// Compute lane merge-readiness including blockers and warnings.
     Readiness(LaneReadinessArgs),
+    /// Merge a ready lane into a target branch, or preview the merge safely.
+    Merge(LaneMergeArgs),
+    /// Schedule and run serialized lane merges.
+    MergeQueue(LaneMergeQueueCommand),
     /// Preview refreshing a lane onto a target branch before merge.
     RefreshPreview(LaneRefreshPreviewArgs),
     /// Merge a branch into a layered lane and advance its pinned view generation.
@@ -109,7 +128,7 @@ pub(super) struct LaneSpawnArgs {
     pub(super) no_materialize: bool,
     #[arg(
         long,
-        value_parser = ["auto", "virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"]
+        value_parser = ["auto", "virtual", "sparse", "native-cow", "portable-copy", "fuse-cow", "nfs-cow", "dokan-cow"]
     )]
     pub(super) workdir_mode: Option<String>,
     #[arg(long)]
@@ -347,6 +366,10 @@ pub(super) struct LaneDiffArgs {
     pub(super) patch: bool,
     #[arg(long)]
     pub(super) stat: bool,
+    #[arg(long = "name-only")]
+    pub(super) name_only: bool,
+    #[arg(long = "name-status")]
+    pub(super) name_status: bool,
     #[arg(long = "show-line-ids")]
     pub(super) show_line_ids: bool,
 }

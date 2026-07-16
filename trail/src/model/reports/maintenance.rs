@@ -29,7 +29,29 @@ pub struct IndexRebuildReport {
     pub messages: u64,
     #[serde(default)]
     pub rich_text_hydrated: u64,
+    /// Immutable roots upgraded with the persistent path-invariant index.
+    #[serde(default)]
+    pub path_index_repaired_roots: Vec<PathIndexRootRepair>,
+    /// Mutable branch/lane refs advanced to equivalent indexed roots.
+    #[serde(default)]
+    pub path_index_repaired_refs: Vec<PathIndexRefRepair>,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIndexRootRepair {
+    pub old_root: ObjectId,
+    pub new_root: ObjectId,
+    pub case_fold_map_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIndexRefRepair {
+    pub name: String,
+    pub old_change: ChangeId,
+    pub new_change: ChangeId,
+    pub old_root: ObjectId,
+    pub new_root: ObjectId,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -37,6 +59,128 @@ pub struct WorktreeIndexReport {
     pub files: u64,
     pub indexed_entries: u64,
     pub duration_ms: u64,
+}
+
+/// Result of a requested full changed-path ledger reconciliation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeLedgerReconcileReport {
+    pub scope_id: String,
+    pub scope_kind: String,
+    pub previous_state: String,
+    pub reason: String,
+    pub observed_paths: u64,
+    pub candidates: u64,
+    pub resulting_epoch: u64,
+    pub resulting_state: String,
+    #[serde(skip)]
+    pub(crate) mode: String,
+    #[serde(skip)]
+    pub(crate) observed_files: u64,
+    #[serde(skip)]
+    pub(crate) staged_rows: u64,
+    #[serde(skip)]
+    pub(crate) observed_candidates: u64,
+    #[serde(skip)]
+    pub(crate) candidate_rows: u64,
+    #[serde(skip)]
+    pub(crate) hashed_bytes: u64,
+    #[serde(skip)]
+    pub(crate) peak_batch_rows: u64,
+    #[serde(skip)]
+    pub(crate) peak_buffer_bytes: u64,
+    #[serde(skip)]
+    pub(crate) start_sequence: u64,
+    #[serde(skip)]
+    pub(crate) end_sequence: u64,
+    #[serde(skip)]
+    pub(crate) start_durable_offset: u64,
+    #[serde(skip)]
+    pub(crate) end_durable_offset: u64,
+    #[serde(skip)]
+    pub(crate) refreshed: bool,
+    #[serde(skip)]
+    pub(crate) published: bool,
+    #[serde(skip)]
+    pub(crate) trust_state: String,
+    #[serde(skip)]
+    pub(crate) retries: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredRecovery {
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredErrorDetails {
+    pub code: String,
+    pub status: u16,
+    pub exit: i32,
+    pub message: String,
+    pub scope: Option<String>,
+    pub state: Option<String>,
+    pub reason: Option<String>,
+    pub recovery: Option<StructuredRecovery>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredErrorEnvelope {
+    pub error: StructuredErrorDetails,
+}
+
+impl StructuredErrorEnvelope {
+    pub fn from_error(error: &crate::Error) -> Self {
+        let status = match error {
+            crate::Error::RefNotFound(_)
+            | crate::Error::OperationNotFound(_)
+            | crate::Error::RootNotFound(_) => 404,
+            crate::Error::Conflict(_)
+            | crate::Error::DirtyWorktree
+            | crate::Error::DirtyWorktreeWithMessage(_)
+            | crate::Error::PatchRejected(_)
+            | crate::Error::StaleBranch(_)
+            | crate::Error::WorkspaceLocked(_)
+            | crate::Error::SchemaReinitializeRequired { .. }
+            | crate::Error::ChangeLedgerReconcileRequired { .. } => 409,
+            crate::Error::InvalidInput(_)
+            | crate::Error::InvalidPath { .. }
+            | crate::Error::IgnoredPath(_)
+            | crate::Error::Json(_) => 400,
+            _ => 500,
+        };
+        let (scope, state, reason, command) = match error {
+            crate::Error::ChangeLedgerReconcileRequired {
+                scope,
+                state,
+                reason,
+                command,
+            } => (
+                Some(scope.clone()),
+                Some(state.clone()),
+                Some(reason.clone()),
+                Some(command.clone()),
+            ),
+            crate::Error::SchemaReinitializeRequired { found, guidance } => (
+                None,
+                Some("reinitialize_required".to_string()),
+                Some(format!("{found}; {guidance}")),
+                Some("trail init --force".to_string()),
+            ),
+            _ => (None, None, None, None),
+        };
+        Self {
+            error: StructuredErrorDetails {
+                code: error.code().to_string(),
+                status,
+                exit: error.exit_code(),
+                message: error.to_string(),
+                scope,
+                state,
+                reason,
+                recovery: command.map(|command| StructuredRecovery { command }),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,4 +251,25 @@ pub struct BackupRestoreReport {
     pub checked_refs: u64,
     pub checked_roots: u64,
     pub checked_texts: u64,
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_index_rebuild_report_defaults_path_index_repairs() {
+        let report: IndexRebuildReport = serde_json::from_value(serde_json::json!({
+            "operations": 1,
+            "operation_parents": 0,
+            "file_history_rows": 0,
+            "line_history_rows": 0,
+            "messages": 0,
+            "errors": []
+        }))
+        .unwrap();
+
+        assert!(report.path_index_repaired_roots.is_empty());
+        assert!(report.path_index_repaired_refs.is_empty());
+    }
 }

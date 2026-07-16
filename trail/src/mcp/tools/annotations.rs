@@ -46,6 +46,12 @@ fn tool_annotations(name: &str) -> Value {
             "idempotentHint": false,
             "openWorldHint": true
         }),
+        ToolRiskClass::OpenWorldDestructiveWrite => json!({
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": true
+        }),
     }
 }
 
@@ -60,6 +66,7 @@ enum ToolRiskClass {
     IdempotentWrite,
     DestructiveWrite,
     OpenWorldWrite,
+    OpenWorldDestructiveWrite,
 }
 
 fn tool_risk_class(name: &str) -> ToolRiskClass {
@@ -69,8 +76,6 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
 fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
     match name {
         "trail.doctor"
-        | "trail.status"
-        | "trail.diff"
         | "trail.timeline"
         | "trail.why"
         | "trail.history"
@@ -117,6 +122,17 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.agent_diff"
         | "trail.agent_review"
         | "trail.agent_focus"
+        | "trail.agent_integrations"
+        | "trail.agent_hook_installations"
+        | "trail.agent_hook_receipts"
+        | "trail.agent_capture_runs"
+        | "trail.agent_artifacts"
+        | "trail.agent_provenance"
+        | "trail.agent_attestations"
+        | "trail.agent_attestation_verify"
+        | "trail.agent_learnings"
+        | "trail.agent_git_links"
+        | "trail.agent_trace"
         | "trail.lane_list"
         | "trail.lane_show"
         | "trail.lane_status"
@@ -129,6 +145,14 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.lane_workspace"
         | "trail.lane_space"
         | "trail.deps_status"
+        | "trail.env_adapters"
+        | "trail.env_status"
+        | "trail.env_discover"
+        | "trail.env_graph"
+        | "trail.env_generation"
+        | "trail.env_runtime_status"
+        | "trail.env_explain"
+        | "trail.env_plan"
         | "trail.cache_list"
         | "trail.cache_inspect"
         | "trail.cache_verify"
@@ -145,8 +169,8 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.lease_list"
         | "trail.anchor_list"
         | "trail.anchor_resolve"
-        | "trail.merge_queue_list"
-        | "trail.merge_queue_explain"
+        | "trail.lane_merge_queue_list"
+        | "trail.lane_merge_queue_explain"
         | "trail.conflict_list"
         | "trail.conflict_show"
         | "trail.event_list"
@@ -158,9 +182,13 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.ignore_list"
         | "trail.ignore_check"
         | "trail.guardrail_check" => Some(ToolRiskClass::ReadOnly),
-        "trail.config_set" | "trail.ignore_add" | "trail.ignore_remove" | "trail.lane_unmount" => {
-            Some(ToolRiskClass::IdempotentWrite)
-        }
+        "trail.status"
+        | "trail.diff"
+        | "trail.config_set"
+        | "trail.ignore_add"
+        | "trail.ignore_remove"
+        | "trail.lane_unmount"
+        | "trail.index_reconcile" => Some(ToolRiskClass::IdempotentWrite),
         "trail.session_start"
         | "trail.session_end"
         | "trail.agent_mark_reviewed"
@@ -179,7 +207,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.lane_checkpoint"
         | "trail.lane_update"
         | "trail.lane_mount"
-        | "trail.merge_queue_add"
+        | "trail.lane_merge_queue_add"
         | "trail.begin_turn"
         | "trail.add_message"
         | "trail.add_event"
@@ -193,16 +221,24 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.agent_undo"
         | "trail.lane_rewind"
         | "trail.anchor_delete"
-        | "trail.merge_queue_run"
-        | "trail.merge_queue_remove"
+        | "trail.lane_merge_queue_run"
+        | "trail.lane_merge_queue_remove"
         | "trail.conflict_resolve"
         | "trail.apply_patch"
         | "trail.read_file"
         | "trail.lane_hydrate"
         | "trail.sync_workdir" => Some(ToolRiskClass::DestructiveWrite),
         "trail.cache_gc" => Some(ToolRiskClass::DestructiveWrite),
-        "trail.agent_test" | "trail.agent_eval" | "trail.run_test" | "trail.run_eval"
-        | "trail.lane_exec" | "trail.deps_sync" => Some(ToolRiskClass::OpenWorldWrite),
+        "trail.agent_test"
+        | "trail.agent_eval"
+        | "trail.run_test"
+        | "trail.run_eval"
+        | "trail.lane_exec"
+        | "trail.deps_sync"
+        | "trail.env_sync"
+        | "trail.env_sync_all"
+        | "trail.env_runtime_reconcile" => Some(ToolRiskClass::OpenWorldWrite),
+        "trail.env_runtime_stop" => Some(ToolRiskClass::OpenWorldDestructiveWrite),
         _ => None,
     }
 }

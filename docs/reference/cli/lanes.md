@@ -31,7 +31,7 @@ workdir.
 ### Create a lane with a workdir
 
 ```sh
-trail lane spawn feature-docs --workdir-mode full-cow
+trail lane spawn feature-docs --workdir-mode native-cow
 trail lane workdir feature-docs
 ```
 
@@ -100,7 +100,7 @@ The common lifecycle is:
 
 ```text
 trail lane spawn <NAME> [--from <REF>] \
-  [--workdir-mode virtual|sparse|full-cow|overlay-cow|nfs-cow] \
+  [--workdir-mode auto|virtual|sparse|native-cow|portable-copy|fuse-cow|nfs-cow|dokan-cow] \
   [--materialize[=true|false]] [--no-materialize] \
   [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] \
   [--provider <PROVIDER>] [--model <MODEL>]
@@ -115,11 +115,14 @@ trail lane rm <NAME> [--force]
 
 | Mode | What it does |
 | --- | --- |
+| `auto` | Tries strict native COW in staging, then restarts with portable materialization when cloning is unavailable. It never selects a mounted backend. |
 | `virtual` | Creates no filesystem workdir. This is the high-scale default. |
 | `sparse` | Materializes only selected paths. |
-| `full-cow` | Materializes the full root and tries filesystem clone COW. |
-| `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
+| `native-cow` | Requires every file to use a filesystem-native clone/reflink and fails without copying otherwise. |
+| `portable-copy` | Opportunistically clones each file, copies bytes when unavailable, and reports `clone`, `mixed`, or `copy`. |
+| `fuse-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
 | `nfs-cow` | On macOS, creates a loopback NFSv3 mount with transparent copy-up and whiteouts, without macFUSE. |
+| `dokan-cow` | On Windows, creates a Dokan-backed transparent COW view. |
 
 Compatibility flags:
 
@@ -127,13 +130,15 @@ Compatibility flags:
 - `--no-materialize` keeps the lane virtual.
 - `--paths <PATH>...` implies a sparse materialized workdir.
 
-`overlay-cow` requires FUSE support when mounted by a runtime such as
-`trail agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
+`fuse-cow` requires FUSE support when mounted by a runtime such as
+`trail agent start --workdir-mode fuse-cow`: macFUSE on macOS, or `/dev/fuse`
 access on Linux. If the mount fails, Trail reports the setup error instead of
 copying the full workdir.
 
 `nfs-cow` is currently macOS-only. The loopback server listens on `127.0.0.1`
 and the mount is removed automatically after recording the agent checkpoint.
+
+`dokan-cow` is Windows-only and requires Dokan 2.x with its driver service running.
 
 ### Sparse path boundaries
 
@@ -305,7 +310,8 @@ Timeline default limit: 30.
 
 `lane diff --patch` prints a Git-style unified diff. In an interactive
 terminal, Trail colorizes patch headers, hunks, additions, and deletions by
-default. Pass the global `--no-color` flag, or set `NO_COLOR=1`, for plain text.
+default. Use `--color never` or set `NO_COLOR=1` to disable human-mode color;
+use `--format plain` for deterministic ASCII logs.
 
 `lane rewind` records a `LaneRewind` operation. With `--record-current`, Trail
 first records dirty materialized workdir edits when possible and preserves the

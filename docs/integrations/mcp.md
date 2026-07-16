@@ -61,4 +61,4 @@ known-good state.
 - Tools: `trail/src/mcp/tools`
 - Resources: `trail/src/mcp/capabilities/resources.rs`
 - Prompts: `trail/src/mcp/capabilities/prompts.rs`
-- Tests: `mcp_stdio_tools_drive_lane_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`
+- Tests: `mcp_stdio_tools_drive_lane_turn_workflow`, `local_api_and_mcp_drive_lane_merge_queue_and_conflicts`

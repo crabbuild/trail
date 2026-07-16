@@ -1,9 +1,13 @@
 use super::*;
 
+#[cfg(target_os = "windows")]
+mod dokan;
+mod fuse;
 mod lifecycle;
 mod manifest;
+mod marker;
+mod materialize;
 mod nfs_overlay;
-mod overlay;
 mod record;
 mod sync;
 mod view_barrier;
@@ -13,6 +17,12 @@ mod view_core;
 mod view_journal;
 mod view_layout;
 
+pub(crate) use materialize::*;
+#[cfg(debug_assertions)]
+pub(crate) use record::{
+    install_lane_record_after_c2_write_for_current_thread,
+    set_lane_record_postcommit_failure_for_current_thread,
+};
 pub(crate) use view_barrier::*;
 #[cfg(test)]
 pub(crate) use view_conformance::*;

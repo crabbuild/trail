@@ -23,19 +23,19 @@ Codex profile and the relay side is provider-neutral.
 For day-to-day editor use, generate a stable high-level command:
 
 ```sh
-trail agent setup
+trail agent acp setup claude-code --editor vscode
 ```
 
 The generated editor entry runs:
 
 ```sh
-trail --workspace /path/to/repo agent acp --provider claude-code
+trail --workspace /path/to/repo agent acp run claude-code
 ```
 
-Use `--provider codex` for the built-in Codex ACP adapter:
+Use `codex` for the built-in Codex ACP adapter:
 
 ```sh
-trail --workspace /path/to/repo agent acp --provider codex
+trail --workspace /path/to/repo agent acp run codex
 ```
 
 That command creates a fresh lane for the ACP session, launches the real
@@ -70,10 +70,10 @@ trail --help
 Confirm the provider profile:
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent doctor --provider codex
-trail agent setup
-trail acp list
+trail agent doctor claude-code
+trail agent doctor codex
+trail agent acp setup claude-code --editor vscode
+trail agent acp status
 ```
 
 Provider doctor validates the Trail workspace, the provider profile, the relay
@@ -108,14 +108,14 @@ and editing without touching your active branch.
 Prefer the high-level setup command:
 
 ```sh
-trail agent setup
-trail agent setup --provider claude-code --editor zed
-trail agent setup --provider codex --editor zed
+trail agent acp setup claude-code --editor vscode
+trail agent acp setup claude-code --editor zed
+trail agent acp setup codex --editor zed
 ```
 
-These snippets use `trail agent acp`, so users do not hard-code or rotate lane
-names manually. Use `trail acp install` only when you intentionally want the
-lower-level relay command.
+These entries use the hidden `trail agent acp run` command, so users do not
+hard-code or rotate lane names manually. Use `trail acp relay` only for a custom
+ACP host or low-level relay diagnostics.
 
 ### Zed
 
@@ -123,7 +123,7 @@ Zed supports ACP External Agents natively. Generate the Trail custom-agent
 snippet:
 
 ```sh
-trail agent setup --provider claude-code --editor zed
+trail agent acp setup claude-code --editor zed
 ```
 
 The generated shape is:
@@ -316,7 +316,7 @@ After editing, reply with a brief summary and the file path changed.
 Launch the high-level ACP entrypoint:
 
 ```sh
-trail --workspace "$PLAYGROUND" agent acp --provider claude-code
+trail --workspace "$PLAYGROUND" agent acp run claude-code
 ```
 
 Then drive the relay over JSON-RPC stdio from your editor or test client.
@@ -694,7 +694,7 @@ trail --workspace "$PLAYGROUND" agent undo-last latest --prompt 'Add hook suppor
 ```
 
 Direct `agent rewind --to <CHECKPOINT_OR_LABEL>` still works, but
-`agent undo-last` avoids copying `ch_...` ids from transcripts.
+`agent undo-last` avoids copying `change_...` ids from transcripts.
 
 If the task is ready, check apply readiness:
 
@@ -708,7 +708,7 @@ trail --workspace "$PLAYGROUND" agent can-land latest
 
 The doctor checks the provider profile and launch command. Run a real ACP
 prompt through your editor or JSON-RPC driver, then inspect it with
-`trail acp sessions`, `trail transcript <lane>`, and
+`trail agent acp sessions`, `trail transcript <lane>`, and
 `trail lane review <lane>`.
 
 ### The agent says permission was refused

@@ -1,13 +1,13 @@
 use crate::server::request_types::{
-    default_lease_mode, AnchorCreateRequest, ConflictResolveRequest, LeaseAcquireRequest,
-    MergeLaneRequest, MergeQueueAddRequest, MergeQueueRunRequest,
+    default_lease_mode, AnchorCreateRequest, ConflictResolveRequest, LaneMergeQueueAddRequest,
+    LaneMergeQueueRunRequest, LaneMergeRequest, LeaseAcquireRequest,
 };
 use crate::server::route::utils::{
-    json_response, query_flag, query_usize, query_value, reject_unexpected_body, required_query,
+    json_response, query_flag, query_usize, query_value, reject_unexpected_body,
     resolve_conflict_request, validate_merge_strategy,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
-use crate::{Error, Result, Trail};
+use crate::{Result, Trail};
 
 pub(super) fn handle_collaboration_routes(
     db: &mut Trail,
@@ -44,29 +44,24 @@ pub(super) fn handle_collaboration_routes(
         return Ok(Some(json_response(201, "Created", &report)?));
     }
 
-    if request.method == "GET" && path == "/v1/merge-queue" {
-        let entries = db.list_merge_queue()?;
+    if request.method == "GET" && path == "/v1/lanes/merges/queue" {
+        let entries = db.list_lane_merge_queue()?;
         return Ok(Some(json_response(200, "OK", &entries)?));
     }
 
-    if request.method == "POST" && path == "/v1/merge-queue" {
-        let body: MergeQueueAddRequest = serde_json::from_slice(&request.body)?;
-        let report = db.enqueue_merge(&body.source, &body.target, body.priority)?;
+    if request.method == "POST" && path == "/v1/lanes/merges/queue" {
+        let body: LaneMergeQueueAddRequest = serde_json::from_slice(&request.body)?;
+        let report = db.enqueue_lane_merge(&body.lane, &body.into, body.priority)?;
         return Ok(Some(json_response(201, "Created", &report)?));
     }
 
-    if request.method == "POST" && path == "/v1/merge-queue/run" {
-        let body: MergeQueueRunRequest = if request.body.is_empty() {
-            MergeQueueRunRequest { limit: None }
+    if request.method == "POST" && path == "/v1/lanes/merges/queue/run" {
+        let body: LaneMergeQueueRunRequest = if request.body.is_empty() {
+            LaneMergeQueueRunRequest { limit: None }
         } else {
             serde_json::from_slice(&request.body)?
         };
-        let report = db.run_merge_queue(body.limit)?;
-        return Ok(Some(json_response(200, "OK", &report)?));
-    }
-
-    if request.method == "GET" && path == "/v1/merge-queue/explain" {
-        let report = db.explain_merge_queue(required_query(query, "selector")?)?;
+        let report = db.run_lane_merge_queue(body.limit)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
@@ -93,23 +88,27 @@ pub(super) fn handle_collaboration_routes(
         }
     }
 
-    if parts.len() == 3
+    if parts.len() == 5
         && parts[0] == "v1"
-        && parts[1] == "merge-queue"
+        && parts[1] == "lanes"
+        && parts[2] == "merges"
+        && parts[3] == "queue"
         && request.method == "DELETE"
     {
-        reject_unexpected_body(request, "DELETE /v1/merge-queue/{queue_id}")?;
-        let report = db.remove_merge_queue(parts[2])?;
+        reject_unexpected_body(request, "DELETE /v1/lanes/merges/queue/{selector}")?;
+        let report = db.remove_lane_merge_queue(parts[4])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
-    if parts.len() == 4
+    if parts.len() == 6
         && parts[0] == "v1"
-        && parts[1] == "merge-queue"
-        && parts[3] == "explain"
+        && parts[1] == "lanes"
+        && parts[2] == "merges"
+        && parts[3] == "queue"
+        && parts[5] == "explain"
         && request.method == "GET"
     {
-        let report = db.explain_merge_queue(parts[2])?;
+        let report = db.explain_lane_merge_queue(parts[4])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
@@ -131,17 +130,15 @@ pub(super) fn handle_collaboration_routes(
 
     if parts.len() == 4
         && parts[0] == "v1"
-        && parts[1] == "branches"
-        && parts[3] == "merge-lane"
+        && parts[1] == "lanes"
+        && parts[3] == "merge"
         && request.method == "POST"
     {
-        let body: MergeLaneRequest = serde_json::from_slice(&request.body)?;
+        let body: LaneMergeRequest = serde_json::from_slice(&request.body)?;
         validate_merge_strategy(body.strategy.as_deref())?;
-        let lane = body.lane_id.ok_or_else(|| {
-            Error::InvalidInput("merge-lane request requires `lane_id`".to_string())
-        })?;
-        let lane = db.resolve_lane_handle(&lane)?;
-        let report = db.merge_lane_user_with_options(&lane, parts[2], body.dry_run, body.direct)?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report =
+            db.merge_lane_user_with_options(&lane, &body.into, body.dry_run, body.direct)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

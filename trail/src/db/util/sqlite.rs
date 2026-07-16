@@ -22,28 +22,49 @@ pub(crate) fn register_sqlite_vec_extension() -> Result<()> {
 }
 
 pub(crate) fn apply_sqlite_pragmas(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "temp_store", "MEMORY")?;
-    Ok(())
+    // WAL mode persists in the database header. Reissuing the mutating
+    // journal-mode pragma on every observer control connection can require an
+    // exclusive transition while the daemon's primary connection and WAL are
+    // live; native Linux filesystems can report that failed transition as
+    // IOERR. New databases still opt into WAL, while runtime connections only
+    // verify and reuse the already-persisted mode.
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|error| {
+            Error::DaemonUnavailable(format!("SQLite journal-mode verification failed: {error}"))
+        })?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| {
+                Error::DaemonUnavailable(format!("SQLite WAL-mode initialization failed: {error}"))
+            })?;
+    }
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|error| {
+            Error::DaemonUnavailable(format!(
+                "SQLite synchronous-mode initialization failed: {error}"
+            ))
+        })?;
+    apply_sqlite_runtime_pragmas(conn)
 }
 
-pub(crate) fn ensure_column(
-    conn: &Connection,
-    table: &'static str,
-    column: &'static str,
-    definition: &'static str,
-) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|existing| existing == column) {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )?;
-    }
+/// Configure connection-local behavior without inspecting or mutating the
+/// database-wide journal mode. Runtime observer connections open only after
+/// Trail's hard-cutover initializer has established WAL mode.
+pub(crate) fn apply_sqlite_runtime_pragmas(conn: &Connection) -> Result<()> {
+    // Do not lower `synchronous` on a live database. New SQLite connections
+    // default to FULL, which is stronger than Trail's initialized NORMAL mode;
+    // attempting to change it while the primary daemon transaction is live can
+    // fail with IOERR on native Linux.
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| {
+            Error::DaemonUnavailable(format!("SQLite foreign-key initialization failed: {error}"))
+        })?;
+    conn.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|error| {
+            Error::DaemonUnavailable(format!(
+                "SQLite temporary-store initialization failed: {error}"
+            ))
+        })?;
     Ok(())
 }

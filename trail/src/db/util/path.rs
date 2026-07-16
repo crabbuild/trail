@@ -1,6 +1,29 @@
 use super::*;
 use unicode_normalization::UnicodeNormalization;
 
+pub(crate) fn canonicalize_lossless(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        #[cfg(unix)]
+        Err(error) if path.to_str().is_none() && error.raw_os_error() == Some(libc::EILSEQ) => {
+            // macOS realpath(3) rejects existing names containing arbitrary
+            // filesystem bytes. Canonicalize the parent so symlinks above the
+            // opaque component are still resolved, then preserve that component
+            // byte-for-byte. Recursing also handles an opaque ancestor.
+            let name = path.file_name().ok_or_else(|| Error::Io(error))?;
+            let parent = path.parent().ok_or_else(|| Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: "path has no parent to canonicalize".into(),
+            })?;
+            let canonical_parent = canonicalize_lossless(parent)?;
+            let resolved = canonical_parent.join(name);
+            fs::metadata(&resolved)?;
+            Ok(resolved)
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
     if path.as_bytes().contains(&0) {
         return Err(Error::InvalidPath {
@@ -293,6 +316,81 @@ pub(crate) fn path_matches_selection(path: &str, selected: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Canonical component-prefix selections used by bounded root reads and
+/// selected-map membership checks.
+///
+/// Stored paths and membership candidates are expected to already use Trail's
+/// normalized relative-path representation. Construction normalizes user or
+/// provider candidates, deduplicates them, and removes a selection only when
+/// an accepted component ancestor covers it. Case-distinct paths remain
+/// distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionSet {
+    paths: Vec<String>,
+    exact: BTreeSet<String>,
+    descendant_ranges: Vec<(String, String)>,
+}
+
+impl SelectionSet {
+    pub(crate) fn from_paths(paths: &[String]) -> Result<Self> {
+        let normalized = paths
+            .iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut exact = BTreeSet::new();
+        for path in normalized {
+            let covered = path
+                .match_indices('/')
+                .any(|(separator, _)| exact.contains(&path[..separator]));
+            if !covered {
+                exact.insert(path);
+            }
+        }
+        let paths = exact.iter().cloned().collect::<Vec<_>>();
+        let mut descendant_ranges = paths
+            .iter()
+            .map(|path| (format!("{path}/"), format!("{path}0")))
+            .collect::<Vec<_>>();
+        descendant_ranges.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(Self {
+            paths,
+            exact,
+            descendant_ranges,
+        })
+    }
+
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, normalized_path: &str) -> bool {
+        self.contains_counted(normalized_path).0
+    }
+
+    /// Returns logical membership probes separately from manifest-entry
+    /// comparisons. The exact set and non-overlapping interval index each
+    /// contribute at most one probe; their internal tree/binary-search work is
+    /// logarithmic in the canonical selection count.
+    pub(crate) fn contains_counted(&self, normalized_path: &str) -> (bool, u64) {
+        if self.exact.contains(normalized_path) {
+            return (true, 1);
+        }
+        let interval_index = self
+            .descendant_ranges
+            .partition_point(|(lower, _)| lower.as_str() <= normalized_path);
+        let matches = interval_index
+            .checked_sub(1)
+            .and_then(|index| self.descendant_ranges.get(index))
+            .is_some_and(|(_, upper)| normalized_path < upper.as_str());
+        (matches, 2)
+    }
+}
+
 pub(crate) fn validate_ref_segment(name: &str) -> Result<()> {
     if name.is_empty()
         || name.contains("..")
@@ -336,4 +434,57 @@ pub(crate) fn is_default_ignored(path: &str) -> bool {
         || file_name.ends_with(".pfx")
         || file_name == "id_rsa"
         || file_name == "id_ed25519"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_set_normalizes_deduplicates_and_collapses_component_descendants() {
+        let selections = SelectionSet::from_paths(&[
+            "docs/sub/deep.txt".to_string(),
+            "docs/./sub".to_string(),
+            "docs".to_string(),
+            "docs".to_string(),
+            "docs-z".to_string(),
+            "README.md".to_string(),
+            "readme.md".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            selections.as_slice(),
+            ["README.md", "docs", "docs-z", "readme.md"]
+        );
+        assert!(selections.contains("docs/sub/deep.txt"));
+        assert!(selections.contains("README.md"));
+        assert!(selections.contains("readme.md"));
+        assert!(!selections.contains("documentation/file.txt"));
+    }
+
+    #[test]
+    fn selection_set_descendant_intervals_survive_lexical_sibling_boundaries() {
+        let selections =
+            SelectionSet::from_paths(&["foo".to_string(), "foo-z".to_string()]).unwrap();
+
+        let (foo_child, foo_comparisons) = selections.contains_counted("foo/bar.txt");
+        let (foo_z_child, foo_z_comparisons) = selections.contains_counted("foo-z/bar.txt");
+
+        assert!(foo_child);
+        assert!(foo_z_child);
+        assert!(!selections.contains("foo-zebra/bar.txt"));
+        assert!(!selections.contains("foobar.txt"));
+        assert!(foo_comparisons <= 2);
+        assert!(foo_z_comparisons <= 2);
+    }
+
+    #[test]
+    fn selection_set_rejects_invalid_paths_without_partial_output() {
+        let err =
+            SelectionSet::from_paths(&["valid/path.txt".to_string(), "../outside.txt".to_string()])
+                .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidPath { .. }));
+    }
 }

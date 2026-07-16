@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use crate::model::LaneGateOptions;
 use crate::server::request_types::{
-    DependencySyncRequest, LaneClaimRequest, LaneReadFileRequest, LaneRecordRequest,
-    LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest, SyncWorkdirRequest,
-    WorkspaceCheckpointRequest, WorkspaceExecRequest,
+    DependencySyncRequest, EnvironmentSyncRequest, LaneClaimRequest, LaneReadFileRequest,
+    LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest,
+    SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -20,6 +20,11 @@ pub(super) fn handle_lane_resources(
     query: &str,
     parts: &[&str],
 ) -> Result<Option<HttpResponse>> {
+    if request.method == "GET" && path == "/v1/environment/adapters" {
+        let report = db.workspace_environment_adapters()?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
     if request.method == "GET" && path == "/v1/lanes" {
         let lanes = db.list_lanes()?;
         return Ok(Some(json_response(200, "OK", &lanes)?));
@@ -73,7 +78,12 @@ pub(super) fn handle_lane_resources(
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
-    if parts.len() == 4 && parts[0] == "v1" && parts[1] == "lanes" && request.method == "GET" {
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && path != "/v1/lanes/merges/queue"
+        && request.method == "GET"
+    {
         let lane = db.resolve_lane_handle(parts[2])?;
         return Ok(Some(match parts[3] {
             "status" => {
@@ -125,6 +135,10 @@ pub(super) fn handle_lane_resources(
                 let report = db.workspace_environment_status(&lane)?;
                 json_response(200, "OK", &report)?
             }
+            "environment" => {
+                let report = db.environment_component_status(&lane)?;
+                json_response(200, "OK", &report)?
+            }
             "diff" => {
                 let diff = db.diff_lane_with_options(
                     &lane,
@@ -137,9 +151,136 @@ pub(super) fn handle_lane_resources(
                 return Err(Error::InvalidInput(format!(
                     "unknown API endpoint `{}`",
                     request.path
-                )))
+                )));
             }
         }));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "explain"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let component = query_value(query, "component").ok_or_else(|| {
+            Error::InvalidInput("environment explain requires `component`".to_string())
+        })?;
+        let report = db.explain_workspace_environment_staleness_page(
+            &lane,
+            component,
+            query_usize(query, "offset", 0)? as u64,
+            query_usize(query, "limit", 256)? as u64,
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 6
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "runtime"
+        && parts[5] == "status"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.active_environment_generation(&lane)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 6
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "runtime"
+        && matches!(parts[5], "reconcile" | "stop")
+        && request.method == "POST"
+    {
+        reject_unexpected_body(request, "environment runtime lifecycle")?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = if parts[5] == "reconcile" {
+            db.reconcile_workspace_environment_runtime(&lane)?
+        } else {
+            db.stop_workspace_environment_runtime(&lane)?
+        };
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "plan"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.plan_workspace_environment_component(
+            &lane,
+            query_value(query, "adapter").unwrap_or("auto"),
+            query_value(query, "path"),
+            query_value(query, "component"),
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "graph"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.workspace_environment_graph_page(
+            &lane,
+            query_value(query, "path"),
+            query_usize(query, "offset", 0)? as u64,
+            query_usize(query, "limit", 256)? as u64,
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "generation"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.active_environment_generation(&lane)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "discover"
+        && request.method == "GET"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.discover_workspace_environment(&lane, query_value(query, "path"))?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "sync-all"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: DependencySyncRequest = if request.body.is_empty() {
+            DependencySyncRequest::default()
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report =
+            db.sync_all_workspace_environments_with_runtime(&lane, body.path.as_deref())?;
+        return Ok(Some(json_response(200, "OK", &report)?));
     }
 
     if parts.len() == 4
@@ -234,11 +375,29 @@ pub(super) fn handle_lane_resources(
     {
         let lane = db.resolve_lane_handle(parts[2])?;
         let body: DependencySyncRequest = if request.body.is_empty() {
-            DependencySyncRequest { path: None }
+            DependencySyncRequest::default()
         } else {
             serde_json::from_slice(&request.body)?
         };
         let report = db.sync_node_dependencies(&lane, body.path.as_deref())?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "sync"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: EnvironmentSyncRequest = serde_json::from_slice(&request.body)?;
+        let report = db.sync_workspace_environment_component_with_runtime(
+            &lane,
+            body.adapter.as_deref().unwrap_or("auto"),
+            body.path.as_deref(),
+            body.component.as_deref(),
+        )?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

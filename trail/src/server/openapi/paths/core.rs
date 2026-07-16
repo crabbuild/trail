@@ -1,8 +1,23 @@
 use serde_json::{json, Value};
 
-use super::{openapi_operation, openapi_path_param, openapi_query, openapi_required_query};
+use super::{
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+    openapi_required_query,
+};
 
 pub(super) fn core_paths() -> Value {
+    let mut index_reconcile = openapi_operation_with_response_schema(
+        "indexReconcile",
+        "Reconcile changed-path ledger",
+        "Start the scope daemon if necessary and run a complete filesystem reconciliation.",
+        vec![],
+        Some("IndexReconcileRequest"),
+        "ChangeLedgerReconcileReport",
+        true,
+    );
+    index_reconcile["requestBody"]["required"] = json!(false);
+    index_reconcile["responses"]["409"] = json!({ "$ref": "#/components/responses/Error" });
+
     json!({
         "/v1/health": {
             "get": openapi_operation("health", "Health check", "Return service liveness without authentication.", vec![], None, false)
@@ -15,6 +30,9 @@ pub(super) fn core_paths() -> Value {
         },
         "/v1/status": {
             "get": openapi_operation("status", "Workspace status", "Return current branch status and changed paths.", vec![], None, true)
+        },
+        "/v1/index/reconcile": {
+            "post": index_reconcile
         },
         "/v1/record": {
             "post": openapi_operation("record", "Record workspace changes", "Record current workspace changes into a branch.", vec![], Some("RecordRequest"), true)

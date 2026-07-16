@@ -86,20 +86,51 @@
   checkpoint after the build records zero source paths.
 - Native macOS loopback NFS now runs equivalent real dependency acceptance
   cases. Two Node lanes share one 1,116-entry lodash/Prettier layer; mounted
-  package binaries and symlinks execute, while overwrite, `rm -rf
-  node_modules`, and `npm ci` in lane A leave lane B and the immutable layer
-  unchanged. A Cargo producer target can be published as an immutable seed for
-  lane B; the consumer reuses dependency artifacts without private copies,
-  `cargo clean` cannot alter the producer or seed, and both dependency
-  checkpoints record zero source paths. These tests also verify that immutable
-  backing files remain read-only while the NFS COW view exposes writable modes
-  required by the macOS client.
+  package binaries and symlinks execute, while lane-A copy-up leaves lane B and
+  the immutable layer unchanged. Direct `rm -rf node_modules && npm ci` remains
+  correct but took about 215 seconds because NFSv3 has no recursive-delete RPC.
+  The supported `trail deps sync` path now bulk-removes private dependency
+  state and subtree whiteouts off-mount before rebinding the cached layer; the
+  same real fixture completed replacement in 978 ms (about 220x faster), left
+  both generated uppers at zero bytes, and recorded zero source paths. A Cargo
+  producer target can be published as an immutable seed for lane B; the
+  consumer reuses dependency artifacts without private copies, and `cargo
+  clean` cannot alter the producer or seed. These tests also verify that
+  immutable backing files remain read-only while the NFS COW view exposes
+  writable modes required by the macOS client.
 - The million-path/twenty-view acceptance test also passes inside Linux: each
   view starts with one indexed path, all 20 views are created in 91 ms, and
   unchanged views consume 0 exclusive physical bytes.
+- A gated native macOS framework benchmark uses current Next.js 16.2.10,
+  React 19.2.7, Vite 8.1.4, and `@vitejs/plugin-react` 6.0.3. The Next layer
+  contains 10,558 entries and 305,041,668 logical bytes: cold sync took 51.2
+  seconds, cache-hit attach 27.1 seconds, two mounts 74 ms, full private-tree
+  materialization 1.9 seconds, and bulk replacement 29.4 seconds. Default
+  Turbopack did not finish within its 120-second budget. The Vite layer contains
+  410 entries and 36,878,763 logical bytes: cold sync took 6.5 seconds,
+  cache-hit attach 3.2 seconds, two mounts 75 ms, its first CLI probe 53.6
+  seconds, production build 7.2 seconds, private-tree materialization 66 ms,
+  and bulk replacement 3.2 seconds. Both replacement cases preserve lane-B and
+  immutable-layer hashes; Next returns both dependency uppers to zero bytes,
+  while Vite retains only its lane-A `dist` output. The reproducible entry point
+  is `scripts/verify-macos-nfs-framework-layers.sh` (optional argument `next`
+  or `vite`).
+- Cache-hit publication and attachment now validate a bounded durable seal containing
+  the exact manifest object, layer summary, and platform filesystem identity instead of
+  hashing every immutable entry. A missing, oversized, malformed, or stale seal falls
+  back to one full scan and self-heals; explicit `cache verify`, doctor, and readiness
+  remain full-content checks. The focused regression proves repeated warm reuse performs
+  zero recursive scans and that root replacement invalidates the seal. The remaining
+  macOS performance work is lower-aware NFS caching/coherency instead of global
+  `noac,actimeo=0`.
 - Native NFS exec/gate/checkpoint/recovery verifies exact source-root,
   environment-key, layer-ID, and stale-gate readiness behavior with no hosted
   service.
+- macOS NFS mounts request synchronous writes. A parallel regression exposed the
+  platform's default `nosync` behavior returning before a queued WRITE reached the
+  userspace server, allowing immediate unmount/remount to observe only the preceding
+  truncate. Eight concurrent real mount/write/sync/remount flows preserve their private
+  bytes with the synchronous mount contract.
 - External process-kill tests stop checkpoint and cache-publish helpers after
   every durable phase: source sync, ref advance, lane-head update, clean
   marker, staging sync, publish marker, atomic rename, and ready-state update.

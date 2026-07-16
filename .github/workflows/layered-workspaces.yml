@@ -4,11 +4,18 @@ on:
   pull_request:
     paths:
       - "trail/**"
-      - "scripts/verify-linux-overlay-cow-docker.sh"
+      - "scripts/verify-linux-fuse-cow-docker.sh"
       - "scripts/verify-layered-lane-scale.sh"
       - "scripts/verify-rust-cache-isolation-docker.sh"
       - "scripts/verify-linux-node-layer-docker.sh"
       - "scripts/install-dokany.ps1"
+      - "scripts/verify-linux-command-recipe-native.sh"
+      - "scripts/verify-linux-command-recipe-sandbox.sh"
+      - "scripts/verify-windows-command-recipe-sandbox.ps1"
+      - "scripts/verify-macos-nfs-framework-layers.sh"
+      - "scripts/verify-environment-adapter-plugin.sh"
+      - "scripts/verify-windows-environment-adapter-plugin.ps1"
+      - "trail-environment-adapter-sdk/**"
       - ".github/workflows/layered-workspaces.yml"
   workflow_dispatch:
     inputs:
@@ -19,6 +26,11 @@ on:
         type: boolean
       run_dokan_conformance:
         description: "Run experimental Dokan mount conformance tests"
+        required: false
+        default: false
+        type: boolean
+      run_macos_framework_bench:
+        description: "Run real Next.js and Vite dependency/build benchmarks through macOS NFS"
         required: false
         default: false
         type: boolean
@@ -50,7 +62,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: sudo chmod 666 /dev/fuse
+      - run: cmake --version && cc --version && make --version
       - run: cargo test -p trail fuse_adapter_runs_shared_mounted_view_suite -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail real_cmake_configure_build_and_clean_stay_lane_private -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail real_python_venvs_embed_lane_paths_and_remain_isolated -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail failed_mounted_initializer_preserves_previous_generation_and_real_uppers -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail killing_mounted_python_initialization_never_exposes_a_partial_generation -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
 
@@ -70,6 +98,53 @@ jobs:
           submodules: recursive
       - run: scripts/verify-linux-node-layer-docker.sh
 
+  command-recipe-sandbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-linux-command-recipe-native.sh
+
+  adapter-plugin-conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-environment-adapter-plugin.sh
+
+  windows-command-recipe-sandbox:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/install-dokany.ps1
+      - shell: pwsh
+        run: |
+          cmake --version
+          cargo test -p trail windows_arguments_follow_command_line_to_argv_w_quoting -- --nocapture
+          cargo test -p trail windows_recipe_publication_rejects_hard_link_aliases -- --nocapture
+          $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
+          cargo test -p trail real_windows_cmake_build_and_clean_stay_lane_private -- --nocapture
+          cargo test -p trail real_windows_python_venvs_embed_lane_paths_and_remain_isolated -- --nocapture
+          cargo test -p trail failed_mounted_initializer_preserves_previous_generation_and_real_uppers -- --nocapture
+          cargo test -p trail killing_mounted_python_initialization_never_exposes_a_partial_generation -- --nocapture
+          cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
+      - run: ./scripts/verify-windows-command-recipe-sandbox.ps1
+      - run: ./scripts/verify-windows-environment-adapter-plugin.ps1
+
   nfs-conformance:
     runs-on: macos-latest
     steps:
@@ -78,6 +153,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: cmake --version && cc --version && make --version
       - run: cargo test -p trail nfs_adapter_runs_shared_mounted_view_suite -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
@@ -90,12 +166,39 @@ jobs:
       - run: cargo test -p trail nfs_git_checkout_reset_and_clean_are_lane_local -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
-      - run: cargo test -p trail nfs_real_node_layer_is_shared_and_writable_installs_are_isolated -- --nocapture
+      - run: cargo test -p trail nfs_real_node_layer_bulk_replacement_is_isolated -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
       - run: cargo test -p trail nfs_cargo_target_seed_is_shared_and_writable_targets_are_isolated -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail restricted_command_recipe_publishes_and_activates_multiple_outputs_atomically -- --nocapture
+      - run: cargo test -p trail real_cmake_configure_build_and_clean_stay_lane_private -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail real_python_venvs_embed_lane_paths_and_remain_isolated -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail failed_mounted_initializer_preserves_previous_generation_and_real_uppers -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail killing_mounted_python_initialization_never_exposes_a_partial_generation -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+
+  nfs-framework-bench:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_macos_framework_bench }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-macos-nfs-framework-layers.sh
 
   dokan-conformance:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_dokan_conformance }}

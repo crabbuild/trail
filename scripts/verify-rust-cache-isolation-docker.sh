@@ -5,8 +5,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${RUST_IMAGE:-rust:bookworm}
 TARGET_DIR=${TRAIL_DOCKER_TARGET_DIR:-/target}
 CARGO_HOME_DIR=${TRAIL_DOCKER_CARGO_HOME:-/cargo-home}
-CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-overlay-cow-cargo}
-TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-overlay-cow-target}
+CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-fuse-cow-cargo}
+TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-fuse-cow-target}
 
 docker run --rm --privileged \
   -v "$ROOT":/work \

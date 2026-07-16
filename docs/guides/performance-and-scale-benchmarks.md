@@ -14,6 +14,41 @@ The smoke target defaults to 1,000 synthetic files and is intended for pull-requ
 python3 scripts/check-cli-scale-thresholds.py <results.tsv> name=max_seconds ... --metrics <metrics.tsv> key=max_value ...
 ```
 
+Structural string invariants use `--metric-equals key=value`. The Git handoff
+gate combines wall-time ceilings, numeric ceilings, and exact export-mode
+checks in one invocation.
+
+The `Changed-path Ledger Native Gates` workflow is a required merge and
+release gate. Branch protection and release automation must require both its
+Linux/ext4 and macOS/APFS matrix jobs for the exact commit being merged or
+released; scheduled artifacts are additional qualification evidence, not a
+substitute for those commit-specific checks.
+
+The workflow is reusable. `release-automation.yml` calls it before creating a
+tag, and cargo-dist declares it as a generated `plan-jobs` dependency so a tag
+push cannot build, host, or publish until both native jobs pass for that tag's
+exact SHA. The compiled activation manifest names those dependencies, but its
+self-hash is only a declaration of the build contract; it is not evidence that
+a workflow ran.
+
+Changed-path structural reports are closed schemas: missing and unknown work
+counters fail the gate. Every repository-size-sensitive counter is either
+required to be zero or capped by an explicit affine O(k) bound. Selected
+worktree-index SQLite work additionally has a typed disposition:
+
+- workspace status, diff, and record report `not_applicable`, one independent
+  N/A proof, and zero selected-index work;
+- materialized lane record, structured patch, and COW checkpoint report
+  `complete`, at least one accounting envelope (including k=0), and no N/A
+  claim;
+- absent, mixed, or ambiguous accounting fails even when every numeric SQLite
+  counter is zero.
+
+COW checkpoint reports must also declare
+`generated_path_accounting=journal_interval`. This proves generated dirty paths
+come from the bounded journal interval rather than a recursive upper-directory
+inventory.
+
 ## Local and Large Runs
 
 ```sh
@@ -46,6 +81,23 @@ Optional toggles:
 - `TRAIL_SCALE_DAEMON=0|1`
 - `TRAIL_SCALE_GIT_IMPORT=0|1`
 
+Run the path-index structural matrix without the unrelated large artifacts:
+
+```sh
+TRAIL_BIN=target/release/trail \
+TRAIL_SCALE_FILES=1000,100000,1000000 \
+TRAIL_SCALE_MATERIALIZED=0 \
+TRAIL_SCALE_BACKUP=0 \
+TRAIL_SCALE_DAEMON=0 \
+TRAIL_SCALE_GIT_IMPORT=0 \
+scripts/cli-scale-bench.sh
+```
+
+This still runs an explicitly bounded sparse record case at every scale. It
+also covers a content-only patch, a case-only rename combined with delete/add,
+and a patch against an empty root. The scheduled workflow applies the same
+structural gates to 10k, 100k, and 1M files.
+
 ## Output
 
 Each scale writes:
@@ -62,6 +114,34 @@ Important storage signals:
 - `manifest_repo_clean_workdir_bytes`
 - `manifest_repo_sparse_workdir_bytes`
 
+Patch and record JSON reports include an operation-scoped `path_index` object:
+
+- `mode`: `indexed` once the operation uses bounded folded-path lookups.
+- `lookup_count`: number of folded-key index lookups. This must be no greater
+  than the unique folded old/new paths touched by the completed operation;
+  content-only writes to existing exact paths can require zero lookups.
+- `full_root_path_load_count`: unbounded traversals that enumerate every path
+  in a persisted root. A fallback that loads both the previous and target roots
+  counts twice.
+- `full_filesystem_path_scan_count`: unbounded repository-shaped filesystem
+  traversals used for path validation. A full materialized workdir validation
+  counts as one, including a clean no-op. Walking an explicitly selected sparse
+  materialization does not count because its size is bounded by that selection.
+
+The counters reset at the public patch or record boundary, including failures,
+retries, and no-ops. This prevents a prior operation from making a later report
+look unbounded. The benchmark extractor independently folds changed paths with
+the same NFKC, per-codepoint lowercase, then NFC sequence as the Rust index and
+rejects malformed or internally inconsistent reports.
+
+A full materialized lane patch normally updates a valid clean manifest from its
+touched subset. If that manifest is missing or stale, the correctness fallback
+loads both complete roots and reports
+`full_root_path_load_count=2`. Likewise, a full materialized record without a
+usable manifest compares one complete root to the disk manifest and reports
+`full_root_path_load_count=1`. These are deliberately visible cold paths; the
+no-materialize and explicitly sparse benchmark operations must remain zero.
+
 Important hot-path rows:
 
 - `status_clean`
@@ -71,6 +151,9 @@ Important hot-path rows:
 - `git_dirty_diff`
 - `git_dirty_record`
 - `git_status_after_dirty_record`
+- `agent_git_apply_dry_run`
+- `agent_git_apply`
+- `agent_git_apply_missing_mapping`
 - `daemon_wait_for_health`
 - `daemon_wait_for_hot_cache`
 - `daemon_persisted_snapshot_status`
@@ -78,7 +161,7 @@ Important hot-path rows:
 - `daemon_persisted_snapshot_diff_dirty`
 - `lane_apply_patch`
 - `lane_readiness`
-- `merge_queue_run`
+- `lane_merge_queue_run`
 - `daemon_cli_status`
 - `daemon_cli_session_start`
 - `daemon_cli_approval_request`
@@ -92,7 +175,52 @@ Important hot-path rows:
 
 `git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate Trail handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
 
+The `agent_git_apply_*` rows exercise the high-level committed Git handoff,
+not only Trail's internal lane merge. The mapped fixture creates a
+no-materialize task that changes
+`k = max(1, min(100, files / 1000))` paths, records the review gate, and runs
+both dry-run and actual apply. Its structural metrics require
+`export_mode=mapped_delta`, exactly `k` changed paths, and at most `k` blob
+writes. `agent_git_plumbing_commands` is specifically the mapped-export
+plumbing subprocess count: `read-tree`, the optional batch `hash-object`, one
+batch `update-index`, `write-tree`, and `commit-tree`. It excludes the final
+porcelain fast-forward and is gated as a constant ceiling of 5, independent of
+`k`; deletion-only exports may be lower because they do not hash new blobs.
+Full-snapshot exports do not use this mapped-export counter. The missing-mapping
+fixture is initialized from the working tree and must return
+`GIT_MAPPING_REQUIRED` without changing Git HEAD, the Git index, or Trail's
+mapping table.
+
 ## Current Evidence
+
+The path-index structural matrix was freshly measured on July 13, 2026 with a
+release binary and headless optional toggles at
+`/tmp/trail-cli-scale-task5-struct-20260713`. All 60 structural and wall/storage
+gates passed (20 per scale):
+
+| Scale | Source files | Init | Content patch | Case rename patch | Empty-root patch | Sparse record |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k | 1,005 | 0.14s | 0.03s | 0.01s | 0.00s | 0.01s |
+| 100k | 100,029 | 9.62s | 0.29s | 0.02s | 0.01s | 0.01s |
+| 1M | 1,000,029 | 188.10s | 0.34s | 0.02s | 0.01s | 0.01s |
+
+At all three scales, all four operation reports used `mode=indexed`, loaded no
+full root path set, and performed no unbounded filesystem path scan. The
+content patch performed 0 lookups for 5 touched folded keys at 1k and 0 for 50
+at 100k/1M. The case fixture performed 1 lookup for 2 reported folded endpoints,
+while empty-root patch and sparse record each performed 1 lookup for 1 touched
+folded key. The 1M artifact was 1,584,734,208 SQLite bytes with 1,000,352
+objects; index rebuild took 3.28s. These results are structural evidence that
+patch and bounded record work scales with touched paths rather than repository
+path count.
+
+Keep legacy missing-index recovery as a separate correctness proof rather than
+mixing it into the performance rows:
+
+```sh
+cargo test -p trail --test e2e \
+  cli_path_index_required_human_json_rebuild_and_retry_lifecycle -- --exact
+```
 
 The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with the release binary:
 
@@ -118,7 +246,7 @@ python3 scripts/check-cli-scale-thresholds.py \
   daemon_cli_approval_request=10 daemon_cli_lease_acquire=10 \
   daemon_cli_timeline=10 daemon_cli_why=10 daemon_cli_history=10 \
   daemon_cli_code_from=10 lane_apply_patch=10 lane_readiness=10 \
-  merge_lane_dry_run=10 merge_lane_apply=10 merge_queue_run=10 \
+  merge_lane_dry_run=10 merge_lane_apply=10 lane_merge_queue_run=10 \
   git_dirty_status=120 git_dirty_diff=120 git_dirty_record=120 \
   git_status_after_dirty_record=90 \
   --metrics /Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \
@@ -151,6 +279,11 @@ Large agent orchestration should use the daemon and no-materialize/sparse workdi
 - If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `lane read`.
 - Keep the daemon running for repeated CLI calls so status, record, trace, gate, handoff, and merge queue commands use a hot SQLite connection and watcher-backed dirty path cache.
 - Separate Trail handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
+- Before high-level `trail agent apply`, reconcile the current Git HEAD with
+  Trail using `trail git import-update` when `GIT_MAPPING_REQUIRED` is
+  reported. A mapped apply builds from the trusted HEAD tree and touches only
+  changed paths. Missing trust is intentionally a fast error; Trail does not
+  silently scan and hash the full repository to manufacture a mapping.
 
 ## Known Limits
 

@@ -1,4 +1,4 @@
-use super::render_json;
+use super::*;
 
 use trail::model::*;
 use trail::Result;
@@ -6,76 +6,102 @@ use trail::Result;
 pub(crate) fn render_git_import_update(
     report: &GitImportReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        match &report.operation {
-            Some(change) => {
-                println!("Imported Git update {}", change.0);
-                println!(
-                    "Imported: {} files ({} text, {} opaque, {} binary)",
-                    report.imported.files,
-                    report.imported.text,
-                    report.imported.opaque,
-                    report.imported.binary
-                );
-                for path in &report.changed_paths {
-                    println!("  {:?} {}", path.kind, path.path);
-                }
-            }
-            None => println!("No Git-tracked changes to import"),
-        }
+    let Some(operation) = &report.operation else {
+        return render_document(
+            &TerminalDocument::new("No Git-tracked changes to import", UiTone::Neutral),
+            options,
+        );
+    };
+    let mut document = TerminalDocument::new(
+        format!("Imported Git update {}", operation.0),
+        UiTone::Success,
+    )
+    .block(UiBlock::Metadata(vec![
+        ("Files".to_string(), report.imported.files.to_string()),
+        ("Text".to_string(), report.imported.text.to_string()),
+        ("Opaque".to_string(), report.imported.opaque.to_string()),
+        ("Binary".to_string(), report.imported.binary.to_string()),
+    ]));
+    if !report.changed_paths.is_empty() {
+        document = document.block(UiBlock::Changes(change_list(&report.changed_paths)));
     }
-    Ok(())
+    render_document(&document, options)
 }
 
-pub(crate) fn render_git_export(report: &GitExportReport, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_git_export(
+    report: &GitExportReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("Created Git commit: {}", report.commit);
-        println!("Range: {}", report.range);
-        println!("Trail operation: {}", report.operation.0);
-        println!("Root: {}", report.root_id.0);
-        if let Some(parent) = &report.parent {
-            println!("Parent: {parent}");
-        }
-        if let Some(mapping) = &report.mapping {
-            println!("Mapping: {}", mapping.mapping_id);
-        }
+    let mut metadata = vec![
+        ("Commit".to_string(), report.commit.clone()),
+        ("Range".to_string(), report.range.clone()),
+        ("Trail operation".to_string(), report.operation.0.clone()),
+        ("Root".to_string(), report.root_id.0.clone()),
+    ];
+    if let Some(parent) = &report.parent {
+        metadata.push(("Parent".to_string(), parent.clone()));
     }
-    Ok(())
+    if let Some(mapping) = &report.mapping {
+        metadata.push(("Mapping".to_string(), mapping.mapping_id.clone()));
+    }
+    render_document(
+        &TerminalDocument::new("Created Git commit", UiTone::Success)
+            .block(UiBlock::Metadata(metadata)),
+        options,
+    )
 }
 
-pub(crate) fn render_git_mappings(entries: &[GitMapping], json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_git_mappings(
+    entries: &[GitMapping],
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(&entries);
     }
-    if !quiet {
-        if entries.is_empty() {
-            println!("No Git mappings");
-        }
-        for entry in entries {
-            let git_head = entry
-                .git_head
-                .as_deref()
-                .map(|head| head.get(..12).unwrap_or(head))
-                .unwrap_or("unborn");
-            let dirty = if entry.git_dirty { " dirty" } else { "" };
-            println!(
-                "{} {}{} {} {} {}",
-                entry.direction,
-                git_head,
-                dirty,
-                entry.branch,
-                entry.crab_change.0,
-                entry.crab_root.0
-            );
-        }
+    if entries.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No Git mappings", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(format!("{} Git mapping(s)", entries.len()), UiTone::Neutral).block(
+            UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("DIRECTION", 0, 9),
+                    UiColumn::left("HEAD", 1, 12),
+                    UiColumn::left("BRANCH", 0, 12),
+                    UiColumn::left("STATE", 1, 7),
+                    UiColumn::left("TRAIL CHANGE", 2, 12),
+                ],
+                entries
+                    .iter()
+                    .map(|entry| {
+                        vec![
+                            entry.direction.clone(),
+                            entry
+                                .git_head
+                                .clone()
+                                .map(|head| head.chars().take(12).collect())
+                                .unwrap_or_else(|| "unborn".to_string()),
+                            entry.branch.clone(),
+                            if entry.git_dirty { "dirty" } else { "clean" }.to_string(),
+                            entry.crab_change.0.clone(),
+                        ]
+                    })
+                    .collect(),
+            )),
+        ),
+        options,
+    )
 }

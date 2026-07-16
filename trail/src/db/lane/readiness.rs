@@ -123,6 +123,50 @@ impl Trail {
                     )),
                 }
             }
+            if let Some(generation) = self.active_environment_generation(lane)? {
+                for component in generation.components {
+                    for resource in component.runtime_resources {
+                        for secret in &resource.secret_statuses {
+                            if secret.reference.required && secret.status != "available" {
+                                blockers.push(readiness_issue(
+                                    "environment_secret_unavailable",
+                                    format!(
+                                        "required secret reference `{}` for runtime resource `{}` is unavailable",
+                                        secret.reference.name, resource.declaration.name
+                                    ),
+                                    Some(serde_json::json!({
+                                        "generation_id": generation.generation_id,
+                                        "component_id": component.component_id,
+                                        "resource": resource.declaration.name,
+                                        "secret": secret.reference.name,
+                                        "provider": secret.reference.provider,
+                                        "status": secret.status,
+                                        "reason": secret.reason,
+                                    })),
+                                ));
+                            }
+                        }
+                        if resource.status != "running" || resource.health_status != "healthy" {
+                            blockers.push(readiness_issue(
+                                "environment_runtime_unhealthy",
+                                format!(
+                                    "runtime resource `{}` for component `{}` is not healthy",
+                                    resource.declaration.name, component.component_id
+                                ),
+                                Some(serde_json::json!({
+                                    "generation_id": generation.generation_id,
+                                    "component_id": component.component_id,
+                                    "resource": resource.declaration.name,
+                                    "allocation_id": resource.allocation_id,
+                                    "status": resource.status,
+                                    "health_status": resource.health_status,
+                                    "reason": resource.reason,
+                                })),
+                            ));
+                        }
+                    }
+                }
+            }
             for layer in self.workspace_view_layer_reports(&view.view_id)? {
                 if layer.state != "ready" || self.verify_workspace_layer(&layer.layer_id).is_err() {
                     blockers.push(readiness_issue(

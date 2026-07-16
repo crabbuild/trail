@@ -1,0 +1,5 @@
+[
+  {"event":"chat.message","payload":{"properties":{"sessionID":"opencode-s1","messageID":"opencode-t1","message":"fix it"}},"expected":["turn.started","message.user"]},
+  {"event":"tool.execute.after","payload":{"sessionID":"opencode-s1","callID":"tool-1","error":"failed"},"expected":["tool.failed"]},
+  {"event":"session.idle","payload":{"sessionID":"opencode-s1"},"expected":["turn.completed"]}
+]

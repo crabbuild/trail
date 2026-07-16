@@ -1,21 +1,7 @@
 use super::*;
 
 impl Trail {
-    pub(crate) fn normalize_merge_queue_source_ref(&self, source: &str) -> Result<String> {
-        if source.starts_with("refs/") {
-            self.get_ref(source)?;
-            return Ok(source.to_string());
-        }
-        let lane_ref_name = lane_ref(source);
-        if self.try_get_ref(&lane_ref_name)?.is_some() {
-            return Ok(lane_ref_name);
-        }
-        let branch_ref_name = branch_ref(source);
-        self.get_ref(&branch_ref_name)?;
-        Ok(branch_ref_name)
-    }
-
-    pub(crate) fn normalize_merge_queue_target_ref(&self, target: &str) -> Result<String> {
+    pub(crate) fn normalize_lane_merge_queue_target_ref(&self, target: &str) -> Result<String> {
         let target_ref_name = branch_ref(target);
         if !target_ref_name.starts_with(MAIN_REF_PREFIX) {
             return Err(Error::InvalidInput(
@@ -26,104 +12,87 @@ impl Trail {
         Ok(target_ref_name)
     }
 
-    pub(crate) fn queued_merge_entries(
+    pub(crate) fn queued_lane_merge_entries(
         &self,
         limit: Option<usize>,
-    ) -> Result<Vec<MergeQueueEntry>> {
-        let sql =
-            "SELECT queue_id, source_ref, target_ref, status, priority, created_at, updated_at \
-                   FROM merge_queue WHERE status = 'queued' \
-                   ORDER BY priority DESC, created_at ASC";
+    ) -> Result<Vec<LaneMergeQueueEntry>> {
+        let sql = "SELECT q.queue_id, q.lane_id, l.name, q.target_ref, q.status, q.priority, q.created_at, q.updated_at \
+             FROM lane_merge_queue q JOIN lanes l ON l.lane_id = q.lane_id \
+             WHERE q.status = 'queued' ORDER BY q.priority DESC, q.created_at ASC";
         match limit {
             Some(limit) => {
                 let mut stmt = self.conn.prepare(&format!("{sql} LIMIT ?1"))?;
-                let rows = stmt.query_map(params![limit as i64], merge_queue_row)?;
+                let rows = stmt.query_map(params![limit as i64], lane_merge_queue_row)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Error::from)
             }
             None => {
                 let mut stmt = self.conn.prepare(sql)?;
-                let rows = stmt.query_map([], merge_queue_row)?;
+                let rows = stmt.query_map([], lane_merge_queue_row)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Error::from)
             }
         }
     }
 
-    pub(crate) fn set_merge_queue_status(&self, queue_id: &str, status: &str) -> Result<()> {
+    pub(crate) fn set_lane_merge_queue_status(&self, queue_id: &str, status: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE merge_queue SET status = ?1, updated_at = ?2 WHERE queue_id = ?3",
+            "UPDATE lane_merge_queue SET status = ?1, updated_at = ?2 WHERE queue_id = ?3",
             params![status, now_ts(), queue_id],
         )?;
         Ok(())
     }
 
-    pub(crate) fn merge_queue_entry(&mut self, entry: &MergeQueueEntry) -> Result<MergeReport> {
-        let target = entry
-            .target_ref
-            .strip_prefix(MAIN_REF_PREFIX)
-            .unwrap_or(&entry.target_ref);
-        if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
-            return self.merge_lane_unlocked(lane, target, false, false);
-        }
-        if let Some(source) = entry.source_ref.strip_prefix(MAIN_REF_PREFIX) {
-            return self.merge_branches_unlocked(source, target, false);
-        }
-        Err(Error::InvalidInput(format!(
-            "merge queue source `{}` must be a lane or branch ref",
-            entry.source_ref
-        )))
-    }
-
-    pub(crate) fn merge_queue_entry_dry_run(
+    pub(crate) fn lane_merge_queue_entry(
         &mut self,
-        entry: &MergeQueueEntry,
+        entry: &LaneMergeQueueEntry,
     ) -> Result<MergeReport> {
         let target = entry
             .target_ref
             .strip_prefix(MAIN_REF_PREFIX)
             .unwrap_or(&entry.target_ref);
-        if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
-            return self.merge_lane_unlocked(lane, target, true, false);
-        }
-        if let Some(source) = entry.source_ref.strip_prefix(MAIN_REF_PREFIX) {
-            return self.merge_branches_unlocked(source, target, true);
-        }
-        Err(Error::InvalidInput(format!(
-            "merge queue source `{}` must be a lane or branch ref",
-            entry.source_ref
-        )))
+        self.merge_lane_unlocked(&entry.lane_id, target, false, false)
     }
 
-    pub(crate) fn merge_queue_entry_by_selector(&self, selector: &str) -> Result<MergeQueueEntry> {
-        let lane_candidate = lane_ref(selector);
-        let branch_candidate = branch_ref(selector);
+    pub(crate) fn lane_merge_queue_entry_dry_run(
+        &mut self,
+        entry: &LaneMergeQueueEntry,
+    ) -> Result<MergeReport> {
+        let target = entry
+            .target_ref
+            .strip_prefix(MAIN_REF_PREFIX)
+            .unwrap_or(&entry.target_ref);
+        self.merge_lane_unlocked(&entry.lane_id, target, true, false)
+    }
+
+    pub(crate) fn lane_merge_queue_entry_by_selector(
+        &self,
+        selector: &str,
+    ) -> Result<LaneMergeQueueEntry> {
         self.conn
             .query_row(
-                "SELECT queue_id, source_ref, target_ref, status, priority, created_at, updated_at \
-                 FROM merge_queue \
-                 WHERE (queue_id = ?1 OR source_ref = ?1 OR source_ref = ?2 OR source_ref = ?3) \
-                   AND status NOT IN ('merged', 'cancelled') \
-                 ORDER BY status = 'queued' DESC, priority DESC, created_at ASC LIMIT 1",
-                params![selector, lane_candidate, branch_candidate],
-                merge_queue_row,
+                "SELECT q.queue_id, q.lane_id, l.name, q.target_ref, q.status, q.priority, q.created_at, q.updated_at \
+                 FROM lane_merge_queue q JOIN lanes l ON l.lane_id = q.lane_id \
+                 WHERE (q.queue_id = ?1 OR q.lane_id = ?1 OR l.name = ?1) \
+                   AND q.status NOT IN ('merged', 'cancelled') \
+                 ORDER BY q.status = 'queued' DESC, q.priority DESC, q.created_at ASC LIMIT 1",
+                params![selector],
+                lane_merge_queue_row,
             )
             .optional()?
             .ok_or_else(|| Error::InvalidInput(format!("merge queue item `{selector}` not found")))
     }
 
-    pub(crate) fn merge_queue_context(
+    pub(crate) fn lane_merge_queue_context(
         &self,
-        source_ref_name: &str,
-        target_ref_name: &str,
+        entry: &LaneMergeQueueEntry,
     ) -> Result<MergeContext> {
+        let lane = self.lane_details(&entry.lane_id)?;
+        let source_ref_name = &lane.branch.ref_name;
+        let target_ref_name = &entry.target_ref;
         let source_ref = self.get_ref(source_ref_name)?;
         let target_ref = self.get_ref(target_ref_name)?;
-        let base_change = if let Some(lane) = source_ref_name.strip_prefix(LANE_REF_PREFIX) {
-            self.lane_branch(lane)?.base_change
-        } else {
-            self.common_parent_hint(&source_ref.change_id, &target_ref.change_id)?
-        };
+        let base_change = lane.branch.base_change;
         let base_ref = self.ref_from_change(&base_change)?;
         Ok(MergeContext {
             base_change,
@@ -141,13 +110,13 @@ impl Trail {
     ) -> Result<PendingConflictMerge> {
         self.conn
             .query_row(
-                "SELECT merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root \
+                "SELECT merge_id, lane_queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root \
                  FROM merge_results WHERE conflict_set = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![conflict_set_id],
                 |row| {
                     Ok(PendingConflictMerge {
                         merge_id: row.get(0)?,
-                        queue_id: row.get(1)?,
+                        lane_queue_id: row.get(1)?,
                         source_ref: row.get(2)?,
                         target_ref: row.get(3)?,
                         base_change: ChangeId(row.get(4)?),
@@ -169,15 +138,16 @@ impl Trail {
 
     pub(crate) fn insert_merge_result(
         &self,
-        entry: &MergeQueueEntry,
+        entry: &LaneMergeQueueEntry,
         context: &MergeContext,
         result_change: Option<&ChangeId>,
         status: &str,
         conflict_detail: Option<&str>,
     ) -> Result<()> {
+        let lane = self.lane_details(&entry.lane_id)?;
         self.insert_merge_result_for_refs(
             Some(&entry.queue_id),
-            &entry.source_ref,
+            &lane.branch.ref_name,
             &entry.target_ref,
             context,
             result_change,
@@ -189,7 +159,7 @@ impl Trail {
 
     pub(crate) fn insert_merge_result_for_refs(
         &self,
-        queue_id: Option<&str>,
+        lane_queue_id: Option<&str>,
         source_ref: &str,
         target_ref: &str,
         context: &MergeContext,
@@ -200,7 +170,7 @@ impl Trail {
         let created_at = now_ts();
         let seed = format!(
             "{}:{}:{}:{}:{}",
-            queue_id.unwrap_or("direct"),
+            lane_queue_id.unwrap_or("direct"),
             source_ref,
             target_ref,
             status,
@@ -225,11 +195,11 @@ impl Trail {
         let result_change = result_change.map(|change| change.0.clone());
         self.conn.execute(
             "INSERT INTO merge_results \
-             (merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root, result_change, status, conflict_set, created_at) \
+             (merge_id, lane_queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root, result_change, status, conflict_set, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 merge_id,
-                queue_id,
+                lane_queue_id,
                 source_ref,
                 target_ref,
                 context.base_change.0,

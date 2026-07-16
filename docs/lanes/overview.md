@@ -50,7 +50,7 @@ cd /path/to/project
 trail lane record docs-lane -m "record task work"
 trail lane diff docs-lane --patch
 trail lane readiness docs-lane
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 See [First lane workflow](../getting-started/first-lane-workflow.md) for the
@@ -77,7 +77,7 @@ Before merge, inspect contribution, readiness, gates, approvals, and diff.
 
 ```sh
 trail lane contribution doc-bot
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 ```
 
 If the branch should be abandoned back to a known-good state, use `lane rewind`

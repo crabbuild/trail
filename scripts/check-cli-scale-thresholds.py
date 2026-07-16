@@ -8,7 +8,8 @@ def main() -> int:
     if len(sys.argv) < 3:
         print(
             "usage: check-cli-scale-thresholds.py RESULTS.tsv name=max_seconds ... "
-            "[--metrics METRICS.tsv key=max_value ...]",
+            "[--metrics METRICS.tsv key=max_value ...] "
+            "[--metric-equals key=expected_value ...]",
             file=sys.stderr,
         )
         return 2
@@ -17,14 +18,24 @@ def main() -> int:
     args = sys.argv[2:]
     metrics_path = None
     metric_specs = []
+    metric_equality_specs = []
     if "--metrics" in args:
         marker = args.index("--metrics")
         if marker + 1 >= len(args):
             print("missing METRICS.tsv after --metrics", file=sys.stderr)
             return 2
         metrics_path = pathlib.Path(args[marker + 1])
-        metric_specs = args[marker + 2 :]
+        metric_args = args[marker + 2 :]
         args = args[:marker]
+        if "--metric-equals" in metric_args:
+            equals_marker = metric_args.index("--metric-equals")
+            metric_specs = metric_args[:equals_marker]
+            metric_equality_specs = metric_args[equals_marker + 1 :]
+        else:
+            metric_specs = metric_args
+    elif "--metric-equals" in args:
+        print("--metric-equals requires --metrics METRICS.tsv", file=sys.stderr)
+        return 2
 
     thresholds = {}
     for spec in args:
@@ -50,6 +61,23 @@ def main() -> int:
             print(f"invalid metric threshold value for `{key}`: {value}", file=sys.stderr)
             return 2
 
+    metric_equalities = {}
+    for spec in metric_equality_specs:
+        if "=" not in spec:
+            print(
+                f"invalid metric equality `{spec}`; expected key=expected_value",
+                file=sys.stderr,
+            )
+            return 2
+        key, value = spec.split("=", 1)
+        if not key or not value:
+            print(
+                f"invalid metric equality `{spec}`; expected key=expected_value",
+                file=sys.stderr,
+            )
+            return 2
+        metric_equalities[key] = value
+
     with results_path.open(newline="") as handle:
         rows = {
             row["name"]: row
@@ -71,15 +99,31 @@ def main() -> int:
             failures.append(f"{name}: {seconds:.2f}s > {max_seconds:.2f}s")
 
     if metrics_path is not None:
-        metrics = read_metrics(metrics_path)
+        metrics = read_metric_values(metrics_path)
         missing_hint = format_available_metrics(metrics)
         for key, max_value in metric_thresholds.items():
             value = metrics.get(key)
             if value is None:
                 failures.append(f"{key}: missing from {metrics_path}{missing_hint}")
                 continue
+            if not isinstance(value, (int, float)):
+                failures.append(f"{key}: expected numeric value, found {value!r}")
+                continue
             if value > max_value:
                 failures.append(f"{key}: {value:.0f} > {max_value:.0f}")
+        for key, expected in metric_equalities.items():
+            value = metrics.get(key)
+            if value is None:
+                failures.append(f"{key}: missing from {metrics_path}{missing_hint}")
+                continue
+            equal = str(value) == expected
+            if isinstance(value, (int, float)):
+                try:
+                    equal = value == float(expected)
+                except ValueError:
+                    equal = False
+            if not equal:
+                failures.append(f"{key}: {value!r} != {expected!r}")
 
     if failures:
         print("CLI scale threshold failures:", file=sys.stderr)
@@ -87,12 +131,12 @@ def main() -> int:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    checked = len(thresholds) + len(metric_thresholds)
+    checked = len(thresholds) + len(metric_thresholds) + len(metric_equalities)
     print(f"checked {checked} CLI scale thresholds")
     return 0
 
 
-def read_metrics(metrics_path: pathlib.Path) -> dict[str, float]:
+def read_metric_values(metrics_path: pathlib.Path) -> dict[str, object]:
     metrics = {}
     with metrics_path.open(newline="") as handle:
         for line in handle:
@@ -108,12 +152,17 @@ def read_metrics(metrics_path: pathlib.Path) -> dict[str, float]:
             try:
                 metrics[key] = float(value)
             except ValueError:
-                continue
+                metrics[key] = value
     add_derived_file_metrics(metrics_path, metrics)
     return metrics
 
 
-def add_derived_file_metrics(metrics_path: pathlib.Path, metrics: dict[str, float]) -> None:
+def read_metrics(metrics_path: pathlib.Path) -> dict[str, object]:
+    """Backward-compatible alias for callers importing the old helper name."""
+    return read_metric_values(metrics_path)
+
+
+def add_derived_file_metrics(metrics_path: pathlib.Path, metrics: dict[str, object]) -> None:
     root = metrics_path.parent
     add_file_size_metric(
         metrics,
@@ -128,7 +177,7 @@ def add_derived_file_metrics(metrics_path: pathlib.Path, metrics: dict[str, floa
 
 
 def add_file_size_metric(
-    metrics: dict[str, float],
+    metrics: dict[str, object],
     key: str,
     path: pathlib.Path,
 ) -> None:
@@ -136,7 +185,7 @@ def add_file_size_metric(
         metrics[key] = float(path.stat().st_size)
 
 
-def format_available_metrics(metrics: dict[str, float]) -> str:
+def format_available_metrics(metrics: dict[str, object]) -> str:
     if not metrics:
         return "; no valid metrics were read"
     keys = sorted(metrics)

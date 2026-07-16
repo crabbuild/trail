@@ -1,5 +1,6 @@
 /target/
 /trail-vscode/
+/.worktrees/
 **/*.rs.bk
 .DS_Store
 .venv/

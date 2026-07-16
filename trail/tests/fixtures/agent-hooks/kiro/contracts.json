@@ -1,0 +1,5 @@
+[
+  {"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"kiro-s1","prompt":"fix it"},"expected":["turn.started","message.user"]},
+  {"event":"PostToolUse","payload":{"hook_event_name":"PostToolUse","session_id":"kiro-s1","tool_name":"shell","tool_response":{"success":false,"error":"failed"}},"expected":["tool.failed"]},
+  {"event":"Stop","payload":{"hook_event_name":"Stop","session_id":"kiro-s1","assistant_response":"Implemented and tested."},"expected":["message.assistant.completed","turn.completed"]}
+]

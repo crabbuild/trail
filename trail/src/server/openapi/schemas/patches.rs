@@ -4,7 +4,7 @@ pub(super) fn patch_schemas() -> Value {
     json!({
         "PatchRequest": {
             "type": "object",
-            "description": "Native Trail PatchDocument or design-style files patch. Provide exactly one non-empty edit source: edits or files. replace_line/modify_line edits must include expected_text.",
+            "description": "Native Trail PatchDocument or design-style files patch. Explicitly provide exactly one source, edits or files; an empty array records a genuine zero-change patch operation. replace_line/modify_line edits must include expected_text.",
             "oneOf": [
                 { "required": ["edits"], "not": { "required": ["files"] } },
                 { "required": ["files"], "not": { "required": ["edits"] } }
@@ -15,8 +15,8 @@ pub(super) fn patch_schemas() -> Value {
                 "session_id": { "type": "string" },
                 "allow_ignored": { "type": "boolean" },
                 "allow_stale": { "type": "boolean" },
-                "edits": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/PatchEdit" } },
-                "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/ApiPatchFile" } }
+                "edits": { "type": "array", "items": { "$ref": "#/components/schemas/PatchEdit" } },
+                "files": { "type": "array", "items": { "$ref": "#/components/schemas/ApiPatchFile" } }
             }
         },
         "PatchEdit": {

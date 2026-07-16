@@ -13,6 +13,9 @@ Execute in the order below unless dependencies say otherwise. Each executor shou
 | 003 | Parallelize copy-on-write cloning | P1 | M | 002 | DONE |
 | 004 | Stream root materialization in chunks | P2 | L | 001, 002 | DONE |
 | 005 | Layered lane workspaces | P0 | XXL | 004 | BLOCKED — native Windows Dokan acceptance run pending |
+| 006 | Universal lane environments | P0 | XXL | 005 semantic core | TODO |
+| 006 | Universal lane environments | P0 | XXL | 005 semantic core | TODO |
+| 007 | Native agent hooks and ACP integration | P0 | XXL | lane activity model, ACP relay | IN PROGRESS |
 
 Status values: TODO, IN PROGRESS, DONE, BLOCKED with a one-line reason, or REJECTED with a one-line rationale.
 
@@ -22,6 +25,9 @@ Status values: TODO, IN PROGRESS, DONE, BLOCKED with a one-line reason, or REJEC
 - 003 depends on 002 so parallel clone workers can return destination stamps through the same report path.
 - 004 depends on 001 and 002 because streaming chunks need clean-index stamp reuse and final manifest assembly to avoid reintroducing full scans.
 - 005 builds on the bounded materialization work but replaces copied agent workdirs with lazy, layered views; its internal task graph and acceptance matrix live in `005-layered-lane-workspaces.md`.
+- 006 generalizes the layered workspace substrate into typed, reproducible environment graphs spanning toolchains, dependencies, private state, caches, secrets, external artifacts, and services. Its work packages can begin after the relevant 005 filesystem semantics are stable, even while a platform-specific 005 release gate remains open.
+- 006 generalizes the layered workspace substrate into typed, reproducible environment graphs spanning toolchains, dependencies, private state, caches, secrets, external artifacts, and services. Its work packages can begin after the relevant 005 filesystem semantics are stable, even while a platform-specific 005 release gate remains open.
+- 007 is additive to the lane activity model and replaces ACP-specific orchestration with a shared capture coordinator incrementally. It does not depend on the unfinished environment release gates.
 
 ## Findings considered and deferred
 

@@ -34,9 +34,10 @@ pub(crate) fn parse_session_end_status(value: &str) -> Result<&'static str> {
         "completed" => Ok("completed"),
         "failed" => Ok("failed"),
         "cancelled" => Ok("cancelled"),
+        "interrupted" => Ok("interrupted"),
         "archived" => Ok("archived"),
         other => Err(Error::InvalidInput(format!(
-            "session end status must be completed, failed, cancelled, or archived, got `{other}`"
+            "session end status must be completed, failed, cancelled, interrupted, or archived, got `{other}`"
         ))),
     }
 }

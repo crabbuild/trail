@@ -10,17 +10,17 @@ pub(super) fn handle_turn_command(ctx: &RuntimeContext, turn: LaneTurnCommand) -
                 args.title,
                 args.base_change.as_deref(),
             )?;
-            render_lane_turn_start(&report, ctx.json, ctx.quiet)
+            render_lane_turn_start(&report, ctx.json, &ctx.render)
         }
         LaneTurnSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let details = db.show_lane_turn(&args.turn_id)?;
-            render_lane_turn_details(&details, ctx.json, ctx.quiet)
+            render_lane_turn_details(&details, ctx.json, &ctx.render)
         }
         LaneTurnSubcommand::Message(args) => {
             let mut db = open_db(ctx)?;
             let report = db.add_lane_turn_message(&args.turn_id, &args.role, &args.text)?;
-            render_lane_message(&report, ctx.json, ctx.quiet)
+            render_lane_message(&report, ctx.json, &ctx.render)
         }
         LaneTurnSubcommand::Event(args) => {
             let mut db = open_db(ctx)?;
@@ -32,7 +32,7 @@ pub(super) fn handle_turn_command(ctx: &RuntimeContext, turn: LaneTurnCommand) -
                 args.change.as_deref(),
                 args.message.as_deref(),
             )?;
-            render_lane_turn_event(&report, ctx.json, ctx.quiet)
+            render_lane_turn_event(&report, ctx.json, &ctx.render)
         }
         LaneTurnSubcommand::ApplyPatch(args) => {
             let mut db = open_db(ctx)?;
@@ -45,12 +45,12 @@ pub(super) fn handle_turn_command(ctx: &RuntimeContext, turn: LaneTurnCommand) -
                 patch.allow_stale = true;
             }
             let report = db.apply_lane_turn_patch(&args.turn_id, patch)?;
-            render_lane_patch(&report, ctx.json, ctx.quiet)
+            render_lane_patch(&report, ctx.json, &ctx.render)
         }
         LaneTurnSubcommand::End(args) => {
             let mut db = open_db(ctx)?;
             let report = db.end_lane_turn(&args.turn_id, &args.status)?;
-            render_lane_turn_end(&report, ctx.json, ctx.quiet)
+            render_lane_turn_end(&report, ctx.json, &ctx.render)
         }
     }
 }

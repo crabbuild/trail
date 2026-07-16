@@ -42,9 +42,9 @@ trail lane record docs-bot -m "record docs workdir"
 ## Merge Safely
 
 ```sh
-trail merge-queue add docs-bot --into main
-trail merge-queue add tests-bot --into main
-trail merge-queue run
+trail lane merge-queue add docs-bot --into main
+trail lane merge-queue add tests-bot --into main
+trail lane merge-queue run
 ```
 
 ## Recover a Bad Attempt

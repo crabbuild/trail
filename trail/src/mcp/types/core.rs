@@ -10,6 +10,13 @@ pub(crate) struct StatusArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct IndexReconcileArgs {
+    #[serde(default)]
+    pub(crate) lane: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiffArgs {
     #[serde(default)]
     pub(crate) range: Option<String>,

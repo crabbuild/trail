@@ -7,9 +7,16 @@ use super::{super::response::tool_result, super::types::*, parse_args};
 pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Option<Value>> {
     let value = match name {
         "trail.doctor" => tool_result(db.doctor()?),
+        "trail.index_reconcile" => {
+            let args: IndexReconcileArgs = parse_args(arguments)?;
+            tool_result(crate::server::reconcile_changed_path_ledger(
+                db,
+                args.lane.as_deref(),
+            )?)
+        }
         "trail.status" => {
             let args: StatusArgs = parse_args(arguments)?;
-            tool_result(db.status_read_only(args.branch.as_deref())?)
+            tool_result(db.status(args.branch.as_deref())?)
         }
         "trail.diff" => {
             let args: DiffArgs = parse_args(arguments)?;

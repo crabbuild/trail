@@ -105,6 +105,7 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
 | POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
+| POST | `/v1/lanes/{lane}/merge` | Dry-run or explicitly direct-merge this lane into body field `into`. |
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
@@ -117,16 +118,17 @@ resolve the workspace default branch. It reports the target branch/ref, target
 change, lane base change, `operations_behind`, and whether the lane base is
 stale.
 
-`POST /v1/lanes` accepts `workdir_mode` values `virtual`, `sparse`,
-`full-cow`, `overlay-cow`, and `nfs-cow`. `virtual` creates no workdir, `sparse` requires
-`paths`, and `full-cow` creates a full materialized workdir using filesystem
-clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
-records an overlay backend; a runtime such as `trail agent start
---workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
-agent runs. The response includes `workdir_mode`, `cow_backend`, `sparse_paths`,
-and `overlay_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs-overlay"` and requires no
-macFUSE installation.
+`POST /v1/lanes` accepts `workdir_mode` values `auto`, `virtual`, `sparse`,
+`native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`.
+`native-cow` is strict, `portable-copy` permits per-file byte-copy fallback,
+and `auto` tries the former before restarting as the latter. `fuse-cow` creates an empty workdir mountpoint and
+records the `fuse` backend; a runtime such as `trail agent start
+--workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
+agent runs. The response includes `requested_workdir_mode`, resolved
+`workdir_mode`, `workdir_backend`, optional `materialization`, `sparse_paths`,
+and `transparent_cow_available`.
+On macOS, `nfs-cow` reports `workdir_backend: "nfs"` and requires no
+macFUSE installation. On Windows, `dokan-cow` reports `workdir_backend: "dokan"`.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.
@@ -143,6 +145,12 @@ entries, oversized changed files, and policy allow/block details.
 `GET /v1/lanes/{lane_or_id}/refresh-preview?target=<branch>` returns a
 non-committing refresh/rebase preview with operations-behind, conflicts, changed
 paths, and next steps.
+
+`POST /v1/lanes/{lane_or_id}/merge` requires a JSON `into` target branch and
+allows `dry_run=true` preflight. A non-dry-run merge into the workspace default
+branch requires `direct=true`; otherwise enqueue with
+`POST /v1/lanes/merges/queue`
+and run the queue. The former branch-scoped `merge-lane` endpoint was removed.
 
 ## Collaboration Routes
 
@@ -161,15 +169,13 @@ paths, and next steps.
 | POST | `/v1/lanes/{lane_or_id}/claims` | Claim path. |
 | GET/POST | `/v1/anchors` | List or create anchors. |
 | GET/DELETE | `/v1/anchors/{anchor_id}` | Resolve or delete anchor. |
-| GET/POST | `/v1/merge-queue` | List or queue merge. |
-| POST | `/v1/merge-queue/run` | Run queue. |
-| GET | `/v1/merge-queue/explain?selector=<selector>` | Explain why a queue item is ready or blocked. |
-| GET | `/v1/merge-queue/{selector}/explain` | Explain a queue item by path-safe selector. |
-| DELETE | `/v1/merge-queue/{selector}` | Remove queue item. |
+| GET/POST | `/v1/lanes/merges/queue` | List or queue a lane merge. |
+| POST | `/v1/lanes/merges/queue/run` | Run queued lane merges. |
+| GET | `/v1/lanes/merges/queue/{selector}/explain` | Explain a queue item by queue id, lane id, or lane name. |
+| DELETE | `/v1/lanes/merges/queue/{selector}` | Remove a lane queue item. |
 | GET | `/v1/conflicts` | List conflicts. |
 | GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
-| POST | `/v1/branches/{branch}/merge-lane` | Dry-run or explicitly direct-merge lane branch. |
 
 Conflict explanations include the stored `base_root`, `target_root`, and
 `source_root` snapshots used to reproduce the conflict, plus per-path
@@ -181,13 +187,9 @@ signature matches a previously resolved conflict.
 or `manual`. Manual file values can be plain strings or objects with only
 `content`, `delete`, and `executable`; unknown keys are rejected.
 
-`POST /v1/branches/{branch}/merge-lane` allows `dry_run=true` preflight. A
-non-dry-run merge into the workspace default branch requires `direct=true`;
-otherwise enqueue with `POST /v1/merge-queue` and run the queue.
-
 Bodyless mutation routes reject non-empty request bodies. This applies to
 path-only deletes such as lane removal, lease release, anchor deletion, and
-merge-queue removal.
+lane merge-queue removal.
 
 ## Turn and Trace Routes
 

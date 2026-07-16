@@ -3,6 +3,13 @@
 Status: implemented behind platform acceptance gates; native Windows Dokan CI
 evidence remains required before declaring the rollout complete.
 
+Environment-layer follow-on: the shared adapter host, normalized component state,
+Node/Cargo/Go adapters, metadata-driven discovery, atomic environment generations, and
+CLI/HTTP/MCP environment surfaces are implemented. Restricted repository command
+recipes, local reusable profiles, multi-output atomic publication, and experimental
+content-addressed isolated subprocess adapters are implemented; signed catalogs/WASI
+packaging and the full universal-environment graph remain tracked by Plan 006.
+
 This document defines the execution and filesystem architecture needed for
 Trail to become the default local coordination substrate for many coding agents
 working concurrently in a large repository. It extends Trail's existing lane,
@@ -32,9 +39,9 @@ Trail already has the right starting points:
 
 - Virtual and sparse lanes.
 - Full materialization with filesystem clone COW where available.
-- FUSE overlay COW on Linux and supported macOS builds.
+- FUSE COW on Linux and supported macOS builds.
 - Loopback NFS COW on macOS.
-- Dokan-backed overlay support on Windows.
+- Dokan COW support on Windows.
 - Persistent lane uppers, whiteouts, workdir manifests, sessions, turns,
   checkpoints, gates, readiness, merge queues, and safe Git apply.
 
@@ -198,8 +205,9 @@ content so filesystem backends can serve ranged reads and use reflink copy-up.
 
 ## Current Foundation and Gaps
 
-`LaneWorkdirMode` currently supports `virtual`, `sparse`, `full-cow`,
-`overlay-cow`, and `nfs-cow`. Lane spawning records the mode and creates either
+`LaneWorkdirMode` currently supports `auto`, `virtual`, `sparse`, `native-cow`,
+`portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. Lane spawning records
+the requested and resolved modes and creates either
 a materialized workdir or an overlay mountpoint. `trail agent start` holds a
 mount for the child process, records the lane workdir when the child exits, and
 then unmounts it.
@@ -288,7 +296,7 @@ trail/src/db/lane/view/
     fuse.rs               Linux/macFUSE adapter
     nfs.rs                macOS loopback NFS adapter
     dokan.rs              Windows adapter
-    clone.rs              full-COW portable fallback
+    clone.rs              native-COW portable fallback
   cache/
     store.rs              immutable layer store and pinning
     builder.rs            build leases, staging, atomic publish
@@ -631,6 +639,19 @@ sync` or fail with a concrete stale-environment blocker. A successful sync
 builds or reuses the new layer and swaps bindings at a quiescent view-generation
 boundary.
 
+Dependency replacement is a Trail administrative operation, not a recursive
+filesystem emulation. `trail deps sync` requires an unmounted lane, builds or
+reuses the immutable layer first, removes the matching dependency subtree from
+the private generated upper, clears whiteouts at or below that mount path, and
+then advances the layer binding and view generation. If the process stops
+before the binding update, the previous immutable layer remains a valid
+fallback. Source-class paths are never accepted by this bulk reset primitive.
+
+This path matters most for loopback NFS: NFSv3 has no recursive-delete request,
+so ordinary `rm -rf node_modules` must still issue one operation per entry.
+Agents should use `trail deps sync` for dependency replacement; direct POSIX
+deletion remains correct but is intentionally not the optimized control path.
+
 Trail must not infer that a lockfile update is valid merely because an agent
 mutated `node_modules`. The lockfile and adapter build remain authoritative.
 
@@ -951,7 +972,7 @@ Preferred order:
    allow an isolated mount.
 2. Shared FUSE `ViewCore` adapter when the source root is lazy or native overlay
    is unavailable.
-3. Filesystem reflink full-COW fallback.
+3. Filesystem reflink native-COW fallback.
 4. Sparse or virtual mode when policy rejects copying.
 
 Unprivileged/container environments require explicit `/dev/fuse` or a suitable
@@ -964,14 +985,31 @@ Preferred order:
 
 1. Built-in loopback NFS COW for installation-free terminal use.
 2. macFUSE when installed and approved.
-3. APFS clonefile full-COW fallback.
+3. APFS clonefile native-COW fallback.
 4. Sparse or virtual mode.
 
 The NFS server must bind only to loopback, validate mount ownership, reject
 unsupported node kinds, and preserve immediate mutation visibility required by
-checkpointing. Metadata-heavy dependency workloads need dedicated benchmarks
-because disabling NFS attribute caches improves correctness but can reduce
-throughput.
+checkpointing. macOS mounts use synchronous write requests because its default
+`nosync` mode may return after queueing a truncate/write sequence; immediate teardown
+could otherwise remount the private upper after the truncate but before the data WRITE.
+The userspace server fsyncs each WRITE before reporting NFS `FILE_SYNC`.
+Metadata-heavy dependency workloads need dedicated benchmarks because disabling NFS
+attribute caches improves correctness but can reduce throughput.
+
+The real Next.js/Vite benchmark confirms that a global `noac,actimeo=0` policy
+does not scale to large Node resolution graphs. Keep strict coherency for
+writable uppers and directory mutation boundaries, but allow long-lived
+attribute/content caching for immutable source and dependency lowers. Layer
+binding generation changes must invalidate those cached lower identities.
+Immutable publication now writes a bounded durable verification seal containing the
+content-addressed manifest identity, layer summary, and platform filesystem identity of
+the published directory. Routine cache-hit reuse and attachment validate that seal
+without reopening the artifact tree. Missing, oversized, malformed, or stale seals
+fall back to one full scan and are rewritten only after every entry matches. Explicit
+`cache verify`, doctor, and readiness remain full-content operations. This removes
+hundreds-of-megabytes of rehashing from warm attachment without claiming that bounded
+attachment evidence is a full audit.
 
 ### Windows
 
@@ -980,13 +1018,14 @@ mapping policy, rename semantics, sharing modes, delete-pending state, and
 reparse-point safety. A future ProjFS backend can be evaluated without changing
 `ViewCore`.
 
-### Clone fallback
+### Native and portable materialization
 
-`full-cow` remains valuable for tools that are incompatible with mounted
-filesystems. It should gain a `require_clone` result: if the filesystem cannot
-clone safely, a large-repository policy can reject ordinary materialization.
-Reports distinguish reflinked bytes, copied bytes, and files hydrated from
-Trail objects.
+`native-cow` requires a successful filesystem clone for every file and never
+falls back to byte copying. `portable-copy` clones opportunistically and copies
+the remainder. Materialized-only `auto` stages a strict attempt first, then
+restarts portably only when clone support, filesystem placement, or a complete
+validated native source is unavailable. Reports distinguish requested mode,
+resolved mode, cloned bytes, and copied bytes.
 
 ### Conformance contract
 
@@ -1239,7 +1278,7 @@ view does not satisfy a required current-root gate.
 ### Phase 0: Specify and benchmark current behavior
 
 - Add a backend-independent filesystem conformance model.
-- Measure current full-COW, FUSE, NFS, and Dokan behavior.
+- Measure current native-COW, FUSE, NFS, and Dokan behavior.
 - Add large-root mount/start benchmarks and physical-space fixtures.
 - Document current backend limitations.
 
@@ -1387,17 +1426,15 @@ and GC. Report logical and physical storage after each additional lane.
 
 ## Migration and Compatibility
 
-Existing lanes remain valid:
+Existing lanes using the current mode vocabulary remain valid:
 
 - `virtual` and `sparse` semantics do not change.
-- `full-cow`, `overlay-cow`, and `nfs-cow` continue to parse.
-- Legacy overlay upper directories can be mounted through a compatibility
-  adapter, checkpointed, and migrated to split uppers.
+- `native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported materialized or mounted COW modes.
+- Removed workdir mode names are rejected. Operators must remove and recreate
+  those lanes with the platform-appropriate current mode.
 - Existing lane `metadata_json` remains readable while typed workspace-view
   tables become authoritative for new lanes.
-- The default remains `full-cow` until `auto` passes platform conformance and
-  performance gates; changing the default is a separately documented product
-  decision.
+- New materialized selections default to `auto`; mounted modes remain explicit.
 
 Backups from older schemas restore without views. New backups restore source
 uppers but rebuild caches. JSON reports add fields compatibly where possible;
@@ -1491,7 +1528,7 @@ The following decisions require prototypes and measurements:
 
 - Whether the persistent directory index belongs in the versioned root object
   or remains a rebuildable projection keyed by root.
-- Whether macOS NFS or APFS full-COW should be the automatic default for
+- Whether macOS NFS or APFS native-COW should be the automatic default for
   metadata-heavy Node workloads.
 - Whether a workspace-local or user-global immutable cache is the first
   supported scope. Workspace-local is simpler and safer; global saves more
@@ -1515,8 +1552,9 @@ Current implementation areas that this design extends:
 - Lane spawn and materialization: `trail/src/db/lane/lifecycle.rs`
 - Workdir lifecycle and manifests: `trail/src/db/lane/workdir.rs` and
   `trail/src/db/lane/workdir/`
-- FUSE and Dokan overlay: `trail/src/db/lane/workdir/overlay.rs`
-- macOS loopback NFS overlay: `trail/src/db/lane/workdir/nfs_overlay.rs`
+- FUSE COW: `trail/src/db/lane/workdir/fuse.rs`
+- Dokan COW: `trail/src/db/lane/workdir/dokan.rs`
+- macOS loopback NFS COW: `trail/src/db/lane/workdir/nfs_overlay.rs`
 - Filesystem clone COW: `trail/src/db/util/fs_cow.rs`
 - Workdir recording: `trail/src/db/lane/workdir/record.rs`
 - Agent terminal lifecycle: `trail/src/cli/command/handler/agent.rs`

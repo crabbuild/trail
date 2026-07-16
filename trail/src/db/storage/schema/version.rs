@@ -7,30 +7,6 @@ impl Trail {
             .map_err(Error::from)
     }
 
-    pub(crate) fn set_schema_user_version(&self, version: i64) -> Result<()> {
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {version};"))?;
-        Ok(())
-    }
-
-    pub(crate) fn record_schema_version(&self) -> Result<()> {
-        self.set_schema_user_version(TRAIL_SCHEMA_VERSION)?;
-        let now = now_ts();
-        for (key, value) in [
-            (SCHEMA_META_VERSION_KEY, TRAIL_SCHEMA_VERSION.to_string()),
-            (
-                SCHEMA_META_APP_VERSION_KEY,
-                env!("CARGO_PKG_VERSION").to_string(),
-            ),
-        ] {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO schema_meta (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                params![key, value, now],
-            )?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn schema_meta_value(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_row(

@@ -7,8 +7,11 @@ impl Trail {
                 value: self.lane_branch(lane)?,
             });
         }
-        if selector.starts_with("ch_") {
-            let operation = self.operation(&ChangeId(selector.to_string()))?;
+        if crate::ids::is_change_id(selector) || ChangeId::from_checkpoint_alias(selector).is_some()
+        {
+            let change_id = ChangeId::from_checkpoint_alias(selector)
+                .unwrap_or_else(|| ChangeId(selector.to_string()));
+            let operation = self.operation(&change_id)?;
             return Ok(ShowResult::Operation {
                 value: OperationShow {
                     changed_paths: summarize_file_changes(&operation.changes),
@@ -17,12 +20,12 @@ impl Trail {
                 },
             });
         }
-        if selector.starts_with("msg_") {
+        if selector.starts_with(crate::ids::MESSAGE_ID_PREFIX) {
             return Ok(ShowResult::Message {
                 value: self.message(selector)?,
             });
         }
-        if selector.starts_with("obj_") {
+        if crate::ids::is_object_id(selector) {
             return Ok(ShowResult::Object {
                 value: self.object_info(selector)?,
             });
@@ -102,7 +105,7 @@ impl Trail {
                     "anchor_id": anchor.id,
                     "label": anchor.label,
                     "file_id": file_id_key(&anchor.file_id),
-                    "line_id": line_id_key_value(&anchor.line_id),
+                    "line_id": anchor.line_id.alias(),
                     "created_path": anchor.created_path,
                     "created_line": anchor.created_line,
                     "created_change": anchor.created_change,
@@ -149,7 +152,7 @@ impl Trail {
             .enumerate()
             .map(|(idx, line)| TextLineInspect {
                 line_number: idx as u64 + 1,
-                line_id: line.line_id_key(),
+                line_id: line.line_id.alias(),
                 text_hash: line.text_hash,
                 text: String::from_utf8_lossy(&line.text).into_owned(),
                 newline: line.newline,

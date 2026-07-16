@@ -41,7 +41,12 @@ impl Trail {
                 lines_by_path.insert(path.clone(), self.load_text_lines(text_id)?);
             }
             let lines = lines_by_path.get_mut(&path).expect("path was loaded");
-            let Some(line_idx) = lines.iter().position(|line| line.line_id_key() == *line_id)
+            let parsed_line_id = parse_line_id_key(line_id)
+                .map_err(|error| Error::PatchRejected(error.to_string()))?;
+            let storage_line_id = line_id_key_value(&parsed_line_id);
+            let Some(line_idx) = lines
+                .iter()
+                .position(|line| line.line_id_key() == storage_line_id)
             else {
                 return Err(Error::PatchRejected(format!(
                     "replace_line line_id `{line_id}` not found in `{path}`"
@@ -213,7 +218,13 @@ impl Trail {
             )));
         };
         let mut lines = self.load_text_lines(text_id)?;
-        let Some(line_idx) = lines.iter().position(|line| line.line_id_key() == line_id) else {
+        let parsed_line_id =
+            parse_line_id_key(&line_id).map_err(|error| Error::PatchRejected(error.to_string()))?;
+        let storage_line_id = line_id_key_value(&parsed_line_id);
+        let Some(line_idx) = lines
+            .iter()
+            .position(|line| line.line_id_key() == storage_line_id)
+        else {
             return Err(Error::PatchRejected(format!(
                 "replace_line line_id `{line_id}` not found in `{path}`"
             )));
@@ -272,7 +283,7 @@ mod tests {
         let head = db.get_ref("refs/branches/main").unwrap();
         let files = db.load_root_files(&head.root_id).unwrap();
         let why = db.why("README.md:1", Some("main")).unwrap();
-        let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+        let line_id = why.line_id.alias();
         let edit = PatchEdit::ReplaceLine {
             path: "README.md".to_string(),
             line_id,
@@ -296,7 +307,7 @@ mod tests {
             .apply_patch_edit_to_files(
                 edit,
                 &mut files,
-                &ChangeId("ch_internal_replace_line_guard".to_string()),
+                &ChangeId("change_internal_replace_line_guard".to_string()),
                 &mut file_seq,
                 &mut line_seq,
                 &mut manual_line_changes,

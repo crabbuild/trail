@@ -6,8 +6,8 @@ pub(super) struct RuntimeContext {
     pub(super) branch: Option<String>,
     pub(super) json: bool,
     pub(super) quiet: bool,
-    pub(super) color: bool,
     pub(super) format: OutputFormat,
+    pub(super) render: RenderOptions,
 }
 
 pub(super) fn resolve_output_format(cli_format: Option<OutputFormat>) -> Result<OutputFormat> {
@@ -19,10 +19,11 @@ pub(super) fn resolve_output_format(cli_format: Option<OutputFormat>) -> Result<
     };
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "human" => Ok(OutputFormat::Human),
+        "plain" => Ok(OutputFormat::Plain),
         "json" => Ok(OutputFormat::Json),
         "ndjson" => Ok(OutputFormat::Ndjson),
         other => Err(Error::InvalidInput(format!(
-            "TRAIL_FORMAT must be human, json, or ndjson, got `{other}`"
+            "TRAIL_FORMAT must be human, plain, json, or ndjson, got `{other}`"
         ))),
     }
 }

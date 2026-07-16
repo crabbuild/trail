@@ -1,4 +1,4 @@
-use super::workdir::{ViewMutationBarrier, ViewMutationJournal};
+use super::workdir::{ViewIntentWriter, ViewJournalCut, ViewMutationBarrier, ViewMutationJournal};
 use super::*;
 
 const VIEW_JOURNAL_FILE: &str = "mutation-journal.jsonl";
@@ -26,10 +26,16 @@ pub(crate) struct WorkspaceMountLease {
 impl WorkspaceMountLease {
     pub(crate) fn mark_mounted(&mut self) -> Result<()> {
         let db = Trail::open_with_db_dir(&self.workspace_root, &self.db_dir)?;
-        db.conn.execute(
+        let updated = db.conn.execute(
             "UPDATE workspace_views SET status = 'mounted', heartbeat_at = ?1, updated_at = ?1 WHERE view_id = ?2 AND owner_start_token = ?3",
             params![now_ts(), self.view_id, self.owner_start_token],
         )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{}` mount lease was lost before the backend became ready",
+                self.view_id
+            )));
+        }
         Ok(())
     }
 
@@ -121,13 +127,13 @@ impl Trail {
                     return Err(Error::InvalidInput(format!(
                         "workspace view `{}` mount worker stopped before becoming ready",
                         view.view_id
-                    )))
+                    )));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return Err(Error::InvalidInput(format!(
                         "workspace view `{}` mount worker exited unexpectedly",
                         view.view_id
-                    )))
+                    )));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -178,8 +184,8 @@ impl Trail {
         }
 
         match mode {
-            LaneWorkdirMode::OverlayCow => {
-                let mount = self.mount_overlay_cow_workdir_for_lane(lane)?;
+            LaneWorkdirMode::FuseCow => {
+                let mount = self.mount_fuse_cow_workdir_for_lane(lane)?;
                 self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
                 drop(mount);
             }
@@ -188,11 +194,23 @@ impl Trail {
                 self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
                 drop(mount);
             }
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
+                    self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
+                    drop(mount);
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::InvalidInput(
+                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                ));
+            }
             _ => {
                 return Err(Error::InvalidInput(format!(
                     "lane `{lane}` uses `{}` rather than a layered workspace view",
                     mode.as_str()
-                )))
+                )));
             }
         }
         let _ = fs::remove_file(&stop_path);
@@ -364,6 +382,7 @@ impl Trail {
         ] {
             fs::create_dir_all(dir)?;
         }
+        ViewMutationJournal::initialize_storage(&paths.source_upper)?;
         let now = now_ts();
         self.conn.execute(
             "INSERT INTO workspace_views \
@@ -401,11 +420,27 @@ impl Trail {
         backend: &str,
     ) -> Result<WorkspaceMountLease> {
         let _lock = self.acquire_write_lock()?;
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        let initial = self.lane_workspace_view(lane)?.ok_or_else(|| {
             Error::InvalidInput(format!(
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
+        let _barrier = ViewMutationBarrier::shared(Path::new(&initial.meta_dir))?;
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "lane `{lane}` lost its layered workspace view while acquiring its mount lease"
+            ))
+        })?;
+        if view.view_id != initial.view_id
+            || view.meta_dir != initial.meta_dir
+            || view.generation != initial.generation
+            || view.base_root != initial.base_root
+            || view.base_change != initial.base_change
+        {
+            return Err(Error::InvalidInput(format!(
+                "workspace view for lane `{lane}` changed while acquiring its mount lease; retry the mount"
+            )));
+        }
         if view.backend != backend {
             return Err(Error::InvalidInput(format!(
                 "workspace view `{}` uses backend `{}`; `{backend}` cannot mount it",
@@ -447,10 +482,25 @@ impl Trail {
             }
         }
         let owner_start_token = current_process_start_token();
-        self.conn.execute(
-            "UPDATE workspace_views SET status = 'mounting', owner_pid = ?1, owner_start_token = ?2, heartbeat_at = ?3, updated_at = ?3 WHERE view_id = ?4",
-            params![std::process::id(), owner_start_token, now_ts(), view.view_id],
+        let installed = self.conn.execute(
+            "UPDATE workspace_views SET status = 'mounting', owner_pid = ?1, owner_start_token = ?2, heartbeat_at = ?3, updated_at = ?3 \
+             WHERE view_id = ?4 AND generation = ?5 AND base_root = ?6 AND base_change = ?7 AND owner_pid IS NULL",
+            params![
+                std::process::id(),
+                owner_start_token,
+                now_ts(),
+                view.view_id,
+                view.generation as i64,
+                view.base_root.0,
+                view.base_change.0,
+            ],
         )?;
+        if installed != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{}` changed before its mount lease could be installed; retry the mount",
+                view.view_id
+            )));
+        }
         write_file_atomic(
             &Path::new(&view.meta_dir).join("mount.json"),
             &serde_json::to_vec_pretty(&serde_json::json!({
@@ -533,7 +583,7 @@ impl Trail {
 
     fn recover_workspace_checkpoint_markers(&self) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT v.view_id, v.meta_dir, v.source_upper, v.checkpoint_seq, b.ref_name \
+            "SELECT v.view_id, v.meta_dir, v.source_upper, v.checkpoint_seq, v.generation, v.checkpoint_root, b.ref_name \
              FROM workspace_views v JOIN lane_branches b ON b.lane_id = v.lane_id \
              WHERE b.status != 'removed'",
         )?;
@@ -544,51 +594,98 @@ impl Trail {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?.max(0) as u64,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (view_id, meta_dir, source_upper, checkpoint_seq, ref_name) in rows {
+        for (
+            view_id,
+            meta_dir,
+            source_upper,
+            checkpoint_seq,
+            generation,
+            checkpoint_root,
+            ref_name,
+        ) in rows
+        {
             let path = Path::new(&meta_dir).join("clean-checkpoint.json");
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(Error::Io(err)),
-            };
-            let marker: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if marker["view_id"].as_str() != Some(view_id.as_str()) {
-                return Err(Error::Corrupt(format!(
-                    "workspace checkpoint marker `{}` belongs to a different view",
-                    path.display()
-                )));
+            let read_barrier = ViewMutationBarrier::shared(Path::new(&meta_dir))?;
+            let marker = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let mirror_matches = marker.as_ref().is_some_and(|marker| {
+                marker["view_id"].as_str() == Some(view_id.as_str())
+                    && marker["root_id"].as_str() == Some(checkpoint_root.as_str())
+                    && marker["journal_sequence"].as_u64() == Some(checkpoint_seq)
+                    && marker["generation"].as_u64() == Some(generation)
+                    && marker["recovery_qualified"].as_bool() == Some(true)
+            });
+            if mirror_matches
+                && read_barrier.checkpoint_sequence() == checkpoint_seq
+                && read_barrier.checkpoint_generation() == generation
+            {
+                continue;
             }
-            let sequence = marker["journal_sequence"].as_u64().ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "workspace checkpoint marker `{}` has no journal sequence",
-                    path.display()
-                ))
-            })?;
-            let root = marker["root_id"].as_str().ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "workspace checkpoint marker `{}` has no root",
-                    path.display()
-                ))
-            })?;
-            let journal_sequence =
-                ViewMutationJournal::open(Path::new(&source_upper))?.last_sequence();
-            if sequence > journal_sequence {
+            drop(read_barrier);
+
+            let mut barrier = ViewMutationBarrier::exclusive(Path::new(&meta_dir))?;
+            let journal = ViewMutationJournal::open(Path::new(&source_upper))?;
+            if !journal.recovery_is_qualified() {
+                return Err(Error::ChangeLedgerReconcileRequired {
+                    scope: view_id,
+                    state: "unqualified_view_journal".into(),
+                    reason:
+                        "workspace checkpoint recovery cannot qualify journal generation evidence"
+                            .into(),
+                    command: "trail ledger reconcile".into(),
+                });
+            }
+            if checkpoint_seq > journal.last_sequence() {
                 return Err(Error::Corrupt(format!(
-                    "workspace checkpoint marker `{}` is ahead of its durable mutation journal",
-                    path.display()
+                    "SQLite workspace checkpoint {} is ahead of durable journal sequence {} for `{}`",
+                    checkpoint_seq,
+                    journal.last_sequence(),
+                    view_id,
                 )));
             }
             let head = self.get_ref(&ref_name)?;
-            if sequence > checkpoint_seq && head.root_id.0 == root {
-                self.conn.execute(
-                    "UPDATE workspace_views SET checkpoint_seq = ?1, checkpoint_root = ?2, updated_at = ?3 WHERE view_id = ?4",
-                    params![sequence as i64, root, now_ts(), view_id],
-                )?;
+            if head.root_id.0 != checkpoint_root {
+                return Err(Error::Corrupt(format!(
+                    "workspace checkpoint root `{checkpoint_root}` is not lane head `{}` for `{view_id}`",
+                    head.root_id.0
+                )));
             }
+            let marker = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let mirror_matches = marker.as_ref().is_some_and(|marker| {
+                marker["view_id"].as_str() == Some(view_id.as_str())
+                    && marker["root_id"].as_str() == Some(checkpoint_root.as_str())
+                    && marker["journal_sequence"].as_u64() == Some(checkpoint_seq)
+                    && marker["generation"].as_u64() == Some(generation)
+                    && marker["recovery_qualified"].as_bool() == Some(true)
+            });
+            if !mirror_matches {
+                let checkpoint = serde_json::json!({
+                    "view_id": view_id,
+                    "root_id": checkpoint_root,
+                    "operation": serde_json::Value::Null,
+                    "journal_sequence": checkpoint_seq,
+                    "journal_qualified": journal.is_qualified(),
+                    "recovery_qualified": true,
+                    "generation": generation,
+                    "completed_at": now_ts(),
+                });
+                write_file_atomic(&path, &serde_json::to_vec_pretty(&checkpoint)?, false)?;
+            }
+            ViewMutationJournal::rotate_after_checkpoint(
+                Path::new(&source_upper),
+                checkpoint_seq,
+                generation,
+            )?;
+            barrier.record_checkpoint_cut(checkpoint_seq, generation)?;
         }
         Ok(())
     }
@@ -614,8 +711,8 @@ impl Trail {
         let head = self.get_ref(&branch.ref_name)?;
         let run = || self.run_workspace_command(&view, &head.root_id, command);
         let exit_code = match mode {
-            LaneWorkdirMode::OverlayCow => {
-                let mount = self.mount_overlay_cow_workdir_for_lane(lane)?;
+            LaneWorkdirMode::FuseCow => {
+                let mount = self.mount_fuse_cow_workdir_for_lane(lane)?;
                 let result = run();
                 drop(mount);
                 result?
@@ -626,13 +723,34 @@ impl Trail {
                 drop(mount);
                 result?
             }
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
+                    let result = run();
+                    drop(mount);
+                    result?
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::InvalidInput(
+                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                ));
+            }
             _ => {
                 return Err(Error::InvalidInput(format!(
                     "lane `{lane}` uses `{}` rather than a layered workspace view",
                     mode.as_str()
-                )))
+                )));
             }
         };
+        let environment_generation = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id = ?1",
+                params![&view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         self.insert_lane_event(
             &branch.lane_id,
             "workspace_view_exec_completed",
@@ -642,6 +760,7 @@ impl Trail {
                 "view_id": view.view_id,
                 "source_root": head.root_id.0,
                 "generation": view.generation,
+                "environment_generation": environment_generation,
                 "command_fingerprint": sha256_hex(&serde_json::to_vec(command)?),
                 "exit_code": exit_code,
             }),
@@ -651,6 +770,7 @@ impl Trail {
             lane_id: branch.lane_id,
             source_root: head.root_id,
             generation: view.generation,
+            environment_generation,
             backend: view.backend,
             command: command.to_vec(),
             exit_code,
@@ -730,6 +850,78 @@ impl Trail {
                 node_cache.to_string_lossy().into_owned(),
             ),
         ];
+        if let Some(generation_id) = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id = ?1",
+                params![&view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            environment.push(("TRAIL_ENVIRONMENT_GENERATION".to_string(), generation_id));
+        }
+        let mut runtime_stmt = self.conn.prepare(
+            "SELECT r.component_id, r.resource_name, r.host_port, r.status, r.health_status
+             FROM environment_view_generations active
+             JOIN environment_generation_runtime_resources r
+               ON r.generation_id = active.generation_id
+             WHERE active.view_id = ?1
+             ORDER BY r.component_id, r.resource_name",
+        )?;
+        let runtime_resources = runtime_stmt
+            .query_map(params![&view.view_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<u16>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !runtime_resources.is_empty() {
+            let mut alias_counts = BTreeMap::<String, usize>::new();
+            for (_, resource_name, _, _, _) in &runtime_resources {
+                *alias_counts
+                    .entry(runtime_service_environment_segment(resource_name))
+                    .or_default() += 1;
+            }
+            let mut services = serde_json::Map::new();
+            for (component_id, resource_name, host_port, status, health_status) in runtime_resources
+            {
+                let host_port = host_port.filter(|_| {
+                    status == "running" && health_status == "healthy"
+                }).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "runtime service `{component_id}/{resource_name}` is {status}/{health_status}; run `trail env runtime reconcile {}` before executing lane commands",
+                        view.lane_id
+                    ))
+                })?;
+                let address = format!("127.0.0.1:{host_port}");
+                services.insert(
+                    format!("{component_id}/{resource_name}"),
+                    serde_json::json!({
+                        "host": "127.0.0.1",
+                        "port": host_port,
+                        "address": address,
+                    }),
+                );
+                let alias = runtime_service_environment_segment(&resource_name);
+                if alias_counts.get(&alias) == Some(&1) {
+                    let prefix = format!("TRAIL_SERVICE_{alias}");
+                    environment.extend([
+                        (format!("{prefix}_HOST"), "127.0.0.1".to_string()),
+                        (format!("{prefix}_PORT"), host_port.to_string()),
+                        (format!("{prefix}_ADDRESS"), address),
+                    ]);
+                }
+            }
+            environment.push((
+                "TRAIL_SERVICES_JSON".to_string(),
+                serde_json::to_string(&services)?,
+            ));
+        }
         if command_available("sccache") {
             environment.extend([
                 ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
@@ -900,17 +1092,92 @@ impl Trail {
         lane: &str,
         root_id: &ObjectId,
         operation: Option<&ChangeId>,
+        barrier: &mut ViewMutationBarrier,
     ) -> Result<u64> {
+        // TRAIL_FS_PRODUCER: cow_checkpoint CowPublication controlled
         let Some(view) = self.lane_workspace_view(lane)? else {
             return Ok(0);
         };
-        let journal = ViewMutationJournal::open(Path::new(&view.source_upper))?;
-        let sequence = journal.last_sequence();
+        let cut = checkpoint_view(Path::new(&view.source_upper))?;
+        if !cut.recovery_qualified {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: view.view_id,
+                state: "unqualified_view_journal".into(),
+                reason: "workspace checkpoint has neither a qualified changed-path journal nor a qualified independent whiteout journal".into(),
+                command: "trail ledger reconcile".into(),
+            });
+        }
+        let sequence = cut.sequence;
+        let next_generation = cut.generation.saturating_add(1);
+        self.conn.execute(
+            "UPDATE workspace_views SET checkpoint_seq = ?1, checkpoint_root = ?2, generation = ?3, updated_at = ?4 WHERE view_id = ?5",
+            params![sequence as i64, root_id.0, next_generation as i64, now_ts(), view.view_id],
+        )?;
+        self.write_workspace_checkpoint_mirror(
+            &view,
+            root_id,
+            operation,
+            sequence,
+            next_generation,
+            cut.qualified,
+            barrier,
+        )?;
+        Ok(sequence)
+    }
+
+    pub(crate) fn repair_workspace_checkpoint_mirror(
+        &self,
+        lane: &str,
+        root_id: &ObjectId,
+        operation: Option<&ChangeId>,
+        sequence: u64,
+        generation: u64,
+        journal_qualified: bool,
+        barrier: &mut ViewMutationBarrier,
+    ) -> Result<()> {
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "layered lane `{lane}` has no persisted workspace view"
+            ))
+        })?;
+        if view.checkpoint_seq != sequence
+            || view.checkpoint_root.as_ref() != Some(root_id)
+            || view.generation != generation
+        {
+            return Err(Error::Corrupt(format!(
+                "workspace view `{}` checkpoint publication is not the committed SQLite generation",
+                view.view_id
+            )));
+        }
+        self.write_workspace_checkpoint_mirror(
+            &view,
+            root_id,
+            operation,
+            sequence,
+            generation,
+            journal_qualified,
+            barrier,
+        )
+    }
+
+    fn write_workspace_checkpoint_mirror(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        root_id: &ObjectId,
+        operation: Option<&ChangeId>,
+        sequence: u64,
+        generation: u64,
+        journal_qualified: bool,
+        barrier: &mut ViewMutationBarrier,
+    ) -> Result<()> {
         let checkpoint = serde_json::json!({
             "view_id": view.view_id,
             "root_id": root_id.0,
             "operation": operation.map(|value| value.0.as_str()),
             "journal_sequence": sequence,
+            "journal_qualified": journal_qualified,
+            "recovery_qualified": true,
+            "generation": generation,
             "completed_at": now_ts(),
         });
         write_file_atomic(
@@ -919,12 +1186,13 @@ impl Trail {
             false,
         )?;
         test_crash_point("checkpoint_after_clean_marker");
-        self.conn.execute(
-            "UPDATE workspace_views SET checkpoint_seq = ?1, checkpoint_root = ?2, updated_at = ?3 WHERE view_id = ?4",
-            params![sequence as i64, root_id.0, now_ts(), view.view_id],
+        ViewMutationJournal::rotate_after_checkpoint(
+            Path::new(&view.source_upper),
+            sequence,
+            generation,
         )?;
-        ViewMutationBarrier::record_checkpoint_sequence(Path::new(&view.meta_dir), sequence)?;
-        Ok(sequence)
+        barrier.record_checkpoint_cut(sequence, generation)?;
+        Ok(())
     }
 
     pub(crate) fn workspace_view_last_journal_sequence(
@@ -939,27 +1207,58 @@ impl Trail {
         lane: &str,
         message: Option<String>,
     ) -> Result<WorkspaceCheckpointReport> {
-        let record = self.record_lane_workdir(lane, message)?;
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "lane `{lane}` does not have a layered workspace view"
-            ))
-        })?;
-        let sequence = view.checkpoint_seq;
-        let generated = directory_usage(Path::new(&view.generated_upper))?;
-        Ok(WorkspaceCheckpointReport {
-            view_id: view.view_id,
-            operation: record.operation,
-            root_id: record.root_id,
-            journal_sequence: sequence,
-            source_paths: record
-                .changed_paths
-                .into_iter()
-                .map(|item| item.path)
-                .collect(),
-            generated_dirty_paths: generated.file_count,
-        })
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::CowCheckpoint,
+            || {
+                let record = self.record_lane_workdir(lane, message)?;
+                let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "lane `{lane}` does not have a layered workspace view"
+                    ))
+                })?;
+                let sequence = view.checkpoint_seq;
+                let report = WorkspaceCheckpointReport {
+                    view_id: view.view_id,
+                    operation: record.operation,
+                    root_id: record.root_id,
+                    journal_sequence: sequence,
+                    source_paths: record
+                        .changed_paths
+                        .into_iter()
+                        .map(|item| item.path)
+                        .collect(),
+                    generated_dirty_paths: record.generated_dirty_paths,
+                    generated_path_accounting: "journal_interval".into(),
+                    upper_recovery_walks: record.upper_recovery_walks,
+                };
+                Ok(report)
+            },
+        )
     }
+}
+
+fn checkpoint_view(source_upper: &Path) -> Result<ViewJournalCut> {
+    let journal: ViewIntentWriter = ViewMutationJournal::open(source_upper)?;
+    Ok(journal.cut())
+}
+
+fn runtime_service_environment_segment(name: &str) -> String {
+    let mut segment = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if segment.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        segment.insert(0, '_');
+    }
+    segment
 }
 
 fn workspace_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneWorkspaceViewReport> {
@@ -1081,9 +1380,14 @@ fn file_physical_bytes(metadata: &fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::workdir::{ViewCore, ViewMutationBarrier, VIEW_ROOT_INO};
+    use super::super::workdir::{
+        ViewCore, ViewMutationBarrier, ViewMutationJournal, ViewUpperLayout, VIEW_ROOT_INO,
+    };
     use super::*;
     use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn checkpoint_crash_helper() {
@@ -1125,8 +1429,10 @@ mod tests {
             let mut db = Trail::open(workspace.path()).unwrap();
             let mode = if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             };
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "checkpoint-crash",
@@ -1172,6 +1478,18 @@ mod tests {
                 "durable after kill\n"
             );
             let mut reopened = Trail::open(workspace.path()).unwrap();
+            if phase == "checkpoint_after_clean_marker" {
+                let view = reopened
+                    .lane_workspace_view("checkpoint-crash")
+                    .unwrap()
+                    .unwrap();
+                let journal = ViewMutationJournal::open(&source_upper).unwrap();
+                assert_eq!(journal.generation(), view.generation);
+                assert_eq!(journal.last_sequence(), view.checkpoint_seq);
+                let barrier = ViewMutationBarrier::shared(Path::new(&view.meta_dir)).unwrap();
+                assert_eq!(barrier.checkpoint_sequence(), view.checkpoint_seq);
+                assert_eq!(barrier.checkpoint_generation(), view.generation);
+            }
             let recovered = reopened
                 .checkpoint_lane_workspace("checkpoint-crash", Some("recover".to_string()))
                 .unwrap();
@@ -1194,6 +1512,47 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|issue| issue.code == "uncheckpointed_source_changes"));
+
+            if phase == "checkpoint_after_clean_marker" {
+                for index in 0..6 {
+                    let branch = reopened.lane_branch("checkpoint-crash").unwrap();
+                    let head = reopened.get_ref(&branch.ref_name).unwrap();
+                    let mut core = ViewCore::new_lazy(
+                        Trail::open(workspace.path()).unwrap(),
+                        source_upper.clone(),
+                        head.root_id,
+                    )
+                    .unwrap();
+                    let name = format!("post-recovery-{index}.txt");
+                    let file = core.create(VIEW_ROOT_INO, &name, 0o644, true).unwrap();
+                    core.write(file.ino, 0, b"generation recovery\n").unwrap();
+                    drop(core);
+                    reopened
+                        .checkpoint_lane_workspace(
+                            "checkpoint-crash",
+                            Some(format!("post-recovery-{index}")),
+                        )
+                        .unwrap();
+                }
+
+                let view = reopened
+                    .lane_workspace_view("checkpoint-crash")
+                    .unwrap()
+                    .unwrap();
+                let journal = ViewMutationJournal::open(&source_upper).unwrap();
+                assert_eq!(journal.generation(), view.generation);
+                assert_eq!(journal.last_sequence(), view.checkpoint_seq);
+                let layout = ViewUpperLayout::from_source_upper(source_upper.clone());
+                let journal_files = fs::read_dir(layout.meta_dir)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_name().to_string_lossy().contains("journal.g"))
+                    .count();
+                assert!(
+                    journal_files <= 4,
+                    "recovered journal generations were not compacted"
+                );
+            }
         }
     }
 
@@ -1205,8 +1564,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "barrier",
@@ -1328,8 +1689,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "layered",
@@ -1371,8 +1734,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "checkpoint",
@@ -1407,6 +1772,7 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.source_paths, vec!["README.md"]);
         assert!(checkpoint.generated_dirty_paths >= 1);
+        assert_eq!(checkpoint.generated_path_accounting, "journal_interval");
         assert!(checkpoint.journal_sequence > 0);
         let entry = db
             .root_file_entry(&checkpoint.root_id, "README.md")
@@ -1484,7 +1850,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let change = ChangeId("ch_layered_native_equivalence".to_string());
+        let change = ChangeId("change_layered_native_equivalence".to_string());
         let layered = db
             .build_root_for_selected_disk_files_incremental(
                 &root,
@@ -1515,8 +1881,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "crash",
@@ -1557,12 +1925,11 @@ mod tests {
         core.write(newer.ino, 0, b"uncheckpointed\n").unwrap();
         drop(core);
         let view = db.lane_workspace_view("crash").unwrap().unwrap();
-        db.conn
-            .execute(
-                "UPDATE workspace_views SET checkpoint_seq = 0, checkpoint_root = NULL WHERE view_id = ?1",
-                params![view.view_id],
-            )
-            .unwrap();
+        fs::write(
+            Path::new(&view.meta_dir).join("clean-checkpoint.json"),
+            b"stale postcommit mirror",
+        )
+        .unwrap();
         drop(db);
 
         let reopened = Trail::open(temp.path()).unwrap();
@@ -1590,8 +1957,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "retry",
@@ -1621,12 +1990,6 @@ mod tests {
         assert!(recorded.operation.is_some());
         let view = db.lane_workspace_view("retry").unwrap().unwrap();
         fs::remove_file(Path::new(&view.meta_dir).join("clean-checkpoint.json")).unwrap();
-        db.conn
-            .execute(
-                "UPDATE workspace_views SET checkpoint_seq = 0, checkpoint_root = NULL WHERE view_id = ?1",
-                params![view.view_id],
-            )
-            .unwrap();
         drop(db);
 
         let mut reopened = Trail::open(temp.path()).unwrap();
@@ -1652,8 +2015,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "lease",
@@ -1701,6 +2066,101 @@ mod tests {
     }
 
     #[test]
+    fn mark_mounted_fails_when_mount_lease_cas_is_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "lease-cas",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let view = db.lane_workspace_view("lease-cas").unwrap().unwrap();
+        let mut lease = db
+            .acquire_workspace_mount_lease("lease-cas", &view.backend)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE workspace_views SET owner_start_token = 'replacement-owner' WHERE view_id = ?1",
+                params![view.view_id],
+            )
+            .unwrap();
+
+        assert!(lease.mark_mounted().is_err());
+        assert_ne!(
+            db.lane_workspace_view("lease-cas").unwrap().unwrap().status,
+            "mounted"
+        );
+    }
+
+    #[test]
+    fn workspace_mount_lease_waits_for_exclusive_view_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "barrier-lease",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let view = db.lane_workspace_view("barrier-lease").unwrap().unwrap();
+        let meta_dir = PathBuf::from(&view.meta_dir);
+        let root = temp.path().to_path_buf();
+        let backend = view.backend;
+        drop(db);
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let db = Trail::open(root).unwrap();
+            opened_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            let lease = db
+                .acquire_workspace_mount_lease("barrier-lease", &backend)
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(lease);
+        });
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let barrier = ViewMutationBarrier::exclusive(&meta_dir).unwrap();
+        go_tx.send(()).unwrap();
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err());
+        drop(barrier);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn unmount_request_is_acknowledged_by_the_mount_owner_before_lease_release() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -1708,8 +2168,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "unmount-control",
@@ -1768,8 +2230,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         for lane in ["cargo-a", "cargo-b"] {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
@@ -1836,8 +2300,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "quota",
@@ -1894,6 +2360,7 @@ mod tests {
         let started = Instant::now();
         let mut paths = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
         let mut file_index = BatchBuilder::new(db.store.clone(), root_map_prolly_config());
+        let mut case_fold = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
         const PATHS: u64 = 1_000_000;
         for index in 0..PATHS {
             let path = format!("tree/{:04}/{:08}.txt", index / 10_000, index);
@@ -1902,13 +2369,21 @@ mod tests {
                 .add(path.as_bytes().to_vec(), cbor(&entry).unwrap())
                 .unwrap();
             file_index.add(entry.file_id.encode_key(), path.as_bytes().to_vec());
+            case_fold
+                .add(
+                    case_insensitive_path_key(&path).into_bytes(),
+                    path.as_bytes().to_vec(),
+                )
+                .unwrap();
         }
         let path_tree = paths.build().unwrap();
         let file_index_tree = file_index.build().unwrap();
+        let case_fold_tree = case_fold.build().unwrap();
         let root = WorktreeRoot {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: PATHS,
             total_text_bytes: PATHS * entry.size_bytes,
             created_by: change.clone(),
@@ -1928,8 +2403,10 @@ mod tests {
         let view_started = Instant::now();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         let mut cores = Vec::new();
         let mut exclusive_bytes = 0_u64;

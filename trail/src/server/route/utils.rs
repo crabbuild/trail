@@ -38,11 +38,11 @@ pub(crate) fn parse_patch_request(body: &[u8]) -> Result<PatchDocument> {
     let request: ApiPatchRequest = serde_json::from_slice(body)?;
     validate_external_patch_edit_sources(
         "patch request",
-        request.edits.len(),
-        request.files.len(),
+        request.edits.is_some(),
+        request.files.is_some(),
     )?;
-    let mut edits = request.edits;
-    for file in request.files {
+    let mut edits = request.edits.unwrap_or_default();
+    for file in request.files.unwrap_or_default() {
         match file {
             ApiPatchFile::AddText {
                 path,
@@ -100,11 +100,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_patch_request_rejects_empty_or_ambiguous_edit_sources() {
-        let empty = parse_patch_request(br#"{"message":"empty"}"#).unwrap_err();
-        assert!(empty
+    fn parse_patch_request_accepts_explicit_empty_source_and_rejects_missing_or_ambiguous_sources()
+    {
+        let empty = parse_patch_request(br#"{"message":"empty","edits":[]}"#).unwrap();
+        assert!(empty.edits.is_empty());
+
+        let missing = parse_patch_request(br#"{"message":"missing"}"#).unwrap_err();
+        assert!(missing
             .to_string()
-            .contains("requires at least one edit in `edits` or `files`"));
+            .contains("requires exactly one explicit edit source"));
 
         let ambiguous = parse_patch_request(
             br#"{
@@ -148,7 +152,7 @@ mod tests {
                             || message.contains("unknown variant")
                             || message.contains("missing field")
                             || message.contains("invalid type")
-                            || message.contains("requires at least one edit")
+                            || message.contains("requires exactly one explicit edit source")
                             || message.contains("must use either `edits` or `files`"),
                         "unexpected parse error for seed {seed}: {message}"
                     );
@@ -228,7 +232,7 @@ mod tests {
             "path": "README.md",
             "edits": [{
                 "type": "modify_line",
-                "line_id": format!("ch_seed_{seed}:1"),
+                "line_id": format!("line_seed_{seed}:1"),
                 "expected_text": format!("old-{seed}"),
                 "new_text": format!("new-{seed}")
             }]
@@ -450,28 +454,12 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub(crate) fn error_response(err: &Error) -> HttpResponse {
-    let status = match err {
-        Error::RefNotFound(_) | Error::OperationNotFound(_) | Error::RootNotFound(_) => 404,
-        Error::Conflict(_)
-        | Error::DirtyWorktree
-        | Error::DirtyWorktreeWithMessage(_)
-        | Error::PatchRejected(_)
-        | Error::StaleBranch(_)
-        | Error::WorkspaceLocked(_) => 409,
-        Error::InvalidInput(_)
-        | Error::InvalidPath { .. }
-        | Error::IgnoredPath(_)
-        | Error::Json(_) => 400,
-        _ => 500,
-    };
+    let structured = crate::model::StructuredErrorEnvelope::from_error(err);
+    let status = structured.error.status;
     let reason = reason_for_status(status);
-    let body = serde_json::to_vec(&ErrorBody {
-        error: ErrorDetails {
-            message: err.to_string(),
-            code: err.exit_code(),
-        },
-    })
-    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"serialization failed\",\"code\":1}}".to_vec());
+    let body = serde_json::to_vec(&structured).unwrap_or_else(|_| {
+        b"{\"error\":{\"message\":\"serialization failed\",\"code\":1}}".to_vec()
+    });
     HttpResponse {
         status,
         reason,
@@ -480,61 +468,50 @@ pub(crate) fn error_response(err: &Error) -> HttpResponse {
     }
 }
 
-#[derive(Serialize)]
-pub(crate) struct ErrorBody {
-    error: ErrorDetails,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ErrorDetails {
-    pub(crate) message: String,
-    pub(crate) code: i32,
-}
-
 pub(crate) fn unauthorized_response() -> HttpResponse {
-    let body = serde_json::to_vec(&ErrorBody {
-        error: ErrorDetails {
-            message: "unauthorized: missing or invalid Trail daemon token".to_string(),
-            code: 11,
-        },
-    })
-    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"unauthorized\",\"code\":11}}".to_vec());
-    HttpResponse {
-        status: 401,
-        reason: "Unauthorized",
-        extra_headers: Vec::new(),
-        body,
-    }
+    static_error_response(
+        401,
+        "UNAUTHORIZED",
+        11,
+        "unauthorized: missing or invalid Trail daemon token",
+    )
 }
 
 pub(crate) fn forbidden_origin_response() -> HttpResponse {
-    let body = serde_json::to_vec(&ErrorBody {
-        error: ErrorDetails {
-            message: "forbidden: request origin is not a local loopback origin".to_string(),
-            code: 11,
-        },
-    })
-    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"forbidden\",\"code\":11}}".to_vec());
-    HttpResponse {
-        status: 403,
-        reason: "Forbidden",
-        extra_headers: Vec::new(),
-        body,
-    }
+    static_error_response(
+        403,
+        "FORBIDDEN_ORIGIN",
+        11,
+        "forbidden: request origin is not a local loopback origin",
+    )
 }
 
 pub(crate) fn forbidden_host_response() -> HttpResponse {
-    let body = serde_json::to_vec(&ErrorBody {
-        error: ErrorDetails {
-            message: "forbidden: request host is missing or is not a local loopback host"
-                .to_string(),
-            code: 11,
-        },
-    })
-    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"forbidden\",\"code\":11}}".to_vec());
+    static_error_response(
+        403,
+        "FORBIDDEN_HOST",
+        11,
+        "forbidden: request host is missing or is not a local loopback host",
+    )
+}
+
+fn static_error_response(status: u16, code: &str, exit: i32, message: &str) -> HttpResponse {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {
+            "code": code,
+            "status": status,
+            "exit": exit,
+            "message": message,
+            "scope": null,
+            "state": null,
+            "reason": null,
+            "recovery": null
+        }
+    }))
+    .unwrap_or_else(|_| b"{\"error\":{\"code\":\"SERIALIZATION_ERROR\"}}".to_vec());
     HttpResponse {
-        status: 403,
-        reason: "Forbidden",
+        status,
+        reason: reason_for_status(status),
         extra_headers: Vec::new(),
         body,
     }

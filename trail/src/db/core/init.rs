@@ -4,6 +4,58 @@ const AUTO_MINIMAL_FILES_THRESHOLD: usize = 10_000;
 const AUTO_MINIMAL_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
 const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
 
+#[cfg(test)]
+thread_local! {
+    static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+    static SCHEMA_PRIMARY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+    static SCHEMA_PROLLY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_schema_primary_open_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_PRIMARY_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_primary_open_hook(db_dir: &Path) {
+    SCHEMA_PRIMARY_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
+#[cfg(test)]
+fn install_schema_prolly_open_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_PROLLY_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_prolly_open_hook(db_dir: &Path) {
+    SCHEMA_PROLLY_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
+#[cfg(test)]
+fn install_schema_handoff_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_HANDOFF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_handoff_hook(db_dir: &Path) {
+    SCHEMA_HANDOFF_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
 impl Trail {
     pub fn init(
         workspace_root: impl AsRef<Path>,
@@ -50,7 +102,8 @@ impl Trail {
         text_policy: Option<&str>,
         prolly_backend: Option<&str>,
     ) -> Result<InitReport> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        super::backup::recover_restore_publication(&workspace_root)?;
         let db_dir = workspace_root.join(".trail");
         if db_dir.exists() {
             if !force {
@@ -60,6 +113,14 @@ impl Trail {
         }
 
         fs::create_dir_all(db_dir.join("index"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&db_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(db_dir.join("index"), fs::Permissions::from_mode(0o700))?;
+        }
+        fs::write(db_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+        fs::write(db_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE), [])?;
         fs::create_dir_all(db_dir.join("refs/branches"))?;
         fs::create_dir_all(db_dir.join("refs/lanes"))?;
         fs::create_dir_all(db_dir.join("worktrees"))?;
@@ -95,8 +156,7 @@ impl Trail {
         fs::write(db_dir.join(HEAD_FILE), format!("{branch}\n"))?;
         write_default_trailignore(&workspace_root)?;
 
-        let mut db = Self::open_at(workspace_root, db_dir, config)?;
-        db.init_schema()?;
+        let mut db = Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::FreshCreate)?;
 
         let actor = Actor::system();
         let change_id = db.allocate_change_id(&actor.id, "init")?;
@@ -209,12 +269,13 @@ impl Trail {
     }
 
     pub fn discover(start: impl AsRef<Path>) -> Result<Self> {
-        let mut current = start.as_ref().canonicalize()?;
+        let mut current = canonicalize_lossless(start.as_ref())?;
         loop {
+            super::backup::recover_restore_publication(&current)?;
             let db_dir = current.join(".trail");
             if db_dir.is_dir() {
                 let config = read_config(&db_dir)?;
-                return Self::open_at(current, db_dir, config);
+                return Self::open_at(current, db_dir, config, SchemaOpenMode::Existing);
             }
             if !current.pop() {
                 return Err(Error::WorkspaceNotFound(start.as_ref().to_path_buf()));
@@ -223,44 +284,149 @@ impl Trail {
     }
 
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        super::backup::recover_restore_publication(&workspace_root)?;
         let db_dir = workspace_root.join(".trail");
         if !db_dir.is_dir() {
             return Err(Error::WorkspaceNotFound(workspace_root));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at(workspace_root, db_dir, config)
+        Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::Existing)
     }
 
     pub fn open_with_db_dir(
         workspace_root: impl AsRef<Path>,
         db_dir: impl AsRef<Path>,
     ) -> Result<Self> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
-        let db_dir = db_dir.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        super::backup::recover_restore_publication(&workspace_root)?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
         if !db_dir.is_dir() {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at(workspace_root, db_dir, config)
+        Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::Existing)
     }
 
     pub(crate) fn open_at(
         workspace_root: PathBuf,
         db_dir: PathBuf,
         config: TrailConfig,
+        schema_mode: SchemaOpenMode,
     ) -> Result<Self> {
-        fs::create_dir_all(db_dir.join("index"))?;
+        let db =
+            Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode, false)?;
+        db.recover_after_open()?;
+        Ok(db)
+    }
+
+    pub(crate) fn open_without_recovering_derived_paths(
+        workspace_root: impl AsRef<Path>,
+        db_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
+        if !db_dir.is_dir() {
+            return Err(Error::WorkspaceNotFound(db_dir));
+        }
+        let config = read_config(&db_dir)?;
+        Self::open_at_without_recovery(
+            workspace_root,
+            db_dir,
+            config,
+            SchemaOpenMode::Existing,
+            false,
+        )
+    }
+
+    pub(crate) fn open_without_recovering_derived_paths_under_write_lock(
+        workspace_root: impl AsRef<Path>,
+        db_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
+        if !db_dir.is_dir() {
+            return Err(Error::WorkspaceNotFound(db_dir));
+        }
+        let config = read_config(&db_dir)?;
+        // The caller owns the workspace write lock and already holds a Trail handle whose
+        // mutable handoff completed schema validation under that same exclusion.
+        Self::open_at_without_recovery(
+            workspace_root,
+            db_dir,
+            config,
+            SchemaOpenMode::Existing,
+            true,
+        )
+    }
+
+    fn open_at_without_recovery(
+        workspace_root: PathBuf,
+        db_dir: PathBuf,
+        config: TrailConfig,
+        schema_mode: SchemaOpenMode,
+        writer_exclusion_held: bool,
+    ) -> Result<Self> {
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
+        let validated_schema = match schema_mode {
+            SchemaOpenMode::FreshCreate => None,
+            SchemaOpenMode::Existing if writer_exclusion_held => None,
+            SchemaOpenMode::Existing => {
+                Some(Self::with_write_lock_wait(Duration::from_secs(10), || {
+                    preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)
+                })?)
+            }
+        };
+        if schema_mode == SchemaOpenMode::FreshCreate {
+            fs::create_dir_all(db_dir.join("index"))?;
+        }
+        #[cfg(test)]
+        if schema_mode == SchemaOpenMode::Existing && !writer_exclusion_held {
+            run_schema_handoff_hook(&db_dir);
+        }
+        if let Some(validated) = &validated_schema {
+            validated.verify_unchanged()?;
+        }
         register_sqlite_vec_extension()?;
-        let store = open_prolly_store(&config, &sqlite_path)?;
-        let conn = Connection::open(&sqlite_path)?;
+        let operation_metrics =
+            operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
+        #[cfg(test)]
+        if validated_schema.is_some() {
+            run_schema_primary_open_hook(&db_dir);
+        }
+        let conn = match schema_mode {
+            SchemaOpenMode::FreshCreate => Connection::open(&sqlite_path)?,
+            SchemaOpenMode::Existing => Connection::open_with_flags(
+                &sqlite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?,
+        };
+        if let Some(validated) = &validated_schema {
+            validated.verify_connection(&conn)?;
+        }
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        #[cfg(test)]
+        if validated_schema.is_some() {
+            run_schema_prolly_open_hook(&db_dir);
+        }
+        let store = open_prolly_store(
+            &config,
+            &sqlite_path,
+            operation_metrics.clone(),
+            schema_mode,
+            validated_schema.as_ref(),
+        )?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
         let root_prolly = Prolly::new(store.clone(), root_map_prolly_config());
         let db = Self {
             workspace_root,
             db_dir,
+            sqlite_path,
             conn,
             store,
             prolly,
@@ -268,10 +434,54 @@ impl Trail {
             config,
             object_cache: Mutex::new(ObjectCache::default()),
             daemon_worktree_cache: None,
+            changed_path_daemon_registry: Mutex::new(
+                change_ledger::ChangedPathDaemonRegistry::default(),
+            ),
+            git_handoff_metrics: Cell::new(GitHandoffMetrics::default()),
+            case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
+            operation_metrics,
         };
-        db.init_schema()?;
-        db.recover_workspace_views()?;
+        if schema_mode == SchemaOpenMode::FreshCreate {
+            db.create_schema_v18()?;
+        }
         Ok(db)
+    }
+
+    pub(crate) fn recover_after_open(&self) -> Result<()> {
+        let lock_path = self.db_dir.join("lock");
+        if lock_path.exists()
+            && fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|holder| {
+                    holder.split_whitespace().find_map(|part| {
+                        part.strip_prefix("pid=")
+                            .and_then(|value| value.parse::<u32>().ok())
+                    })
+                })
+                .is_none()
+        {
+            // Legacy or manually managed writer locks have always allowed a read-only open.
+            // Defer recovery until a later open after that writer releases its lock.
+            return Ok(());
+        }
+        match Self::with_write_lock_wait(Duration::from_secs(30), || {
+            let _lock = self.acquire_write_lock()?;
+            self.recover_after_open_under_write_lock()
+        }) {
+            Err(Error::WorkspaceLocked(_)) => Ok(()),
+            result => result,
+        }
+    }
+
+    fn recover_after_open_under_write_lock(&self) -> Result<()> {
+        if self.has_pending_path_index_derived_repairs()? {
+            self.drain_pending_path_index_derived_repairs()?;
+        }
+        self.recover_materialization_stages()?;
+        self.recover_workspace_views()?;
+        self.recover_workspace_environment_sync_attempts()?;
+        self.recover_workspace_runtime_leases()?;
+        Ok(())
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -280,6 +490,10 @@ impl Trail {
 
     pub fn db_dir(&self) -> &Path {
         &self.db_dir
+    }
+
+    pub(crate) fn changed_path_ledger(&self) -> super::change_ledger::ChangedPathLedger<'_> {
+        super::change_ledger::ChangedPathLedger::new_at(&self.conn, &self.sqlite_path)
     }
 
     pub fn config(&self) -> &TrailConfig {
@@ -343,38 +557,17 @@ impl Trail {
     }
 
     pub(crate) fn acquire_write_lock(&self) -> Result<WorkspaceLock> {
-        let path = self.db_dir.join("lock");
-        let mut delay = Duration::from_millis(2);
-        let mut file = loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => break file,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder =
-                        fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
-                    if is_stale_lock_holder(&holder)
-                        && fs::read_to_string(&path).unwrap_or_default() == holder
-                    {
-                        match fs::remove_file(&path) {
-                            Ok(()) => continue,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(err) => return Err(Error::Io(err)),
-                        }
-                    }
-                    let should_wait = WRITE_LOCK_WAIT_DEADLINE
-                        .with(|deadline| deadline.get())
-                        .is_some_and(|deadline| Instant::now() < deadline);
-                    if should_wait {
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(Duration::from_millis(50));
-                        continue;
-                    }
-                    return Err(Error::WorkspaceLocked(holder.trim().to_string()));
-                }
-                Err(err) => return Err(Error::Io(err)),
-            }
-        };
-        writeln!(file, "pid={} created_at={}", std::process::id(), now_ts())?;
-        Ok(WorkspaceLock { path })
+        // Every in-process Trail mutation is an authorized handoff against
+        // native observer durability. Register before waiting so no new
+        // observer append/heartbeat can enter, then retain the exclusion for
+        // the complete workspace-lock lifetime. A writer in another process
+        // cannot publish this process-local authority and remains terminal to
+        // observer continuity.
+        let exclusion = begin_authorized_observer_write_exclusion(&self.db_dir);
+        wait_for_observer_workspace_lock(&self.db_dir);
+        let mut lock = acquire_workspace_lock(&self.db_dir)?;
+        lock.observer_write_exclusion = Some(exclusion);
+        Ok(lock)
     }
 }
 
@@ -435,16 +628,1409 @@ fn worktree_path_scan_is_large(scan: &WorktreePathScan) -> bool {
         || scan.total_bytes > AUTO_MINIMAL_BYTES_THRESHOLD
 }
 
-fn is_stale_lock_holder(holder: &str) -> bool {
-    let Some(pid) = lock_holder_pid(holder) else {
-        return false;
+#[cfg(test)]
+mod schema_handoff_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Child, Stdio};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
     };
-    !process_is_alive(pid)
-}
 
-fn lock_holder_pid(holder: &str) -> Option<u32> {
-    holder.split_whitespace().find_map(|part| {
-        part.strip_prefix("pid=")
-            .and_then(|value| value.parse::<u32>().ok())
-    })
+    #[cfg(unix)]
+    fn assert_open_replacement_is_rejected_before_mutation(
+        install: impl FnOnce(Box<dyn FnOnce(&Path)>),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let original_bytes = fs::read(&db_path).unwrap();
+        let replacement = db_path.with_extension("replacement.sqlite");
+        fs::copy(&db_path, &replacement).unwrap();
+        let replacement_bytes = fs::read(&replacement).unwrap();
+        let retained = db_path.with_extension("validated.sqlite");
+        let hook_db = db_path.clone();
+        let hook_replacement = replacement.clone();
+        let hook_retained = retained.clone();
+        install(Box::new(move |_| {
+            fs::rename(&hook_db, &hook_retained).unwrap();
+            fs::rename(&hook_replacement, &hook_db).unwrap();
+        }));
+        let error = Trail::open(root.path()).err();
+        assert!(
+            matches!(error, Some(Error::SchemaReinitializeRequired { .. })),
+            "replacement rejection returned {error:?}"
+        );
+        assert_eq!(fs::read(retained).unwrap(), original_bytes);
+        assert_eq!(fs::read(db_path).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_sqlite_open_binds_the_validated_inode_before_any_statement() {
+        assert_open_replacement_is_rejected_before_mutation(|hook| {
+            install_schema_primary_open_hook(hook)
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prolly_sqlite_open_binds_the_validated_inode_before_any_pragma() {
+        assert_open_replacement_is_rejected_before_mutation(|hook| {
+            install_schema_prolly_open_hook(hook)
+        });
+    }
+
+    const CROSS_PROCESS_TEST: &str =
+        "db::core::init::schema_handoff_tests::cross_process_schema_validation_fanout";
+    const SCHEMA_LEADER_LOCK_PROBE_TEST: &str =
+        "db::core::init::schema_handoff_tests::schema_leader_lock_probe";
+
+    fn wait_for_path(path: &Path, deadline: Duration) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(
+                started.elapsed() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn validation_count(path: &Path) -> usize {
+        fs::read_to_string(path).unwrap_or_default().lines().count()
+    }
+
+    fn spawn_schema_children(
+        root: &Path,
+        counter: &Path,
+        go: &Path,
+        count: usize,
+        mode: &str,
+        configure: impl Fn(&mut Command),
+    ) -> Vec<Child> {
+        let ready_dir = go.with_extension("ready");
+        fs::create_dir(&ready_dir).unwrap();
+        let children = (0..count)
+            .map(|index| {
+                let ready = ready_dir.join(format!("{index}.ready"));
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", CROSS_PROCESS_TEST, "--nocapture"])
+                    .env("RUST_TEST_THREADS", "1")
+                    .env("TRAIL_TEST_SCHEMA_CHILD", mode)
+                    .env("TRAIL_TEST_SCHEMA_WORKSPACE", root)
+                    .env("TRAIL_TEST_SCHEMA_GO", go)
+                    .env("TRAIL_TEST_SCHEMA_READY", &ready)
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_COUNTER", counter)
+                    // These waves prove exact-one fanout while the authenticated
+                    // leader remains live for the server's bounded grace period.
+                    // A process that exits earlier may conservatively trigger a
+                    // second read-only validation.
+                    .env("TRAIL_TEST_SCHEMA_CHILD_LINGER_MS", "400")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit());
+                configure(&mut command);
+                command.spawn().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        while fs::read_dir(&ready_dir).unwrap().count() != count {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        children
+    }
+
+    fn release_and_wait(mut children: Vec<Child>, go: &Path) {
+        fs::write(go, []).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "schema validation child {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("schema validation child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_schema_validation_server(
+        root: &Path,
+    ) -> (SchemaValidationServer, PathBuf, PathBuf, String, String) {
+        use std::os::unix::net::UnixListener;
+
+        let lock_path = root.join("schema-validation.lock");
+        let leader_exclusion = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::fcntl_lock(
+            &leader_exclusion,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
+        let socket_path = root.join("schema-validation.socket");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let socket_cleanup = SchemaValidationRuntimeEntry::capture(&socket_path).unwrap();
+        let socket_authority =
+            secure_schema_validation_socket(&socket_path, &socket_cleanup).unwrap();
+        let announcement_path = root.join("schema-validation.announce");
+        fs::write(&announcement_path, b"test announcement").unwrap();
+        let announcement_cleanup =
+            SchemaValidationRuntimeEntry::capture(&announcement_path).unwrap();
+        let nonce = "a".repeat(64);
+        let generation = "b".repeat(64);
+        (
+            SchemaValidationServer {
+                listener,
+                nonce: nonce.clone(),
+                generation: generation.clone(),
+                backend: "sqlite".to_owned(),
+                outcome: CrossProcessSchemaValidationOutcome::Success("a".repeat(64)),
+                _leader_exclusion: leader_exclusion,
+                _socket_authority: socket_authority,
+                _socket_cleanup: socket_cleanup,
+                _announcement_cleanup: announcement_cleanup,
+                panic_on_serve: false,
+                start_delay: Duration::ZERO,
+                shutdown_delay: Duration::ZERO,
+            },
+            socket_path,
+            lock_path,
+            nonce,
+            generation,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_schema_leader_lock_available_to_child(lock_path: &Path) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", SCHEMA_LEADER_LOCK_PROBE_TEST, "--nocapture"])
+            .env("TRAIL_TEST_SCHEMA_LEADER_LOCK_PROBE", lock_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "schema leader lock remained held");
+    }
+
+    fn run_schema_child() -> bool {
+        fn linger_after_open() {
+            if let Some(delay) = std::env::var_os("TRAIL_TEST_SCHEMA_CHILD_LINGER_MS") {
+                std::thread::sleep(Duration::from_millis(
+                    delay.to_string_lossy().parse::<u64>().unwrap(),
+                ));
+            }
+        }
+
+        let Ok(mode) = std::env::var("TRAIL_TEST_SCHEMA_CHILD") else {
+            return false;
+        };
+        let root = PathBuf::from(std::env::var_os("TRAIL_TEST_SCHEMA_WORKSPACE").unwrap());
+        let go = PathBuf::from(std::env::var_os("TRAIL_TEST_SCHEMA_GO").unwrap());
+        fs::write(std::env::var_os("TRAIL_TEST_SCHEMA_READY").unwrap(), []).unwrap();
+        wait_for_path(&go, Duration::from_secs(10));
+        let result = Trail::open(root);
+        match mode.as_str() {
+            "success" | "crash" => result.unwrap(),
+            "failure" => {
+                let error = match result {
+                    Ok(_) => panic!("injected schema failure opened"),
+                    Err(error) => error,
+                };
+                assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+                assert!(error.to_string().contains("cross-process injected failure"));
+                linger_after_open();
+                return true;
+            }
+            "schema-failure" => {
+                assert!(matches!(
+                    result,
+                    Err(Error::SchemaReinitializeRequired { .. })
+                ));
+                linger_after_open();
+                return true;
+            }
+            other => panic!("unknown schema child mode {other}"),
+        };
+        linger_after_open();
+        true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_leader_lock_probe() {
+        let Some(lock_path) = std::env::var_os("TRAIL_TEST_SCHEMA_LEADER_LOCK_PROBE") else {
+            return;
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cross_process_schema_validation_fanout() {
+        if run_schema_child() {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let writer = Connection::open(root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='success-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let counter = root.path().join("success-count");
+        let go = root.path().join("success-go");
+        let started_marker = root.path().join("success-started");
+        let started = Instant::now();
+        let children =
+            spawn_schema_children(root.path(), &counter, &go, 16, "success", |command| {
+                command
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "1000")
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_STARTED", &started_marker);
+            });
+        fs::write(&go, []).unwrap();
+        wait_for_path(&started_marker, Duration::from_secs(5));
+        let exclusion =
+            File::open(root.path().join(".trail/index").join(SCHEMA_EXCLUSION_FILE)).unwrap();
+        assert_eq!(
+            rustix::fs::flock(
+                &exclusion,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            )
+            .unwrap_err(),
+            rustix::io::Errno::AGAIN,
+            "external schema writer was not excluded during validation"
+        );
+        release_and_wait(children, &go);
+        assert_eq!(validation_count(&counter), 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='failure-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let failure_counter = root.path().join("failure-count");
+        let failure_go = root.path().join("failure-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &failure_counter,
+            &failure_go,
+            16,
+            "failure",
+            |command| {
+                command
+                    .env(
+                        "TRAIL_TEST_SCHEMA_VALIDATION_FAIL",
+                        "cross-process injected failure",
+                    )
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "500");
+            },
+        );
+        release_and_wait(children, &failure_go);
+        assert_eq!(validation_count(&failure_counter), 1);
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='crash-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let crash_counter = root.path().join("crash-count");
+        let crash_go = root.path().join("crash-go");
+        let crash_once = root.path().join("crash-once");
+        let mut children = spawn_schema_children(
+            root.path(),
+            &crash_counter,
+            &crash_go,
+            16,
+            "crash",
+            |command| {
+                command.env("TRAIL_TEST_SCHEMA_VALIDATION_CRASH_ONCE", &crash_once);
+            },
+        );
+        fs::write(&crash_go, []).unwrap();
+        wait_for_path(&crash_once, Duration::from_secs(5));
+        let leader_pid = fs::read_to_string(&crash_once)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let leader = children
+            .iter_mut()
+            .find(|child| child.id() == leader_pid)
+            .unwrap();
+        leader.kill().unwrap();
+        let _ = leader.wait().unwrap();
+        children.retain(|child| child.id() != leader_pid);
+        release_and_wait(children, &crash_go);
+        assert_eq!(
+            validation_count(&crash_counter),
+            2,
+            "crash validation leaders: {}",
+            fs::read_to_string(&crash_counter).unwrap_or_default()
+        );
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='later-generation' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let later_counter = root.path().join("later-count");
+        let later_go = root.path().join("later-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &later_counter,
+            &later_go,
+            16,
+            "success",
+            |command| {
+                command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "500");
+            },
+        );
+        release_and_wait(children, &later_go);
+        assert_eq!(validation_count(&later_counter), 1);
+
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let (runtime_dir, namespace) = schema_validation_runtime_namespace(&db_path)
+            .unwrap()
+            .unwrap();
+        let prefix = format!("{}-", &namespace[..24]);
+        let leftovers = fs::read_dir(runtime_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(&prefix)
+                    && (name.ends_with(".socket") || name.ends_with(".announce"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "schema validation runtime artifacts survived bounded cleanup: {leftovers:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipc_result_is_bound_to_exact_main_wal_shm_generation_and_backend() {
+        let mut generation = SchemaGeneration(
+            ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, suffix)| SchemaFileGeneration {
+                    suffix,
+                    present: true,
+                    device: 10,
+                    inode: 20 + index as u64,
+                    length: 30 + index as u64,
+                    modified_seconds: 40,
+                    modified_nanoseconds: 50,
+                    changed_seconds: 60,
+                    changed_nanoseconds: 70,
+                })
+                .collect(),
+        );
+        let original_key = schema_generation_key(&generation);
+        let response = schema_validation_wire_result(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &original_key,
+            "sqlite",
+            &CrossProcessSchemaValidationOutcome::Success("d".repeat(64)),
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let index = generation
+                .0
+                .iter()
+                .position(|file| file.suffix == suffix)
+                .unwrap();
+            generation.0[index].inode += 1;
+            let changed_key = schema_generation_key(&generation);
+            assert!(parse_schema_validation_wire_result(
+                &response,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &changed_key,
+                "sqlite",
+            )
+            .is_none());
+            generation.0[index].inode -= 1;
+        }
+        assert!(parse_schema_validation_wire_result(
+            &response,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &original_key,
+            "slatedb",
+        )
+        .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_schema_socket_is_really_published_owner_only() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let mut generation = schema_generation(&db_path).unwrap();
+
+        let mut authenticated_wal_digest = None;
+        let (validation, foreground_leader) = coordinate_schema_snapshot_validation(
+            &db_path,
+            "sqlite",
+            &mut generation,
+            &mut authenticated_wal_digest,
+        );
+        validation.unwrap();
+        assert!(
+            foreground_leader.is_none(),
+            "Linux silently fell back to per-process validation instead of publishing IPC"
+        );
+        assert!(authenticated_wal_digest.is_some());
+
+        let (runtime_dir, namespace) = schema_validation_runtime_namespace(&db_path)
+            .unwrap()
+            .unwrap();
+        let prefix = format!("{}-", &namespace[..24]);
+        let announcement = fs::read_dir(&runtime_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".announce")
+            })
+            .expect("Linux schema validation announcement was not published");
+        let (_, socket_path) = read_schema_validation_announcement(
+            &announcement.path(),
+            std::process::id(),
+            &namespace,
+        )
+        .expect("published Linux announcement was not authenticated");
+        let metadata = fs::symlink_metadata(&socket_path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        assert!(stop_schema_validation_server(&db_path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_schema_socket_rejects_last_moment_path_substitution() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let socket_path = root.path().join("schema.socket");
+        let retained_path = root.path().join("retained.socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let expected = SchemaValidationRuntimeEntry::capture(&socket_path).unwrap();
+        let hook_retained = retained_path.clone();
+        install_schema_socket_authority_hook(
+            &socket_path,
+            Box::new(move |path| {
+                fs::rename(path, &hook_retained).unwrap();
+                let replacement = UnixListener::bind(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+                drop(replacement);
+            }),
+        );
+
+        let result = secure_schema_validation_socket(&socket_path, &expected);
+        assert!(
+            result.is_err(),
+            "descriptor-bound socket authority accepted a substituted pathname"
+        );
+        let retained = fs::symlink_metadata(&retained_path).unwrap();
+        let replacement = fs::symlink_metadata(&socket_path).unwrap();
+        assert!(retained.file_type().is_socket());
+        assert_eq!(retained.dev(), expected.device);
+        assert_eq!(retained.ino(), expected.inode);
+        assert_eq!(retained.permissions().mode() & 0o777, 0o600);
+        assert!(replacement.file_type().is_socket());
+        assert_ne!(replacement.ino(), expected.inode);
+        assert_eq!(replacement.permissions().mode() & 0o777, 0o644);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipc_rejects_spoofed_announcement_and_nonleader_peer() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let announcement = root.path().join("spoof.announce");
+        fs::write(
+            &announcement,
+            format!(
+                "trail-schema-validation-announce-v1\n{}\nwrong-namespace\n{}\n{}\n",
+                std::process::id(),
+                "a".repeat(64),
+                hex::encode(
+                    root.path()
+                        .join("spoof.socket")
+                        .as_os_str()
+                        .as_encoded_bytes()
+                ),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&announcement, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_schema_validation_announcement(
+            &announcement,
+            std::process::id(),
+            "expected-namespace",
+        )
+        .is_none());
+
+        let socket = root.path().join("peer.socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        assert!(request_schema_validation_result(
+            &socket,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "sqlite",
+            std::process::id().wrapping_add(1),
+        )
+        .is_none());
+        drop(accept.join().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_main_wal_and_shm_changes_each_start_one_fresh_multiprocess_validation() {
+        fn open_stable_writer(db_path: &Path, label: &str) -> Connection {
+            let writer = Connection::open(db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value=?1 WHERE key='app.version'",
+                    [label],
+                )
+                .unwrap();
+            writer
+        }
+
+        for (index, suffix) in ["", "-wal", "-shm"].into_iter().enumerate() {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_dir = root.path().join(".trail");
+            let db_path = db_dir.join(DB_RELATIVE_PATH);
+            let writer = open_stable_writer(&db_path, &format!("before-{index}"));
+            let before = schema_generation(&db_path).unwrap();
+            assert!(before
+                .0
+                .iter()
+                .find(|file| file.suffix == suffix)
+                .is_some_and(|file| file.present));
+
+            let counter = root.path().join(format!("{index}-count"));
+            let initial_go = root.path().join(format!("{index}-initial-go"));
+            let children = spawn_schema_children(
+                root.path(),
+                &counter,
+                &initial_go,
+                16,
+                "success",
+                |command| {
+                    command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "100");
+                },
+            );
+            release_and_wait(children, &initial_go);
+            assert_eq!(validation_count(&counter), 1);
+            drop(writer);
+
+            let lock = acquire_workspace_lock(&db_dir).unwrap();
+            if suffix.is_empty() {
+                let replacement = db_path.with_extension("validation-replacement");
+                fs::copy(&db_path, &replacement).unwrap();
+                fs::rename(&replacement, &db_path).unwrap();
+            } else {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                match fs::remove_file(PathBuf::from(sidecar)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("failed to rotate {suffix}: {error}"),
+                }
+            }
+            let writer = open_stable_writer(&db_path, &format!("after-{index}"));
+            if suffix == "-shm" {
+                let mut shm = db_path.as_os_str().to_os_string();
+                shm.push("-shm");
+                assert!(PathBuf::from(shm).exists());
+            }
+            let after = schema_generation(&db_path).unwrap();
+            let before_file = before.0.iter().find(|file| file.suffix == suffix).unwrap();
+            let after_file = after.0.iter().find(|file| file.suffix == suffix).unwrap();
+            assert_ne!(
+                before_file, after_file,
+                "{suffix} generation did not change"
+            );
+            drop(lock);
+
+            let fresh_go = root.path().join(format!("{index}-fresh-go"));
+            let children =
+                spawn_schema_children(root.path(), &counter, &fresh_go, 16, "success", |command| {
+                    command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "100");
+                });
+            release_and_wait(children, &fresh_go);
+            assert_eq!(
+                validation_count(&counter),
+                2,
+                "{suffix} change did not start exactly one fresh validation"
+            );
+            drop(writer);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_dir = root.path().join(".trail");
+        let db_path = db_dir.join(DB_RELATIVE_PATH);
+        let writer = open_stable_writer(&db_path, "backend-before");
+        let counter = root.path().join("backend-count");
+        let sqlite_go = root.path().join("backend-sqlite-go");
+        let children =
+            spawn_schema_children(root.path(), &counter, &sqlite_go, 16, "success", |_| {});
+        release_and_wait(children, &sqlite_go);
+        assert_eq!(validation_count(&counter), 1);
+        drop(writer);
+        let lock = acquire_workspace_lock(&db_dir).unwrap();
+        let config_path = db_dir.join(CONFIG_FILE);
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "prolly_backend = \"sqlite\"",
+            "prolly_backend = \"slatedb\"",
+        );
+        fs::write(&config_path, config).unwrap();
+        drop(lock);
+        let slatedb_go = root.path().join("backend-slatedb-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &counter,
+            &slatedb_go,
+            16,
+            "schema-failure",
+            |_| {},
+        );
+        release_and_wait(children, &slatedb_go);
+        assert_eq!(
+            validation_count(&counter),
+            2,
+            "backend change reused the sqlite validation result"
+        );
+    }
+
+    #[test]
+    fn schema_snapshot_exclusion_is_retained_through_mutable_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_in_hook = observed.clone();
+        install_schema_handoff_hook(move |db_dir| {
+            assert!(matches!(
+                acquire_workspace_lock(db_dir),
+                Err(Error::WorkspaceLocked(_))
+            ));
+            observed_in_hook.store(true, Ordering::SeqCst);
+        });
+        let reopened = Trail::open(root.path()).unwrap();
+        drop(reopened);
+        assert!(observed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn same_process_observer_writers_serialize_without_weakening_external_lock_failure() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_dir = root.path().join(".trail");
+        let database = db_dir.join(DB_RELATIVE_PATH);
+
+        let first = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let (acquired, received) = std::sync::mpsc::sync_channel(1);
+        let other_db_dir = db_dir.clone();
+        let other_database = database.clone();
+        let waiter = std::thread::spawn(move || {
+            let second =
+                acquire_workspace_lock_for_observer(&other_db_dir, &other_database).unwrap();
+            acquired.send(()).unwrap();
+            drop(second);
+        });
+        assert!(received
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+
+        let observer = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let (mutated, mutation_received) = std::sync::mpsc::sync_channel(1);
+        let workspace = root.path().to_path_buf();
+        let mutation = std::thread::spawn(move || {
+            let db = Trail::open(workspace).unwrap();
+            let lock = db.acquire_write_lock().unwrap();
+            mutated.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(mutation_received
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(observer);
+        mutation_received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        mutation.join().unwrap();
+
+        let external = acquire_workspace_lock(&db_dir).unwrap();
+        assert!(matches!(
+            acquire_workspace_lock_for_observer(&db_dir, &database),
+            Err(Error::WorkspaceLocked(_))
+        ));
+        drop(external);
+    }
+
+    #[test]
+    fn one_hundred_ordinary_opens_share_one_unchanged_generation_validation() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='singleflight' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(100));
+        let started = Instant::now();
+        let handles = (0..100)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Trail::open(root).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(schema_validation_count(&db_path), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "100 shared schema opens exceeded the five second budget"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn live_wal_advance_during_schema_snapshot_retries_without_reinitialize_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        // Retain the writer across the generation recapture. Dropping the last
+        // writer here can checkpoint and remove the WAL/SHM files, which is a
+        // main-database rewrite rather than the in-place WAL churn this test
+        // is meant to model.
+        let writer = Arc::new(Mutex::new(Some(Connection::open(&db_path).unwrap())));
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let hook_writer = writer.clone();
+        install_schema_snapshot_generation_hook(&db_path, move |_path| {
+            hook_writer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "UPDATE schema_meta SET value='live-wal-retry' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer.lock().unwrap().take());
+    }
+
+    #[test]
+    fn low_level_snapshot_failure_retries_only_when_same_wal_advanced() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='snapshot-error-baseline' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        fail_next_schema_validation(&db_path);
+        let advancing_path = db_path.clone();
+        let advancing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let connection = Connection::open(advancing_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE schema_meta SET value='snapshot-error-retry' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+        });
+
+        Trail::open(root.path()).unwrap();
+        advancing.join().unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_wal_advance_during_digest_retries_without_reinitialize_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Arc::new(Mutex::new(Some(Connection::open(&db_path).unwrap())));
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE schema_meta SET value='digest-baseline' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let hook_writer = writer.clone();
+        install_schema_wal_digest_hook(
+            &wal,
+            Box::new(move |_path| {
+                hook_writer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .execute(
+                        "UPDATE schema_meta SET value='live-digest-retry' WHERE key='app.version'",
+                        [],
+                    )
+                    .unwrap();
+            }),
+        );
+
+        Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+        drop(writer.lock().unwrap().take());
+    }
+
+    #[test]
+    fn snapshot_retry_rejects_main_wal_and_shm_pathname_substitution() {
+        for suffix in ["", "-wal", "-shm"] {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_path =
+                canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value='snapshot-substitution' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+            let suffix = suffix.to_string();
+            install_schema_snapshot_generation_hook(&db_path, move |path| {
+                let mut selected = path.as_os_str().to_os_string();
+                selected.push(&suffix);
+                let selected = PathBuf::from(selected);
+                assert!(
+                    selected.exists(),
+                    "missing schema file `{}`",
+                    selected.display()
+                );
+                let replacement = selected.with_extension(format!(
+                    "{}snapshot-replacement",
+                    selected
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| format!("{value}."))
+                        .unwrap_or_default()
+                ));
+                fs::copy(&selected, &replacement).unwrap();
+                fs::rename(&replacement, &selected).unwrap();
+            });
+
+            let error = match Trail::open(root.path()) {
+                Ok(_) => panic!("schema pathname substitution unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+            assert!(error
+                .to_string()
+                .contains("generation changed during snapshot validation"));
+            drop(writer);
+        }
+    }
+
+    #[test]
+    fn generation_replacement_or_sidecar_change_invalidates_mutable_handoff() {
+        for changed_suffix in ["", "-wal", "-shm"] {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value='toctou' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+            let mut changed_path = db_path.as_os_str().to_os_string();
+            changed_path.push(changed_suffix);
+            let changed_path = PathBuf::from(changed_path);
+            assert!(changed_path.exists(), "missing sidecar {changed_suffix}");
+            install_schema_handoff_hook(move |_| {
+                if changed_suffix.is_empty() {
+                    let replacement = changed_path.with_extension("replacement");
+                    fs::copy(&changed_path, &replacement).unwrap();
+                    fs::rename(replacement, &changed_path).unwrap();
+                } else {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&changed_path)
+                        .unwrap()
+                        .write_all(b"generation-change")
+                        .unwrap();
+                }
+            });
+            assert!(matches!(
+                Trail::open(root.path()),
+                Err(Error::SchemaReinitializeRequired { .. })
+            ));
+            drop(writer);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_wal_byte_change_invalidates_authenticated_handoff() {
+        use std::ffi::CString;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-race' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let hook_wal = wal.clone();
+        install_schema_handoff_hook(move |_| {
+            let metadata = fs::metadata(&hook_wal).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&hook_wal)
+                .unwrap();
+            file.seek(SeekFrom::End(-1)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            file.seek(SeekFrom::End(-1)).unwrap();
+            file.write_all(&[byte[0] ^ 0xff]).unwrap();
+            file.sync_all().unwrap();
+            let path = CString::new(hook_wal.as_os_str().as_bytes()).unwrap();
+            let times = [
+                libc::timespec {
+                    tv_sec: metadata.atime(),
+                    tv_nsec: metadata.atime_nsec(),
+                },
+                libc::timespec {
+                    tv_sec: metadata.mtime(),
+                    tv_nsec: metadata.mtime_nsec(),
+                },
+            ];
+            assert_eq!(
+                unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+                0
+            );
+        });
+
+        assert!(matches!(
+            Trail::open(root.path()),
+            Err(Error::SchemaReinitializeRequired { .. })
+        ));
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_digest_rejects_last_component_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-symlink' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let expected = schema_generation(&db_path).unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let retained = wal.with_extension("wal.digest-retained");
+        let hook_retained = retained.clone();
+        install_schema_wal_digest_hook(
+            &wal,
+            Box::new(move |path| {
+                fs::rename(path, &hook_retained).unwrap();
+                symlink(&hook_retained, path).unwrap();
+            }),
+        );
+
+        let error = schema_wal_digest(&db_path, &expected).unwrap_err();
+        assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+        assert!(wal.symlink_metadata().unwrap().file_type().is_symlink());
+
+        fs::remove_file(&wal).unwrap();
+        fs::rename(&retained, &wal).unwrap();
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_digest_continuous_churn_is_bounded_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-churn' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let expected = schema_generation(&db_path).unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let mut owner_only = false;
+        install_schema_wal_digest_attempt_hook(
+            &wal,
+            Box::new(move |path| {
+                owner_only = !owner_only;
+                let mode = if owner_only { 0o600 } else { 0o640 };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }),
+        );
+
+        let started = Instant::now();
+        let error =
+            schema_wal_digest_allowing_wal_ctime_transition(&db_path, &expected).unwrap_err();
+        clear_schema_wal_digest_attempt_hook(&wal);
+        assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+        assert!(error.to_string().contains("stable descriptor snapshot"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded WAL digest retry took {:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn schema_validation_leader_failure_propagates_and_next_open_retries() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        fail_next_schema_validation(&db_path);
+        delay_next_schema_validation_server_shutdown_for_test(&db_path, Duration::from_millis(300));
+        let barrier = Arc::new(Barrier::new(16));
+        let started = Instant::now();
+        let handles = (0..16)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Trail::open(root)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert!(matches!(
+                handle.join().unwrap(),
+                Err(Error::SchemaReinitializeRequired { .. })
+            ));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "invalid-schema peers paid the detached IPC fanout lifetime: {:?}",
+            started.elapsed()
+        );
+        let retry_started = Instant::now();
+        Trail::open(root.path()).unwrap();
+        assert!(
+            retry_started.elapsed() < Duration::from_millis(250),
+            "retry waited for the failed result server to retire: {:?}",
+            retry_started.elapsed()
+        );
+        assert_eq!(schema_validation_count(&db_path), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn production_server_start_does_not_rendezvous_with_the_spawned_thread() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        delay_next_schema_validation_server_start_for_test(&db_path, Duration::from_millis(300));
+
+        let started = Instant::now();
+        Trail::open(root.path()).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "production start rendezvoused with the delayed server thread: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn generation_replacement_does_not_wait_for_the_old_server() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let canonical_db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        delay_next_schema_validation_server_shutdown_for_test(
+            &canonical_db_path,
+            Duration::from_millis(300),
+        );
+        Trail::open(root.path()).unwrap();
+
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='replacement-latency' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        Trail::open(root.path()).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "replacement waited for the old result server: {:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn completed_schema_servers_naturally_leave_a_bounded_registry() {
+        let roots = (0..24)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let keys = roots
+            .iter()
+            .map(|root| root.path().join("workspace.sqlite"))
+            .collect::<Vec<_>>();
+        let resources = roots
+            .iter()
+            .zip(&keys)
+            .map(|(root, key)| {
+                let (server, socket, lock, _, _) = test_schema_validation_server(root.path());
+                start_schema_validation_server(key, server);
+                (socket, root.path().join("schema-validation.announce"), lock)
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let registered = SCHEMA_VALIDATION_SERVERS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if keys.iter().all(|key| !registered.contains_key(key)) {
+                break;
+            }
+            drop(registered);
+            assert!(
+                Instant::now() < deadline,
+                "completed detached servers remained registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for (socket, announcement, lock) in resources {
+            assert!(!socket.exists());
+            assert!(!announcement.exists());
+            assert_schema_leader_lock_available_to_child(&lock);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_validation_server_returns_immediately_and_serves_a_late_follower() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, socket_path, lock_path, nonce, generation) =
+            test_schema_validation_server(root.path());
+
+        let started = Instant::now();
+        let shutdown = Arc::new(SchemaValidationServerShutdown::default());
+        let server = spawn_schema_validation_server(server, shutdown.clone()).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(5),
+            "starting the background IPC server delayed mutable handoff: {:?}",
+            started.elapsed()
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            request_schema_validation_result(
+                &socket_path,
+                &nonce,
+                &generation,
+                "sqlite",
+                std::process::id(),
+            ),
+            Some(CrossProcessSchemaValidationOutcome::Success(digest))
+                if digest == "a".repeat(64)
+        ));
+        let stopped = Instant::now();
+        shutdown.stop();
+        server.join().unwrap();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(50),
+            "schema server shutdown did not wake immediately: {:?}",
+            stopped.elapsed()
+        );
+        assert!(!socket_path.exists());
+        assert!(!root.path().join("schema-validation.announce").exists());
+        assert_schema_leader_lock_available_to_child(&lock_path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_validation_server_panic_releases_ipc_and_leader_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut server, socket_path, lock_path, _, _) = test_schema_validation_server(root.path());
+        server.panic_on_serve = true;
+        let key = root.path().join("workspace.sqlite");
+
+        start_schema_validation_server(&key, server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while SCHEMA_VALIDATION_SERVERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "panicked detached server remained registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!socket_path.exists());
+        assert!(!root.path().join("schema-validation.announce").exists());
+        assert_schema_leader_lock_available_to_child(&lock_path);
+    }
 }

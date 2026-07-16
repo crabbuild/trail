@@ -1,22 +1,28 @@
 [workspace]
 members = [
     "trail",
+    "trail-environment-adapter-sdk",
     "prolly",
     "prolly/stores/prolly-store-cosmosdb",
     "prolly/stores/prolly-store-dynamodb",
     "prolly/stores/prolly-store-mysql",
+    "prolly/stores/prolly-store-pglite",
     "prolly/stores/prolly-store-postgres",
     "prolly/stores/prolly-store-redis",
+    "prolly/stores/prolly-store-rocksdb",
+    "prolly/stores/prolly-store-slatedb",
+    "prolly/stores/prolly-store-sqlite",
     "prolly/stores/prolly-store-spanner",
+    "prolly/stores/prolly-store-test",
     "prolly/bindings/node/native",
     "prolly/bindings/uniffi",
     "prolly/bindings/wasm",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-edition = "2021"
-rust-version = "1.81"
+edition = "2024"
+rust-version = "1.89"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 authors = ["Crab Build"]
@@ -45,6 +51,9 @@ dist = false
 publish-prereleases = false
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# Block every cargo-dist release phase on Linux and macOS native ledger gates
+# executed against the exact tag SHA.
+plan-jobs = ["./changed-path-ledger-native"]
 # Checksums to generate for each App
 checksum = "sha256"
 # Whether to enable GitHub Attestations
@@ -58,13 +67,16 @@ install-updater = false
 
 [workspace.dependencies]
 bzip2 = "0.5"
+ed25519-dalek = "2.2"
 flate2 = "1.0"
 rayon = "1.10"
 rocksdb = "0.22"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
 serde_cbor = "0.11"
 serde_json = "1.0"
+globset = "0.4"
 sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sqlite-vec = "=0.1.9"
@@ -75,8 +87,13 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 ignore = "0.4"
+jsonschema = { version = "0.29.1", default-features = false }
 libc = "0.2"
+landlock = "0.4.5"
 notify = "6.1"
+inotify = { version = "0.9.6", default-features = false }
+fsevent-sys = "4.1.0"
+core-foundation-sys = "0.8.7"
 getrandom = "0.2"
 similar = "2.6"
 tempfile = "3.10"
@@ -85,6 +102,11 @@ thiserror = "1.0"
 tokio = { version = "1.45", features = ["rt-multi-thread", "time"] }
 toml = "0.8"
 unicode-normalization = "0.1"
+unicode-width = "0.2.2"
+url = "2.5"
+terminal_size = "0.4.4"
+anstyle = "1.0.14"
+time = { version = "=0.3.36", features = ["formatting"] }
 walkdir = "2.5"
 zip = { version = "0.6.6", default-features = false, features = ["bzip2", "deflate"] }
 uniffi = "=0.31.0"

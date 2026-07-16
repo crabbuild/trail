@@ -5,7 +5,7 @@ Start with Trail's state-aware diagnosis commands:
 ```sh
 trail agent guide
 trail agent diagnose latest
-trail agent doctor --provider codex
+trail agent doctor codex
 ```
 
 `diagnose` inspects an existing task and suggests safe recovery actions.
@@ -17,8 +17,8 @@ Commands using `latest` cannot select a task until an editor prompt or terminal
 task has created one. Configure an editor or start a terminal task:
 
 ```sh
-trail agent setup --provider codex
-trail agent start --provider codex --name first-task
+trail agent acp setup codex
+trail agent start codex --name first-task
 ```
 
 `trail agent action` also publishes first-run setup, doctor, and start actions
@@ -41,33 +41,33 @@ Commands accept a task ID, lane, session, or ACP session selector.
 Run the provider check:
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent doctor --provider codex
+trail agent doctor claude-code
+trail agent doctor codex
 ```
 
 Confirm that the provider executable is installed and available in `PATH`. If
 you need a custom executable or flags, override the profile after `--`:
 
 ```sh
-trail agent start --provider codex -- /absolute/path/to/codex --flag
+trail agent start codex -- /absolute/path/to/codex --flag
 ```
 
-## Overlay COW Mount Fails
+## FUSE COW Mount Fails
 
-`overlay-cow` requires macFUSE on macOS or FUSE access such as `/dev/fuse` on
+`fuse-cow` requires macFUSE on macOS or FUSE access such as `/dev/fuse` on
 Linux. Trail reports the mount error and does not silently fall back to a full
 copy.
 
 Use the portable mode while diagnosing the host setup:
 
 ```sh
-trail agent start --provider codex --workdir-mode full-cow
+trail agent start codex --workdir-mode native-cow
 ```
 
 On macOS, `nfs-cow` is another large-workspace option:
 
 ```sh
-trail agent start --provider codex --workdir-mode nfs-cow
+trail agent start codex --workdir-mode nfs-cow
 ```
 
 See [Spawn and materialize workdirs](../lanes/spawn-and-materialize-workdirs.md)
@@ -216,7 +216,7 @@ trail agent summary latest
 trail agent report latest --markdown
 trail agent timeline latest
 trail agent workdir latest
-trail agent doctor --provider <PROVIDER>
+trail agent doctor <PROVIDER>
 ```
 
 For workspace-level corruption or storage problems, continue with the general

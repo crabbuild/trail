@@ -7,14 +7,14 @@ pub(super) fn handle_watch_command(ctx: &RuntimeContext, args: LaneWatchArgs) ->
     let _include_untracked = args.include_untracked;
     if args.once {
         let report = db.watch_lane_workdir(&args.name, args.message, interval, Some(1))?;
-        render_lane_watch(&report, ctx.json, ctx.quiet)
+        render_lane_watch(&report, ctx.json, &ctx.render)
     } else {
         loop {
             let report = db.record_lane_workdir(&args.name, args.message.clone())?;
             if matches!(ctx.format, OutputFormat::Ndjson) {
-                println!("{}", serde_json::to_string(&report)?);
+                render_ndjson(&report)?;
             } else if report.operation.is_some() {
-                render_lane_record(&report, ctx.json, ctx.quiet)?;
+                render_lane_record(&report, ctx.json, &ctx.render)?;
             }
             thread::sleep(interval);
         }
@@ -53,7 +53,7 @@ pub(super) fn handle_gate_command(
             options,
         )?,
     };
-    let render_result = render_lane_test(&report, ctx.json, ctx.quiet);
+    let render_result = render_lane_test(&report, ctx.json, &ctx.render);
     if render_result.is_ok() && !report.success {
         std::process::exit(command_failure_exit_code(report.exit_code));
     }

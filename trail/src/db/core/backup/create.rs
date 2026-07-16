@@ -1,4 +1,8 @@
 use super::*;
+use crate::db::change_ledger::mark_backup_scopes_untrusted;
+use crate::db::core::backup::publication::{
+    publish_staged_tree, remove_any, remove_retained_tree, sibling_stage,
+};
 
 impl Trail {
     pub fn create_backup(
@@ -13,26 +17,40 @@ impl Trail {
                 "backup output cannot be inside .trail".to_string(),
             ));
         }
-        if output.exists() {
-            if !overwrite {
-                return Err(Error::WorkspaceExists(output));
-            }
-            if output.is_dir() {
-                fs::remove_dir_all(&output)?;
-            } else {
-                fs::remove_file(&output)?;
-            }
+        self.changed_path_ledger().recover()?;
+        if output.exists() && !overwrite {
+            return Err(Error::WorkspaceExists(output));
         }
-
-        let result = self.create_backup_inner(&output);
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&output);
-        }
-        result
+        let parent = output
+            .parent()
+            .ok_or_else(|| Error::InvalidInput("backup output has no parent".into()))?;
+        fs::create_dir_all(parent)?;
+        let stage = sibling_stage(&output, "backup-stage")?;
+        let mut report = match self.create_backup_inner(&stage) {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = remove_any(&stage);
+                return Err(error);
+            }
+        };
+        let retained = match publish_staged_tree(&stage, &output) {
+            Ok(retained) => retained,
+            Err(error) => {
+                let _ = remove_any(&stage);
+                return Err(error);
+            }
+        };
+        remove_retained_tree(retained, parent)?;
+        report.path = output.to_string_lossy().to_string();
+        report.manifest_path = backup_manifest_path(&output).to_string_lossy().to_string();
+        report.sqlite_path = backup_sqlite_path(&output).to_string_lossy().to_string();
+        Ok(report)
     }
 
     pub(crate) fn create_backup_inner(&self, output: &Path) -> Result<BackupCreateReport> {
         fs::create_dir_all(output.join("index"))?;
+        fs::write(output.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+        fs::write(output.join("index").join(SCHEMA_VALIDATION_LEADER_FILE), [])?;
         fs::create_dir_all(output.join("refs/branches"))?;
         fs::create_dir_all(output.join("refs/lanes"))?;
 
@@ -47,6 +65,20 @@ impl Trail {
         let sqlite_path_text = sqlite_path.to_string_lossy().to_string();
         self.conn
             .execute("VACUUM main INTO ?1", params![sqlite_path_text])?;
+        let backup_conn = Connection::open(&sqlite_path)?;
+        mark_backup_scopes_untrusted(&backup_conn)?;
+        let checkpoint_busy: i64 =
+            backup_conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if checkpoint_busy != 0 {
+            return Err(Error::Conflict(
+                "backup SQLite checkpoint remained busy".into(),
+            ));
+        }
+        drop(backup_conn);
+        OpenOptions::new()
+            .read(true)
+            .open(&sqlite_path)?
+            .sync_all()?;
         let (sqlite_bytes, sqlite_sha256) = file_digest(&sqlite_path)?;
 
         let worktree_bytes =
@@ -77,6 +109,10 @@ impl Trail {
         };
         let manifest_path = backup_manifest_path(output);
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        OpenOptions::new()
+            .read(true)
+            .open(&manifest_path)?
+            .sync_all()?;
 
         Ok(BackupCreateReport {
             path: output.to_string_lossy().to_string(),

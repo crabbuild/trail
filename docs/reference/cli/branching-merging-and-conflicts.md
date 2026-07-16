@@ -25,30 +25,31 @@ trail merge <SOURCE> --into <TARGET> [--strategy <STRATEGY>] [--dry-run]
 
 Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
 
-## `merge-lane`
+## `lane merge`
 
 ```text
-trail merge-lane <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
+trail lane merge <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
 ```
 
 Default target is `main`. Non-dry-run direct merges into the workspace default
-branch are rejected by default so shared targets flow through `merge-queue`.
+branch are rejected by default so shared targets flow through
+`lane merge-queue`.
 Use `--dry-run` to preview or `--direct` for an explicit one-off immediate
 merge.
 
-## `merge-queue`
+## `lane merge-queue`
 
 ```text
-trail merge-queue add <SOURCE> --into <TARGET> [--priority <N>]
-trail merge-queue list
-trail merge-queue explain <SELECTOR>
-trail merge-queue run [--limit <N>]
-trail merge-queue remove <SELECTOR>
+trail lane merge-queue add <LANE> --into <TARGET> [--priority <N>]
+trail lane merge-queue list
+trail lane merge-queue explain <SELECTOR>
+trail lane merge-queue run [--limit <N>]
+trail lane merge-queue remove <SELECTOR>
 ```
 
 Default priority is 0.
 
-`merge-queue explain` resolves a queue id, lane name/ref, or branch name/ref and
+`lane merge-queue explain` resolves a queue id, lane id, or lane name and
 reports readiness blockers, dry-run merge conflicts, preflight errors, warnings,
 and suggested next steps without mutating refs or recording conflict state.
 
@@ -72,6 +73,6 @@ rejected rather than ignored.
 
 ## Code Facts Used
 
-- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/collaboration_args/merge.rs`
+- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/lane_args.rs`
 - Merge logic: `trail/src/db/merge`
 - Conflict reports: `trail/src/model/reports/merge.rs`

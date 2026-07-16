@@ -6,6 +6,7 @@ impl Trail {
         turn_id: &str,
         patch: PatchDocument,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         let turn = self.lane_turn(turn_id)?;
         if turn.ended_at.is_some() {
@@ -13,7 +14,7 @@ impl Trail {
                 "turn `{turn_id}` is already ended"
             )));
         }
-        self.apply_lane_patch_locked(&turn.lane_id, patch, Some(&turn))
+        self.apply_lane_patch_with_reconciliation_retry(&turn.lane_id, patch, Some(&turn))
     }
 
     pub fn end_lane_turn(&mut self, turn_id: &str, status: &str) -> Result<LaneTurnEndReport> {

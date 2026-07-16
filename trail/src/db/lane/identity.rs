@@ -26,16 +26,70 @@ impl Trail {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        let mut rewritten = 0;
-        for (lane_id, name) in rows {
-            let workdir = self.default_lane_workdir_path(&name)?;
-            self.conn.execute(
-                "UPDATE lane_branches SET workdir = ?1, updated_at = ?2 WHERE lane_id = ?3",
-                params![workdir.to_string_lossy(), now_ts(), lane_id],
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let rewrite = (|| -> Result<u64> {
+            let mut rewritten = 0;
+            for (lane_id, name) in rows {
+                let workdir = self.default_lane_workdir_path(&name)?;
+                self.conn.execute(
+                    "UPDATE lane_branches SET workdir = ?1, updated_at = ?2 WHERE lane_id = ?3",
+                    params![workdir.to_string_lossy(), now_ts(), lane_id],
+                )?;
+                rewritten += 1;
+            }
+
+            // Backups do not contain `.trail/views`. Invalidate every view and
+            // its derived environment state before normal open recovery can
+            // inspect source-workspace absolute paths from the copied SQLite
+            // store. A lane can create a fresh view in the restored workspace.
+            self.conn.execute_batch(
+                "DELETE FROM environment_secret_access_audit
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_runtime_secrets
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_runtime_resources
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_external_artifacts
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_caches
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_edges
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_outputs
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_generation_components
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM environment_view_generations;
+                 DELETE FROM environment_generations;
+                 DELETE FROM environment_sync_attempts;
+                 DELETE FROM environment_component_runtime_secrets;
+                 DELETE FROM environment_component_runtime_resources;
+                 DELETE FROM environment_component_external_artifacts;
+                 DELETE FROM environment_component_caches;
+                 DELETE FROM environment_component_dependencies;
+                 DELETE FROM environment_component_output_bindings;
+                 DELETE FROM environment_component_bindings;
+                 DELETE FROM environment_component_states;
+                 DELETE FROM workspace_environment_states;
+                 DELETE FROM workspace_view_layers;
+                 DELETE FROM workspace_git_shadows;
+                 DELETE FROM workspace_views;",
             )?;
-            rewritten += 1;
+            Ok(rewritten)
+        })();
+        match rewrite {
+            Ok(rewritten) => {
+                if let Err(err) = self.conn.execute_batch("COMMIT;") {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(Error::from(err));
+                }
+                Ok(rewritten)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
         }
-        Ok(rewritten)
     }
 
     pub fn lane_details(&self, lane: &str) -> Result<LaneDetails> {
@@ -78,8 +132,8 @@ impl Trail {
             .as_ref()
             .map(|_| worktree_state_from_changes(&workdir_changed_paths));
         let queued_merges: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM merge_queue WHERE source_ref = ?1 AND status IN ('queued', 'running')",
-            params![details.branch.ref_name],
+            "SELECT COUNT(*) FROM lane_merge_queue WHERE lane_id = ?1 AND status IN ('queued', 'running')",
+            params![details.branch.lane_id],
             |row| row.get(0),
         )?;
         Ok(LaneStatusReport {

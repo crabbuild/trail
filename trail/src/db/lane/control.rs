@@ -1,6 +1,8 @@
 use super::*;
 
 mod acp_sessions;
+mod agent_capture;
+mod agent_evidence;
 mod approvals;
 mod conversations;
 mod events;

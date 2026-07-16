@@ -1,42 +1,34 @@
 use super::*;
 
-pub(super) fn handle_merge_lane_command(ctx: &RuntimeContext, args: MergeLaneArgs) -> Result<()> {
-    let mut db = open_db(ctx)?;
-    validate_merge_strategy(args.strategy.as_deref())?;
-    let report =
-        db.merge_lane_user_with_options(&args.name, &args.into, args.dry_run, args.direct)?;
-    render_merge(&report, ctx.json, ctx.quiet)
-}
-
-pub(super) fn handle_merge_queue_command(
+pub(super) fn handle_lane_merge_queue_command(
     ctx: &RuntimeContext,
-    queue: MergeQueueCommand,
+    queue: LaneMergeQueueCommand,
 ) -> Result<()> {
     match queue.command {
-        MergeQueueSubcommand::Add(args) => {
+        LaneMergeQueueSubcommand::Add(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.enqueue_merge(&args.source, &args.into, args.priority)?;
-            render_merge_queue_add(&report, ctx.json, ctx.quiet)
+            let report = db.enqueue_lane_merge(&args.lane, &args.into, args.priority)?;
+            render_lane_merge_queue_add(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::List => {
+        LaneMergeQueueSubcommand::List => {
             let db = open_db(ctx)?;
-            let entries = db.list_merge_queue()?;
-            render_merge_queue_list(&entries, ctx.json, ctx.quiet)
+            let entries = db.list_lane_merge_queue()?;
+            render_lane_merge_queue_list(&entries, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Explain(args) => {
+        LaneMergeQueueSubcommand::Explain(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.explain_merge_queue(&args.selector)?;
-            render_merge_queue_explain(&report, ctx.json, ctx.quiet)
+            let report = db.explain_lane_merge_queue(&args.selector)?;
+            render_lane_merge_queue_explain(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Run(args) => {
+        LaneMergeQueueSubcommand::Run(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.run_merge_queue(args.limit)?;
-            render_merge_queue_run(&report, ctx.json, ctx.quiet)
+            let report = db.run_lane_merge_queue(args.limit)?;
+            render_lane_merge_queue_run(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Remove(args) => {
+        LaneMergeQueueSubcommand::Remove(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.remove_merge_queue(&args.selector)?;
-            render_merge_queue_remove(&report, ctx.json, ctx.quiet)
+            let report = db.remove_lane_merge_queue(&args.selector)?;
+            render_lane_merge_queue_remove(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -49,12 +41,12 @@ pub(super) fn handle_conflicts_command(
         ConflictsSubcommand::List => {
             let db = open_db(ctx)?;
             let conflicts = db.list_conflicts()?;
-            render_conflicts(&conflicts, ctx.json, ctx.quiet)
+            render_conflicts(&conflicts, ctx.json, &ctx.render)
         }
         ConflictsSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let conflict = db.show_conflict_with_limit(&args.conflict_set_id, args.limit)?;
-            render_conflict(&conflict, ctx.json, ctx.quiet)
+            render_conflict(&conflict, ctx.json, &ctx.render)
         }
         ConflictsSubcommand::Resolve(args) => {
             let mut db = open_db(ctx)?;
@@ -68,7 +60,7 @@ pub(super) fn handle_conflicts_command(
                     "conflicts resolve requires `--take` or `--manual`".to_string(),
                 ));
             };
-            render_conflict_resolve(&report, ctx.json, ctx.quiet)
+            render_conflict_resolve(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -78,22 +70,22 @@ pub(super) fn handle_anchor_command(ctx: &RuntimeContext, anchor: AnchorCommand)
         AnchorSubcommand::Create(args) => {
             let mut db = open_db(ctx)?;
             let report = db.create_anchor(&args.path_line, args.label, ctx.branch.as_deref())?;
-            render_anchor_create(&report, ctx.json, ctx.quiet)
+            render_anchor_create(&report, ctx.json, &ctx.render)
         }
         AnchorSubcommand::Resolve(args) => {
             let db = open_db(ctx)?;
             let report = db.resolve_anchor(&args.anchor_id, ctx.branch.as_deref())?;
-            render_anchor_resolve(&report, ctx.json, ctx.quiet)
+            render_anchor_resolve(&report, ctx.json, &ctx.render)
         }
         AnchorSubcommand::List => {
             let db = open_db(ctx)?;
             let anchors = db.list_anchors()?;
-            render_anchor_list(&anchors, ctx.json, ctx.quiet)
+            render_anchor_list(&anchors, ctx.json, &ctx.render)
         }
         AnchorSubcommand::Delete(args) => {
             let mut db = open_db(ctx)?;
             let report = db.delete_anchor(&args.anchor_id)?;
-            render_anchor_delete(&report, ctx.json, ctx.quiet)
+            render_anchor_delete(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -108,17 +100,17 @@ pub(super) fn handle_lease_command(ctx: &RuntimeContext, lease: LeaseCommand) ->
                 args.mode.as_str(),
                 args.ttl_secs,
             )?;
-            render_lease_acquire(&report, ctx.json, ctx.quiet)
+            render_lease_acquire(&report, ctx.json, &ctx.render)
         }
         LeaseSubcommand::List(args) => {
             let db = open_db(ctx)?;
             let leases = db.list_leases(args.all)?;
-            render_lease_list(&leases, ctx.json, ctx.quiet)
+            render_lease_list(&leases, ctx.json, &ctx.render)
         }
         LeaseSubcommand::Release(args) => {
             let mut db = open_db(ctx)?;
             let report = db.release_lease(&args.lease_id)?;
-            render_lease_release(&report, ctx.json, ctx.quiet)
+            render_lease_release(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -128,32 +120,32 @@ pub(super) fn handle_session_command(ctx: &RuntimeContext, session: SessionComma
         SessionSubcommand::Start(args) => {
             let mut db = open_db(ctx)?;
             let report = db.start_lane_session(&args.lane, args.title, args.id)?;
-            render_session_start(&report, ctx.json, ctx.quiet)
+            render_session_start(&report, ctx.json, &ctx.render)
         }
         SessionSubcommand::Current(args) => {
             let db = open_db(ctx)?;
             let reports = db.current_lane_sessions(args.lane.as_deref())?;
-            render_session_current(&reports, ctx.json, ctx.quiet)
+            render_session_current(&reports, ctx.json, &ctx.render)
         }
         SessionSubcommand::List(args) => {
             let db = open_db(ctx)?;
             let sessions = db.list_lane_sessions(args.lane.as_deref())?;
-            render_session_list(&sessions, ctx.json, ctx.quiet)
+            render_session_list(&sessions, ctx.json, &ctx.render)
         }
         SessionSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let details = db.show_lane_session(&args.session_id)?;
-            render_session_details(&details, ctx.json, ctx.quiet)
+            render_session_details(&details, ctx.json, &ctx.render)
         }
         SessionSubcommand::Context(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_session_context(&args.session_id, args.limit)?;
-            render_session_context(&report, ctx.json, ctx.quiet)
+            render_session_context(&report, ctx.json, &ctx.render)
         }
         SessionSubcommand::End(args) => {
             let mut db = open_db(ctx)?;
             let report = db.end_lane_session(&args.session_id, &args.status)?;
-            render_session_end(&report, ctx.json, ctx.quiet)
+            render_session_end(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -177,17 +169,17 @@ pub(super) fn handle_approvals_command(
                 args.session.as_deref(),
                 args.turn.as_deref(),
             )?;
-            render_approval_request(&report, ctx.json, ctx.quiet)
+            render_approval_request(&report, ctx.json, &ctx.render)
         }
         ApprovalsSubcommand::List(args) => {
             let db = open_db(ctx)?;
             let approvals = db.list_lane_approvals(args.lane.as_deref(), args.status.as_deref())?;
-            render_approval_list(&approvals, ctx.json, ctx.quiet)
+            render_approval_list(&approvals, ctx.json, &ctx.render)
         }
         ApprovalsSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let approval = db.show_lane_approval(&args.approval_id)?;
-            render_approval(&approval, ctx.json, ctx.quiet)
+            render_approval(&approval, ctx.json, &ctx.render)
         }
         ApprovalsSubcommand::Decide(args) => {
             let mut db = open_db(ctx)?;
@@ -197,7 +189,7 @@ pub(super) fn handle_approvals_command(
                 args.reviewer,
                 args.note,
             )?;
-            render_approval_decision(&report, ctx.json, ctx.quiet)
+            render_approval_decision(&report, ctx.json, &ctx.render)
         }
     }
 }

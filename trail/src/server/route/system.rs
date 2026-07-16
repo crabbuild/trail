@@ -1,12 +1,23 @@
 use crate::model::{Actor, OperationKind, RecordOptions};
-use crate::server::transport::{HttpRequest, HttpResponse};
+use crate::server::transport::{HttpRequest, HttpResponse, ServerAuth};
 use crate::{Error, Result};
 
 use super::utils;
 
+#[derive(serde::Deserialize)]
+struct LedgerFenceRequest {
+    protocol_version: u16,
+    owner_nonce: String,
+    workspace_identity: String,
+    executable_identity: String,
+    scope_id: String,
+    expected_epoch: u64,
+}
+
 pub(super) fn handle_system_route(
     db: &mut crate::Trail,
     request: &HttpRequest,
+    auth: &ServerAuth,
     path: &str,
     query: &str,
     parts: &[&str],
@@ -25,8 +36,85 @@ pub(super) fn handle_system_route(
     }
 
     if request.method == "GET" && path == "/v1/status" {
+        // Public status performs the authority dispatch. Never turn a missing
+        // structural dependency into a legacy full-scan success: qualification
+        // failures must remain fail-closed.
         let report = db.status(None)?;
         return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST" && path == "/v1/index/reconcile" {
+        let body: crate::server::request_types::IndexReconcileRequest = if request.body.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = super::super::reconcile_changed_path_ledger(db, body.lane.as_deref())?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST"
+        && matches!(
+            path,
+            "/v1/ledger/challenge" | "/v1/ledger/fence" | "/v1/ledger/reconcile"
+        )
+    {
+        let body: LedgerFenceRequest = serde_json::from_slice(&request.body)?;
+        let expected_identity = auth.daemon_identity.as_ref();
+        if body.protocol_version != 2
+            || expected_identity.is_none_or(|identity| {
+                identity.owner_nonce != body.owner_nonce
+                    || identity.workspace_identity != body.workspace_identity
+                    || identity.executable_identity != body.executable_identity
+            })
+        {
+            return Err(Error::DaemonUnavailable(
+                "changed-path ledger RPC identity mismatch".into(),
+            ));
+        }
+        let proof = if path == "/v1/ledger/challenge" {
+            let proof = super::super::workspace_changed_path_ready_proof(db)?;
+            if proof.scope_id != body.scope_id || proof.epoch != body.expected_epoch {
+                return Err(Error::DaemonUnavailable(
+                    "changed-path daemon challenge scope or epoch mismatch".into(),
+                ));
+            }
+            proof
+        } else if path == "/v1/ledger/reconcile" {
+            super::super::workspace_changed_path_reconcile(
+                db,
+                Some(&body.scope_id),
+                Some(body.expected_epoch),
+            )?
+        } else {
+            super::super::workspace_changed_path_fence(
+                db,
+                Some(&body.scope_id),
+                Some(body.expected_epoch),
+            )?
+        };
+        return Ok(Some(utils::json_response(
+            200,
+            "OK",
+            &serde_json::json!({
+                "pid": std::process::id(),
+                "process_start_identity": expected_identity
+                    .map(|identity| identity.process_start_identity.as_str())
+                    .unwrap_or_default(),
+                "executable_identity": expected_identity
+                    .map(|identity| identity.executable_identity.as_str())
+                    .unwrap_or_default(),
+                "owner_nonce": body.owner_nonce,
+                "workspace_identity": body.workspace_identity,
+                "scope_id": proof.scope_id,
+                "epoch": proof.epoch,
+                "daemon_launch_nonce": proof.daemon_launch_nonce,
+                "live_fence_sequence": proof.sequence,
+                "durable_offset": proof.durable_offset,
+                "folded_offset": proof.folded_offset,
+                "protocol_version": 2
+            }),
+        )?));
     }
 
     if request.method == "POST" && path == "/v1/record" {

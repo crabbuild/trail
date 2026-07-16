@@ -50,7 +50,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.session_end",
             "title": "End Lane Session",
-            "description": "End a durable lane session with completed, failed, cancelled, or archived status.",
+            "description": "End a durable lane session with completed, failed, cancelled, interrupted, or archived status.",
             "inputSchema": object_schema(json!({
                 "session_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["completed", "failed", "cancelled", "archived"] }

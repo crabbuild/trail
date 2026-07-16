@@ -1,4 +1,4 @@
-use super::render_json;
+use crate::cli::command::render::*;
 
 use trail;
 use trail::model::*;
@@ -7,160 +7,192 @@ use trail::Result;
 pub(crate) fn render_lane_trace_span_start(
     report: &LaneTraceSpanStartReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!(
-            "Started span {} {} {}",
-            report.span.span_id, report.span.span_type, report.span.name
-        );
-        println!("Trace: {}", report.span.trace_id);
-    }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("Started {} span", report.span.span_type),
+            UiTone::Success,
+        )
+        .block(span_metadata(&report.span)),
+        options,
+    )
 }
 
 pub(crate) fn render_lane_trace_span_end(
     report: &LaneTraceSpanEndReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("Ended span {} {}", report.span.span_id, report.span.status);
-        if let Some(duration_ms) = report.span.duration_ms {
-            println!("Duration: {duration_ms} ms");
-        }
-    }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("Ended span {}", report.span.span_id),
+            UiTone::Success,
+        )
+        .block(span_metadata(&report.span)),
+        options,
+    )
 }
 
 pub(crate) fn render_lane_trace_spans(
     spans: &[LaneTraceSpan],
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(spans);
     }
-    if !quiet {
-        for span in spans {
-            let parent = span.parent_span_id.as_deref().unwrap_or("-");
-            let turn = span.turn_id.as_deref().unwrap_or("-");
-            let duration = span
-                .duration_ms
-                .map(|duration_ms| format!("{duration_ms}ms"))
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{} {} {} status={} trace={} parent={} turn={} duration={}",
-                span.span_id,
-                span.span_type,
-                span.name,
-                span.status,
-                span.trace_id,
-                parent,
-                turn,
-                duration
-            );
-        }
+    if spans.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No trace spans", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(format!("{} trace span(s)", spans.len()), UiTone::Neutral)
+            .block(UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("STATUS", 0, 8),
+                    UiColumn::left("TYPE", 0, 8),
+                    UiColumn::left("NAME", 0, 14),
+                    UiColumn::left("TIME", 1, 7),
+                    UiColumn::left("TRACE", 2, 12),
+                ],
+                spans
+                    .iter()
+                    .map(|span| {
+                        vec![
+                            span.status.clone(),
+                            span.span_type.clone(),
+                            span.name.clone(),
+                            duration(span.duration_ms),
+                            span.trace_id.clone(),
+                        ]
+                    })
+                    .collect(),
+            )))
+            .pager_eligible(),
+        options,
+    )
 }
 
 pub(crate) fn render_lane_trace_summary(
     report: &LaneTraceSummaryReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!(
-            "Trace summary: {} spans ({} open, {} ended, {} failed)",
-            report.span_count,
-            report.open_span_count,
-            report.ended_span_count,
-            report.failed_span_count
-        );
-        if let Some(trace_id) = &report.trace_id {
-            println!("Trace: {trace_id}");
-        }
-        if let Some(lane_id) = &report.lane_id {
-            println!("Lane: {lane_id}");
-        }
-        if let Some(turn_id) = &report.turn_id {
-            println!("Turn: {turn_id}");
-        }
-        if report.total_duration_ms > 0 {
-            let average = report
-                .average_duration_ms
-                .map(|duration| format!("{duration:.1}"))
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "Duration: total={}ms max={}ms avg={}ms",
-                report.total_duration_ms, report.max_duration_ms, average
-            );
-        }
-        println!("Statuses: {}", render_named_counts(&report.status_counts));
-        println!("Types: {}", render_named_counts(&report.span_type_counts));
-        println!("Traces: {}", render_named_counts(&report.trace_counts));
-        if !report.slowest_spans.is_empty() {
-            println!("Slowest spans:");
-            for span in &report.slowest_spans {
-                println!(
-                    "  {} {} {} {}ms",
-                    span.span_id,
-                    span.span_type,
-                    span.status,
-                    span.duration_ms.unwrap_or(0)
-                );
-            }
-        }
-        if !report.open_spans.is_empty() {
-            println!("Open spans:");
-            for span in &report.open_spans {
-                println!("  {} {} {}", span.span_id, span.span_type, span.name);
-            }
-        }
+    let mut metadata = vec![
+        ("Spans".to_string(), report.span_count.to_string()),
+        ("Open".to_string(), report.open_span_count.to_string()),
+        ("Ended".to_string(), report.ended_span_count.to_string()),
+        ("Failed".to_string(), report.failed_span_count.to_string()),
+        (
+            "Total duration".to_string(),
+            duration(Some(report.total_duration_ms)),
+        ),
+        (
+            "Max duration".to_string(),
+            duration(Some(report.max_duration_ms)),
+        ),
+    ];
+    if let Some(avg) = report.average_duration_ms {
+        metadata.push(("Average duration".to_string(), format!("{avg:.1} ms")));
     }
-    Ok(())
+    if let Some(trace) = &report.trace_id {
+        metadata.push(("Trace".to_string(), trace.clone()));
+    }
+    if let Some(lane) = &report.lane_id {
+        metadata.push(("Lane".to_string(), lane.clone()));
+    }
+    let mut document = TerminalDocument::new(
+        "Trace summary",
+        if report.failed_span_count > 0 {
+            UiTone::Attention
+        } else {
+            UiTone::Success
+        },
+    )
+    .block(UiBlock::Metadata(metadata));
+    if !report.slowest_spans.is_empty() {
+        document = document.block(UiBlock::section(
+            "Slowest spans:",
+            vec![UiBlock::Table(span_table(&report.slowest_spans))],
+        ));
+    }
+    if !report.open_spans.is_empty() {
+        document = document.block(UiBlock::section(
+            "Open spans:",
+            vec![UiBlock::Table(span_table(&report.open_spans))],
+        ));
+    }
+    render_document(&document, options)
 }
 
-pub(crate) fn render_named_counts(counts: &[trail::model::NamedCount]) -> String {
-    if counts.is_empty() {
-        return "-".to_string();
-    }
-    counts
-        .iter()
-        .map(|count| format!("{}={}", count.name, count.count))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-pub(crate) fn render_lane_trace_span(span: &LaneTraceSpan, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_lane_trace_span(
+    span: &LaneTraceSpan,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(span);
     }
-    if !quiet {
-        println!("Span: {}", span.span_id);
-        println!("Trace: {}", span.trace_id);
-        println!("Type: {}", span.span_type);
-        println!("Name: {}", span.name);
-        println!("Status: {}", span.status);
-        if let Some(parent) = &span.parent_span_id {
-            println!("Parent: {parent}");
-        }
-        if let Some(turn) = &span.turn_id {
-            println!("Turn: {turn}");
-        }
-        if let Some(duration_ms) = span.duration_ms {
-            println!("Duration: {duration_ms} ms");
-        }
+    render_document(
+        &TerminalDocument::new(format!("Span {}", span.name), UiTone::Neutral)
+            .block(span_metadata(span)),
+        options,
+    )
+}
+
+fn span_metadata(span: &LaneTraceSpan) -> UiBlock {
+    let mut metadata = vec![
+        ("Span".to_string(), span.span_id.clone()),
+        ("Trace".to_string(), span.trace_id.clone()),
+        ("Type".to_string(), span.span_type.clone()),
+        ("Status".to_string(), span.status.clone()),
+        ("Duration".to_string(), duration(span.duration_ms)),
+    ];
+    if let Some(parent) = &span.parent_span_id {
+        metadata.push(("Parent".to_string(), parent.clone()));
     }
-    Ok(())
+    if let Some(turn) = &span.turn_id {
+        metadata.push(("Turn".to_string(), turn.clone()));
+    }
+    UiBlock::Metadata(metadata)
+}
+
+fn span_table(spans: &[LaneTraceSpan]) -> UiTable {
+    UiTable::new(
+        vec![
+            UiColumn::left("STATUS", 0, 8),
+            UiColumn::left("TYPE", 0, 8),
+            UiColumn::left("NAME", 0, 14),
+            UiColumn::left("TIME", 1, 7),
+        ],
+        spans
+            .iter()
+            .map(|span| {
+                vec![
+                    span.status.clone(),
+                    span.span_type.clone(),
+                    span.name.clone(),
+                    duration(span.duration_ms),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn duration(duration: Option<u64>) -> String {
+    duration
+        .map(|value| format!("{value} ms"))
+        .unwrap_or_else(|| "—".to_string())
 }

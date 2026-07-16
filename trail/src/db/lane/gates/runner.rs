@@ -100,7 +100,7 @@ impl Trail {
             let layer_ids = if let Some(view) = &view {
                 self.workspace_layer_bindings_for_source_upper(Path::new(&view.source_upper))?
                     .into_iter()
-                    .map(|binding| binding.layer_id)
+                    .filter_map(|binding| binding.layer_id)
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -172,13 +172,19 @@ impl Trail {
             )
         };
 
-        let overlay_mount = if workdir_mode == LaneWorkdirMode::OverlayCow {
-            Some(self.mount_overlay_cow_workdir_for_lane(lane)?)
+        let fuse_mount = if workdir_mode == LaneWorkdirMode::FuseCow {
+            Some(self.mount_fuse_cow_workdir_for_lane(lane)?)
         } else {
             None
         };
         let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
             Some(self.mount_nfs_cow_workdir_for_lane(lane)?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "windows")]
+        let dokan_mount = if workdir_mode == LaneWorkdirMode::DokanCow {
+            Some(self.mount_dokan_cow_workdir_for_lane(lane)?)
         } else {
             None
         };
@@ -194,7 +200,9 @@ impl Trail {
             &environment,
         )?;
         drop(nfs_mount);
-        drop(overlay_mount);
+        drop(fuse_mount);
+        #[cfg(target_os = "windows")]
+        drop(dokan_mount);
         let threshold_met = score
             .zip(threshold)
             .map(|(score, threshold)| score >= threshold);

@@ -113,7 +113,7 @@ lane: docs-lane
         |     +-- message(role=assistant)
         |     +-- event(type=tool_call)
         |     +-- event(type=patch_applied)
-        |     +-- operation(change_id=ch_...)
+        |     +-- operation(change_id=change_...)
         |
         +-- turn: turn_002
               |
@@ -313,7 +313,7 @@ run test/eval gates
   v
 review readiness
   |
-  +-- ready ---------> merge-lane or merge queue
+  +-- ready ---------> lane merge or merge queue
   |
   +-- not ready -----> continue, approve, resolve conflict, or rewind
 ```
@@ -349,9 +349,9 @@ trail lane test docs-lane --suite unit -- cargo test
 trail lane readiness docs-lane
 
 # Merge when ready.
-trail merge-lane docs-lane --into main --dry-run
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge docs-lane --into main --dry-run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 ## Readiness Model
@@ -453,14 +453,14 @@ trail lane rewind docs-lane \
 Merge uses the lane ref as source:
 
 ```sh
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 Use the merge queue for shared targets:
 
 ```sh
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 The merge updates Trail's target branch ref. Git history remains separate until
@@ -562,7 +562,7 @@ Workdir: DirtyTracked
 Observed record output:
 
 ```text
-Recorded lane workdir ch_4ee8...
+Recorded lane workdir change_4ee8...
   Modified README.md
 ```
 
@@ -619,15 +619,15 @@ Merge through the queue:
 
 ```sh
 trail session end session-svelte-readme --status completed
-trail merge-queue add svelte-readme --into main
-trail merge-queue run
+trail lane merge-queue add svelte-readme --into main
+trail lane merge-queue run
 ```
 
 Observed merge result:
 
 ```text
 Queued refs/lanes/svelte-readme into refs/branches/main
-merged as ch_f348...
+merged as change_f348...
 ```
 
 This demonstrates the intended large-repo pattern:

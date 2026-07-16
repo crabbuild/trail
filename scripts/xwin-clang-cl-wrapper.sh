@@ -28,4 +28,4 @@ for arg in "$@"; do
   fi
 done
 
-exec clang-cl "$@"
+exec "${TRAIL_REAL_CLANG_CL:-clang-cl}" "$@"

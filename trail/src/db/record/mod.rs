@@ -7,3 +7,7 @@ mod checkout;
 mod diff;
 mod inspection;
 mod recording;
+#[cfg(debug_assertions)]
+pub(crate) use recording::{
+    install_observed_record_after_compare_hook, install_observed_record_with_lock_hook,
+};

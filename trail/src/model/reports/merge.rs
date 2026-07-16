@@ -12,9 +12,10 @@ pub struct MergeReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueEntry {
+pub struct LaneMergeQueueEntry {
     pub queue_id: String,
-    pub source_ref: String,
+    pub lane_id: String,
+    pub lane: String,
     pub target_ref: String,
     pub status: String,
     pub priority: i64,
@@ -23,18 +24,18 @@ pub struct MergeQueueEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueAddReport {
-    pub entry: MergeQueueEntry,
+pub struct LaneMergeQueueAddReport {
+    pub entry: LaneMergeQueueEntry,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueRemoveReport {
-    pub entry: MergeQueueEntry,
+pub struct LaneMergeQueueRemoveReport {
+    pub entry: LaneMergeQueueEntry,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueExplainReport {
-    pub entry: MergeQueueEntry,
+pub struct LaneMergeQueueExplainReport {
+    pub entry: LaneMergeQueueEntry,
     pub readiness: Option<LaneReadinessReport>,
     pub dry_run: Option<MergeReport>,
     pub blockers: Vec<LaneReadinessIssue>,
@@ -44,16 +45,17 @@ pub struct MergeQueueExplainReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueRunReport {
-    pub processed: Vec<MergeQueueRunItem>,
+pub struct LaneMergeQueueRunReport {
+    pub processed: Vec<LaneMergeQueueRunItem>,
     pub stopped_on_conflict: bool,
     pub stopped_on_failure: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MergeQueueRunItem {
+pub struct LaneMergeQueueRunItem {
     pub queue_id: String,
-    pub source_ref: String,
+    pub lane_id: String,
+    pub lane: String,
     pub target_ref: String,
     pub status: String,
     pub operation: Option<ChangeId>,
@@ -85,7 +87,7 @@ pub struct ConflictExplanation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConflictMergeContext {
     pub merge_id: String,
-    pub queue_id: Option<String>,
+    pub lane_queue_id: Option<String>,
     pub source_ref: String,
     pub target_ref: String,
     pub base_change: ChangeId,

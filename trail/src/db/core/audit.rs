@@ -6,6 +6,12 @@ impl Trail {
         mut input: ExternalMutationAuditInput,
     ) -> Result<String> {
         let _lock = self.acquire_write_lock()?;
+        #[cfg(debug_assertions)]
+        if let Some(milliseconds) = std::env::var_os("TRAIL_TEST_EXTERNAL_AUDIT_HOLD_MS")
+            .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        }
         if let Some(lane_handle) = input.lane_id.clone() {
             if let Some((lane_id, ref_name)) = self.external_mutation_lane_identity(&lane_handle)? {
                 input.lane_id = Some(lane_id);

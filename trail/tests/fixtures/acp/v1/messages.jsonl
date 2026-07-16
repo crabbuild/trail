@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"request-1","method":"session/list","params":{},"_meta":{"extension":true}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}
+{"jsonrpc":"2.0","id":7,"result":{"sessions":[]},"unknown":"preserved"}
+{"jsonrpc":"2.0","id":8,"error":{"code":-32602,"message":"invalid params","data":{"extension":true}}}

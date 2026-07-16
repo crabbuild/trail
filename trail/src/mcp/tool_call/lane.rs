@@ -129,6 +129,84 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.sync_node_dependencies(&lane, args.path.as_deref())?)
         }
+        "trail.env_adapters" => tool_result(db.workspace_environment_adapters()?),
+        "trail.env_status" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.environment_component_status(&lane)?)
+        }
+        "trail.env_discover" => {
+            let args: DependencySyncArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.discover_workspace_environment(&lane, args.path.as_deref())?)
+        }
+        "trail.env_graph" => {
+            let args: EnvironmentGraphArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.workspace_environment_graph_page(
+                &lane,
+                args.path.as_deref(),
+                args.offset,
+                args.limit,
+            )?)
+        }
+        "trail.env_generation" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.active_environment_generation(&lane)?)
+        }
+        "trail.env_explain" => {
+            let args: EnvironmentExplainArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.explain_workspace_environment_staleness_page(
+                &lane,
+                &args.component,
+                args.offset,
+                args.limit,
+            )?)
+        }
+        "trail.env_plan" => {
+            let args: EnvironmentSyncArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.plan_workspace_environment_component(
+                &lane,
+                args.adapter.as_deref().unwrap_or("auto"),
+                args.path.as_deref(),
+                args.component.as_deref(),
+            )?)
+        }
+        "trail.env_sync" => {
+            let args: EnvironmentSyncArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.sync_workspace_environment_component_with_runtime(
+                &lane,
+                args.adapter.as_deref().unwrap_or("auto"),
+                args.path.as_deref(),
+                args.component.as_deref(),
+            )?)
+        }
+        "trail.env_sync_all" => {
+            let args: DependencySyncArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(
+                db.sync_all_workspace_environments_with_runtime(&lane, args.path.as_deref())?,
+            )
+        }
+        "trail.env_runtime_status" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.active_environment_generation(&lane)?)
+        }
+        "trail.env_runtime_reconcile" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.reconcile_workspace_environment_runtime(&lane)?)
+        }
+        "trail.env_runtime_stop" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.stop_workspace_environment_runtime(&lane)?)
+        }
         "trail.cache_list" => tool_result(db.list_workspace_layers()?),
         "trail.cache_inspect" | "trail.cache_verify" => {
             let args: CacheLayerArgs = parse_args(arguments)?;

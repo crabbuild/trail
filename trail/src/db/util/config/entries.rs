@@ -4,6 +4,12 @@ pub(crate) fn config_entries_from(config: &TrailConfig) -> Vec<ConfigEntry> {
     vec![
         config_entry("workspace.id", &config.workspace.id.0, "string", true),
         config_entry(
+            "agent.default_provider",
+            config.agent.default_provider.as_deref().unwrap_or_default(),
+            "string",
+            false,
+        ),
+        config_entry(
             "workspace.default_branch",
             &config.workspace.default_branch,
             "string",

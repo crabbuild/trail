@@ -33,23 +33,24 @@ trail --json agent dashboard latest
 
 | Command | Purpose and important options |
 | --- | --- |
-| `setup` | Print editor setup. `--provider <NAME>` defaults to `claude-code`; `--editor <NAME>` defaults to `vscode`. |
-| `doctor` | Check provider and workspace readiness. `--provider <NAME>` defaults to `claude-code`. |
-| `start` | Create a fresh task lane and launch a terminal agent. Supports `--provider`, `--name`, `--from`, `--workdir-mode`, and a command after `--`. |
+| `acp setup <PROVIDER>` | Preview ACP editor setup. Accepts equivalent `--provider`, plus `--editor`, `--print`, and `--yes`. |
+| `hooks setup <PROVIDER>` | Preview native hook setup. Accepts equivalent `--provider`, plus `--scope`, `--print`, and `--yes`. |
+| `doctor [PROVIDER]` | Check terminal provider and workspace readiness. Accepts equivalent `--provider`. |
+| `start [PROVIDER]` | Create a fresh task lane and launch a terminal agent. Accepts equivalent `--provider`, a configured default, `--name`, `--from`, `--workdir-mode`, and a command after `--`. |
 | `continue [TASK]` | Create a follow-up task from an existing task checkpoint. Supports `--provider`, `--name`, `--workdir-mode`, and a command after `--`. Alias: `follow-up`. |
-| `acp` | Hidden stable ACP entry point used by editor integrations. Supports `--provider`, `--name`, `--from`, `--no-mcp`, and a command after `--`. |
+| `acp status/doctor/sessions` | Inspect ACP providers, readiness, and captured sessions. Editors use the hidden `acp run` entrypoint. |
 
 Built-in terminal profiles are `claude-code`, `codex`, `cursor`, `gemini`,
 `aider`, and `opencode`.
 
-Valid terminal workdir modes are `full-cow`, `overlay-cow`, and `nfs-cow`; the
-default is `full-cow`.
+Valid terminal workdir modes are `auto`, `native-cow`, `portable-copy`,
+`fuse-cow`, `nfs-cow`, and `dokan-cow`; the default is `auto`.
 
 ```sh
-trail agent setup --provider codex --editor vscode
-trail agent doctor --provider codex
-trail agent start --provider codex --name docs-task
-trail agent start --provider codex --from main --workdir-mode full-cow
+trail agent acp setup codex --editor vscode
+trail agent doctor codex
+trail agent start codex --name docs-task
+trail agent start codex --from main --workdir-mode native-cow
 trail agent continue latest --provider claude-code
 ```
 
@@ -208,6 +209,35 @@ scripts and integrations; the high-level apply workflow targets the current
 Git branch.
 
 ## Recovery
+
+### Native hooks, evidence, and managed capture
+
+| Command | Purpose and important options |
+| --- | --- |
+| `hooks add PROVIDER` | Safely install Trail-owned project or user hooks. Use `--scope project|user`, `--lane`, `--dry-run`, and `--force` only after reviewing foreign config. |
+| `hooks remove PROVIDER` | Remove only exact Trail-owned entries or files. Supports scope, dry-run, and force. |
+| `hooks list` | List all eight adapters and recorded installations; `--installed` filters the catalog. |
+| `hooks status PROVIDER` | Compare persisted ownership digests with current provider configuration. |
+| `hooks doctor [PROVIDER]` | Report compatibility, drift, receipt failures, spool pressure, capture ownership, transcript fidelity, and stale finalizers. Use `--all` or `--probe`. |
+| `hooks events PROVIDER` | List durable redacted receipt rows; `--failed` selects retry, quarantine, and discarded states. |
+| `hooks replay --pending` | Drain the secure fallback spool, recover stale processing leases, and replay due receipts with bounded exponential backoff. |
+| `hooks retry RECEIPT` | Move a retrying or quarantined receipt back to the replay queue. |
+| `hooks discard RECEIPT` | Retain the receipt audit row while explicitly preventing later replay. |
+| `capture begin` | Declare a leased managed run with `--owner`, `--session`, optional `--executor`, `--lane`, `--workdir`, `--work-item`, and `--ttl-ms`. |
+| `capture renew RUN` | Renew the exact owner/session lease. |
+| `capture end RUN` | Idempotently end the exact owner/session run. |
+| `capture status` | List active runs; `--all` includes ended and expired runs. |
+| `capture reconcile` | Expire abandoned runs and close their open mappings, turns, and sessions as interrupted. |
+| `artifacts SESSION` | List immutable native transcript, canonical export, or reconstructed evidence artifacts. |
+| `provenance SESSION` | Read factual and explicitly derived causal nodes and edges. |
+| `attest create|list|show|verify` | Create and verify content-addressed, chained session attestations. |
+| `learnings list|accept|reject` | Review reusable findings; Trail never edits provider context files automatically. |
+| `export SESSION` | Write or print the verified portable agent-trace representation; `--attachments` includes bounded attachment bytes. |
+| `git-link link|list` | Record or query exact Git commit, Trail change, turn, and session associations. |
+
+The singular `trail agent hook receive PROVIDER EVENT` command is an internal,
+fail-open provider callback. Integration authors may call it, but users should
+manage installations through `trail agent hooks`.
 
 | Command | Purpose and important options |
 | --- | --- |

@@ -21,41 +21,40 @@ and apply.
 ### Set up an agent provider
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent setup
+trail agent doctor claude-code
+trail agent acp setup claude-code --editor vscode
 ```
 
-`agent setup` defaults to Claude Code plus VS Code. Use `--provider` for another
-agent:
+ACP setup requires an explicit provider. Terminal agents do not require setup:
 
 ```sh
-trail agent setup --provider codex
-trail agent setup --provider cursor
-trail agent setup --provider gemini --editor generic
+trail agent acp setup codex
+trail agent acp setup cursor
+trail agent start gemini
 ```
 
 ### Run an agent task from the terminal
 
 ```sh
-trail agent start --provider claude-code
-trail agent start --provider codex
-trail agent start --provider cursor
-trail agent start --provider gemini
-trail agent start --provider aider
-trail agent start --provider opencode
+trail agent start claude-code
+trail agent start codex
+trail agent start cursor
+trail agent start gemini
+trail agent start aider
+trail agent start opencode
 ```
 
-Use `--workdir-mode overlay-cow` when a large repository should be exposed as a
+Use `--workdir-mode fuse-cow` when a large repository should be exposed as a
 mounted COW filesystem view instead of a full copied workdir:
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
+trail agent start codex --workdir-mode fuse-cow
 ```
 
 For an unsupported terminal agent, pass the exact command after `--`:
 
 ```sh
-trail agent start --provider custom -- my-agent --flag
+trail agent start custom -- my-agent --flag
 ```
 
 ### After the agent runs
@@ -78,7 +77,8 @@ validation, apply, or recovery step.
 | Family | Use it for |
 | --- | --- |
 | `agent` | Task-oriented coding-agent workflow |
-| `acp` | Low-level ACP relay, install snippets, and captured sessions |
+| `agent acp` | ACP editor setup, provider status, diagnostics, and captured sessions |
+| `acp` | Low-level ACP relay for custom hosts and diagnostics |
 | `mcp` | MCP stdio server for agent context tools |
 | `git` | Export, import, and inspect Git mappings |
 | `api` | Generate OpenAPI output |
@@ -97,7 +97,7 @@ validation, apply, or recovery step.
 | --- | --- |
 | Task | One unit of agent work tracked by Trail |
 | Lane | Isolated Trail branch-like workspace for the task |
-| Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally overlay-cow |
+| Workdir | Filesystem directory where a terminal agent edits; usually native-cow, optionally fuse-cow |
 | Turn | One prompt or response cycle captured from ACP |
 | Checkpoint | Recorded code state that can be reviewed, applied, or rewound |
 | `latest` | The most recent non-archived agent task |
@@ -114,9 +114,9 @@ The high-level workflow is:
 
 | Provider | ACP | MCP | Terminal default | Notes |
 | --- | --- | --- | --- | --- |
-| `claude-code` | Yes | Yes | `claude` | Default setup provider |
+| `claude-code` | Yes | Yes | `claude` | Built-in ACP and terminal provider |
 | `codex` | Yes | Yes | `codex` | Uses the Codex ACP adapter for ACP mode |
-| `cursor` | Yes | Yes | `agent` | Uses `agent acp` for ACP mode |
+| `cursor` | Yes | Yes | `agent` | Uses Trail's hidden `agent acp run` entrypoint in ACP mode |
 | `gemini` | No | Yes | `gemini` | Terminal-first provider |
 | `aider` | No | No | `aider` | Terminal-first provider |
 | `opencode` | No | No | `opencode` | Terminal-first provider |
@@ -130,14 +130,14 @@ agents direct Trail context tools when they support MCP.
 
 | Command | Use it when |
 | --- | --- |
-| `trail agent setup` | Print the default Claude Code + VS Code setup |
-| `trail agent setup --provider codex` | Print Codex setup |
-| `trail agent setup --provider cursor` | Print Cursor setup |
-| `trail agent setup --provider gemini` | Print Gemini setup notes |
-| `trail agent doctor --provider <PROVIDER>` | Check workspace and provider readiness |
+| `trail agent acp setup claude-code --editor vscode` | Print a Claude Code + VS Code ACP entry |
+| `trail agent acp setup codex` | Print Codex setup |
+| `trail agent acp setup cursor` | Print Cursor setup |
+| `trail agent start gemini` | Launch Gemini in an isolated terminal task |
+| `trail agent doctor <PROVIDER>` | Check workspace and provider readiness |
 | `trail agent action` | Show runnable setup, review, validation, apply, and recovery actions |
 
-`agent setup` output includes:
+`agent acp setup` output includes:
 
 - The selected mode: `acp` or `terminal`.
 - Provider capabilities: ACP, MCP, and terminal.
@@ -147,29 +147,33 @@ agents direct Trail context tools when they support MCP.
 ### Start or continue work
 
 ```text
-trail agent acp --provider <claude-code|codex|cursor> \
+trail agent acp run <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
-trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow|nfs-cow] \
+trail agent start [<claude-code|codex|cursor|gemini|aider|opencode>] \
+  [--provider <PROVIDER>] \
+  [--name <NAME>] [--from <REF>] [--workdir-mode auto|native-cow|portable-copy|fuse-cow|nfs-cow|dokan-cow] \
   [-- <COMMAND>...]
 
 trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
-  [--workdir-mode full-cow|overlay-cow|nfs-cow] [-- <COMMAND>...]
+  [--workdir-mode auto|native-cow|portable-copy|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
 ```
 
-Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
-for each ACP session.
+Editors use the hidden `agent acp run` entrypoint generated by ACP setup. It
+creates a fresh task lane for each ACP session.
 
 Use `agent start` when launching an agent directly from the terminal. It creates
 a task workdir, runs the agent there, and records a checkpoint when the command
-exits. The default `full-cow` mode creates a full materialized workdir using
-filesystem clone COW when possible. `overlay-cow` mounts a FUSE view for the
+exits. The default `auto` mode first requires native cloning for every file and
+restarts portably if native COW is unavailable. Explicit `native-cow` never
+copies bytes, while `portable-copy` reports the actual clone/copy mix.
+`fuse-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.
 On macOS, `nfs-cow` provides the same write-time copy-up behavior through the
 built-in loopback NFS client and requires no kernel extension.
+On Windows, `dokan-cow` exposes the same layered semantics through Dokan 2.x.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.
@@ -375,14 +379,14 @@ trail acp relay [AGENT] [--lane <LANE>] [--from <REF>] \
   [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] \
   [--provider <NAME>] [--model <NAME>] [--no-mcp] [-- <COMMAND>...]
 
-trail acp install --agent <AGENT> \
-  [--editor generic|zed] [--dry-run] [--print]
+trail agent acp setup <AGENT> [--editor generic|vscode|zed] [--print] [--yes]
+trail agent acp setup --provider <AGENT> [--editor generic|vscode|zed] [--print] [--yes]
 
-trail acp doctor --agent <AGENT> \
+trail agent acp doctor <AGENT> \
   [--relay-command <COMMAND>...]
 
-trail acp list
-trail acp sessions [--lane <LANE>]
+trail agent acp status
+trail agent acp sessions [--lane <LANE>]
 ```
 
 Start a built-in ACP provider with its default upstream adapter:
@@ -393,17 +397,17 @@ trail acp relay codex
 trail acp relay cursor
 ```
 
-`AGENT` may also be any ID from the official ACP registry. `trail acp list`
+`AGENT` may also be any ID from the official ACP registry. `trail agent acp status`
 fetches and caches that registry, then shows the current IDs. Registry `npx`
 and `uvx` entries install through their package runner; matching binary entries
 download into `.trail/acp/agents/` on first launch.
 
 `--materialize` is enabled by default. For an ACP-compatible agent outside the
 registry, keep the explicit form: `trail acp relay --provider my-agent -- my-agent acp`.
-For a terminal-first agent session instead, use `trail agent start --provider codex`.
+For a terminal-first agent session instead, use `trail agent start codex`.
 
-Use `acp install` to print setup snippets. It does not mutate editor
-configuration. Use `acp sessions` to inspect captured ACP sessions.
+Use `agent acp setup` to preview editor configuration. Add `--yes` to apply an
+exact supported adapter. Use `agent acp sessions` to inspect captured sessions.
 
 ## MCP
 
@@ -414,8 +418,8 @@ trail mcp
 Starts the MCP stdio server.
 
 Register this command in agents that support MCP when you want the agent to ask
-Trail for workspace context. `agent setup --provider gemini --editor generic`
-prints the same command as part of the Gemini setup notes.
+Trail for workspace context. Terminal-only providers can run through
+`trail agent start <provider>` without an ACP setup step.
 
 ## Git Integration
 
@@ -478,8 +482,8 @@ Runs workspace and integration diagnostics.
 Use provider-specific diagnostics when the question is about agent setup:
 
 ```sh
-trail agent doctor --provider claude-code
-trail acp doctor --agent claude-code
+trail agent doctor claude-code
+trail agent acp doctor claude-code
 ```
 
 ## Backup

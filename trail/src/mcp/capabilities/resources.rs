@@ -246,10 +246,10 @@ pub(crate) fn resources() -> Value {
             "mimeType": "application/json"
         },
         {
-            "uri": RESOURCE_MERGE_QUEUE,
-            "name": "merge-queue",
-            "title": "Merge Queue",
-            "description": "Current serialized merge queue entries.",
+            "uri": RESOURCE_LANE_MERGE_QUEUE,
+            "name": "lane-merge-queue",
+            "title": "Lane Merge Queue",
+            "description": "Current serialized lane merge queue entries.",
             "mimeType": "application/json"
         },
         {
@@ -271,6 +271,20 @@ pub(crate) fn resources() -> Value {
             "name": "agent-tasks",
             "title": "Agent Task Inbox",
             "description": "Grouped agent tasks and the one next useful action.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_INTEGRATIONS,
+            "name": "agent-integrations",
+            "title": "Agent Integration Capabilities",
+            "description": "Built-in provider hook, transcript/export, and ACP capability contracts.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_HOOK_RECEIPTS,
+            "name": "agent-hook-receipts",
+            "title": "Agent Hook Receipt Diagnostics",
+            "description": "The latest durable redacted native hook receipt journal rows.",
             "mimeType": "application/json"
         },
         {

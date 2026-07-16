@@ -27,7 +27,7 @@ Honor tool risk annotations:
 
 - Read-only: status, reports, diff, readiness, diagnosis, resources.
 - Workspace write: review markers and archive metadata.
-- Destructive write: apply/finish, undo/rewind, merge-queue execution.
+- Destructive write: apply/finish, undo/rewind, lane merge-queue execution.
 - Open-world write: test/eval commands.
 
 Require confirmation appropriate to the risk. For non-dry-run apply/finish, call readiness and dry-run first.
@@ -52,11 +52,11 @@ Use `trail.run_pause`/`trail.run_resume` across real interruptions. Never fabric
 Use ACP when an editor should keep its normal agent UX while Trail records turns, events, edits, and checkpoints and injects Trail MCP tools:
 
 ```sh
-trail agent setup --provider codex --editor vscode
+trail agent acp setup codex --editor vscode
 trail acp relay codex
 ```
 
-Use `trail agent start --provider <name>` for terminal-first agents. ACP relay is the richer streaming-capture path; terminal tasks universally isolate work and record the final checkpoint.
+Use `trail agent start <name>` for terminal-first agents. ACP relay is the richer streaming-capture path; terminal tasks universally isolate work and record the final checkpoint.
 
 ## HTTP Daemon
 

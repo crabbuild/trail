@@ -14,11 +14,29 @@ mod readiness;
 mod rewind;
 mod turns;
 mod workdir;
+mod workspace_cargo;
+mod workspace_cmake;
+mod workspace_environment;
 mod workspace_git;
+mod workspace_go;
 mod workspace_layer;
 mod workspace_node;
+mod workspace_oci;
+mod workspace_plugin;
+mod workspace_python;
+mod workspace_recipe;
+mod workspace_runtime;
 mod workspace_view;
 
+#[cfg(debug_assertions)]
+pub(crate) use lifecycle::set_sparse_selection_write_failure_for_current_thread;
 pub(crate) use workdir::ViewMutationBarrier;
-pub(crate) use workspace_layer::WorkspaceLayerBinding;
+#[cfg(debug_assertions)]
+pub(crate) use workdir::{
+    install_lane_record_after_c2_write_for_current_thread, run_changed_path_view_flow,
+    set_lane_record_postcommit_failure_for_current_thread,
+};
+pub(crate) use workspace_layer::{
+    EnvironmentLayerActivation, EnvironmentLayerOutputActivation, WorkspaceLayerBinding,
+};
 pub(crate) use workspace_view::WorkspaceMountLease;

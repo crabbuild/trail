@@ -6,13 +6,14 @@ use super::{render::*, *};
 
 use trail::{
     acp::AcpRelayOptions, Actor, Error, InitImportMode, LaneGateOptions, OperationKind,
-    PatchDocument, RecordOptions, Result, Trail,
+    PatchDocument, RecordOptions, Result, StructuredErrorEnvelope, Trail,
 };
 
 mod acp;
 mod agent;
 mod collaboration;
 mod daemon_rpc;
+mod daemon_start;
 mod errors;
 mod inspect;
 mod lane;
@@ -26,6 +27,24 @@ use errors::*;
 use parsing::*;
 use runtime::*;
 
+fn resolve_agent_provider_argument(
+    positional: Option<String>,
+    named: Option<String>,
+    fallback: Option<&str>,
+) -> Result<String> {
+    match (positional, named) {
+        (Some(_), Some(_)) => Err(Error::InvalidInput(
+            "provider may be supplied either positionally or with --provider, not both".to_string(),
+        )),
+        (Some(provider), None) | (None, Some(provider)) => Ok(provider),
+        (None, None) => fallback.map(ToString::to_string).ok_or_else(|| {
+            Error::InvalidInput(
+                "choose a provider positionally or with --provider <PROVIDER>".to_string(),
+            )
+        }),
+    }
+}
+
 pub(crate) fn run_cli() {
     let json_errors =
         args_request_json_errors(std::env::args_os().skip(1)) || env_requests_json_errors();
@@ -34,7 +53,10 @@ pub(crate) fn run_cli() {
         Err(err) => handle_cli_parse_error(err, json_errors),
     };
     let json_errors = cli.json
-        || matches!(cli.format.as_ref(), Some(OutputFormat::Json))
+        || matches!(
+            cli.format.as_ref(),
+            Some(OutputFormat::Json | OutputFormat::Ndjson)
+        )
         || env_requests_json_errors();
     if let Err(err) = run(cli) {
         render_error(&err, json_errors);
@@ -45,6 +67,18 @@ pub(crate) fn run_cli() {
 fn run(cli: Cli) -> Result<()> {
     let format = resolve_output_format(cli.format)?;
     let json = cli.json || matches!(format, OutputFormat::Json);
+    let render_mode = if matches!(format, OutputFormat::Plain) {
+        RenderMode::Plain
+    } else {
+        RenderMode::Human
+    };
+    let render = RenderOptions::from_environment(
+        render_mode,
+        cli.color.as_policy(),
+        cli.pager.as_policy(),
+        cli.verbose,
+        cli.quiet,
+    );
     let workspace = cli
         .workspace
         .clone()
@@ -73,10 +107,16 @@ fn run(cli: Cli) -> Result<()> {
         branch,
         json,
         quiet: cli.quiet,
-        color: !cli.no_color && std::env::var_os("NO_COLOR").is_none(),
         format,
+        render,
     };
     let command = cli.command;
+    if matches!(ctx.format, OutputFormat::Ndjson) && !supports_ndjson(&command) {
+        return Err(Error::InvalidInput(
+            "--format ndjson is available only for streaming watch commands; use --format json for a single report"
+                .to_string(),
+        ));
+    }
     if let Some(daemon_url) = daemon_url {
         if daemon_rpc::try_handle_daemon_command(
             &ctx,
@@ -110,7 +150,7 @@ fn run(cli: Cli) -> Result<()> {
                 args.text_policy.as_ref().map(TextPolicyArg::as_str),
                 args.prolly_backend.as_ref().map(ProllyBackendArg::as_str),
             )?;
-            render_init(&report, ctx.json, ctx.quiet)
+            render_init(&report, ctx.json, &ctx.render)
         }
         Command::Config(config) => workspace::handle_config_command(&ctx, config),
         Command::Ignore(ignore) => workspace::handle_ignore_command(&ctx, ignore),
@@ -133,6 +173,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
         Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
         Command::Deps(deps) => handle_deps_command(&ctx, deps),
+        Command::Env(environment) => handle_environment_command(&ctx, environment),
         Command::Cache(cache) => handle_cache_command(&ctx, cache),
         Command::Acp(acp_command) => acp::handle_acp_command(&ctx, acp_command),
         Command::Agent(agent_command) => agent::handle_agent_command(&ctx, agent_command),
@@ -144,8 +185,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Approvals(approvals_command) => {
             collaboration::handle_approvals_command(&ctx, approvals_command)
         }
-        Command::MergeLane(args) => collaboration::handle_merge_lane_command(&ctx, args),
-        Command::MergeQueue(queue) => collaboration::handle_merge_queue_command(&ctx, queue),
         Command::Conflicts(conflicts) => collaboration::handle_conflicts_command(&ctx, conflicts),
         Command::Anchor(anchor) => collaboration::handle_anchor_command(&ctx, anchor),
         Command::Lease(lease) => collaboration::handle_lease_command(&ctx, lease),
@@ -161,44 +200,170 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+fn supports_ndjson(command: &Command) -> bool {
+    match command {
+        Command::Watch(_) => true,
+        Command::Index(IndexCommand {
+            command: IndexSubcommand::Watch(_),
+        }) => true,
+        Command::Index(IndexCommand {
+            command: IndexSubcommand::Reconcile(_),
+        }) => true,
+        Command::Lane(LaneCommand {
+            command: LaneSubcommand::Watch(args),
+        }) => !args.once,
+        _ => false,
+    }
+}
+
+fn render_specialist<T: serde::Serialize>(
+    ctx: &RuntimeContext,
+    title: &str,
+    report: &T,
+) -> Result<()> {
+    render_semantic_report(title, report, ctx.json, &ctx.render)
+}
+
+fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentCommand) -> Result<()> {
+    let db = open_db(ctx)?;
+    match environment.command {
+        EnvironmentSubcommand::Adapters => render_specialist(
+            ctx,
+            "Environment adapters",
+            &db.workspace_environment_adapters()?,
+        ),
+        EnvironmentSubcommand::Plugin(plugin) => match plugin.command {
+            EnvironmentPluginSubcommand::Inspect(args) => render_specialist(
+                ctx,
+                "Environment adapter package",
+                &db.inspect_environment_adapter_plugin_package(&args.package)?,
+            ),
+            EnvironmentPluginSubcommand::Install(args) => render_specialist(
+                ctx,
+                "Installed environment adapter",
+                &db.install_environment_adapter_plugin(&args.package)?,
+            ),
+            EnvironmentPluginSubcommand::Remove(args) => render_specialist(
+                ctx,
+                "Updated environment adapter",
+                &db.remove_environment_adapter_plugin(&args.identity)?,
+            ),
+            EnvironmentPluginSubcommand::Trust(args) => match args.command {
+                EnvironmentPluginTrustSubcommand::Add(args) => render_specialist(
+                    ctx,
+                    "Trusted adapter publisher",
+                    &db.trust_environment_adapter_publisher_key(&args.key)?,
+                ),
+                EnvironmentPluginTrustSubcommand::List => render_specialist(
+                    ctx,
+                    "Trusted adapter publishers",
+                    &db.environment_adapter_publisher_trust()?,
+                ),
+                EnvironmentPluginTrustSubcommand::Remove(args) => render_specialist(
+                    ctx,
+                    "Removed adapter publisher trust",
+                    &db.remove_environment_adapter_publisher_key(&args.key_id)?,
+                ),
+            },
+        },
+        EnvironmentSubcommand::Discover(args) => render_specialist(
+            ctx,
+            "Environment discovery",
+            &db.discover_workspace_environment(&args.lane, args.path.as_deref())?,
+        ),
+        EnvironmentSubcommand::Graph(args) => render_specialist(
+            ctx,
+            "Environment graph",
+            &db.workspace_environment_graph_page(
+                &args.lane,
+                args.path.as_deref(),
+                args.offset,
+                args.limit,
+            )?,
+        ),
+        EnvironmentSubcommand::Status(args) => render_specialist(
+            ctx,
+            "Environment status",
+            &db.environment_component_status(&args.lane)?,
+        ),
+        EnvironmentSubcommand::Generation(args) => render_specialist(
+            ctx,
+            "Environment generation",
+            &db.active_environment_generation(&args.lane)?,
+        ),
+        EnvironmentSubcommand::Explain(args) => render_specialist(
+            ctx,
+            "Environment staleness",
+            &db.explain_workspace_environment_staleness_page(
+                &args.lane,
+                &args.component,
+                args.offset,
+                args.limit,
+            )?,
+        ),
+        EnvironmentSubcommand::Plan(args) => render_specialist(
+            ctx,
+            "Environment plan",
+            &db.plan_workspace_environment_component(
+                &args.lane,
+                &args.adapter,
+                args.path.as_deref(),
+                args.component.as_deref(),
+            )?,
+        ),
+        EnvironmentSubcommand::Sync(args) => render_specialist(
+            ctx,
+            "Synchronized environment",
+            &db.sync_workspace_environment_component_with_runtime(
+                &args.lane,
+                &args.adapter,
+                args.path.as_deref(),
+                args.component.as_deref(),
+            )?,
+        ),
+        EnvironmentSubcommand::SyncAll(args) => render_specialist(
+            ctx,
+            "Synchronized environments",
+            &db.sync_all_workspace_environments_with_runtime(&args.lane, args.path.as_deref())?,
+        ),
+        EnvironmentSubcommand::Runtime(runtime) => {
+            let generation = match runtime.command {
+                EnvironmentRuntimeSubcommand::Status(args) => db
+                    .active_environment_generation(&args.lane)?
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "lane `{}` has no active environment generation",
+                            args.lane
+                        ))
+                    })?,
+                EnvironmentRuntimeSubcommand::Reconcile(args) => {
+                    db.reconcile_workspace_environment_runtime(&args.lane)?
+                }
+                EnvironmentRuntimeSubcommand::Stop(args) => {
+                    db.stop_workspace_environment_runtime(&args.lane)?
+                }
+            };
+            render_specialist(ctx, "Environment runtime", &generation)
+        }
+    }
+}
+
 fn handle_deps_command(ctx: &RuntimeContext, deps: DepsCommand) -> Result<()> {
+    let db = open_db(ctx)?;
     match deps.command {
         DepsSubcommand::Status(args) => {
-            let db = open_db(ctx)?;
             db.refresh_workspace_environment_staleness(&args.lane)?;
-            let report = db.workspace_environment_status(&args.lane)?;
-            if ctx.json {
-                render_json(&report)
-            } else {
-                if !ctx.quiet {
-                    for environment in report {
-                        println!(
-                            "{} {} expected={} attached={}",
-                            environment.adapter,
-                            environment.status,
-                            environment.expected_key,
-                            environment.attached_key.as_deref().unwrap_or("-")
-                        );
-                    }
-                }
-                Ok(())
-            }
+            render_specialist(
+                ctx,
+                "Dependency status",
+                &db.workspace_environment_status(&args.lane)?,
+            )
         }
-        DepsSubcommand::Sync(args) => {
-            let db = open_db(ctx)?;
-            let report = db.sync_node_dependencies(&args.lane, args.path.as_deref())?;
-            if ctx.json {
-                render_json(&report)
-            } else {
-                if !ctx.quiet {
-                    println!(
-                        "Attached layer {} ({}, {} bytes)",
-                        report.layer_id, report.adapter, report.logical_bytes
-                    );
-                }
-                Ok(())
-            }
-        }
+        DepsSubcommand::Sync(args) => render_specialist(
+            ctx,
+            "Synchronized dependencies",
+            &db.sync_node_dependencies(&args.lane, args.path.as_deref())?,
+        ),
     }
 }
 
@@ -206,72 +371,21 @@ fn handle_cache_command(ctx: &RuntimeContext, cache: CacheCommand) -> Result<()>
     let db = open_db(ctx)?;
     match cache.command {
         CacheSubcommand::List => {
-            let report = db.list_workspace_layers()?;
-            if ctx.json {
-                render_json(&report)
-            } else {
-                if !ctx.quiet {
-                    for layer in report {
-                        println!(
-                            "{} {} {} logical={} physical={}",
-                            layer.layer_id,
-                            layer.adapter,
-                            layer.state,
-                            layer.logical_bytes,
-                            layer
-                                .physical_bytes
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
-                    }
-                }
-                Ok(())
-            }
+            render_specialist(ctx, "Workspace cache", &db.list_workspace_layers()?)
         }
-        CacheSubcommand::Verify(args) | CacheSubcommand::Inspect(args) => {
-            let report = db.verify_workspace_layer(&args.layer)?;
-            if ctx.json {
-                render_json(&report)
+        CacheSubcommand::Verify(args) | CacheSubcommand::Inspect(args) => render_specialist(
+            ctx,
+            "Workspace cache layer",
+            &db.verify_workspace_layer(&args.layer)?,
+        ),
+        CacheSubcommand::Gc(args) => render_specialist(
+            ctx,
+            if args.dry_run {
+                "Workspace cache cleanup preview"
             } else {
-                if !ctx.quiet {
-                    println!(
-                        "{} {} {} entries={} bytes={}",
-                        report.layer_id,
-                        report.adapter,
-                        report.state,
-                        report.entry_count,
-                        report.logical_bytes
-                    );
-                }
-                Ok(())
-            }
-        }
-        CacheSubcommand::Gc(args) => {
-            let report = db.workspace_cache_gc(args.dry_run, args.retention_secs)?;
-            if ctx.json {
-                render_json(&report)
-            } else {
-                if !ctx.quiet {
-                    println!(
-                        "cache gc {}: candidates={} reclaimable={} reclaimed={}",
-                        if report.dry_run {
-                            "dry-run"
-                        } else {
-                            "complete"
-                        },
-                        report.candidates.len(),
-                        report.reclaimable_bytes,
-                        report.reclaimed_bytes
-                    );
-                    for item in &report.candidates {
-                        println!(
-                            "{} {} bytes={} reason={}",
-                            item.kind, item.id, item.physical_bytes, item.reason
-                        );
-                    }
-                }
-                Ok(())
-            }
-        }
+                "Workspace cache cleanup"
+            },
+            &db.workspace_cache_gc(args.dry_run, args.retention_secs)?,
+        ),
     }
 }

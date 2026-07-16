@@ -7,7 +7,7 @@ Use Trail's safety signals as workflow inputs, not obstacles to bypass.
 Preview and obtain clear user intent before:
 
 - Non-dry-run `trail agent apply` or `finish` because they can record a task workdir, create a Git commit, and fast-forward the current Git branch.
-- Direct/shared-ref merge, `merge-queue run`, or conflict resolution.
+- Direct/shared-ref merge, `trail lane merge-queue run`, or conflict resolution.
 - `undo`, `rewind`, checkout into an active workspace, forced workdir sync, lane removal, restore, non-dry-run GC, or destructive branch operations.
 - Approval decisions, test/eval execution, network/deploy commands, or other open-world actions.
 
@@ -69,7 +69,7 @@ Readiness may block on dirty materialized workdirs, required or failed gates, pe
 For queued work:
 
 ```sh
-trail merge-queue explain <lane>
+trail lane merge-queue explain <lane>
 trail lane refresh-preview <lane> --target main
 ```
 

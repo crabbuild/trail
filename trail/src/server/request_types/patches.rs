@@ -13,10 +13,8 @@ pub(crate) struct ApiPatchRequest {
     pub(crate) allow_ignored: bool,
     #[serde(default)]
     pub(crate) allow_stale: bool,
-    #[serde(default)]
-    pub(crate) edits: Vec<crate::PatchEdit>,
-    #[serde(default)]
-    pub(crate) files: Vec<ApiPatchFile>,
+    pub(crate) edits: Option<Vec<crate::PatchEdit>>,
+    pub(crate) files: Option<Vec<ApiPatchFile>>,
 }
 
 #[derive(Debug, Deserialize)]

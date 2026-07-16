@@ -17,6 +17,63 @@ struct CleanWorkdirManifestEntry {
 }
 
 impl Trail {
+    pub(crate) fn repair_clean_workdir_manifest_root_mirror(
+        &self,
+        path: &Path,
+        old_root_id: &ObjectId,
+        new_root_id: &ObjectId,
+    ) -> bool {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        };
+        let mut manifest: CleanWorkdirManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(_) => return remove_clean_workdir_manifest_path(path).is_ok(),
+        };
+        if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION {
+            return remove_clean_workdir_manifest_path(path).is_ok();
+        }
+        if manifest.root_id == new_root_id.0 {
+            return true;
+        }
+        if manifest.root_id != old_root_id.0 {
+            return remove_clean_workdir_manifest_path(path).is_ok();
+        }
+        manifest.root_id = new_root_id.0.clone();
+        if self
+            .write_clean_workdir_manifest_entries_to_path(path, new_root_id, manifest.files)
+            .is_ok()
+        {
+            return true;
+        }
+        remove_clean_workdir_manifest_path(path).is_ok()
+    }
+
+    pub(crate) fn preflight_clean_workdir_manifest_root_retarget(
+        &self,
+        dir: &Path,
+        manifest_path: Option<&Path>,
+        old_root_id: &ObjectId,
+    ) -> Result<bool> {
+        let path = manifest_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| clean_workdir_manifest_path(dir));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let manifest: CleanWorkdirManifest = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::Corrupt(format!(
+                "clean workdir manifest `{}` cannot be retargeted: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(manifest.version == CLEAN_WORKDIR_MANIFEST_VERSION && manifest.root_id == old_root_id.0)
+    }
+
     pub(crate) fn cached_workdir_manifest_status(
         &self,
         dir: &Path,
@@ -35,6 +92,13 @@ impl Trail {
         manifest_path: &Path,
         root_id: &ObjectId,
     ) -> Result<CachedWorkdirManifestStatus> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            // Registered lane authority is the qualified v2 marker plus its
+            // ledger snapshot. A legacy N-entry manifest is never consulted.
+            return Ok(CachedWorkdirManifestStatus::Missing);
+        }
         let Some(manifest) = self.read_clean_workdir_manifest_from_path(manifest_path)? else {
             return Ok(CachedWorkdirManifestStatus::Missing);
         };
@@ -103,6 +167,45 @@ impl Trail {
             disk_manifest,
             candidate_paths: root_matches.then(|| candidate_paths.into_iter().collect()),
         })
+    }
+
+    /// Verify a freshly written materialization manifest without changing the
+    /// workdir. The caller must pin case sensitivity before its durability
+    /// barrier; probing it here would create and unlink a file after the
+    /// barrier, and the ordinary cached-manifest path may retire an invalid
+    /// manifest while classifying it.
+    pub(crate) fn clean_workdir_manifest_matches_read_only(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        case_insensitive: bool,
+    ) -> Result<bool> {
+        let manifest_path = clean_workdir_manifest_path(dir);
+        let bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let manifest = match serde_json::from_slice::<CleanWorkdirManifest>(&bytes) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(false),
+        };
+        if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION || manifest.root_id != root_id.0 {
+            return Ok(false);
+        }
+        let manifest_paths = manifest.files.keys().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+            dir,
+            &manifest_paths,
+            case_insensitive,
+        )?;
+        Ok(stamps.len() == manifest.files.len()
+            && stamps.iter().all(|(path, stamp)| {
+                manifest
+                    .files
+                    .get(path)
+                    .is_some_and(|cached| cached.stamp == *stamp)
+            }))
     }
 
     pub(crate) fn write_clean_workdir_manifest<'a, I>(
@@ -300,30 +403,6 @@ impl Trail {
         self.write_clean_workdir_manifest_entries_to_path(manifest_path, root_id, entries)
     }
 
-    pub(crate) fn write_clean_workdir_manifest_from_disk_manifest_and_stamps<'a, I>(
-        &self,
-        dir: &Path,
-        root_id: &ObjectId,
-        disk_manifest: &BTreeMap<String, DiskManifest>,
-        expected_paths: I,
-        stamps: BTreeMap<String, WorkdirFileStamp>,
-    ) -> Result<()>
-    where
-        I: IntoIterator<Item = &'a String>,
-    {
-        let expected = expected_paths
-            .into_iter()
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<BTreeSet<_>>>()?;
-        self.write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
-            dir,
-            root_id,
-            disk_manifest,
-            expected,
-            stamps,
-        )
-    }
-
     fn write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
         &self,
         dir: &Path,
@@ -369,6 +448,22 @@ impl Trail {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let target_paths = target.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &target_paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            if !self
+                .diff_file_maps_to_manifest_for_paths(target, &disk_manifest, &target_paths)?
+                .is_empty()
+            {
+                self.invalidate_materialized_lane_marker(dir)?;
+                return Ok(false);
+            }
+            self.invalidate_materialized_lane_marker(dir)?;
+            return Ok(true);
+        }
         let Some(mut manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -413,13 +508,23 @@ impl Trail {
         Ok(true)
     }
 
-    pub(crate) fn clean_workdir_manifest_allows_file_subset_update(
+    pub(crate) fn clean_workdir_manifest_allows_touched_path_update(
         &self,
         dir: &Path,
         previous_root_id: &ObjectId,
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let previous_paths = previous.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &previous_paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            return Ok(self
+                .diff_file_maps_to_manifest_for_paths(previous, &disk_manifest, &previous_paths)?
+                .is_empty());
+        }
         let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -431,15 +536,59 @@ impl Trail {
             return Ok(false);
         }
 
-        let mut paths = manifest.files.keys().cloned().collect::<BTreeSet<_>>();
-        for path in previous.keys() {
-            if !target.contains_key(path) {
-                paths.remove(path);
+        let case_insensitive = is_case_insensitive_filesystem(dir)?;
+        let candidate_paths = previous
+            .keys()
+            .chain(target.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let observed =
+            observed_exact_paths_for_candidates(dir, &candidate_paths, case_insensitive)?;
+        let observed_by_folded = index_observed_paths_by_folded(&observed);
+
+        for (path, entry) in previous {
+            let Some(cached) = manifest.files.get(path) else {
+                return Ok(false);
+            };
+            if cached.kind != entry.kind || cached.content_hash != entry.content_hash {
+                return Ok(false);
+            }
+            if observed.get(path) != Some(&ObservedPathKind::RegularFile) {
+                return Ok(false);
+            }
+            let metadata = match fs::symlink_metadata(safe_join(dir, path)?) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || cached.stamp != WorkdirFileStamp::from_metadata(&metadata)
+            {
+                return Ok(false);
             }
         }
-        paths.extend(target.keys().cloned());
-        if is_case_insensitive_filesystem(dir)? {
-            validate_no_case_fold_collisions(paths.iter())?;
+
+        let removed_paths = previous
+            .keys()
+            .filter(|path| !target.contains_key(*path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for path in target.keys().filter(|path| !previous.contains_key(*path)) {
+            let folded = case_insensitive_path_key(path);
+            let observed_aliases = observed_by_folded.get(&folded);
+            let aliases_are_removed_previous = observed_aliases.is_none_or(|aliases| {
+                aliases
+                    .iter()
+                    .all(|observed_path| removed_paths.contains(*observed_path))
+            });
+            if observed_aliases.is_some_and(|aliases| !aliases.is_empty())
+                && !aliases_are_removed_previous
+            {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -460,6 +609,15 @@ impl Trail {
         root_id: &ObjectId,
         entries: BTreeMap<String, CleanWorkdirManifestEntry>,
     ) -> Result<()> {
+        if let Some(workdir) = workdir_root_for_manifest_path(path) {
+            if crate::db::change_ledger::command_authority_enabled()
+                && self
+                    .registered_materialized_lane_for_root(workdir)?
+                    .is_some()
+            {
+                return self.invalidate_materialized_lane_marker(workdir);
+            }
+        }
         let parent = path.parent().ok_or_else(|| Error::InvalidPath {
             path: path.to_string_lossy().to_string(),
             reason: "clean workdir manifest has no parent".to_string(),
@@ -470,7 +628,7 @@ impl Trail {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, false)?;
+        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, true)?;
         Ok(())
     }
 
@@ -480,6 +638,16 @@ impl Trail {
         root_id: &ObjectId,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
+        if crate::db::change_ledger::command_authority_enabled()
+            && self.registered_materialized_lane_for_root(dir)?.is_some()
+        {
+            let paths = target.keys().cloned().collect::<Vec<_>>();
+            let disk = self.scan_files_under_for_paths(dir, &paths)?;
+            let disk_manifest = self.disk_manifest(&disk);
+            return Ok(self
+                .diff_file_maps_to_manifest_for_paths(target, &disk_manifest, &paths)?
+                .is_empty());
+        }
         let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
             return Ok(false);
         };
@@ -523,6 +691,15 @@ impl Trail {
         &self,
         path: &Path,
     ) -> Result<Option<CleanWorkdirManifest>> {
+        if let Some(workdir) = workdir_root_for_manifest_path(path) {
+            if crate::db::change_ledger::command_authority_enabled()
+                && self
+                    .registered_materialized_lane_for_root(workdir)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+        }
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -582,26 +759,220 @@ impl Trail {
         pinned_paths: &[String],
     ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
         let root = root.canonicalize()?;
+        let case_insensitive = match self.persisted_materialized_case_insensitive(&root)? {
+            Some(case_insensitive) => case_insensitive,
+            None => is_case_insensitive_filesystem(&root)?,
+        };
+        self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+            &root,
+            pinned_paths,
+            case_insensitive,
+        )
+    }
+
+    fn persisted_materialized_case_insensitive(&self, root: &Path) -> Result<Option<bool>> {
+        if !crate::db::change_ledger::command_authority_enabled() {
+            return Ok(None);
+        }
+        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        let persisted = self
+            .conn
+            .query_row(
+                "SELECT scope.case_sensitive,scope.filesystem_identity
+                 FROM lane_branches branch
+                 JOIN changed_path_scopes scope
+                   ON scope.scope_kind='materialized_lane' AND scope.owner_id=branch.lane_id
+                 WHERE branch.workdir=?1 AND branch.status<>'removed'
+                   AND scope.trust_state='trusted' AND scope.retired_at IS NULL",
+                [normalized.to_string_lossy().as_ref()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((case_sensitive, persisted_identity)) = persisted else {
+            return Ok(None);
+        };
+        let persisted_identity = hex::decode(persisted_identity)
+            .map_err(|_| Error::Corrupt("invalid materialized filesystem identity".into()))?;
+        if self.pinned_worktree_identity_for_path(root)? != persisted_identity {
+            return Ok(None);
+        }
+        match case_sensitive {
+            0 => Ok(Some(true)),
+            1 => Ok(Some(false)),
+            _ => Err(Error::Corrupt(
+                "invalid materialized case-sensitivity metadata".into(),
+            )),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_persisted_materialized_case_insensitive(
+        &self,
+        root: &Path,
+    ) -> Result<Option<bool>> {
+        self.persisted_materialized_case_insensitive(root)
+    }
+
+    fn scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+        case_insensitive: bool,
+    ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
+        self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+            root,
+            pinned_paths,
+            case_insensitive,
+        )
+        .map(|(files, _)| files)
+    }
+
+    fn scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+        case_insensitive: bool,
+    ) -> Result<(BTreeMap<String, WorkdirFileStamp>, usize)> {
+        let root = root.canonicalize()?;
         let mut files = self.scan_workdir_file_stamps(&root)?;
+        let mut exact_paths = files.keys().cloned().collect::<BTreeSet<_>>();
+        let observed = observed_exact_paths_for_candidates(&root, pinned_paths, case_insensitive)?;
+        let actual_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
+        let folded_paths = actual_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
+        let mut observed_insertions = 0;
+        for (path, kind) in &observed {
+            if exact_paths.contains(path) || *kind != ObservedPathKind::RegularFile {
+                continue;
+            }
+            observed_insertions += 1;
+            let Some(stamp) = open_observed_exact_regular_file_stamp(&root, path)? else {
+                continue;
+            };
+            exact_paths.insert(path.clone());
+            files.insert(path.clone(), stamp);
+        }
         for path in pinned_paths {
             let path = normalize_relative_path(path)?;
+            if !pinned_path_needs_probe(
+                case_insensitive,
+                &exact_paths,
+                &actual_paths,
+                &folded_paths,
+                &path,
+            ) {
+                continue;
+            }
             let abs = safe_join(&root, &path)?;
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     files.remove(&path);
+                    exact_paths.remove(&path);
                     continue;
                 }
                 Err(err) => return Err(Error::Io(err)),
             };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 files.remove(&path);
+                exact_paths.remove(&path);
                 continue;
             }
+            exact_paths.insert(path.clone());
             files.insert(path, WorkdirFileStamp::from_metadata(&metadata));
         }
-        Ok(files)
+        Ok((files, observed_insertions))
     }
+
+    fn registered_materialized_lane_for_root(&self, root: &Path) -> Result<Option<String>> {
+        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        self.conn
+            .query_row(
+                "SELECT lane.name FROM lanes lane JOIN lane_branches branch USING(lane_id)
+                 WHERE branch.workdir=?1 AND branch.status<>'removed'",
+                [normalized.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+}
+
+fn workdir_root_for_manifest_path(path: &Path) -> Option<&Path> {
+    (path.file_name().and_then(|name| name.to_str()) == Some("workdir-manifest.json")
+        && path.parent()?.file_name().and_then(|name| name.to_str()) == Some(".trail"))
+    .then(|| path.parent().and_then(Path::parent))
+    .flatten()
+}
+
+fn open_observed_exact_regular_file_stamp(
+    root: &Path,
+    path: &str,
+) -> Result<Option<WorkdirFileStamp>> {
+    let abs = safe_join(root, path)?;
+    #[cfg(not(unix))]
+    {
+        let metadata = match fs::symlink_metadata(&abs) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(None);
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = match options.open(&abs) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(not(unix))]
+    {
+        let final_metadata = fs::symlink_metadata(&abs)?;
+        if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(WorkdirFileStamp::from_metadata(&metadata)))
+}
+
+fn index_observed_paths_by_folded(
+    observed: &BTreeMap<String, ObservedPathKind>,
+) -> BTreeMap<String, Vec<&str>> {
+    let mut indexed = BTreeMap::<String, Vec<&str>>::new();
+    for path in observed.keys() {
+        indexed
+            .entry(case_insensitive_path_key(path))
+            .or_default()
+            .push(path);
+    }
+    indexed
+}
+
+fn pinned_path_needs_probe(
+    case_insensitive: bool,
+    exact_paths: &BTreeSet<String>,
+    actual_paths: &BTreeSet<String>,
+    folded_paths: &BTreeSet<String>,
+    path: &str,
+) -> bool {
+    !case_insensitive
+        || exact_paths.contains(path)
+        || actual_paths.contains(path)
+        || !folded_paths.contains(&case_insensitive_path_key(path))
 }
 
 fn clean_workdir_manifest_path(dir: &Path) -> PathBuf {
@@ -767,5 +1138,224 @@ mod tests {
         .unwrap();
 
         assert!(!clean_workdir_manifest_path(workdir.path()).exists());
+    }
+
+    #[test]
+    fn pinned_path_probe_skips_different_spelling_already_seen_by_directory_scan() {
+        let visible_paths = ["readme.md".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let actual_paths = visible_paths.clone();
+        let folded_paths = actual_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
+
+        assert!(!pinned_path_needs_probe(
+            true,
+            &visible_paths,
+            &actual_paths,
+            &folded_paths,
+            "README.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &visible_paths,
+            &actual_paths,
+            &folded_paths,
+            "readme.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &visible_paths,
+            &actual_paths,
+            &folded_paths,
+            "other.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            false,
+            &visible_paths,
+            &actual_paths,
+            &folded_paths,
+            "README.md"
+        ));
+
+        let ignored_visible = BTreeSet::new();
+        assert!(!pinned_path_needs_probe(
+            true,
+            &ignored_visible,
+            &actual_paths,
+            &folded_paths,
+            "README.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &ignored_visible,
+            &actual_paths,
+            &folded_paths,
+            "readme.md"
+        ));
+    }
+
+    #[test]
+    fn ignored_actual_spelling_prevents_fabricated_pinned_alias() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("readme.md"), "ignored\n").unwrap();
+        fs::write(workspace.path().join(".trailignore"), "readme.md\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let visible = db.scan_workdir_file_stamps(workspace.path()).unwrap();
+        assert!(!visible.contains_key("readme.md"));
+
+        let observed =
+            observed_exact_paths_for_candidates(workspace.path(), &["README.md".to_string()], true)
+                .unwrap();
+        let actual_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
+        let folded_paths = actual_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
+        assert!(actual_paths.contains("readme.md"));
+        assert!(!pinned_path_needs_probe(
+            true,
+            &BTreeSet::new(),
+            &actual_paths,
+            &folded_paths,
+            "README.md",
+        ));
+
+        let (stamps, observed_insertions) = db
+            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+                workspace.path(),
+                &["README.md".to_string()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(observed_insertions, 1);
+        assert!(stamps.contains_key("readme.md"));
+        assert!(!stamps.contains_key("README.md"));
+    }
+
+    #[test]
+    fn visible_exact_pinned_file_needs_no_observed_insertion_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("visible.md"), "visible\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+
+        let (stamps, observed_insertions) = db
+            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+                workspace.path(),
+                &["visible.md".to_string()],
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(observed_insertions, 0);
+        assert!(stamps.contains_key("visible.md"));
+    }
+
+    #[test]
+    fn observed_fold_index_supports_ten_thousand_constant_domain_lookups() {
+        let observed = (0..10_000)
+            .map(|index| {
+                (
+                    format!("Dir-{index:05}/File.txt"),
+                    ObservedPathKind::RegularFile,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let folded = index_observed_paths_by_folded(&observed);
+
+        assert_eq!(folded.len(), 10_000);
+        for path in observed.keys() {
+            let aliases = folded
+                .get(&case_insensitive_path_key(path))
+                .expect("folded path is indexed once");
+            assert_eq!(aliases.as_slice(), &[path.as_str()]);
+        }
+    }
+
+    #[test]
+    fn touched_manifest_guard_does_not_probe_unrelated_large_manifest_paths() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let metadata = fs::symlink_metadata(workdir.path().join("a.txt")).unwrap();
+        let template = CleanWorkdirManifestEntry {
+            stamp: WorkdirFileStamp::from_metadata(&metadata),
+            kind: files["a.txt"].kind.clone(),
+            content_hash: files["a.txt"].content_hash.clone(),
+        };
+        let mut entries = BTreeMap::new();
+        entries.insert("a.txt".to_string(), template.clone());
+        for idx in 0..10_000 {
+            entries.insert(format!("missing/{idx:05}.txt"), template.clone());
+        }
+        db.write_clean_workdir_manifest_entries(workdir.path(), &head.root_id, entries)
+            .unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = previous.clone();
+
+        assert!(db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn touched_manifest_guard_allows_case_only_rename_from_removed_path() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = [("A.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn touched_manifest_guard_rejects_external_new_target() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        fs::write(workdir.path().join("external.txt"), "external\n").unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = [
+            ("a.txt".to_string(), files["a.txt"].clone()),
+            ("external.txt".to_string(), files["a.txt"].clone()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        assert!(!db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
     }
 }

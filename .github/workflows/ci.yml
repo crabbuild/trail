@@ -4,8 +4,31 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
 
 jobs:
+  acp-v1-reference-interop:
+    name: ACP v1 official-type interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Official ACP v1 peer interoperability
+        run: scripts/test-acp-v1-reference-interop.sh
+
+  acp-v1-schema-drift:
+    name: ACP v1 upstream schema drift
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare pinned ACP v1 artifacts with upstream
+        run: scripts/check-acp-v1-schema-drift.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +47,14 @@ jobs:
         run: cargo test -p trail
       - name: Scale Benchmark Syntax
         run: bash -n scripts/cli-scale-bench.sh
+      - name: Scale Threshold Checker Tests
+        run: >-
+          python3 -m unittest
+          scripts/test_cli_scale_bench_source.py
+          scripts/test_check_cli_scale_thresholds.py
+          scripts/test_check_changed_path_ledger_thresholds.py
+          scripts/test_extract_agent_git_performance.py
+          scripts/test_extract_path_index_performance.py
       - name: Scale Benchmark Smoke
         run: make bench-cli-scale-smoke
         env:
@@ -55,7 +86,13 @@ jobs:
           daemon_cli_history=10
           daemon_cli_code_from=10
           agent_apply_patch=30
-          merge_queue_run=30
+          path_index_rename_patch=30
+          path_index_empty_patch=30
+          path_index_record=30
+          agent_git_apply_dry_run=15
+          agent_git_apply=20
+          agent_git_apply_missing_mapping=5
+          lane_merge_queue_run=30
           agent_spawn_sparse=15
           agent_read_sparse_hydrate_neighbors=15
           agent_sync_sparse_dir=15
@@ -70,6 +107,50 @@ jobs:
           dbstat_repo_prolly_nodes=32000000
           object_kind_repo_TextContent_bytes=16000000
           object_count=20000
+          agent_git_changed_paths=1
+          agent_git_blob_writes=1
+          agent_git_plumbing_commands=5
+          patch_path_index_lookup_count=5
+          patch_path_index_full_root_path_load_count=0
+          patch_path_index_full_filesystem_path_scan_count=0
+          record_path_index_lookup_count=1
+          record_path_index_full_root_path_load_count=0
+          record_path_index_full_filesystem_path_scan_count=0
+          empty_root_patch_path_index_lookup_count=1
+          empty_root_patch_path_index_full_root_path_load_count=0
+          empty_root_patch_path_index_full_filesystem_path_scan_count=0
+          rename_patch_path_index_lookup_count=2
+          rename_patch_path_index_full_root_path_load_count=0
+          rename_patch_path_index_full_filesystem_path_scan_count=0
+          --metric-equals
+          agent_git_export_mode=mapped_delta
+          agent_git_changed_paths=1
+          patch_path_index_mode=indexed
+          record_path_index_mode=indexed
+          empty_root_patch_path_index_mode=indexed
+          rename_patch_path_index_mode=indexed
+      - name: Changed-path Ledger 1k Benchmark
+        run: scripts/cli-scale-bench.sh changed-path-ledger
+        env:
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: changed-path-ci-${{ github.run_id }}
+          TRAIL_SCALE_FILES: "1000"
+          TRAIL_CHANGED_PATH_COW: "0"
+      - name: Changed-path Ledger 1k Thresholds
+        run: >-
+          python3 scripts/check-changed-path-ledger-thresholds.py
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/results.tsv"
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/structural-metrics.jsonl"
+          --oracle
+          "${{ runner.temp }}/trail-cli-scale-changed-path-ci-${{ github.run_id }}/1000/oracle-results.tsv"
+          --max-seconds workspace_status=15
+          --max-seconds workspace_diff=20
+          --max-seconds workspace_record=30
+          --max-seconds materialized_lane_record=60
+          --max-seconds structured_patch=30
+          --max-rss-bytes workspace_status=2147483648
+          --max-rss-bytes workspace_diff=2147483648
+          --max-rss-bytes workspace_record=2147483648
 
   prolly:
     name: Prolly core
@@ -91,25 +172,25 @@ jobs:
         run: cargo test -p prolly-map
       - name: Clippy
         run: >-
-          cargo clippy -p prolly-map --all-targets --features "tokio sqlite" --
+          cargo clippy -p prolly-map --all-targets --features tokio --
           -D warnings
           -A clippy::result-large-err
           -A clippy::large-enum-variant
           -A clippy::type-complexity
       - name: Rustdoc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc -p prolly-map --no-deps --features "tokio sqlite"
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p prolly-map --no-deps --features tokio
       - name: Inspect binary
         run: cargo check -p prolly-map --bin prolly-inspect
       - name: Examples
         run: cargo check -p prolly-map --examples
       - name: Bench compile
-        run: cargo check -p prolly-map --benches --features "tokio sqlite"
+        run: cargo check -p prolly-map --benches --features tokio
       - name: Package
         run: cargo package -p prolly-map --no-verify
       - name: Tokio feature tests
         run: cargo test -p prolly-map --features tokio
       - name: SQLite store contract
-        run: cargo test -p prolly-map --features sqlite --test sqlite_store
+        run: cargo test -p prolly-store-sqlite
 
   prolly-optional-backends:
     name: Prolly optional backend (${{ matrix.backend }})
@@ -120,11 +201,9 @@ jobs:
       matrix:
         include:
           - backend: rocksdb
-            features: rocksdb
-            test: rocksdb_store
+            package: prolly-store-rocksdb
           - backend: slatedb
-            features: slatedb
-            test: slatedb_store
+            package: prolly-store-slatedb
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,7 +214,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Store contract
-        run: cargo test -p prolly-map --features "${{ matrix.features }}" --test "${{ matrix.test }}"
+        run: cargo test -p "${{ matrix.package }}"
 
   prolly-pglite-sidecar:
     name: Prolly PGlite sidecar
@@ -155,7 +234,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/prolly-pglite-node"
           npm install --prefix "${{ runner.temp }}/prolly-pglite-node" @electric-sql/pglite@0.5.3
       - name: PGlite store contract
-        run: cargo test -p prolly-map --features pglite --test pglite_store
+        run: cargo test -p prolly-store-pglite
         env:
           PROLLY_PGLITE_TEST: "1"
           PROLLY_PGLITE_NODE_CWD: ${{ runner.temp }}/prolly-pglite-node

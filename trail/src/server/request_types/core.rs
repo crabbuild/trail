@@ -17,6 +17,13 @@ pub(crate) struct RecordRequest {
     pub(crate) allow_ignored: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IndexReconcileRequest {
+    #[serde(default)]
+    pub(crate) lane: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IgnorePatternRequest {

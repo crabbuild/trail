@@ -96,7 +96,7 @@ pub(super) fn resolve_registry_provider(
         .find(|agent| agent.id.eq_ignore_ascii_case(&requested))
         .ok_or_else(|| {
             Error::InvalidInput(format!(
-                "unknown ACP agent `{requested_agent}`; run `trail acp list` to see built-in and registry agents"
+                "unknown ACP agent `{requested_agent}`; run `trail agent acp status` to see built-in and registry agents"
             ))
         })?;
     let profile = registry_profile(agent);
@@ -121,7 +121,7 @@ pub(super) fn registry_provider_profile(
         .map(registry_profile)
         .ok_or_else(|| {
             Error::InvalidInput(format!(
-                "unknown ACP agent `{requested_agent}`; run `trail acp list` to see built-in and registry agents"
+                "unknown ACP agent `{requested_agent}`; run `trail agent acp status` to see built-in and registry agents"
             ))
         })
 }
@@ -387,7 +387,7 @@ fn install_registry_binary(
     }
     match fs::rename(&staging, &install_dir) {
         Ok(()) => Ok(command_path),
-        Err(error) if command_path.is_file() => {
+        Err(_error) if command_path.is_file() => {
             let _ = fs::remove_dir_all(&staging);
             Ok(command_path)
         }

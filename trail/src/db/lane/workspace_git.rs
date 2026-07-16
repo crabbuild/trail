@@ -1,6 +1,15 @@
 use super::*;
 
 impl Trail {
+    /// A lane shadow is deliberately a compatibility/status projection. Its
+    /// private index and HEAD are never a clean proof for the real workspace,
+    /// even when the shadow still points at its pinned commit.
+    pub(crate) const fn workspace_git_shadow_clean_proof_allowed(
+        _shadow: &WorkspaceGitShadowReport,
+    ) -> bool {
+        false
+    }
+
     pub(crate) fn ensure_workspace_git_shadow(
         &self,
         view: &LaneWorkspaceViewReport,
@@ -125,6 +134,7 @@ impl Trail {
         } else {
             "diverged"
         };
+        debug_assert!(!Self::workspace_git_shadow_clean_proof_allowed(shadow));
         self.conn.execute(
             "UPDATE workspace_git_shadows SET current_head = ?1, status = ?2, updated_at = ?3 WHERE view_id = ?4",
             params![current_head, status, now_ts(), shadow.view_id],
@@ -211,8 +221,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "git-shadow",
@@ -232,6 +244,7 @@ mod tests {
             .ensure_workspace_git_shadow(&view, &head.root_id)
             .unwrap()
             .unwrap();
+        assert!(!Trail::workspace_git_shadow_clean_proof_allowed(&shadow));
         let real_head = Command::new("git")
             .arg("-C")
             .arg(workspace.path())

@@ -204,6 +204,53 @@ pub(crate) struct DependencySyncArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentGraphArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default = "default_environment_graph_limit")]
+    pub(crate) limit: u64,
+}
+
+fn default_environment_graph_limit() -> u64 {
+    256
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentSyncArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) adapter: Option<String>,
+    #[serde(default, alias = "component_id")]
+    pub(crate) component: Option<String>,
+    #[serde(default, alias = "component_root")]
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentExplainArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(alias = "component_id")]
+    pub(crate) component: String,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default = "default_environment_explain_limit")]
+    pub(crate) limit: u64,
+}
+
+fn default_environment_explain_limit() -> u64 {
+    256
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CacheLayerArgs {
     #[serde(alias = "layer_id")]
     pub(crate) layer: String,

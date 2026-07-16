@@ -108,9 +108,18 @@ jobs:
           git commit -m "chore: update Cargo.lock for ${release_version}"
           git push origin "HEAD:${RELEASE_PR_BRANCH}"
 
+  exact-sha-native-ledger:
+    name: Exact-SHA Linux + macOS changed-path gates
+    needs: release-please
+    if: ${{ needs.release-please.outputs.token_available == 'true' }}
+    uses: ./.github/workflows/changed-path-ledger-native.yml
+    with:
+      scale_files: "100000"
+      require_cow: true
+
   tag-release:
     name: Tag merged release pull request
-    needs: release-please
+    needs: [release-please, exact-sha-native-ledger]
     if: ${{ needs.release-please.outputs.token_available == 'true' }}
     runs-on: ubuntu-latest
     steps:

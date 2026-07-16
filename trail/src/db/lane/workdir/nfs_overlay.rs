@@ -23,7 +23,8 @@ mod macos {
 
     const ROOT_INO: u64 = 1;
     const OVERLAY_META_DIR: &str = ".trail";
-    const MOUNT_STATE_FILE: &str = "mount.json";
+    const NFS_MOUNT_STATE_FILE: &str = "nfs-mount.json";
+    const LEGACY_NFS_MOUNT_STATE_FILE: &str = "mount.json";
 
     type CowCore = ViewCore;
     type NodeKind = ViewNodeKind;
@@ -270,6 +271,52 @@ mod macos {
         }
     }
 
+    struct PendingNfsMount {
+        mountpoint: PathBuf,
+        state_path: PathBuf,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        worker: Option<JoinHandle<()>>,
+        mounted: bool,
+        committed: bool,
+    }
+
+    impl PendingNfsMount {
+        fn commit(
+            mut self,
+        ) -> (
+            PathBuf,
+            PathBuf,
+            tokio::sync::oneshot::Sender<()>,
+            JoinHandle<()>,
+        ) {
+            self.committed = true;
+            (
+                std::mem::take(&mut self.mountpoint),
+                std::mem::take(&mut self.state_path),
+                self.shutdown.take().expect("pending NFS shutdown sender"),
+                self.worker.take().expect("pending NFS worker"),
+            )
+        }
+    }
+
+    impl Drop for PendingNfsMount {
+        fn drop(&mut self) {
+            if self.committed {
+                return;
+            }
+            if self.mounted {
+                let _ = unmount(&self.mountpoint);
+            }
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            let _ = fs::remove_file(&self.state_path);
+        }
+    }
+
     pub(crate) fn prepare_nfs_cow_workdir(
         db: &Trail,
         lane: &str,
@@ -284,32 +331,40 @@ mod macos {
         Ok(upper)
     }
 
-    pub(crate) fn nfs_clean_manifest_path(db: &Trail, lane: &str) -> Result<PathBuf> {
-        Ok(db
-            .workspace_view_paths_for_lane_name(lane)
-            .meta_dir
-            .join("workdir-manifest.json"))
-    }
-
-    pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<ViewCheckpointCandidates> {
         let upper = nfs_upperdir(db, lane)?;
         let branch = db.lane_branch(lane)?;
         let head = db.get_ref(&branch.ref_name)?;
-        Ok(
-            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
-                .paths
-                .into_iter()
-                .filter(|path| {
-                    !Path::new(path)
-                        .file_name()
-                        .and_then(OsStr::to_str)
-                        .is_some_and(is_macos_junk)
-                })
-                .collect(),
-        )
+        let mut candidates =
+            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?;
+        candidates.paths.retain(|path| {
+            !Path::new(path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(is_macos_junk)
+        });
+        Ok(candidates)
     }
 
     pub(crate) fn mount_nfs_cow_for_lane(db: &Trail, lane: &str) -> Result<NfsCowMount> {
+        mount_nfs_cow_for_lane_with_view(db, lane, None)
+    }
+
+    pub(crate) fn mount_nfs_cow_for_lane_with_ephemeral_bindings(
+        db: &Trail,
+        lane: &str,
+        source_upper: PathBuf,
+        source_root: ObjectId,
+        bindings: Vec<WorkspaceLayerBinding>,
+    ) -> Result<NfsCowMount> {
+        mount_nfs_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
+    }
+
+    fn mount_nfs_cow_for_lane_with_view(
+        db: &Trail,
+        lane: &str,
+        ephemeral: Option<(PathBuf, ObjectId, Vec<WorkspaceLayerBinding>)>,
+    ) -> Result<NfsCowMount> {
         validate_ref_segment(lane)?;
         let branch = db.lane_branch(lane)?;
         let record = db.lane_record(&branch.lane_id)?;
@@ -326,20 +381,45 @@ mod macos {
                 "nfs-cow requires /sbin/mount_nfs on macOS".to_string(),
             ));
         }
-        let mut lease = db.acquire_workspace_mount_lease(lane, "nfs")?;
-        fs::create_dir_all(&mountpoint)?;
-        let upper = nfs_upperdir(db, lane)?;
-        fs::create_dir_all(upper.join(OVERLAY_META_DIR))?;
         let state_path = db
             .workspace_view_paths_for_lane_name(lane)
             .meta_dir
-            .join(MOUNT_STATE_FILE);
+            .join(NFS_MOUNT_STATE_FILE);
+        let legacy_state_path = state_path.with_file_name(LEGACY_NFS_MOUNT_STATE_FILE);
+        if fs::read(&legacy_state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| {
+                value
+                    .get("pid")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some()
+            })
+        {
+            recover_stale_mount(&mountpoint, &legacy_state_path)?;
+        }
+        // A dead loopback server can leave the mountpoint in an unresponsive
+        // NFS state. Recover it before *any* path operation on the mountpoint;
+        // even `create_dir_all` or metadata can otherwise block in the kernel.
+        recover_stale_mount(&mountpoint, &state_path)?;
+        let mut lease = db.acquire_workspace_mount_lease(lane, "nfs")?;
+        fs::create_dir_all(&mountpoint)?;
         let head = db.get_ref(&branch.ref_name)?;
-        let core = CowCore::new_lazy(
-            Trail::open_with_db_dir(db.workspace_root.clone(), db.db_dir.clone())?,
-            upper.clone(),
-            head.root_id,
-        )?;
+        let (upper, source_root, bindings) = match ephemeral {
+            Some((upper, source_root, bindings)) => (upper, source_root, Some(bindings)),
+            None => (nfs_upperdir(db, lane)?, head.root_id, None),
+        };
+        fs::create_dir_all(upper.join(OVERLAY_META_DIR))?;
+        let core_db = Trail::open_with_db_dir(db.workspace_root.clone(), db.db_dir.clone())?;
+        let core = match bindings {
+            Some(bindings) => CowCore::new_lazy_with_ephemeral_bindings(
+                core_db,
+                upper.clone(),
+                source_root,
+                bindings,
+            )?,
+            None => CowCore::new_lazy(core_db, upper.clone(), source_root)?,
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -349,7 +429,6 @@ mod macos {
             .block_on(NFSTcpListener::bind("127.0.0.1:0", adapter))
             .map_err(Error::Io)?;
         let port = listener.get_listen_port();
-        recover_stale_mount(&mountpoint, &state_path)?;
         let state_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -359,9 +438,15 @@ mod macos {
                     "nfs-cow lane `{lane}` is already being mounted: {err}"
                 ))
             })?;
+        let process_start_token = current_process_start_token();
         serde_json::to_writer(
             &state_file,
-            &serde_json::json!({"pid": std::process::id(), "port": port, "mountpoint": mountpoint}),
+            &serde_json::json!({
+                "pid": std::process::id(),
+                "process_start_token": process_start_token,
+                "port": port,
+                "mountpoint": mountpoint,
+            }),
         )?;
         state_file.sync_all()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -370,32 +455,43 @@ mod macos {
                 tokio::select! { _ = listener.handle_forever() => {}, _ = shutdown_rx => {} }
             })
         });
+        let mut pending_mount = PendingNfsMount {
+            mountpoint: mountpoint.clone(),
+            state_path: state_path.clone(),
+            shutdown: Some(shutdown_tx),
+            worker: Some(worker),
+            mounted: false,
+            committed: false,
+        };
         // Directory mutations must be visible to the checkpoint scan that runs
         // immediately after the agent exits. Attribute caching can otherwise
-        // retain a pre-create READDIR result and omit brand-new paths.
-        let opts = format!("locallocks,vers=3,tcp,rsize=1048576,wsize=1048576,noac,actimeo=0,nonegnamecache,nobrowse,port={port},mountport={port}");
+        // retain a pre-create READDIR result and omit brand-new paths. macOS
+        // also defaults to `nosync`, where a write syscall may return before
+        // this userspace server has received the WRITE RPC. A lane can then be
+        // unmounted and remounted with only the preceding truncate visible.
+        // `sync` makes successful writes an actual durability boundary; the
+        // server itself fsyncs every WRITE before reporting FILE_SYNC.
+        let opts = format!(
+            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,noac,actimeo=0,nonegnamecache,nobrowse,port={port},mountport={port}"
+        );
         let status = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])
             .status()?;
         if !status.success() {
-            let _ = shutdown_tx.send(());
-            let _ = worker.join();
-            let _ = fs::remove_file(&state_path);
             return Err(Error::InvalidInput(format!(
                 "mount_nfs failed for `{}` with {status}",
                 mountpoint.display()
             )));
         }
         if !is_nfs_mount(&mountpoint) {
-            let _ = shutdown_tx.send(());
-            let _ = worker.join();
-            let _ = fs::remove_file(&state_path);
             return Err(Error::InvalidInput(format!(
                 "mount_nfs returned success, but `{}` is not an active NFS mount",
                 mountpoint.display()
             )));
         }
+        pending_mount.mounted = true;
         lease.mark_mounted()?;
+        let (mountpoint, state_path, shutdown_tx, worker) = pending_mount.commit();
         Ok(NfsCowMount {
             mountpoint,
             state_path,
@@ -411,23 +507,54 @@ mod macos {
     }
 
     fn recover_stale_mount(mountpoint: &Path, state: &Path) -> Result<()> {
+        let mut known_dead_owner = false;
         if let Ok(bytes) = fs::read(state) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) {
-                    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                    let token = value
+                        .get("process_start_token")
+                        .and_then(serde_json::Value::as_str);
+                    if token.is_some_and(|token| process_matches_start_token(pid as u32, token)) {
                         return Err(Error::InvalidInput(format!(
                             "nfs-cow mount `{}` is already active in process {pid}",
                             mountpoint.display()
                         )));
                     }
+                    known_dead_owner = true;
                 }
             }
         }
-        if is_nfs_mount(mountpoint) {
+        if known_dead_owner {
+            force_unmount_stale_without_probe(mountpoint)?;
+        } else if is_nfs_mount(mountpoint) {
             unmount(mountpoint)?;
         }
         let _ = fs::remove_file(state);
         Ok(())
+    }
+
+    fn force_unmount_stale_without_probe(path: &Path) -> Result<()> {
+        let cpath = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| Error::InvalidInput("invalid NFS mount path".to_string()))?;
+        if unsafe { libc::unmount(cpath.as_ptr(), libc::MNT_FORCE) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EINVAL || code == libc::ENOENT)
+        {
+            return Ok(());
+        }
+        let status = Command::new("/sbin/umount").arg("-f").arg(path).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput(format!(
+                "failed to force-unmount stale NFS mount `{}` after owner death: {error}",
+                path.display()
+            )))
+        }
     }
 
     fn unmount(path: &Path) -> Result<()> {
@@ -531,6 +658,9 @@ mod macos {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        static COMMAND_AUTHORITY_TEST: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
 
         #[test]
         fn cow_core_copies_up_writes_and_persists_whiteouts() {
@@ -649,12 +779,74 @@ mod macos {
             let temp = tempfile::tempdir().unwrap();
             let mountpoint = temp.path().join("mount");
             fs::create_dir_all(&mountpoint).unwrap();
-            let state = temp.path().join(MOUNT_STATE_FILE);
+            let state = temp.path().join(NFS_MOUNT_STATE_FILE);
             fs::write(&state, br#"{"pid":2147483647,"port":1}"#).unwrap();
 
             recover_stale_mount(&mountpoint, &state).unwrap();
 
             assert!(!state.exists());
+        }
+
+        #[test]
+        fn stale_mount_state_uses_process_start_identity_not_pid_alone() {
+            let temp = tempfile::tempdir().unwrap();
+            let mountpoint = temp.path().join("mount");
+            fs::create_dir_all(&mountpoint).unwrap();
+            let state = temp.path().join(NFS_MOUNT_STATE_FILE);
+            fs::write(
+                &state,
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": std::process::id(),
+                    "process_start_token": "reused-pid",
+                    "port": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            recover_stale_mount(&mountpoint, &state).unwrap();
+            assert!(!state.exists());
+
+            fs::write(
+                &state,
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": std::process::id(),
+                    "process_start_token": current_process_start_token(),
+                    "port": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(recover_stale_mount(&mountpoint, &state).is_err());
+            assert!(state.exists());
+        }
+
+        #[test]
+        fn pending_nfs_mount_drop_cleans_state_and_worker_before_publication() {
+            let temp = tempfile::tempdir().unwrap();
+            let mountpoint = temp.path().join("mount");
+            fs::create_dir_all(&mountpoint).unwrap();
+            let state_path = temp.path().join(NFS_MOUNT_STATE_FILE);
+            fs::write(&state_path, b"pending").unwrap();
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            let worker = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _ = runtime.block_on(stopped);
+            });
+
+            drop(PendingNfsMount {
+                mountpoint,
+                state_path: state_path.clone(),
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+                mounted: false,
+                committed: false,
+            });
+
+            assert!(!state_path.exists());
         }
 
         #[test]
@@ -890,6 +1082,119 @@ mod macos {
         }
 
         #[test]
+        fn command_authority_checkpoints_unmounted_nfs_view_from_qualified_journal() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let _serial = COMMAND_AUTHORITY_TEST
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            struct AuthorityReset;
+            impl Drop for AuthorityReset {
+                fn drop(&mut self) {
+                    crate::db::change_ledger::set_command_authority_override(false);
+                }
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            let spawned = db
+                .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    "authority-nfs",
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            let lane_id = spawned.lane_id;
+            let workdir = PathBuf::from(spawned.workdir.unwrap());
+            assert!(workdir.read_dir().unwrap().next().is_none());
+
+            crate::db::change_ledger::set_command_authority_override(true);
+            let _reset = AuthorityReset;
+            let empty = db
+                .checkpoint_lane_workspace("authority-nfs", Some("empty".into()))
+                .unwrap();
+            assert!(empty.source_paths.is_empty());
+
+            let mounted = db.start_lane_workspace_mount("authority-nfs").unwrap();
+            assert!(mounted.healthy);
+            fs::write(workdir.join("changed.txt"), "changed\n").unwrap();
+            db.request_lane_workspace_unmount("authority-nfs").unwrap();
+            assert!(workdir.read_dir().unwrap().next().is_none());
+            let changed = db
+                .checkpoint_lane_workspace("authority-nfs", Some("changed".into()))
+                .unwrap();
+            assert_eq!(changed.source_paths, vec!["changed.txt"]);
+
+            let observer_scopes: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM changed_path_scopes
+                     WHERE scope_kind='materialized_lane' AND owner_id=?1",
+                    [&lane_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(observer_scopes, 0);
+        }
+
+        #[test]
+        fn command_authority_nfs_checkpoint_rejects_missing_journal_pair() {
+            let _serial = COMMAND_AUTHORITY_TEST
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            struct AuthorityReset;
+            impl Drop for AuthorityReset {
+                fn drop(&mut self) {
+                    crate::db::change_ledger::set_command_authority_override(false);
+                }
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "authority-nfs-corrupt",
+                Some("main"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let view = db
+                .lane_workspace_view("authority-nfs-corrupt")
+                .unwrap()
+                .unwrap();
+            let layout = ViewUpperLayout::from_source_upper(PathBuf::from(view.source_upper));
+            fs::remove_file(layout.journal_path()).unwrap();
+            fs::remove_file(layout.whiteout_journal_path()).unwrap();
+
+            crate::db::change_ledger::set_command_authority_override(true);
+            let _reset = AuthorityReset;
+            let error = db
+                .checkpoint_lane_workspace("authority-nfs-corrupt", None)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::ChangeLedgerReconcileRequired { state, .. }
+                    if state == "unqualified_view_journal"
+            ));
+        }
+
+        #[test]
         fn real_nfs_mount_records_new_modified_and_renamed_files() {
             if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
                 return;
@@ -1056,7 +1361,7 @@ mod macos {
         }
 
         #[test]
-        fn nfs_real_node_layer_is_shared_and_writable_installs_are_isolated() {
+        fn nfs_real_node_layer_bulk_replacement_is_isolated() {
             if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
                 return;
             }
@@ -1172,66 +1477,58 @@ mod macos {
             );
             assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
 
-            let clean = Command::new("rm")
-                .args(["-rf", "node_modules"])
-                .current_dir(&workdir_a)
-                .output()
-                .unwrap();
-            assert!(clean.status.success());
-            assert!(!workdir_a.join("node_modules").exists());
-            assert!(workdir_b.join("node_modules/lodash/lodash.js").is_file());
-            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
-
-            let install = Command::new("npm")
-                .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
-                .env("npm_config_cache", temp.path().join("npm-test-cache"))
-                .current_dir(&workdir_a)
-                .output()
-                .unwrap();
+            drop(mount_a);
+            let replace_started = std::time::Instant::now();
+            let replaced = db.sync_node_dependencies("node-nfs-a", None).unwrap();
+            let replace_ms = replace_started.elapsed().as_millis();
+            assert_eq!(replaced.layer_id, first.layer_id);
             assert!(
-                install.status.success(),
-                "npm ci through NFS failed: {}",
-                String::from_utf8_lossy(&install.stderr)
+                replace_ms < 30_000,
+                "bulk dependency replacement took {replace_ms} ms"
             );
-            let reinstalled_prettier = Command::new("node_modules/.bin/prettier")
+            let remount_a = db.mount_nfs_cow_workdir_for_lane("node-nfs-a").unwrap();
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_a.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_b.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+            let restored_prettier = Command::new("node_modules/.bin/prettier")
                 .arg("--version")
                 .current_dir(&workdir_a)
                 .output()
                 .unwrap();
             assert!(
-                reinstalled_prettier.status.success(),
-                "npm-created bin symlink did not execute through NFS: {}",
-                String::from_utf8_lossy(&reinstalled_prettier.stderr)
+                restored_prettier.status.success(),
+                "bulk-replaced npm bin symlink did not execute through NFS: {}",
+                String::from_utf8_lossy(&restored_prettier.stderr)
             );
-            for path in [
-                workdir_a.join("node_modules/lodash/lodash.js"),
-                workdir_b.join("node_modules/lodash/lodash.js"),
-                layer_file.clone(),
-            ] {
-                assert_eq!(sha256_hex(&fs::read(path).unwrap()), immutable_hash);
-            }
 
             let lane_head_before = db.lane_details("node-nfs-a").unwrap().branch.head_change;
             let checkpoint = db.checkpoint_lane_workspace("node-nfs-a", None).unwrap();
             assert!(checkpoint.source_paths.is_empty());
-            assert!(checkpoint.generated_dirty_paths > 500);
+            assert_eq!(checkpoint.generated_dirty_paths, 0);
             assert_eq!(
                 db.lane_details("node-nfs-a").unwrap().branch.head_change,
                 lane_head_before
             );
             let view_a = db.lane_workspace_view("node-nfs-a").unwrap().unwrap();
             let view_b = db.lane_workspace_view("node-nfs-b").unwrap().unwrap();
-            assert!(Path::new(&view_a.generated_upper)
-                .join("node_modules/lodash/lodash.js")
-                .is_file());
+            assert!(!Path::new(&view_a.generated_upper)
+                .join("node_modules")
+                .exists());
             assert!(!Path::new(&view_b.generated_upper)
                 .join("node_modules/lodash/lodash.js")
                 .exists());
             db.verify_workspace_layer(&first.layer_id).unwrap();
             eprintln!(
-                "macos-nfs-node-layer layer_entries={} mount_two_ms={} shared_layer={} generated_a_bytes={} generated_b_bytes={}",
+                "macos-nfs-node-layer layer_entries={} mount_two_ms={} bulk_replace_ms={} shared_layer={} generated_a_bytes={} generated_b_bytes={}",
                 first.entry_count,
                 mount_ms,
+                replace_ms,
                 first.layer_id,
                 db.lane_workspace_space("node-nfs-a")
                     .unwrap()
@@ -1241,7 +1538,354 @@ mod macos {
                     .generated_upper_bytes,
             );
             drop(mount_b);
+            drop(remount_a);
+        }
+
+        struct NfsFrameworkFixture<'a> {
+            name: &'static str,
+            package_json: &'static str,
+            files: &'a [(&'static str, &'static str)],
+            package_probe: &'static str,
+            bin: &'static str,
+            build_args: &'static [&'static str],
+            build_mode: &'static str,
+            build_timeout_secs: u64,
+            require_build_success: bool,
+            build_output: &'static str,
+            min_layer_entries: u64,
+        }
+
+        #[test]
+        fn nfs_large_nextjs_and_vite_layers_build_and_bulk_replace() {
+            if std::env::var_os("TRAIL_RUN_NFS_FRAMEWORK_BENCH").is_none() {
+                return;
+            }
+            for tool in ["node", "npm"] {
+                assert!(
+                    Command::new(tool)
+                        .arg("--version")
+                        .output()
+                        .is_ok_and(|output| output.status.success()),
+                    "{tool} is required for the NFS framework benchmark"
+                );
+            }
+
+            let next_files = [
+                (
+                    "app/layout.jsx",
+                    "export const metadata = { title: 'Trail Next benchmark' };\nexport default function Layout({ children }) { return <html><body>{children}</body></html>; }\n",
+                ),
+                (
+                    "app/page.jsx",
+                    "export default function Page() { return <main>Trail Next benchmark</main>; }\n",
+                ),
+                (
+                    "next.config.mjs",
+                    "export default { turbopack: { root: process.cwd() }, outputFileTracingRoot: process.cwd() };\n",
+                ),
+            ];
+            let vite_files = [
+                (
+                    "index.html",
+                    "<div id=\"root\"></div><script type=\"module\" src=\"/src/main.jsx\"></script>\n",
+                ),
+                (
+                    "src/main.jsx",
+                    "import React from 'react';\nimport { createRoot } from 'react-dom/client';\ncreateRoot(document.getElementById('root')).render(<main>Trail Vite benchmark</main>);\n",
+                ),
+                (
+                    "vite.config.mjs",
+                    "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\nexport default defineConfig({ plugins: [react()] });\n",
+                ),
+            ];
+            let fixtures = [
+                NfsFrameworkFixture {
+                    name: "next",
+                    package_json: r#"{"name":"trail-next-nfs-bench","version":"1.0.0","private":true,"scripts":{"build":"next build"},"dependencies":{"next":"16.2.10","react":"19.2.7","react-dom":"19.2.7"}}"#,
+                    files: &next_files,
+                    package_probe: "next/package.json",
+                    bin: "next",
+                    build_args: &["build"],
+                    build_mode: "turbopack",
+                    build_timeout_secs: 120,
+                    require_build_success: false,
+                    build_output: ".next/BUILD_ID",
+                    min_layer_entries: 2_000,
+                },
+                NfsFrameworkFixture {
+                    name: "vite",
+                    package_json: r#"{"name":"trail-vite-nfs-bench","version":"1.0.0","private":true,"scripts":{"build":"vite build"},"dependencies":{"react":"19.2.7","react-dom":"19.2.7"},"devDependencies":{"@vitejs/plugin-react":"6.0.3","vite":"8.1.4"}}"#,
+                    files: &vite_files,
+                    package_probe: "vite/package.json",
+                    bin: "vite",
+                    build_args: &["build"],
+                    build_mode: "rolldown",
+                    build_timeout_secs: 120,
+                    require_build_success: true,
+                    build_output: "dist/index.html",
+                    min_layer_entries: 300,
+                },
+            ];
+
+            let filter = std::env::var("TRAIL_NFS_FRAMEWORK_FILTER").ok();
+            let mut ran = 0_u32;
+            for fixture in fixtures {
+                if filter.as_deref().is_some_and(|name| name != fixture.name) {
+                    continue;
+                }
+                run_nfs_framework_benchmark(fixture);
+                ran += 1;
+            }
+            assert!(ran > 0, "framework benchmark filter matched no fixture");
+        }
+
+        fn run_nfs_framework_benchmark(fixture: NfsFrameworkFixture<'_>) {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("package.json"), fixture.package_json).unwrap();
+            fs::write(
+                temp.path().join(".gitignore"),
+                "node_modules/\n.next/\ndist/\ntarget/\n",
+            )
+            .unwrap();
+            for (path, contents) in fixture.files {
+                let path = temp.path().join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, contents).unwrap();
+            }
+            let lock_started = std::time::Instant::now();
+            let lock = Command::new("npm")
+                .args([
+                    "install",
+                    "--package-lock-only",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                ])
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+            let lock_ms = lock_started.elapsed().as_millis();
+            assert!(
+                lock.status.success(),
+                "{} lock generation failed: {}",
+                fixture.name,
+                String::from_utf8_lossy(&lock.stderr)
+            );
+
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            let lane_a = format!("{}-nfs-a", fixture.name);
+            let lane_b = format!("{}-nfs-b", fixture.name);
+            for lane in [&lane_a, &lane_b] {
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    lane,
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            }
+
+            let cold_started = std::time::Instant::now();
+            let first = db.sync_node_dependencies(&lane_a, None).unwrap();
+            let cold_sync_ms = cold_started.elapsed().as_millis();
+            let hit_started = std::time::Instant::now();
+            let second = db.sync_node_dependencies(&lane_b, None).unwrap();
+            let cache_hit_ms = hit_started.elapsed().as_millis();
+            assert_eq!(first.layer_id, second.layer_id);
+            assert_eq!(first.cache_key, second.cache_key);
+            assert!(
+                first.entry_count >= fixture.min_layer_entries,
+                "{} layer had only {} entries",
+                fixture.name,
+                first.entry_count
+            );
+            assert!(
+                first.logical_bytes >= 10 * 1024 * 1024,
+                "{} layer had only {} logical bytes",
+                fixture.name,
+                first.logical_bytes
+            );
+            assert!(cache_hit_ms < 30_000);
+
+            let layer_probe = Path::new(&first.storage_path).join(fixture.package_probe);
+            let immutable_hash = sha256_hex(&fs::read(&layer_probe).unwrap());
+            let layer_bin = Path::new(&first.storage_path)
+                .join(".bin")
+                .join(fixture.bin);
+            assert!(fs::symlink_metadata(&layer_bin)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            db.verify_workspace_layer(&first.layer_id).unwrap();
+
+            let mount_started = std::time::Instant::now();
+            let mount_a = db.mount_nfs_cow_workdir_for_lane(&lane_a).unwrap();
+            let mount_b = db.mount_nfs_cow_workdir_for_lane(&lane_b).unwrap();
+            let mount_two_ms = mount_started.elapsed().as_millis();
+            let workdir_a = PathBuf::from(db.lane_workdir(&lane_a).unwrap().workdir.unwrap());
+            let workdir_b = PathBuf::from(db.lane_workdir(&lane_b).unwrap().workdir.unwrap());
+
+            let bin_started = std::time::Instant::now();
+            let version = Command::new(format!("node_modules/.bin/{}", fixture.bin))
+                .arg("--version")
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            let bin_probe_ms = bin_started.elapsed().as_millis();
+            assert!(
+                version.status.success(),
+                "{} bin failed through NFS: {}",
+                fixture.name,
+                String::from_utf8_lossy(&version.stderr)
+            );
+
+            let mut build_command = vec![format!("node_modules/.bin/{}", fixture.bin)];
+            build_command.extend(fixture.build_args.iter().map(|arg| (*arg).to_string()));
+            let build = run_command_with_timeout_env(
+                &build_command,
+                &workdir_a,
+                Duration::from_secs(fixture.build_timeout_secs),
+                &[
+                    ("CI".to_string(), "1".to_string()),
+                    ("NEXT_TELEMETRY_DISABLED".to_string(), "1".to_string()),
+                ],
+            )
+            .unwrap();
+            let build_ms = build.duration_ms;
+            if fixture.require_build_success {
+                assert!(
+                    build.success,
+                    "{} build failed through NFS\nstdout:\n{}\nstderr:\n{}",
+                    fixture.name,
+                    String::from_utf8_lossy(&build.stdout),
+                    String::from_utf8_lossy(&build.stderr)
+                );
+            } else {
+                assert!(
+                    build.success || build.timed_out,
+                    "{} build failed before its benchmark budget\nstdout:\n{}\nstderr:\n{}",
+                    fixture.name,
+                    String::from_utf8_lossy(&build.stdout),
+                    String::from_utf8_lossy(&build.stderr)
+                );
+            }
+            if build.success {
+                assert!(workdir_a.join(fixture.build_output).is_file());
+            }
+            assert!(!workdir_b.join(fixture.build_output).exists());
+
+            let probe_a = workdir_a.join("node_modules").join(fixture.package_probe);
+            let probe_b = workdir_b.join("node_modules").join(fixture.package_probe);
+            fs::write(&probe_a, "lane-a-private\n").unwrap();
+            assert_eq!(fs::read_to_string(&probe_a).unwrap(), "lane-a-private\n");
+            assert_eq!(sha256_hex(&fs::read(&probe_b).unwrap()), immutable_hash);
+            assert_eq!(sha256_hex(&fs::read(&layer_probe).unwrap()), immutable_hash);
+
             drop(mount_a);
+            let view_a = db.lane_workspace_view(&lane_a).unwrap().unwrap();
+            let private_root = Path::new(&view_a.generated_upper).join("node_modules");
+            let private_started = std::time::Instant::now();
+            let private_entries =
+                materialize_private_dependency_tree(Path::new(&first.storage_path), &private_root);
+            let private_materialize_ms = private_started.elapsed().as_millis();
+            assert_eq!(private_entries, first.entry_count);
+            assert!(private_root.join(fixture.package_probe).is_file());
+
+            let replace_started = std::time::Instant::now();
+            let replaced = db.sync_node_dependencies(&lane_a, None).unwrap();
+            let bulk_replace_ms = replace_started.elapsed().as_millis();
+            assert_eq!(replaced.layer_id, first.layer_id);
+            assert!(
+                bulk_replace_ms < 60_000,
+                "{} bulk replacement took {} ms",
+                fixture.name,
+                bulk_replace_ms
+            );
+            assert!(!private_root.exists());
+
+            let remount_a = db.mount_nfs_cow_workdir_for_lane(&lane_a).unwrap();
+            assert_eq!(sha256_hex(&fs::read(&probe_a).unwrap()), immutable_hash);
+            assert_eq!(sha256_hex(&fs::read(&probe_b).unwrap()), immutable_hash);
+            if build.success {
+                assert!(workdir_a.join(fixture.build_output).is_file());
+            }
+            let restored_bin = Command::new(format!("node_modules/.bin/{}", fixture.bin))
+                .arg("--version")
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(restored_bin.status.success());
+
+            let checkpoint = db.checkpoint_lane_workspace(&lane_a, None).unwrap();
+            assert!(checkpoint.source_paths.is_empty());
+            if build.success {
+                assert!(checkpoint.generated_dirty_paths > 0);
+            }
+            let space_a = db.lane_workspace_space(&lane_a).unwrap();
+            let space_b = db.lane_workspace_space(&lane_b).unwrap();
+            assert_eq!(space_b.generated_upper_bytes, 0);
+            eprintln!(
+                "macos-nfs-framework name={} build_mode={} layer_entries={} logical_bytes={} physical_bytes={} lock_ms={} cold_sync_ms={} cache_hit_ms={} mount_two_ms={} bin_probe_ms={} build_ms={} build_success={} build_timed_out={} private_materialize_ms={} private_entries={} bulk_replace_ms={} generated_a_bytes={} generated_b_bytes={}",
+                fixture.name,
+                fixture.build_mode,
+                first.entry_count,
+                first.logical_bytes,
+                first.physical_bytes.unwrap_or(0),
+                lock_ms,
+                cold_sync_ms,
+                cache_hit_ms,
+                mount_two_ms,
+                bin_probe_ms,
+                build_ms,
+                build.success,
+                build.timed_out,
+                private_materialize_ms,
+                private_entries,
+                bulk_replace_ms,
+                space_a.generated_upper_bytes,
+                space_b.generated_upper_bytes,
+            );
+            drop(mount_b);
+            drop(remount_a);
+        }
+
+        fn materialize_private_dependency_tree(source: &Path, destination: &Path) -> u64 {
+            if destination.exists() {
+                fs::remove_dir_all(destination).unwrap();
+            }
+            fs::create_dir_all(destination).unwrap();
+            let mut entries = 0_u64;
+            for entry in walkdir::WalkDir::new(source).follow_links(false) {
+                let entry = entry.unwrap();
+                if entry.path() == source {
+                    continue;
+                }
+                entries += 1;
+                let relative = entry.path().strip_prefix(source).unwrap();
+                let target = destination.join(relative);
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(&target).unwrap();
+                } else if entry.file_type().is_symlink() {
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(fs::read_link(entry.path()).unwrap(), target)
+                        .unwrap();
+                } else {
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    clone_or_copy_projected_file(entry.path(), &target).unwrap();
+                    let metadata = fs::metadata(entry.path()).unwrap();
+                    fs::set_permissions(
+                        &target,
+                        fs::Permissions::from_mode(metadata.permissions().mode() | 0o200),
+                    )
+                    .unwrap();
+                }
+            }
+            entries
         }
 
         #[test]
@@ -1330,37 +1974,10 @@ mod macos {
             let target_a = PathBuf::from(&view_a.generated_upper).join("target");
             assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
 
-            let cargo_version = Command::new("cargo").arg("--version").output().unwrap();
-            let key = WorkspaceLayerKeyV1 {
-                kind: "compiler-results".to_string(),
-                adapter: "cargo-target-seed".to_string(),
-                adapter_version: 1,
-                inputs: BTreeMap::from([
-                    ("source_root".to_string(), first.source_root.0.clone()),
-                    ("command".to_string(), "cargo build --offline".to_string()),
-                ]),
-                tool_versions: BTreeMap::from([(
-                    "cargo".to_string(),
-                    String::from_utf8_lossy(&cargo_version.stdout)
-                        .trim()
-                        .to_string(),
-                )]),
-                platform: std::env::consts::OS.to_string(),
-                architecture: std::env::consts::ARCH.to_string(),
-                portability_scope: "source-root-toolchain-platform".to_string(),
-                strategy: "immutable-target-seed".to_string(),
-            };
             let layer = db
-                .publish_workspace_layer_from_directory(&key, &target_a)
+                .sync_workspace_environment("rust-nfs-b", "cargo", None)
                 .unwrap();
-            db.attach_workspace_layer(
-                "rust-nfs-b",
-                &layer.layer_id,
-                "target",
-                "cargo-target-seed",
-                &layer.cache_key,
-            )
-            .unwrap();
+            assert_eq!(layer.adapter, "cargo-target-seed");
 
             let second = db
                 .exec_lane_workspace(
@@ -1576,14 +2193,20 @@ pub(crate) fn mount_nfs_cow_for_lane(_db: &Trail, _lane: &str) -> Result<NfsCowM
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn nfs_clean_manifest_path(_db: &Trail, _lane: &str) -> Result<PathBuf> {
+pub(crate) fn mount_nfs_cow_for_lane_with_ephemeral_bindings(
+    _db: &Trail,
+    _lane: &str,
+    _source_upper: PathBuf,
+    _source_root: ObjectId,
+    _bindings: Vec<WorkspaceLayerBinding>,
+) -> Result<NfsCowMount> {
     Err(Error::InvalidInput(
         "nfs-cow workdirs are currently supported only on macOS".to_string(),
     ))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn nfs_candidate_paths(_db: &Trail, _lane: &str) -> Result<Vec<String>> {
+pub(crate) fn nfs_candidate_paths(_db: &Trail, _lane: &str) -> Result<ViewCheckpointCandidates> {
     Err(Error::InvalidInput(
         "nfs-cow workdirs are currently supported only on macOS".to_string(),
     ))
@@ -1599,15 +2222,30 @@ impl Trail {
         prepare_nfs_cow_workdir(self, lane, dir, custom)
     }
 
-    pub fn mount_nfs_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+    pub fn mount_nfs_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop + use<>> {
         mount_nfs_cow_for_lane(self, lane)
     }
 
-    pub(crate) fn nfs_clean_workdir_manifest_path_for_lane(&self, lane: &str) -> Result<PathBuf> {
-        nfs_clean_manifest_path(self, lane)
+    pub(crate) fn mount_nfs_cow_workdir_for_lane_with_ephemeral_bindings(
+        &self,
+        lane: &str,
+        source_upper: PathBuf,
+        source_root: ObjectId,
+        bindings: Vec<WorkspaceLayerBinding>,
+    ) -> Result<impl Drop + use<>> {
+        mount_nfs_cow_for_lane_with_ephemeral_bindings(
+            self,
+            lane,
+            source_upper,
+            source_root,
+            bindings,
+        )
     }
 
-    pub(crate) fn nfs_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn nfs_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+    ) -> Result<ViewCheckpointCandidates> {
         nfs_candidate_paths(self, lane)
     }
 

@@ -2,10 +2,14 @@ use serde_json::{json, Value};
 
 use super::{
     openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+    openapi_required_query,
 };
 
 pub(super) fn lane_paths() -> Value {
     json!({
+        "/v1/environment/adapters": {
+            "get": openapi_operation_with_response_schema("environmentAdapterCatalog", "Workspace environment adapters", "List registered adapters and their side-effect-free discovery metadata, provenance, and stability.", vec![], None, "EnvironmentAdapterCatalogReport", true)
+        },
         "/v1/lanes": {
             "get": openapi_operation("laneList", "List lanes", "List lane branches with metadata and branch state.", vec![], None, true),
             "post": openapi_operation("laneSpawn", "Spawn lane", "Create or reuse a lane branch.", vec![], Some("SpawnLaneRequest"), true)
@@ -96,9 +100,74 @@ pub(super) fn lane_paths() -> Value {
             ], None, true)
         },
         "/v1/lanes/{lane_or_id}/dependencies/sync": {
-            "post": openapi_operation("laneDependencySync", "Synchronize dependencies", "Build or reuse a frozen dependency layer and attach it to the lane.", vec![
+            "post": openapi_operation("laneDependencySync", "Synchronize dependencies", "Build or reuse a frozen dependency layer, then bulk-replace private dependency state in an unmounted lane.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], Some("DependencySyncRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/environment": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentStatus", "Workspace environment status", "Return normalized logical component and versioned adapter state for a layered lane.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "EnvironmentComponentStateReportList", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/discover": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentDiscover", "Discover workspace environments", "Detect built-in environment components without executing tools, network providers, or repository code.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("path", "string")
+            ], None, "EnvironmentDiscoveryReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/graph": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentGraph", "Desired environment graph", "Return the validated component DAG, deterministic topological order, output ownership, component keys, and ordering/invalidation edges without executing tools or mutating state.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("path", "string"),
+                openapi_query("offset", "integer"),
+                openapi_query("limit", "integer")
+            ], None, "EnvironmentGraphReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/generation": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentGeneration", "Active environment generation", "Return the exact source root, component keys, layers, mounts, and predecessor atomically active for a lane.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "EnvironmentGenerationReportNullable", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/explain": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentExplain", "Explain environment staleness", "Return every canonical input, tool, platform, and policy edge that differs from the attached component artifact.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_required_query("component", "string"),
+                openapi_query("offset", "integer"),
+                openapi_query("limit", "integer")
+            ], None, "EnvironmentStaleExplanationReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/plan": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentPlan", "Plan workspace environment", "Return the normalized key, inputs, argv actions, output, and capability grants without executing or mutating state.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("adapter", "string"),
+                openapi_query("component", "string"),
+                openapi_query("path", "string")
+            ], None, "EnvironmentPlanReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/sync": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentSync", "Synchronize workspace environment", "Prepare one adapter-owned environment component and atomically activate its shared and/or writable-private outputs for an unmounted lane.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("EnvironmentSyncRequest"), "EnvironmentSyncReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/sync-all": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentSyncAll", "Synchronize all workspace environments", "Build all discovered components before atomically activating one complete generation.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("DependencySyncRequest"), "EnvironmentSyncReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/runtime/status": {
+            "get": openapi_operation_with_response_schema("laneEnvironmentRuntimeStatus", "Environment runtime status", "Return persisted container, network, volume, port, lifecycle, and health state without contacting the runtime provider.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "EnvironmentGenerationReportNullable", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/runtime/reconcile": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeReconcile", "Reconcile environment runtime", "Idempotently create or adopt declared lane-private OCI resources and wait for health.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "EnvironmentGenerationReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/runtime/stop": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeStop", "Stop environment runtime", "Stop active Trail-owned containers while retaining private networks and volumes for restart.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "EnvironmentGenerationReport", true)
         },
         "/v1/lanes/{lane_or_id}/checkpoint": {
             "post": openapi_operation("laneWorkspaceCheckpoint", "Checkpoint lane workspace", "Checkpoint source-upper mutations into the lane ref under a mutation barrier.", vec![
@@ -154,9 +223,9 @@ pub(super) fn lane_paths() -> Value {
             ], Some("LaneTestRequest"), true)
         },
         "/v1/lanes/{lane_or_id}/patches": {
-            "post": openapi_operation("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![
+            "post": openapi_operation_with_response_schema("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("PatchRequest"), true)
+            ], Some("PatchRequest"), "LanePatchReport", true)
         }
     })
 }

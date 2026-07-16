@@ -13,13 +13,13 @@ pub(super) fn handle_trace_command(ctx: &RuntimeContext, trace: LaneTraceCommand
                 args.trace_id.as_deref(),
                 attributes,
             )?;
-            render_lane_trace_span_start(&report, ctx.json, ctx.quiet)
+            render_lane_trace_span_start(&report, ctx.json, &ctx.render)
         }
         LaneTraceSubcommand::End(args) => {
             let mut db = open_db(ctx)?;
             let result = parse_optional_json(args.result_json.as_deref())?;
             let report = db.end_lane_trace_span(&args.span_id, &args.status, result)?;
-            render_lane_trace_span_end(&report, ctx.json, ctx.quiet)
+            render_lane_trace_span_end(&report, ctx.json, &ctx.render)
         }
         LaneTraceSubcommand::List(args) => {
             let db = open_db(ctx)?;
@@ -30,7 +30,7 @@ pub(super) fn handle_trace_command(ctx: &RuntimeContext, trace: LaneTraceCommand
                 args.trace_id.as_deref(),
                 args.limit,
             )?;
-            render_lane_trace_spans(&spans, ctx.json, ctx.quiet)
+            render_lane_trace_spans(&spans, ctx.json, &ctx.render)
         }
         LaneTraceSubcommand::Summary(args) => {
             let db = open_db(ctx)?;
@@ -41,12 +41,12 @@ pub(super) fn handle_trace_command(ctx: &RuntimeContext, trace: LaneTraceCommand
                 args.trace_id.as_deref(),
                 args.slowest_limit,
             )?;
-            render_lane_trace_summary(&report, ctx.json, ctx.quiet)
+            render_lane_trace_summary(&report, ctx.json, &ctx.render)
         }
         LaneTraceSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let span = db.show_lane_trace_span(&args.span_id)?;
-            render_lane_trace_span(&span, ctx.json, ctx.quiet)
+            render_lane_trace_span(&span, ctx.json, &ctx.render)
         }
     }
 }

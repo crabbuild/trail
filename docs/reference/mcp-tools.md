@@ -289,11 +289,11 @@ before non-dry-run apply.
 
 ## Merge and Conflicts
 
-- `trail.merge_queue_add`
-- `trail.merge_queue_list`
-- `trail.merge_queue_run`
-- `trail.merge_queue_explain`
-- `trail.merge_queue_remove`
+- `trail.lane_merge_queue_add`
+- `trail.lane_merge_queue_list`
+- `trail.lane_merge_queue_run`
+- `trail.lane_merge_queue_explain`
+- `trail.lane_merge_queue_remove`
 - `trail.conflict_list`
 - `trail.conflict_show` returns conflict details plus deterministic explanation evidence and conservative next steps.
 - `trail.conflict_resolve`
@@ -329,16 +329,17 @@ file values can be plain strings or objects with only `content`, `delete`, and
 - `trail.sync_workdir`
 - `trail.read_file`
 
-`trail.lane_spawn` accepts `workdir_mode` values `virtual`, `sparse`,
-`full-cow`, `overlay-cow`, and `nfs-cow`. `virtual` creates no workdir, `sparse` requires
-`paths`, and `full-cow` creates a full materialized workdir using filesystem
-clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
-records an overlay backend; a runtime such as `trail agent start
---workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
-agent runs. Spawn results include `workdir_mode`, `cow_backend`, `sparse_paths`,
-and `overlay_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs-overlay"` and uses the built-in
-loopback NFS client.
+`trail.lane_spawn` accepts `workdir_mode` values `auto`, `virtual`, `sparse`,
+`native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`.
+`native-cow` is strict, `portable-copy` permits per-file byte-copy fallback,
+and `auto` tries the former before restarting as the latter. `fuse-cow` creates an empty workdir mountpoint and
+records the `fuse` backend; a runtime such as `trail agent start
+--workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
+agent runs. Spawn results include `requested_workdir_mode`, resolved
+`workdir_mode`, `workdir_backend`, optional `materialization`, `sparse_paths`,
+and `transparent_cow_available`.
+On macOS, `nfs-cow` reports `workdir_backend: "nfs"` and uses the built-in
+loopback NFS client. On Windows, `dokan-cow` reports `workdir_backend: "dokan"`.
 
 `trail.apply_patch` accepts either native `edits` or compatibility `files`;
 provide exactly one non-empty array. Native edit objects and compatibility file
@@ -355,7 +356,7 @@ workdir path. That directory contains copied recoverable regular files and
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under Trail's read-only guard, so they must not persist SQLite database changes or mutate Trail sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `trail://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/inbox/board/stack/next/guide/dashboard/review-data/review-flow/ask/view/brief/validate/test-plan/report/handoff/story/tools/impact/review-map/risk/confidence/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Workspace-write examples include `trail.agent_mark_reviewed`, `trail.agent_mark_file_reviewed`, `trail.agent_archive`, and `trail.agent_unarchive` because they write task metadata markers without deleting provenance. Destructive-write examples include `trail.agent_apply`, `trail.agent_finish`, `trail.agent_undo`, `trail.agent_rewind`, `trail.lane_rewind`, and `trail.merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under Trail's read-only guard, so they must not persist SQLite database changes or mutate Trail sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `trail://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/inbox/board/stack/next/guide/dashboard/review-data/review-flow/ask/view/brief/validate/test-plan/report/handoff/story/tools/impact/review-map/risk/confidence/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, lane merge queue list, conflict show, event/span queries, and guardrail check. Workspace-write examples include `trail.agent_mark_reviewed`, `trail.agent_mark_file_reviewed`, `trail.agent_archive`, and `trail.agent_unarchive` because they write task metadata markers without deleting provenance. Destructive-write examples include `trail.agent_apply`, `trail.agent_finish`, `trail.agent_undo`, `trail.agent_rewind`, `trail.lane_rewind`, and `trail.lane_merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
 
 Open-world write examples are `trail.agent_test`, `trail.agent_eval`,
 `trail.run_test`, and `trail.run_eval` because they execute commands in lane

@@ -7,7 +7,7 @@ Use a lane for one bounded unit of active work that needs isolation, provenance,
 From the original Trail workspace:
 
 ```sh
-trail lane spawn <lane> --from main --workdir-mode full-cow
+trail lane spawn <lane> --from main --workdir-mode native-cow
 trail lane status <lane>
 trail lane workdir <lane>
 ```
@@ -16,9 +16,10 @@ Choose intentionally:
 
 - `virtual`: no filesystem workdir; use structured patches.
 - `sparse`: selected paths only; supply `--paths`.
-- `full-cow`: portable full materialization.
-- `overlay-cow`: runtime-mounted FUSE COW where supported.
+- `native-cow`: portable full materialization using native clone/reflink COW when available.
+- `fuse-cow`: runtime-mounted FUSE COW where supported.
 - `nfs-cow`: macOS loopback NFS COW.
+- `dokan-cow`: Windows Dokan COW.
 
 For a narrow large-repository task:
 
@@ -29,6 +30,76 @@ trail lane claim <lane> README.md --ttl-secs 1800
 ```
 
 Edit only in the returned lane workdir. From that workdir, pass `--workspace <original-root>` to Trail commands unless workspace discovery is known to resolve correctly.
+
+For a layered lane with a single supported environment at the selected root, build or
+reuse its immutable environment before starting work:
+
+```sh
+trail env adapters
+trail env sync <lane>
+trail env status <lane>
+```
+
+`trail env adapters` lists canonical identities, accepted selectors, stability, and
+manifest names used by side-effect-free discovery. It does not probe package managers,
+compilers, or repository files.
+
+For semantic planning beyond a command profile, install an experimental local adapter
+package explicitly:
+
+```sh
+trail env plugin install path/to/package
+trail env adapters
+trail env plan <lane> --adapter namespace/name@1
+trail env plugin remove namespace/name@1
+```
+
+Trail content-addresses and revalidates the package, gives its planner only bounded bytes
+from the pinned root, and runs it without repository, network, child-process, database,
+mount, or publication authority. Local packages are experimental; signed organization
+catalogs and WASI distribution are not yet available.
+
+Auto-detection supports Node, the experimental Cargo target-seed adapter,
+single-module Go vendoring, and lane-private CMake build trees. For a polyglot root,
+select explicitly with
+`--adapter trail/node@1`, `--adapter trail/cargo-target-seed@1`, or
+`--adapter trail/go-vendor@1`; use `--adapter trail/cmake-build@1` for CMake and
+`--path <root>` for a nested component.
+Environment synchronization requires an unmounted lane because it atomically advances
+the environment binding generation. `trail deps sync` remains the Node compatibility
+command.
+
+For CMake, synchronization provisions the lane-private build directory without running
+configure in a disposable staging path. Configure and build inside the lane so
+`CMakeCache.txt` records the correct mounted path:
+
+```sh
+trail env sync <lane> --adapter trail/cmake-build@1
+trail lane exec <lane> -- cmake -S . -B build -G Ninja
+trail lane exec <lane> -- cmake --build build
+```
+
+Inspect a monorepo before executing installers, then activate every non-conflicting
+proposal together:
+
+```sh
+trail env discover <lane>
+trail env plan <lane>
+trail env sync-all <lane>
+trail env generation <lane>
+```
+
+`trail env plan` is read-only and shows the normalized component key, input hashes,
+resolved executable identity, argv, mount, portability, and capability grants before
+synchronization. Repository-defined `trail/command@1` components may be declared in
+`trail.environment.toml`; execution uses macOS sandbox-exec, Linux Landlock plus
+seccomp, or a capability-free Windows AppContainer constrained by a one-process Job
+Object, and fails closed when the required native enforcement is unavailable.
+If discovery reports multiple components at one root, pass `--component <id>` to
+`env plan` or `env sync`, or use `env sync-all` to activate the whole environment.
+
+`sync-all` builds components before changing mounts; activation advances one durable
+generation or leaves the predecessor authoritative.
 
 ## Materialized Workdir Changes
 
@@ -117,19 +188,31 @@ trail lane diff <lane> --patch --show-line-ids
 trail approvals list --lane <lane>
 ```
 
+If readiness reports `dependency_environment_stale`, inspect the exact cause before
+rebuilding:
+
+```sh
+trail env status <lane>
+trail env explain <lane> --component <component-id>
+trail env plan <lane> --component <component-id>
+```
+
+Explanation reports name changed inputs, tools, platforms, and policies without
+rendering their values. Use `--offset` and `--limit` for large monorepos.
+
 Stop on readiness blockers. Preview refresh and merge:
 
 ```sh
 trail lane refresh-preview <lane> --target main
-trail merge-lane <lane> --into main --dry-run
+trail lane merge <lane> --into main --dry-run
 ```
 
 For shared targets, queue rather than directly merging:
 
 ```sh
-trail merge-queue add <lane> --into main
-trail merge-queue explain <lane>
-trail merge-queue run
+trail lane merge-queue add <lane> --into main
+trail lane merge-queue explain <lane>
+trail lane merge-queue run
 ```
 
 Queue execution is consequential and re-runs readiness. Do it only when authorized. Remove a lane only after verifying it is merged or intentionally abandoned; `lane rm --force` is not routine cleanup.

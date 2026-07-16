@@ -1,5 +1,98 @@
 use super::*;
 
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static LANE_RECORD_AFTER_C2_WRITE: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>> =
+        const { std::cell::RefCell::new(None) };
+    static FAIL_LANE_RECORD_POSTCOMMIT_BOUNDARY: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn install_lane_record_after_c2_write_for_current_thread(path: PathBuf, bytes: Vec<u8>) {
+    LANE_RECORD_AFTER_C2_WRITE.with(|pending| *pending.borrow_mut() = Some((path, bytes)));
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_lane_record_postcommit_failure_for_current_thread(
+    boundary: Option<&'static str>,
+) {
+    FAIL_LANE_RECORD_POSTCOMMIT_BOUNDARY.with(|selected| *selected.borrow_mut() = boundary);
+}
+
+#[cfg(debug_assertions)]
+fn run_lane_record_after_c2_write() -> Result<()> {
+    let pending = LANE_RECORD_AFTER_C2_WRITE.with(|pending| pending.borrow_mut().take());
+    if let Some((path, bytes)) = pending {
+        fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn run_lane_record_after_c2_write() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn fail_lane_record_postcommit_if_requested(boundary: &'static str) -> Result<()> {
+    if FAIL_LANE_RECORD_POSTCOMMIT_BOUNDARY.with(|selected| *selected.borrow() == Some(boundary)) {
+        return Err(Error::InvalidInput(format!(
+            "injected lane record postcommit failure at {boundary}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn fail_lane_record_postcommit_if_requested(_boundary: &'static str) -> Result<()> {
+    Ok(())
+}
+
+fn lane_record_committed_repair_error(
+    operation: &ObjectId,
+    repair: &'static str,
+    error: Error,
+) -> Error {
+    match error {
+        Error::CommittedRepairRequired { .. } => error,
+        error => Error::CommittedRepairRequired {
+            operation: operation.0.clone(),
+            repair: repair.into(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+enum RecordChangedPathsCaseFold {
+    AlreadySafe,
+    NeedsValidation,
+    LegacyUnavailable,
+    Collision { path: String, previous: String },
+}
+
+struct RecordChangedPaths {
+    summaries: Vec<FileDiffSummary>,
+    case_fold: RecordChangedPathsCaseFold,
+}
+
+fn record_changed_paths_case_fold(
+    state: &RecordCaseFoldResolutionState,
+) -> RecordChangedPathsCaseFold {
+    match state {
+        RecordCaseFoldResolutionState::Indexed { .. } => RecordChangedPathsCaseFold::AlreadySafe,
+        RecordCaseFoldResolutionState::LegacyUnavailable => {
+            RecordChangedPathsCaseFold::LegacyUnavailable
+        }
+        RecordCaseFoldResolutionState::Collision { path, previous } => {
+            RecordChangedPathsCaseFold::Collision {
+                path: path.clone(),
+                previous: previous.clone(),
+            }
+        }
+    }
+}
+
 impl Trail {
     pub fn preview_lane_workdir_record(&self, lane: &str) -> Result<LaneRecordPreviewReport> {
         validate_ref_segment(lane)?;
@@ -14,17 +107,33 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
         let head = self.get_ref(&branch.ref_name)?;
-        let changed_paths =
-            self.lane_workdir_record_changed_paths(&branch, &head, &workdir_path)?;
+        let changed =
+            self.lane_workdir_record_changed_paths_with_case_fold(&branch, &head, &workdir_path)?;
+        let changed_paths = changed.summaries;
         let (ignored_paths, risky_paths) =
             self.preview_lane_workdir_path_warnings(&workdir_path)?;
         let oversized_files =
             self.lane_record_oversized_files_on_disk(&workdir_path, &changed_paths)?;
         let mut policy = self.preview_lane_record_policy(&branch, &changed_paths)?;
-        if policy.error.is_none() {
-            if let Err(err) = self
-                .ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &changed_paths)
-            {
+        if policy.error.is_none() && !changed_paths.is_empty() {
+            let case_fold_result: Result<()> = match changed.case_fold {
+                RecordChangedPathsCaseFold::AlreadySafe => Ok(()),
+                RecordChangedPathsCaseFold::NeedsValidation => self
+                    .ensure_record_final_root_paths_safe_from_summaries(
+                        &head.root_id,
+                        &changed_paths,
+                    ),
+                RecordChangedPathsCaseFold::LegacyUnavailable => Err(Error::PathIndexRequired(
+                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
+                )),
+                RecordChangedPathsCaseFold::Collision { path, previous } => {
+                    Err(Error::InvalidPath {
+                        path,
+                        reason: format!("case-insensitive path collision with `{previous}`"),
+                    })
+                }
+            };
+            if let Err(err) = case_fold_result {
                 policy.allowed = false;
                 policy.error = Some(err.to_string());
             }
@@ -53,8 +162,28 @@ impl Trail {
         lane: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
-        let _lock = self.acquire_write_lock()?;
-        self.record_lane_workdir_locked(lane, message, None)
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::MaterializedLaneRecord,
+            || {
+                self.reset_case_fold_index_metrics();
+                let _lock = if crate::db::change_ledger::command_authority_enabled() {
+                    None
+                } else {
+                    Some(self.acquire_write_lock()?)
+                };
+                let result = self.record_lane_workdir_locked(lane, message, None);
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
     }
 
     pub fn record_lane_workdir_for_turn(
@@ -63,8 +192,28 @@ impl Trail {
         turn_id: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
-        let _lock = self.acquire_write_lock()?;
-        self.record_lane_workdir_locked(lane, message, Some(turn_id))
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::MaterializedLaneRecord,
+            || {
+                self.reset_case_fold_index_metrics();
+                let _lock = if crate::db::change_ledger::command_authority_enabled() {
+                    None
+                } else {
+                    Some(self.acquire_write_lock()?)
+                };
+                let result = self.record_lane_workdir_locked(lane, message, Some(turn_id));
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
     }
 
     fn record_lane_workdir_locked(
@@ -73,6 +222,8 @@ impl Trail {
         message: Option<String>,
         existing_turn_id: Option<&str>,
     ) -> Result<LaneRecordReport> {
+        // TRAIL_FS_PRODUCER: observed_lane_checkpoint ObservedCheckpoint controlled
+        self.reset_case_fold_index_metrics();
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         ensure_lane_record_message_has_no_secrets(message.as_deref())?;
@@ -107,55 +258,141 @@ impl Trail {
         let is_sparse = sparse_paths.is_some();
         let workdir_mode =
             self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
-        let _mutation_barrier = if workdir_mode.is_transparent_cow() {
-            let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        // Layered COW lanes are authorized by their persistent view mutation
+        // journal and exclusive view barrier. Their mountpoint is intentionally
+        // empty after unmount, so starting a filesystem observer there would
+        // both inspect the wrong authority and fail closed on absent `.trail`
+        // storage. Ordinary materialized lanes retain the native observer
+        // handoff before candidate comparison.
+        if crate::db::change_ledger::command_authority_enabled()
+            && !workdir_mode.is_transparent_cow()
+        {
+            crate::db::change_ledger::materialized_lane_daemon_expected_scope(self, lane)?;
+        }
+        // Authority-on mounted views still take the workspace writer lock
+        // before the view barrier. Materialized observer-backed lanes retain
+        // their explicit daemon handoff instead of deadlocking that observer
+        // behind a lock held by its caller.
+        let _view_workspace_lock = if workdir_mode.is_transparent_cow()
+            && crate::db::change_ledger::command_authority_enabled()
+        {
+            Some(self.acquire_write_lock()?)
+        } else {
+            None
+        };
+        let workspace_view = if workdir_mode.is_transparent_cow() {
+            Some(self.lane_workspace_view(lane)?.ok_or_else(|| {
                 Error::Corrupt(format!(
                     "layered lane `{lane}` has no persisted workspace view"
                 ))
-            })?;
-            Some(ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?)
+            })?)
         } else {
             None
         };
-        let source_upper = if workdir_mode.is_transparent_cow() {
-            Some(self.workspace_view_paths_for_lane(lane)?.source_upper)
-        } else {
-            None
-        };
+        let mut mutation_barrier = workspace_view
+            .as_ref()
+            .map(|view| ViewMutationBarrier::exclusive(Path::new(&view.meta_dir)))
+            .transpose()?;
+        let source_upper = workspace_view
+            .as_ref()
+            .map(|view| PathBuf::from(&view.source_upper));
         let record_scan_root = source_upper.as_deref().unwrap_or(&workdir_path);
-        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(&branch)?;
-        let cached_status = if matches!(
-            &workdir_mode,
-            LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow
-        ) {
+        let layered_manifest_path = self.lane_layered_clean_manifest_path(&branch)?;
+        let mut observed_record_cut = None;
+        let mut observed_record_files = None;
+        let mut upper_recovery_walks = 0_u64;
+        let mut generated_dirty_paths = 0_u64;
+        let cached_status = if crate::db::change_ledger::command_authority_enabled()
+            && !workdir_mode.is_transparent_cow()
+        {
+            let (mut comparison, fenced) = self.compare_materialized_lane_candidates(
+                &branch.lane_id,
+                crate::db::change_ledger::CandidateMaterialization::RecordBytes,
+            )?;
+            observed_record_cut = Some(crate::db::change_ledger::ObservedRecordCut {
+                expected: fenced.candidates.expected.clone(),
+                c1: fenced.candidates.cut.clone(),
+                c2: fenced.c2.clone(),
+                acknowledgement_tokens: fenced.candidates.acknowledgement_tokens.clone(),
+            });
+            // The comparison owns the exact descriptor-relative bytes read
+            // between c1 and c2. A later same-path write must remain pending
+            // evidence, never replace the bytes authorized for this record.
+            observed_record_files = comparison.disk_files.take();
+            if observed_record_files.is_none() {
+                return Err(Error::Corrupt(
+                    "lane record candidate comparison omitted pinned contents".into(),
+                ));
+            }
+            run_lane_record_after_c2_write()?;
+            if comparison.summaries.is_empty() {
+                CachedWorkdirManifestStatus::Clean
+            } else {
+                CachedWorkdirManifestStatus::Dirty {
+                    disk_manifest: comparison.disk_manifest,
+                    candidate_paths: Some(comparison.selections),
+                }
+            }
+        } else if workdir_mode.is_transparent_cow() {
             // Derive the delta from the persistent upper layer instead of an
             // FUSE/NFS READDIR result or a scan of the composed repository.
-            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
-                self.nfs_cow_candidate_paths_for_lane(lane)?
-            } else {
-                self.overlay_cow_candidate_paths_for_lane(lane)?
-            };
+            let candidates = self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
+            upper_recovery_walks = candidates.upper_recovery_walks;
+            generated_dirty_paths = candidates
+                .generated_paths
+                .len()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let candidate_paths = candidates.paths.into_iter().collect::<Vec<_>>();
+            self.note_operation_metrics(OperationMetricsDelta {
+                authoritative_candidate_count: candidate_paths.len().try_into().unwrap_or(u64::MAX),
+                ..OperationMetricsDelta::default()
+            });
             let disk_files = self.scan_files_under_for_paths(record_scan_root, &candidate_paths)?;
+            let disk_manifest = self.disk_manifest(&disk_files);
+            // The exclusive view mutation barrier pins the qualified journal
+            // and its source upper for this checkpoint. Reuse these selected
+            // bytes when building the root instead of reading every candidate
+            // a second time under the same barrier.
+            observed_record_files = Some(disk_files);
             CachedWorkdirManifestStatus::Dirty {
-                disk_manifest: self.disk_manifest(&disk_files),
+                disk_manifest,
                 candidate_paths: Some(candidate_paths),
             }
         } else {
+            // A full materialized workdir is repository-shaped: validating its
+            // manifest walks every materialized path (or falls back to a full
+            // scan when the manifest is missing). Sparse workdirs remain
+            // bounded by their explicit selection and are not counted here.
+            if !is_sparse {
+                self.note_full_filesystem_path_scan();
+            }
             self.lane_cached_workdir_manifest_status(
                 &workdir_path,
-                overlay_manifest_path.as_deref(),
+                layered_manifest_path.as_deref(),
                 &head.root_id,
             )?
         };
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
             if workdir_mode.is_transparent_cow() {
-                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                self.complete_workspace_checkpoint(
+                    lane,
+                    &head.root_id,
+                    None,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint lost its mutation barrier".into())
+                    })?,
+                )?;
             }
+            self.publish_lane_marker_if_materialized(lane)?;
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks,
+                generated_dirty_paths,
             });
         }
         if let Some(session_id) = &branch.session_id {
@@ -170,7 +407,7 @@ impl Trail {
                 disk_manifest,
                 candidate_paths,
             } => {
-                let (summaries, previous_files, use_disk_manifest_for_clean) =
+                let (summaries, previous_files, use_disk_manifest_for_clean, record_preflight) =
                     if let Some(mut selected_paths) = sparse_paths.clone() {
                         selected_paths.extend(disk_manifest.keys().cloned());
                         selected_paths.sort();
@@ -181,17 +418,28 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &selected_paths,
-                        );
-                        (summaries, previous_files, false)
+                        )?;
+                        (summaries, previous_files, false, None)
                     } else if let Some(candidate_paths) = candidate_paths {
+                        let resolution = self.resolve_record_case_fold_candidates_read_only(
+                            &head.root_id,
+                            &candidate_paths,
+                            &disk_manifest,
+                        )?;
+                        let candidate_paths = resolution.selected_paths.clone();
                         let previous_files =
                             self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
                         let summaries = self.diff_file_maps_to_manifest_for_paths(
                             &previous_files,
                             &disk_manifest,
                             &candidate_paths,
-                        );
-                        (summaries, previous_files, true)
+                        )?;
+                        (
+                            summaries,
+                            previous_files,
+                            true,
+                            Some(self.finalize_record_case_fold_resolution(resolution)?),
+                        )
                     } else {
                         let summaries =
                             self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?;
@@ -201,7 +449,7 @@ impl Trail {
                             .collect::<Vec<_>>();
                         let previous_files =
                             self.load_root_files_for_paths(&head.root_id, &selected_paths)?;
-                        (summaries, previous_files, true)
+                        (summaries, previous_files, true, None)
                     };
                 let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
                 if summaries.is_empty() {
@@ -214,7 +462,7 @@ impl Trail {
                     if use_disk_manifest_for_clean {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
@@ -222,35 +470,93 @@ impl Trail {
                     } else {
                         self.write_lane_clean_workdir_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &previous_files,
                             materialized_paths.iter(),
                         )?;
                     }
                     if workdir_mode.is_transparent_cow() {
-                        self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                        self.complete_workspace_checkpoint(
+                            lane,
+                            &head.root_id,
+                            None,
+                            mutation_barrier.as_mut().ok_or_else(|| {
+                                Error::Corrupt(
+                                    "layered checkpoint lost its mutation barrier".into(),
+                                )
+                            })?,
+                        )?;
                     }
+                    self.publish_lane_marker_if_materialized(lane)?;
                     return Ok(LaneRecordReport {
                         lane_id: branch.lane_id,
                         operation: None,
                         root_id: head.root_id,
                         changed_paths: Vec::new(),
+                        path_index: self.case_fold_index_metrics_report(),
+                        upper_recovery_walks,
+                        generated_dirty_paths,
                     });
                 }
                 let selected_paths = summaries
                     .iter()
                     .map(|summary| summary.path.clone())
                     .collect::<Vec<_>>();
-                let disk_files =
-                    self.scan_files_under_for_paths(record_scan_root, &selected_paths)?;
-                let built = self.build_root_for_selected_disk_files_incremental(
-                    &head.root_id,
-                    &previous_files,
-                    &disk_files,
-                    &selected_paths,
-                    &change_id,
-                )?;
+                let selected_disk_paths = record_preflight
+                    .as_ref()
+                    .map(|preflight| {
+                        preflight
+                            .expected_observed_present_paths
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        selected_paths
+                            .iter()
+                            .filter(|path| disk_manifest.contains_key(*path))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    });
+                let scanned_disk_files;
+                let disk_files = if let Some(captured) = observed_record_files.as_ref() {
+                    captured.as_slice()
+                } else {
+                    // Legacy and transparent-COW record paths do not use the
+                    // authoritative c1/c2 snapshot and retain their existing
+                    // selected filesystem scan.
+                    scanned_disk_files =
+                        self.scan_files_under_for_paths(record_scan_root, &selected_disk_paths)?;
+                    scanned_disk_files.as_slice()
+                };
+                let built = if observed_record_files.is_some() {
+                    self.build_root_for_selected_disk_files_incremental(
+                        &head.root_id,
+                        &previous_files,
+                        disk_files,
+                        &selected_paths,
+                        &change_id,
+                    )?
+                } else if let Some(record_preflight) = record_preflight {
+                    self.build_root_for_selected_disk_files_incremental_with_record_preflight(
+                        record_scan_root,
+                        &head.root_id,
+                        &previous_files,
+                        &disk_files,
+                        &selected_paths,
+                        &change_id,
+                        record_preflight,
+                    )?
+                } else {
+                    self.build_root_for_selected_disk_files_incremental(
+                        &head.root_id,
+                        &previous_files,
+                        &disk_files,
+                        &selected_paths,
+                        &change_id,
+                    )?
+                };
                 let clean_disk_manifest = use_disk_manifest_for_clean.then_some(disk_manifest);
                 (
                     built,
@@ -287,16 +593,20 @@ impl Trail {
                     if summaries.is_empty() {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
                         )?;
+                        self.publish_lane_marker_if_materialized(lane)?;
                         return Ok(LaneRecordReport {
                             lane_id: branch.lane_id,
                             operation: None,
                             root_id: head.root_id,
                             changed_paths: Vec::new(),
+                            path_index: self.case_fold_index_metrics_report(),
+                            upper_recovery_walks,
+                            generated_dirty_paths,
                         });
                     }
                     let selected_paths = summaries
@@ -329,7 +639,7 @@ impl Trail {
             if let Some(disk_manifest) = &clean_disk_manifest {
                 self.write_lane_clean_workdir_manifest_from_disk_manifest(
                     &workdir_path,
-                    overlay_manifest_path.as_deref(),
+                    layered_manifest_path.as_deref(),
                     &head.root_id,
                     disk_manifest,
                     materialized_paths.iter(),
@@ -337,20 +647,31 @@ impl Trail {
             } else {
                 self.write_lane_clean_workdir_manifest(
                     &workdir_path,
-                    overlay_manifest_path.as_deref(),
+                    layered_manifest_path.as_deref(),
                     &head.root_id,
                     &built.files,
                     materialized_paths.iter(),
                 )?;
             }
             if workdir_mode.is_transparent_cow() {
-                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                self.complete_workspace_checkpoint(
+                    lane,
+                    &head.root_id,
+                    None,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint lost its mutation barrier".into())
+                    })?,
+                )?;
             }
+            self.publish_lane_marker_if_materialized(lane)?;
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
+                upper_recovery_walks,
+                generated_dirty_paths,
             });
         }
         self.ensure_lane_record_policy(&branch, &diff.summaries)?;
@@ -387,99 +708,253 @@ impl Trail {
             changes: diff.changes,
             created_at: now_ts(),
         };
-        let operation_id = self.store_operation(&operation)?;
-        self.advance_ref_cas(&head, &change_id, &built.root_id, &operation_id)?;
-        test_crash_point("checkpoint_after_ref_advance");
-        let message_id = if let Some(message) = message {
-            Some(self.store_message(
-                "lane",
-                &message,
-                Some(&branch.lane_id),
-                branch.session_id.as_deref(),
-                Some(&change_id),
-                operation.created_at,
-            )?)
+        let workspace_checkpoint = workspace_view
+            .as_ref()
+            .map(|view| -> Result<_> {
+                let cut = ViewMutationJournal::open(Path::new(&view.source_upper))?.cut();
+                if !cut.recovery_qualified {
+                    return Err(Error::ChangeLedgerReconcileRequired {
+                        scope: view.view_id.clone(),
+                        state: "unqualified_view_journal".into(),
+                        reason: "workspace checkpoint cannot qualify either changed-path or whiteout evidence".into(),
+                        command: "trail ledger reconcile".into(),
+                    });
+                }
+                Ok(crate::db::change_ledger::WorkspaceViewCheckpointPublication {
+                    view_id: view.view_id.clone(),
+                    expected_generation: view.generation,
+                    journal_sequence: cut.sequence,
+                    next_generation: cut.generation.saturating_add(1),
+                    journal_qualified: cut.qualified,
+                })
+            })
+            .transpose()?;
+        self.invalidate_lane_marker_if_materialized(&branch)?;
+        let committed_operation_id = if let Some(observed) = observed_record_cut.as_ref() {
+            let evidence = crate::db::change_ledger::IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: Vec::new(),
+            };
+            crate::db::change_ledger::run_ref_advancing_projection(
+                self,
+                &observed.expected,
+                &head,
+                &branch.lane_id,
+                crate::db::change_ledger::IntentProducer::ObservedCheckpoint,
+                &operation,
+                &evidence,
+                crate::db::change_ledger::RefAdvancingProjectionMode::ObservedCut {
+                    cut: observed,
+                    acknowledge_complete_prefixes: true,
+                },
+                |_, _| {
+                    Err(Error::InvalidInput(
+                        "observed checkpoint cannot enter a controlled intent interval".into(),
+                    ))
+                },
+                |db, publication| {
+                    crate::db::change_ledger::accept_materialized_lane_daemon_baseline(
+                        db,
+                        &branch.lane_id,
+                        &observed.expected,
+                        &publication.baseline,
+                    )
+                },
+            )?
+            .operation_id
         } else {
-            None
+            crate::db::change_ledger::commit_lane_operation_atomic(
+                self,
+                &head,
+                &branch.lane_id,
+                &operation,
+                workspace_checkpoint.as_ref(),
+            )?
         };
-        self.conn.execute(
-            "UPDATE lane_branches SET head_change = ?1, head_root = ?2, updated_at = ?3 WHERE lane_id = ?4",
-            params![change_id.0, built.root_id.0, now_ts(), branch.lane_id],
-        )?;
+        test_crash_point("checkpoint_after_ref_advance");
+        let message_id = (|| {
+            fail_lane_record_postcommit_if_requested("message")?;
+            if let Some(message) = message {
+                Ok(Some(self.store_message(
+                    "lane",
+                    &message,
+                    Some(&branch.lane_id),
+                    branch.session_id.as_deref(),
+                    Some(&change_id),
+                    operation.created_at,
+                )?))
+            } else {
+                Ok(None)
+            }
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(
+                &committed_operation_id,
+                "lane record message",
+                error,
+            )
+        })?;
         test_crash_point("checkpoint_after_lane_head_update");
-        if is_sparse {
-            self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
-        }
-        if let Some(disk_manifest) = &clean_disk_manifest {
-            self.write_lane_clean_workdir_manifest_from_disk_manifest(
-                &workdir_path,
-                overlay_manifest_path.as_deref(),
-                &built.root_id,
-                disk_manifest,
-                materialized_paths.iter(),
-            )?;
-        } else {
-            self.write_lane_clean_workdir_manifest(
-                &workdir_path,
-                overlay_manifest_path.as_deref(),
-                &built.root_id,
-                &built.files,
-                materialized_paths.iter(),
-            )?;
-        }
-        self.insert_lane_event_with_context(
-            &branch.lane_id,
-            branch.session_id.as_deref(),
-            Some(&turn_id),
-            "workdir_recorded",
-            Some(&change_id),
-            message_id.as_ref(),
-            &serde_json::json!({
-                "workdir": workdir,
-                "root_id": built.root_id.0.clone(),
-                "session_id": branch.session_id.clone(),
-                "changed_paths": diff.summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
-            }),
-        )?;
-        if existing_turn.is_some() {
-            self.update_lane_turn_progress(&turn_id, "workdir_recorded", Some(&change_id))?;
-        } else {
-            self.finish_lane_turn(&turn_id, "completed", Some(&change_id))?;
-        }
-        if workdir_mode.is_transparent_cow() {
-            self.complete_workspace_checkpoint(lane, &built.root_id, Some(&change_id))?;
-        }
+        (|| {
+            fail_lane_record_postcommit_if_requested("manifest")?;
+            if is_sparse {
+                self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
+            }
+            if let Some(disk_manifest) = &clean_disk_manifest {
+                self.write_lane_clean_workdir_manifest_from_disk_manifest(
+                    &workdir_path,
+                    layered_manifest_path.as_deref(),
+                    &built.root_id,
+                    disk_manifest,
+                    materialized_paths.iter(),
+                )?;
+            } else {
+                self.write_lane_clean_workdir_manifest(
+                    &workdir_path,
+                    layered_manifest_path.as_deref(),
+                    &built.root_id,
+                    &built.files,
+                    materialized_paths.iter(),
+                )?;
+            }
+            Ok(())
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(
+                &committed_operation_id,
+                "lane record manifest",
+                error,
+            )
+        })?;
+        (|| {
+            fail_lane_record_postcommit_if_requested("event")?;
+            self.insert_lane_event_with_context(
+                &branch.lane_id,
+                branch.session_id.as_deref(),
+                Some(&turn_id),
+                "workdir_recorded",
+                Some(&change_id),
+                message_id.as_ref(),
+                &serde_json::json!({
+                    "workdir": workdir,
+                    "root_id": built.root_id.0.clone(),
+                    "session_id": branch.session_id.clone(),
+                    "changed_paths": diff.summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
+                }),
+            )
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(
+                &committed_operation_id,
+                "lane record event",
+                error,
+            )
+        })?;
+        (|| {
+            fail_lane_record_postcommit_if_requested("turn")?;
+            if existing_turn.is_some() {
+                self.update_lane_turn_progress(&turn_id, "workdir_recorded", Some(&change_id))
+            } else {
+                self.finish_lane_turn(&turn_id, "completed", Some(&change_id))
+            }
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(&committed_operation_id, "lane record turn", error)
+        })?;
+        (|| {
+            fail_lane_record_postcommit_if_requested("checkpoint")?;
+            if let Some(checkpoint) = &workspace_checkpoint {
+                self.repair_workspace_checkpoint_mirror(
+                    lane,
+                    &built.root_id,
+                    Some(&change_id),
+                    checkpoint.journal_sequence,
+                    checkpoint.next_generation,
+                    checkpoint.journal_qualified,
+                    mutation_barrier.as_mut().ok_or_else(|| {
+                        Error::Corrupt("layered checkpoint repair lost its mutation barrier".into())
+                    })?,
+                )?;
+            }
+            Ok(())
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(
+                &committed_operation_id,
+                "lane record workspace checkpoint",
+                error,
+            )
+        })?;
+        (|| {
+            fail_lane_record_postcommit_if_requested("marker")?;
+            self.publish_lane_marker_if_materialized(lane)
+        })()
+        .map_err(|error| {
+            lane_record_committed_repair_error(&committed_operation_id, "lane record marker", error)
+        })?;
         Ok(LaneRecordReport {
             lane_id: branch.lane_id,
             operation: Some(change_id),
             root_id: built.root_id,
             changed_paths: diff.summaries,
+            path_index: self.case_fold_index_metrics_report(),
+            upper_recovery_walks,
+            generated_dirty_paths,
         })
     }
 
-    pub(crate) fn lane_overlay_clean_manifest_path(
+    pub(crate) fn lane_layered_clean_manifest_path(
         &self,
         branch: &LaneBranch,
     ) -> Result<Option<PathBuf>> {
         let record = self.lane_record(&branch.lane_id)?;
-        match self.lane_workdir_mode_for(&record, branch)? {
-            LaneWorkdirMode::OverlayCow => Ok(Some(
-                self.overlay_clean_workdir_manifest_path_for_lane(&record.name)?,
-            )),
-            LaneWorkdirMode::NfsCow => Ok(Some(
-                self.nfs_clean_workdir_manifest_path_for_lane(&record.name)?,
-            )),
-            _ => Ok(None),
+        if self
+            .lane_workdir_mode_for(&record, branch)?
+            .is_transparent_cow()
+        {
+            return Ok(Some(
+                self.workspace_view_paths_for_lane_name(&record.name)
+                    .meta_dir
+                    .join("workdir-manifest.json"),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn transparent_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+        mode: &LaneWorkdirMode,
+    ) -> Result<ViewCheckpointCandidates> {
+        match mode {
+            LaneWorkdirMode::FuseCow => self.fuse_cow_candidate_paths_for_lane(lane),
+            LaneWorkdirMode::NfsCow => self.nfs_cow_candidate_paths_for_lane(lane),
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.dokan_cow_candidate_paths_for_lane(lane)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Err(Error::InvalidInput(
+                        "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                    ))
+                }
+            }
+            _ => Err(Error::InvalidInput(format!(
+                "lane `{lane}` uses non-layered workdir mode `{}`",
+                mode.as_str()
+            ))),
         }
     }
 
     pub(crate) fn lane_cached_workdir_manifest_status(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
     ) -> Result<CachedWorkdirManifestStatus> {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.cached_workdir_manifest_status_from_path(workdir_path, manifest_path, root_id)
         } else {
             self.cached_workdir_manifest_status(workdir_path, root_id)
@@ -489,7 +964,7 @@ impl Trail {
     fn write_lane_clean_workdir_manifest<'a, I>(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
         files: &BTreeMap<String, FileEntry>,
         expected_paths: I,
@@ -497,7 +972,7 @@ impl Trail {
     where
         I: IntoIterator<Item = &'a String>,
     {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.write_clean_workdir_manifest_to_path(
                 workdir_path,
                 manifest_path,
@@ -513,7 +988,7 @@ impl Trail {
     fn write_lane_clean_workdir_manifest_from_disk_manifest<'a, I>(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
         disk_manifest: &BTreeMap<String, DiskManifest>,
         expected_paths: I,
@@ -521,7 +996,7 @@ impl Trail {
     where
         I: IntoIterator<Item = &'a String>,
     {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.write_clean_workdir_manifest_from_disk_manifest_to_path(
                 workdir_path,
                 manifest_path,
@@ -545,34 +1020,72 @@ impl Trail {
         head: &RefRecord,
         workdir_path: &Path,
     ) -> Result<Vec<FileDiffSummary>> {
+        Ok(self
+            .lane_workdir_record_changed_paths_with_case_fold(branch, head, workdir_path)?
+            .summaries)
+    }
+
+    fn lane_workdir_record_changed_paths_with_case_fold(
+        &self,
+        branch: &LaneBranch,
+        head: &RefRecord,
+        workdir_path: &Path,
+    ) -> Result<RecordChangedPaths> {
         let lane_record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
         if workdir_mode.is_transparent_cow() {
-            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
-                self.nfs_cow_candidate_paths_for_lane(&lane_record.name)?
-            } else {
-                self.overlay_cow_candidate_paths_for_lane(&lane_record.name)?
-            };
+            let candidate_paths = self
+                .transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?
+                .paths
+                .into_iter()
+                .collect::<Vec<_>>();
             let source_upper = self
                 .workspace_view_paths_for_lane(&lane_record.name)?
                 .source_upper;
             let disk_files = self.scan_files_under_for_paths(&source_upper, &candidate_paths)?;
             let disk_manifest = self.disk_manifest(&disk_files);
-            let previous_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
-            return Ok(self.diff_file_maps_to_manifest_for_paths(
-                &previous_files,
-                &disk_manifest,
+            let resolution = self.resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
                 &candidate_paths,
-            ));
+                &disk_manifest,
+            )?;
+            let case_fold = record_changed_paths_case_fold(&resolution.state);
+            let candidate_paths = resolution.selected_paths;
+            let previous_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
+            return Ok(RecordChangedPaths {
+                summaries: self.diff_file_maps_to_manifest_for_paths(
+                    &previous_files,
+                    &disk_manifest,
+                    &candidate_paths,
+                )?,
+                case_fold,
+            });
+        }
+        if crate::db::change_ledger::command_authority_enabled() {
+            let (comparison, _) = self.compare_materialized_lane_candidates(
+                &branch.lane_id,
+                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+            )?;
+            return Ok(RecordChangedPaths {
+                case_fold: if comparison.summaries.is_empty() {
+                    RecordChangedPathsCaseFold::AlreadySafe
+                } else {
+                    RecordChangedPathsCaseFold::NeedsValidation
+                },
+                summaries: comparison.summaries,
+            });
         }
         let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
-        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
+        let layered_manifest_path = self.lane_layered_clean_manifest_path(branch)?;
         match self.lane_cached_workdir_manifest_status(
             workdir_path,
-            overlay_manifest_path.as_deref(),
+            layered_manifest_path.as_deref(),
             &head.root_id,
         )? {
-            CachedWorkdirManifestStatus::Clean => Ok(Vec::new()),
+            CachedWorkdirManifestStatus::Clean => Ok(RecordChangedPaths {
+                summaries: Vec::new(),
+                case_fold: RecordChangedPathsCaseFold::AlreadySafe,
+            }),
             CachedWorkdirManifestStatus::Dirty {
                 disk_manifest,
                 candidate_paths,
@@ -583,21 +1096,38 @@ impl Trail {
                     selected_paths.dedup();
                     let previous_files =
                         self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &selected_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &selected_paths,
+                        )?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 } else if let Some(candidate_paths) = candidate_paths {
+                    let resolution = self.resolve_record_case_fold_candidates_read_only(
+                        &head.root_id,
+                        &candidate_paths,
+                        &disk_manifest,
+                    )?;
+                    let case_fold = record_changed_paths_case_fold(&resolution.state);
+                    let candidate_paths = resolution.selected_paths;
                     let previous_files =
                         self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &candidate_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &candidate_paths,
+                        )?,
+                        case_fold,
+                    })
                 } else {
-                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                    Ok(RecordChangedPaths {
+                        summaries: self
+                            .diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 }
             }
             CachedWorkdirManifestStatus::Missing => {
@@ -609,13 +1139,20 @@ impl Trail {
                     selected_paths.dedup();
                     let previous_files =
                         self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &selected_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &selected_paths,
+                        )?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 } else {
-                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                    Ok(RecordChangedPaths {
+                        summaries: self
+                            .diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 }
             }
         }
@@ -677,7 +1214,7 @@ impl Trail {
         Ok(oversized.into_values().collect())
     }
 
-    fn ensure_lane_record_file_size_policy(
+    pub(crate) fn ensure_lane_record_file_size_policy(
         &self,
         files: &BTreeMap<String, FileEntry>,
         summaries: &[FileDiffSummary],

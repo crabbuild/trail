@@ -13,9 +13,9 @@ Trail now treats code-agent integration as three complementary paths:
   turns/tool events as they stream through the relay.
 - **MCP server**: context-tool path. Register `trail mcp` in the native agent
   when the agent supports MCP so it can inspect Trail state directly.
-- **Terminal task**: universal CLI path. `trail agent start --provider <NAME>`
+- **Terminal task**: universal CLI path. `trail agent start <NAME>`
   creates a task lane workdir, runs the provider command there, and records the
-  final checkpoint when the process exits. Use `--workdir-mode overlay-cow` to
+  final checkpoint when the process exits. Use `--workdir-mode fuse-cow` to
   mount a transparent COW view for large repositories instead of creating a full
   copied workdir.
 
@@ -26,14 +26,14 @@ Trail ships provider profiles for:
 - `claude-code`, via `@agentclientprotocol/claude-agent-acp`
 - `codex`, via `@agentclientprotocol/codex-acp`
 - `cursor`, via the Cursor CLI `agent acp` server
-- `gemini`, terminal mode with MCP setup notes
+- `gemini`, terminal mode with optional Trail MCP registration
 - `aider`, terminal mode
 - `opencode`, terminal mode
 
 Trail also reads the [official ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json), so every current registry ID can be launched directly:
 
 ```sh
-trail acp list
+trail agent acp status
 trail acp relay gemini
 trail acp relay qwen-code
 trail acp relay github-copilot-cli
@@ -45,7 +45,7 @@ validated registry index locally and uses it if the registry is temporarily
 unavailable. Built-in aliases remain available without a registry request.
 
 An ACP-compatible agent outside the registry can still be used by passing its
-upstream command after `--` to `trail agent acp` or `trail acp relay`.
+upstream command after `--` to `trail agent acp run` or `trail acp relay`.
 Any terminal agent can be used by passing its command after `--` to
 `trail agent start`.
 
@@ -60,17 +60,17 @@ make install
 Check the agent setup:
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent doctor --provider codex
-trail agent doctor --provider cursor
-trail agent doctor --provider gemini
+trail agent doctor claude-code
+trail agent doctor codex
+trail agent doctor cursor
+trail agent doctor gemini
 ```
 
 Print editor configuration that creates a fresh Trail task lane for each ACP
 session:
 
 ```sh
-trail agent setup
+trail agent acp setup claude-code --editor vscode
 ```
 
 After one prompt:
@@ -148,21 +148,21 @@ form: `trail acp relay --provider my-agent -- my-agent acp`.
 Terminal-first agents use fresh task lanes:
 
 ```sh
-trail agent start --provider gemini
-trail agent start --provider aider
-trail agent start --provider opencode
-trail agent start --provider custom -- my-agent --flag
+trail agent start gemini
+trail agent start aider
+trail agent start opencode
+trail agent start custom -- my-agent --flag
 ```
 
-For large repositories, terminal agents can use the overlay COW workdir mode:
+For large repositories, terminal agents can use the FUSE COW workdir mode:
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
-trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
-trail agent start --provider codex --workdir-mode nfs-cow
+trail agent start codex --workdir-mode fuse-cow
+trail agent start custom --workdir-mode fuse-cow -- my-agent --flag
+trail agent start codex --workdir-mode nfs-cow
 ```
 
-The overlay mount is held only while the terminal process runs and while Trail
+The FUSE COW mount is held only while the terminal process runs and while Trail
 records the checkpoint afterward. On macOS it requires macFUSE; on Linux it
 requires FUSE access such as `/dev/fuse`.
 
@@ -222,7 +222,7 @@ trail agent apply latest
 For low-level ACP inspection:
 
 ```sh
-trail acp sessions
+trail agent acp sessions
 trail transcript <lane>
 trail lane review <lane>
 ```

@@ -21,7 +21,6 @@ pub(crate) fn redact_sensitive_json(value: serde_json::Value) -> serde_json::Val
     }
 }
 
-#[cfg(test)]
 pub(crate) fn contains_sensitive_json(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
@@ -121,7 +120,6 @@ fn split_line_ending(chunk: &str) -> (&str, &str) {
     }
 }
 
-#[cfg(test)]
 fn json_value_has_payload(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,

@@ -52,14 +52,14 @@ trail config set lane.required_eval_suites policy-smoke
 Preview the lane merge first:
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 ```
 
 Use the queue for shared targets:
 
 ```sh
-trail merge-queue add doc-bot --into main --priority 10
-trail merge-queue run
+trail lane merge-queue add doc-bot --into main --priority 10
+trail lane merge-queue run
 ```
 
 Direct non-dry-run merges into the default branch require `--direct`.

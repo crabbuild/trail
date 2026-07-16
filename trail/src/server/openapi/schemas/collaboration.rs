@@ -2,15 +2,13 @@ use serde_json::{json, Value};
 
 pub(super) fn collaboration_schemas() -> Value {
     json!({
-        "MergeLaneRequest": {
+        "LaneMergeRequest": {
             "type": "object",
+            "required": ["into"],
             "properties": {
-                "lane_id": { "type": "string" },
-                "lane": { "type": "string" },
-                "name": { "type": "string" },
+                "into": { "type": "string" },
                 "strategy": { "type": "string" },
                 "dry_run": { "type": "boolean" },
-                "dry-run": { "type": "boolean" },
                 "direct": { "type": "boolean" }
             }
         },
@@ -80,19 +78,19 @@ pub(super) fn collaboration_schemas() -> Value {
                 "branch": { "type": "string" }
             }
         },
-        "MergeQueueAddRequest": {
+        "LaneMergeQueueAddRequest": {
             "type": "object",
-            "required": ["source", "target"],
+            "required": ["lane", "into"],
+            "additionalProperties": false,
             "properties": {
-                "source": { "type": "string" },
-                "target": { "type": "string" },
+                "lane": { "type": "string" },
                 "into": { "type": "string" },
-                "target_branch": { "type": "string" },
                 "priority": { "type": "integer" }
             }
         },
-        "MergeQueueRunRequest": {
+        "LaneMergeQueueRunRequest": {
             "type": "object",
+            "additionalProperties": false,
             "properties": { "limit": { "type": "integer", "minimum": 1 } }
         },
         "ConflictSetSummary": {
@@ -124,7 +122,7 @@ pub(super) fn collaboration_schemas() -> Value {
             "required": ["merge_id", "source_ref", "target_ref", "base_change", "target_change", "source_change", "base_root", "target_root", "source_root"],
             "properties": {
                 "merge_id": { "type": "string" },
-                "queue_id": { "type": "string" },
+                "lane_queue_id": { "type": "string" },
                 "source_ref": { "type": "string" },
                 "target_ref": { "type": "string" },
                 "base_change": { "type": "string" },

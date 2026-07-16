@@ -1,0 +1,159 @@
+#[test]
+fn concurrent_same_path_event_survives_intent_acknowledgement() {
+    trail::test_support::changed_path_intent_acknowledgement_race().unwrap();
+}
+
+#[test]
+fn prepared_target_is_a_gc_root_until_terminal_recovery() {
+    trail::test_support::changed_path_intent_gc_root_lifecycle().unwrap();
+}
+
+#[test]
+fn deterministic_crash_boundaries_recover_without_false_clean_results() {
+    trail::test_support::changed_path_intent_crash_matrix().unwrap();
+}
+
+#[test]
+fn backup_and_restore_never_transfer_trusted_filesystem_identity() {
+    trail::test_support::changed_path_backup_restore_rotation().unwrap();
+}
+
+#[test]
+fn unqualified_or_stale_filesystem_proof_cannot_publish_a_baseline() {
+    trail::test_support::changed_path_qualified_proof_revalidation().unwrap();
+}
+
+#[test]
+fn ambiguous_recovery_requires_reconciliation_before_another_intent() {
+    trail::test_support::changed_path_ambiguous_recovery_gate().unwrap();
+}
+
+#[test]
+fn failed_backup_overwrite_retains_the_previous_valid_tree() {
+    trail::test_support::changed_path_backup_overwrite_rollback().unwrap();
+}
+
+#[test]
+fn retirement_validates_paths_and_waits_for_preexisting_readers() {
+    trail::test_support::changed_path_retirement_barrier().unwrap();
+}
+
+#[test]
+fn lane_deletion_retires_changed_path_scope_before_filesystem_removal() {
+    trail::test_support::changed_path_lane_deletion_retirement().unwrap();
+}
+
+#[test]
+fn metadata_only_intent_proof_without_a_real_sidecar_is_rejected() {
+    trail::test_support::changed_path_missing_sidecar_rejection().unwrap();
+}
+
+#[test]
+fn authenticated_intent_cut_remains_a_prefix_after_later_observer_advance() {
+    trail::test_support::changed_path_advanced_prefix_recovery().unwrap();
+}
+
+#[test]
+fn pre_and_post_events_cannot_bridge_an_empty_exact_path_interval() {
+    trail::test_support::changed_path_exact_interval_bridge_rejection().unwrap();
+}
+
+#[test]
+fn pre_and_post_events_cannot_bridge_an_empty_complete_prefix_interval() {
+    trail::test_support::changed_path_prefix_interval_bridge_rejection().unwrap();
+}
+
+#[test]
+fn authenticated_complete_prefix_interval_preserves_later_suffix() {
+    trail::test_support::changed_path_valid_prefix_interval_recovery().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_directory_substitution_is_rejected_at_marking() {
+    trail::test_support::changed_path_mark_ancestor_substitution_rejection().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_directory_substitution_is_rejected_at_recovery() {
+    trail::test_support::changed_path_recovery_ancestor_substitution_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_keeps_retained_parent_authority() {
+    trail::test_support::changed_path_deletion_parent_substitution_rejection().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn retired_segment_deletion_rejects_leaf_substitution() {
+    trail::test_support::changed_path_deletion_leaf_substitution_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_rejects_name_substitution_after_verification() {
+    trail::test_support::changed_path_deletion_post_verification_substitution_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_rejects_substitution_after_quarantine_verification() {
+    trail::test_support::changed_path_deletion_post_quarantine_verification_substitution_rejection(
+    )
+    .unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_retry_rejects_hostile_quarantine_replacement() {
+    trail::test_support::changed_path_deletion_retry_hostile_quarantine_replacement_rejection()
+        .unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_normal_retry_is_durably_idempotent() {
+    trail::test_support::changed_path_deletion_normal_retry_idempotence().unwrap();
+}
+
+#[test]
+fn retirement_waits_for_retained_segment_writer_close_acknowledgement() {
+    trail::test_support::changed_path_retained_writer_quiescence().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn orphan_quarantine_substitution_after_verification_is_rejected() {
+    trail::test_support::changed_path_orphan_quarantine_substitution_rejection().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn empty_orphan_quarantine_is_retained_and_rejected() {
+    trail::test_support::changed_path_empty_orphan_quarantine_rejection().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn normal_retirement_allocates_fresh_quarantine_without_orphan() {
+    trail::test_support::changed_path_no_orphan_quarantine_allocation().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_quiesced_retry_rejects_missing_quarantine() {
+    trail::test_support::changed_path_deletion_quiesced_missing_quarantine_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_quiesced_retry_rejects_reappeared_original() {
+    trail::test_support::changed_path_deletion_quiesced_reappeared_original_rejection().unwrap();
+}
+
+#[test]
+fn restored_nullable_provider_lane_and_view_scopes_can_be_deleted() {
+    trail::test_support::changed_path_restored_nullable_provider_lane_deletion().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn lossless_database_path_supports_mark_recovery_and_retirement() {
+    trail::test_support::changed_path_non_utf_database_path_mark_recover_and_retire().unwrap();
+}

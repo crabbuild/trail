@@ -7,17 +7,17 @@ Use this surface when the user is operating coding-agent tasks. It owns task lan
 Check prerequisites:
 
 ```sh
-trail agent doctor --provider codex
-trail agent setup --provider codex --editor vscode
+trail agent doctor codex
+trail agent acp setup codex --editor vscode
 ```
 
 Start one isolated terminal task:
 
 ```sh
-trail agent start --provider codex --name <task-name>
+trail agent start codex --name <task-name>
 ```
 
-Profiles include `claude-code`, `codex`, `cursor`, `gemini`, `aider`, and `opencode`. Use `--workdir-mode full-cow` as the portable default. Use `overlay-cow` only when FUSE is available and `nfs-cow` on macOS when its tradeoffs are acceptable. Override the provider command only after `--`.
+Profiles include `claude-code`, `codex`, `cursor`, `gemini`, `aider`, and `opencode`. Use `--workdir-mode native-cow` as the portable default. Use `fuse-cow` only when FUSE is available, `nfs-cow` on macOS when its tradeoffs are acceptable, and `dokan-cow` on Windows with Dokan 2.x. Override the provider command only after `--`.
 
 If already launched inside the task, edit and test in the provided workdir. Do not create a nested task.
 

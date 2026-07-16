@@ -1,6 +1,32 @@
 use super::*;
 
 impl Trail {
+    pub(crate) fn insert_new_ref_database_only(
+        &self,
+        name: &str,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO refs
+             (name,change_id,root_id,operation_id,generation,updated_at)
+             VALUES (?1,?2,?3,?4,1,?5)",
+            params![name, change_id.0, root_id.0, operation_id.0, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn repair_new_ref_mirror(
+        &self,
+        name: &str,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        write_ref_file(&self.db_dir, name, change_id, root_id, operation_id, 1)
+    }
+
     pub(crate) fn set_ref(
         &self,
         name: &str,
@@ -47,8 +73,18 @@ impl Trail {
         root_id: &ObjectId,
         operation_id: &ObjectId,
     ) -> Result<()> {
+        self.advance_ref_cas_in_transaction(expected, change_id, root_id, operation_id)?;
+        self.repair_ref_mirror(expected, change_id, root_id, operation_id)
+    }
+
+    pub(crate) fn advance_ref_cas_in_transaction(
+        &self,
+        expected: &RefRecord,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
         let generation = expected.generation + 1;
-        let now = now_ts();
         let updated = self.conn.execute(
             "UPDATE refs SET change_id = ?1, root_id = ?2, operation_id = ?3, generation = ?4, updated_at = ?5 \
              WHERE name = ?6 AND generation = ?7 AND change_id = ?8",
@@ -57,7 +93,7 @@ impl Trail {
                 root_id.0,
                 operation_id.0,
                 generation,
-                now,
+                now_ts(),
                 expected.name.clone(),
                 expected.generation,
                 expected.change_id.0.clone()
@@ -66,6 +102,17 @@ impl Trail {
         if updated != 1 {
             return Err(Error::StaleBranch(expected.name.clone()));
         }
+        Ok(())
+    }
+
+    pub(crate) fn repair_ref_mirror(
+        &self,
+        expected: &RefRecord,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        let generation = expected.generation + 1;
         write_ref_file(
             &self.db_dir,
             &expected.name,
@@ -120,7 +167,10 @@ impl Trail {
         if let Some(root_id) = refish.strip_prefix("root:") {
             return self.ref_from_root(&ObjectId(root_id.to_string()));
         }
-        if refish.starts_with("ch_") {
+        if let Some(change_id) = ChangeId::from_checkpoint_alias(refish) {
+            return self.ref_from_change(&change_id);
+        }
+        if crate::ids::is_change_id(refish) {
             return self.ref_from_change(&ChangeId(refish.to_string()));
         }
         if refish.starts_with("refs/") {
@@ -132,7 +182,7 @@ impl Trail {
         if let Ok(record) = self.get_ref(&lane_ref(refish)) {
             return Ok(record);
         }
-        if refish.starts_with("obj_") {
+        if crate::ids::is_object_id(refish) {
             return self.ref_from_root(&ObjectId(refish.to_string()));
         }
         Err(Error::RefNotFound(refish.to_string()))

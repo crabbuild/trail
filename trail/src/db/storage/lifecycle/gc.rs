@@ -1,9 +1,17 @@
 use super::*;
+use crate::db::change_ledger::{ledger_gc_roots, IntentGcRoot};
 
 impl Trail {
     pub fn gc(&mut self, dry_run: bool) -> Result<GcReport> {
         let _lock = self.acquire_write_lock()?;
-        let reachable = self.reachable_object_ids()?;
+        // Capture roots before recovery terminalizes an intent. This makes the
+        // recovery boundary itself conservative: the next GC, not this one,
+        // may collect a target that recovery proved terminal.
+        let intent_roots = ledger_gc_roots(&self.conn)?;
+        if !dry_run {
+            self.changed_path_ledger().recover()?;
+        }
+        let reachable = self.reachable_object_ids_with_intent_roots(&intent_roots)?;
         let known_kinds = known_gc_object_kinds();
         let mut stmt = self
             .conn
@@ -48,7 +56,10 @@ impl Trail {
         Ok(report)
     }
 
-    pub(crate) fn reachable_object_ids(&self) -> Result<HashSet<String>> {
+    fn reachable_object_ids_with_intent_roots(
+        &self,
+        intent_roots: &[IntentGcRoot],
+    ) -> Result<HashSet<String>> {
         let (operation_objects, mut errors) = self.operation_objects()?;
         let reachable_changes =
             self.reachable_operation_changes(&operation_objects, &mut errors)?;
@@ -57,6 +68,60 @@ impl Trail {
             .map(|object| (object.operation.change_id.0.clone(), object))
             .collect::<HashMap<_, _>>();
         let mut reachable = HashSet::new();
+
+        let by_object = operation_objects
+            .iter()
+            .map(|object| (object.object_id.0.as_str(), object))
+            .collect::<HashMap<_, _>>();
+        for intent in intent_roots {
+            self.collect_root_reachable(&intent.root_id, &mut reachable, &mut errors);
+            let Some(operation_id) = &intent.operation_id else {
+                continue;
+            };
+            let Some(target_operation) = by_object.get(operation_id.0.as_str()) else {
+                errors.push(format!(
+                    "intent operation {} is missing or is not a valid operation object",
+                    operation_id.0
+                ));
+                continue;
+            };
+            if target_operation.operation.change_id != intent.change_id
+                || target_operation.operation.after_root != intent.root_id
+            {
+                errors.push(format!(
+                    "intent operation {} does not match target change/root",
+                    operation_id.0
+                ));
+                continue;
+            }
+            let mut pending = vec![intent.change_id.0.clone()];
+            while let Some(change_id) = pending.pop() {
+                let Some(object) = by_change.get(&change_id) else {
+                    errors.push(format!(
+                        "intent operation ancestry is missing change {change_id}"
+                    ));
+                    continue;
+                };
+                if !reachable.insert(object.object_id.0.clone()) {
+                    continue;
+                }
+                if let Some(before) = &object.operation.before_root {
+                    self.collect_root_reachable(before, &mut reachable, &mut errors);
+                }
+                self.collect_root_reachable(
+                    &object.operation.after_root,
+                    &mut reachable,
+                    &mut errors,
+                );
+                pending.extend(
+                    object
+                        .operation
+                        .parents
+                        .iter()
+                        .map(|parent| parent.0.clone()),
+                );
+            }
+        }
 
         for reference in self.all_refs()? {
             reachable.insert(reference.root_id.0.clone());

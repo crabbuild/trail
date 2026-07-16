@@ -25,3 +25,14 @@ mod schema;
 mod validation;
 mod worktree_index;
 mod worktree_scan;
+
+#[cfg(debug_assertions)]
+pub(crate) use git::{
+    install_git_qualification_after_c2_hook, install_git_qualification_after_porcelain_hook,
+};
+pub(crate) use schema::{validate_no_prolly_sqlite_schema_v18, validate_prolly_sqlite_schema_v18};
+pub(crate) use worktree_index::{
+    file_kind_from_index, PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile,
+    ReconciliationScanEntry,
+};
+pub(crate) use worktree_scan::{observed_exact_paths_for_candidates, ObservedPathKind};

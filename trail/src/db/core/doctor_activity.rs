@@ -46,8 +46,8 @@ pub(super) fn push_active_leases_check(db: &Trail, checks: &mut Vec<DoctorCheck>
     }
 }
 
-pub(super) fn push_merge_queue_check(db: &Trail, checks: &mut Vec<DoctorCheck>) {
-    match db.list_merge_queue() {
+pub(super) fn push_lane_merge_queue_check(db: &Trail, checks: &mut Vec<DoctorCheck>) {
+    match db.list_lane_merge_queue() {
         Ok(entries) => {
             let queued = entries
                 .iter()
@@ -71,14 +71,14 @@ pub(super) fn push_merge_queue_check(db: &Trail, checks: &mut Vec<DoctorCheck>) 
                 "ok"
             };
             let message = if status == "ok" {
-                "merge queue has no pending attention".to_string()
+                "lane merge queue has no pending attention".to_string()
             } else {
                 format!(
-                    "merge queue has {queued} queued, {running} running, {conflicted} conflicted, and {failed} failed item(s)"
+                    "lane merge queue has {queued} queued, {running} running, {conflicted} conflicted, and {failed} failed item(s)"
                 )
             };
             checks.push(doctor_check(
-                "merge_queue",
+                "lane_merge_queue",
                 status,
                 message,
                 Some(serde_json::json!({
@@ -91,9 +91,9 @@ pub(super) fn push_merge_queue_check(db: &Trail, checks: &mut Vec<DoctorCheck>) 
             ));
         }
         Err(err) => checks.push(doctor_check(
-            "merge_queue",
+            "lane_merge_queue",
             "error",
-            format!("could not list merge queue: {err}"),
+            format!("could not list lane merge queue: {err}"),
             None,
         )),
     }

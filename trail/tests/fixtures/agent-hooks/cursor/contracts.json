@@ -1,0 +1,5 @@
+[
+  {"event":"beforeSubmitPrompt","payload":{"conversation_id":"cursor-s1","turn_id":"cursor-t1","prompt":"fix it"},"expected":["turn.started","message.user"]},
+  {"event":"postToolUse","payload":{"conversation_id":"cursor-s1","tool_id":"tool-1","error":"failed"},"expected":["tool.failed"]},
+  {"event":"stop","payload":{"conversation_id":"cursor-s1","turn_id":"cursor-t1","status":"cancelled"},"expected":["turn.cancelled"]}
+]

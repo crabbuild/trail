@@ -20,7 +20,7 @@ impl Trail {
                 now_nanos()
             );
             ChangeId(format!(
-                "msg_seed_{}",
+                "change_message_seed_{}",
                 crate::ids::short_hash(seed.as_bytes(), 16)
             ))
         });

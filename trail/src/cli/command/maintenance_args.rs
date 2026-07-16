@@ -83,10 +83,19 @@ pub(super) struct DaemonArgs {
 
 #[derive(Subcommand)]
 pub(super) enum IndexSubcommand {
+    /// Reconcile the changed-path ledger with a complete filesystem walk.
+    Reconcile(IndexReconcileArgs),
     /// Rebuild all derived indexes from current workspace state.
     Rebuild(IndexRebuildArgs),
     /// Continuously refresh the persisted worktree file index.
     Watch(IndexWatchArgs),
+}
+
+#[derive(Args)]
+pub(super) struct IndexReconcileArgs {
+    /// Reconcile a materialized lane instead of the workspace.
+    #[arg(long)]
+    pub(super) lane: Option<String>,
 }
 
 #[derive(Args)]

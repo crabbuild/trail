@@ -267,85 +267,6 @@ impl Trail {
         )
     }
 
-    pub fn agent_setup_report(&self, provider: &str, editor: &str) -> Result<AgentSetupReport> {
-        let profile = crate::acp::agent_provider_profile(provider)?;
-        let editor = match editor {
-            "generic" | "vscode" | "zed" => editor,
-            other => {
-                return Err(Error::InvalidInput(format!(
-                    "unsupported agent editor `{other}`; supported editors: generic, vscode, zed"
-                )))
-            }
-        };
-        let mode = if profile.supports_acp {
-            "acp"
-        } else {
-            "terminal"
-        };
-        let mut command = vec![
-            "trail".to_string(),
-            "--workspace".to_string(),
-            self.workspace_root.to_string_lossy().to_string(),
-            "agent".to_string(),
-        ];
-        if profile.supports_acp {
-            command.push("acp".to_string());
-        } else {
-            command.push("start".to_string());
-        }
-        command.push("--provider".to_string());
-        command.push(profile.agent.clone());
-        let mcp_command = vec![
-            "trail".to_string(),
-            "--workspace".to_string(),
-            self.workspace_root.to_string_lossy().to_string(),
-            "mcp".to_string(),
-        ];
-        let snippet = if profile.supports_acp {
-            agent_editor_snippet(editor, &profile.agent, &command)
-        } else {
-            agent_terminal_setup_snippet(&profile, &command, &mcp_command)
-        };
-        let mut suggestions = vec![StatusSuggestion {
-            command: format!("trail agent doctor --provider {}", profile.agent),
-            reason: "verify the workspace and provider before the first agent session".to_string(),
-        }];
-        if profile.supports_terminal {
-            suggestions.push(StatusSuggestion {
-                command: format!("trail agent start --provider {}", profile.agent),
-                reason: "launch a fresh materialized task lane with this provider".to_string(),
-            });
-        }
-        suggestions.extend([
-            StatusSuggestion {
-                command: "trail agent".to_string(),
-                reason: "after one prompt, show the task inbox and next useful action".to_string(),
-            },
-            StatusSuggestion {
-                command: "trail agent action".to_string(),
-                reason: "show runnable setup, review, validation, apply, and recovery actions"
-                    .to_string(),
-            },
-        ]);
-        Ok(AgentSetupReport {
-            provider: profile.agent,
-            editor: editor.to_string(),
-            mode: mode.to_string(),
-            command,
-            snippet,
-            detected: profile.available,
-            supports_acp: profile.supports_acp,
-            supports_mcp: profile.supports_mcp,
-            supports_terminal: profile.supports_terminal,
-            warnings: if profile.available {
-                Vec::new()
-            } else {
-                profile.notes
-            },
-            suggestions,
-        })
-    }
-
     pub fn list_agent_tasks(&self) -> Result<AgentTaskListReport> {
         self.list_agent_tasks_with_options(false)
     }
@@ -449,7 +370,7 @@ impl Trail {
         if inbox.total == 0 {
             agent_push_suggestion(
                 &mut suggestions,
-                "trail agent start --provider claude-code".to_string(),
+                "trail agent start claude-code".to_string(),
                 "start a terminal agent task without configuring an editor",
             );
         }
@@ -475,7 +396,7 @@ impl Trail {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentStackReport {
@@ -491,7 +412,7 @@ impl Trail {
                 suggestions: vec![
                     next.clone(),
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task without configuring an editor"
                             .to_string(),
                     },
@@ -590,7 +511,7 @@ impl Trail {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentInboxReport {
@@ -604,12 +525,12 @@ impl Trail {
                 suggestions: vec![
                     next.clone(),
                     StatusSuggestion {
-                        command: "trail agent doctor --provider claude-code".to_string(),
+                        command: "trail agent doctor claude-code".to_string(),
                         reason: "verify the provider and workspace before connecting an editor"
                             .to_string(),
                     },
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task instead of using an editor"
                             .to_string(),
                     },
@@ -649,7 +570,7 @@ impl Trail {
             })
             .or_else(|| items.first().map(|item| item.next.clone()))
             .unwrap_or_else(|| StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             });
         let mut suggestions = vec![next.clone()];
@@ -694,7 +615,7 @@ impl Trail {
                 latest: None,
                 risk: None,
                 suggestions: vec![StatusSuggestion {
-                    command: "trail agent setup".to_string(),
+                    command: "trail agent acp setup claude-code --editor vscode".to_string(),
                     reason: "configure an editor once, then start an agent task".to_string(),
                 }],
             });
@@ -715,7 +636,7 @@ impl Trail {
     pub fn agent_next(&self, selector: &str) -> Result<AgentNextReport> {
         let Some(lane) = self.resolve_agent_selector(selector)? else {
             let primary = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason:
                     "configure an editor once; Trail will create fresh task lanes automatically"
                         .to_string(),
@@ -728,12 +649,12 @@ impl Trail {
                 primary,
                 suggestions: vec![
                     StatusSuggestion {
-                        command: "trail agent doctor --provider claude-code".to_string(),
+                        command: "trail agent doctor claude-code".to_string(),
                         reason: "verify the provider and workspace before connecting an editor"
                             .to_string(),
                     },
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task instead of using an editor"
                             .to_string(),
                     },
@@ -1047,7 +968,10 @@ impl Trail {
             .resolve_agent_selector(selector)?
             .ok_or_else(|| Error::InvalidInput("no agent tasks have been recorded".to_string()))?;
         let review = self.lane_review_packet(&lane, 50)?;
-        let transcript = self.transcript(&lane).ok();
+        let transcript = self
+            .preferred_agent_session_id(&review)?
+            .and_then(|session_id| self.transcript(&session_id).ok())
+            .or_else(|| self.transcript(&lane).ok());
         let task = self.agent_task_from_review(&review, transcript.as_ref())?;
         Ok(AgentTaskViewReport {
             task,
@@ -2332,7 +2256,7 @@ impl Trail {
             target_kind: "reviewed".to_string(),
             target: reviewed
                 .as_ref()
-                .map(|marker| format!("since {}", marker.checkpoint.0))
+                .map(|marker| format!("since {}", marker.checkpoint.checkpoint_alias()))
                 .unwrap_or_else(|| "whole task".to_string()),
             turn_id: None,
             operation_id: None,
@@ -2901,6 +2825,7 @@ impl Trail {
         dry_run: bool,
         message: Option<String>,
     ) -> Result<AgentApplyReport> {
+        self.reset_git_handoff_metrics();
         let lane = self
             .resolve_agent_selector(selector)?
             .ok_or_else(|| Error::InvalidInput("no agent tasks have been recorded".to_string()))?;
@@ -2927,6 +2852,7 @@ impl Trail {
                 merge: None,
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: vec![
                     "agent task has already been applied; use `trail agent continue` for follow-up work to avoid reusing old lane history"
                         .to_string(),
@@ -2934,29 +2860,24 @@ impl Trail {
                 suggestions: agent_already_applied_suggestions(&view.task),
             });
         }
-        let git_branch = self.current_git_branch()?;
-        let git_state = self.current_git_state()?.ok_or_else(|| {
+        let git_identity = self.current_git_identity()?.ok_or_else(|| {
             Error::Git(format!(
-                "agent apply requires a Git working tree at {}; Trail branch `{crab_branch}` is the internal apply base",
+                "agent apply requires a Git working tree with a HEAD commit at {}; Trail branch `{crab_branch}` is the internal apply base",
                 self.workspace_root.display()
             ))
         })?;
-        if git_state.dirty {
-            return Err(Error::Git(
-                "current Git worktree has tracked changes; commit, stash, or revert them before `trail agent apply`".to_string(),
-            ));
-        }
-        self.ensure_git_head_matches_root(
-            &target_ref.change_id,
-            &target_ref.root_id,
-            git_state.head.as_deref(),
-            &crab_branch,
-        )?;
+        let git_branch = git_identity.branch.clone();
+        self.ensure_git_head_matches_root(&target_ref.root_id, &git_identity.head)?;
+        self.set_git_export_mode(GitExportMode::MappedDelta);
 
-        let _overlay_mount = self.maybe_mount_overlay_cow_workdir_for_lane(&lane)?;
+        let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
         let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
+        #[cfg(target_os = "windows")]
+        let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {
+            let git_state = self.tracked_git_state(&git_identity)?;
+            validate_git_publication_state(&git_identity.head, &git_state)?;
             let view = self.agent_task_view(&lane)?;
             let plan = AgentGitApplyPlan {
                 crab_branch,
@@ -2977,6 +2898,7 @@ impl Trail {
                 merge: None,
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: vec![
                     "lane workdir has unrecorded changes; actual apply will record them first"
                         .to_string(),
@@ -2995,32 +2917,40 @@ impl Trail {
         };
         self.ensure_agent_checkpoint_reviewed(&lane)?;
 
-        let merge = self.merge_lane_user_with_options(&lane, &crab_branch, dry_run, true)?;
-        let range = if merge.changed_paths.is_empty() {
+        let merge_preview = self.merge_lane_user_with_options(&lane, &crab_branch, true, true)?;
+        self.set_git_changed_path_count(merge_preview.changed_paths.len() as u64);
+        let preview_range = if merge_preview.changed_paths.is_empty() {
             None
         } else {
-            Some(format!("{}..{}", target_ref.change_id.0, merge.operation.0))
+            Some(format!(
+                "{}..{}",
+                target_ref.change_id.0, merge_preview.operation.0
+            ))
         };
-        let plan = AgentGitApplyPlan {
+        let preview_plan = AgentGitApplyPlan {
             crab_branch: crab_branch.clone(),
             git_branch: git_branch.clone(),
             base_change: target_ref.change_id.clone(),
-            result_change: range.as_ref().map(|_| merge.operation.clone()),
-            range: range.clone(),
+            result_change: preview_range
+                .as_ref()
+                .map(|_| merge_preview.operation.clone()),
+            range: preview_range.clone(),
             would_record,
-            would_create_git_commit: range.is_some(),
-            would_fast_forward: range.is_some(),
+            would_create_git_commit: preview_range.is_some(),
+            would_fast_forward: preview_range.is_some(),
         };
         if dry_run {
+            let git_state = self.tracked_git_state(&git_identity)?;
+            validate_git_publication_state(&git_identity.head, &git_state)?;
             let view = self.agent_task_view(&lane)?;
-            let (status, suggestions) = if merge.conflicts.is_empty() {
+            let (status, suggestions) = if merge_preview.conflicts.is_empty() {
                 let mut suggestions = vec![StatusSuggestion {
-                        command: format!("trail agent land {lane}"),
-                        reason: format!(
-                            "create a Git commit using default message `{}` and fast-forward the current branch",
-                            default_agent_apply_message_for_task(&view.task)
-                        ),
-                    }];
+                    command: format!("trail agent land {lane}"),
+                    reason: format!(
+                        "create a Git commit using default message `{}` and fast-forward the current branch",
+                        default_agent_apply_message_for_task(&view.task)
+                    ),
+                }];
                 agent_push_suggestion(
                     &mut suggestions,
                     format!("trail agent finish {lane}"),
@@ -3040,26 +2970,49 @@ impl Trail {
                 task: view.task,
                 status,
                 dry_run,
-                git_apply_plan: plan,
+                git_apply_plan: preview_plan,
                 recorded,
-                merge: Some(merge),
+                merge: Some(merge_preview),
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: Vec::new(),
                 suggestions,
             });
         }
 
+        let git_state = self.tracked_git_state(&git_identity)?;
+        validate_git_publication_state(&git_identity.head, &git_state)?;
+        self.ensure_git_identity_unchanged(&git_identity)?;
+
+        let merge = self.merge_lane_user_with_options(&lane, &crab_branch, false, true)?;
+        self.set_git_changed_path_count(merge.changed_paths.len() as u64);
+        let range = if merge.changed_paths.is_empty() {
+            None
+        } else {
+            Some(format!("{}..{}", target_ref.change_id.0, merge.operation.0))
+        };
+        let plan = AgentGitApplyPlan {
+            crab_branch: crab_branch.clone(),
+            git_branch,
+            base_change: target_ref.change_id.clone(),
+            result_change: range.as_ref().map(|_| merge.operation.clone()),
+            range: range.clone(),
+            would_record,
+            would_create_git_commit: range.is_some(),
+            would_fast_forward: range.is_some(),
+        };
         let git_export = if let Some(range) = &range {
             let view = self.agent_task_view(&lane)?;
             let message = message
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| default_agent_apply_message_for_task(&view.task));
-            Some(self.git_export_commit(range, &message)?)
+            Some(self.git_export_commit_mapped(range, &message, Some(git_state))?)
         } else {
             None
         };
         if let Some(export) = &git_export {
+            self.ensure_git_identity_unchanged(&git_identity)?;
             self.git_fast_forward(&export.commit)?;
         }
         let view = self.agent_task_view(&lane)?;
@@ -3076,6 +3029,7 @@ impl Trail {
             merge: Some(merge),
             git_export,
             fast_forwarded: range.is_some(),
+            performance: self.git_handoff_metrics_report(),
             warnings: Vec::new(),
             suggestions: vec![StatusSuggestion {
                 command: format!("trail agent view {lane}"),
@@ -3187,7 +3141,10 @@ impl Trail {
         limit: usize,
     ) -> Result<AgentTaskReport> {
         let review = self.lane_review_packet(&lane.record.name, limit)?;
-        let transcript = self.transcript(&lane.record.name).ok();
+        let transcript = self
+            .preferred_agent_session_id(&review)?
+            .and_then(|session_id| self.transcript(&session_id).ok())
+            .or_else(|| self.transcript(&lane.record.name).ok());
         self.agent_task_from_review(&review, transcript.as_ref())
     }
 
@@ -3205,35 +3162,28 @@ impl Trail {
         let session_id = acp_session
             .as_ref()
             .map(|session| session.trail_session_id.clone())
-            .or_else(|| {
-                review
-                    .recent_sessions
-                    .first()
-                    .map(|session| session.session_id.clone())
-            });
-        let latest_checkpoint = transcript
-            .and_then(|report| {
-                report
-                    .turns
-                    .iter()
-                    .rev()
-                    .find_map(|turn| turn.checkpoint.clone())
-            })
-            .or_else(|| {
-                review
-                    .recent_operations
-                    .iter()
-                    .find(|operation| {
-                        matches!(
-                            operation.kind,
-                            OperationKind::LaneRecord
-                                | OperationKind::LanePatch
-                                | OperationKind::LaneMerge
-                                | OperationKind::LaneRewind
-                        )
+            .or(self.preferred_agent_session_id(review)?);
+        let latest_checkpoint =
+            review
+                .recent_operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        OperationKind::LaneRecord
+                            | OperationKind::LanePatch
+                            | OperationKind::LaneMerge
+                            | OperationKind::LaneRewind
+                    )
+                })
+                .map(|operation| operation.change_id.clone())
+                .or_else(|| {
+                    transcript.and_then(|report| {
+                        report.turns.iter().rev().find_map(|turn| {
+                            turn.turn.after_change.clone().or(turn.checkpoint.clone())
+                        })
                     })
-                    .map(|operation| operation.change_id.clone())
-            });
+                });
         let turns = transcript
             .map(|report| report.turns.len())
             .unwrap_or(review.recent_sessions.len());
@@ -3285,6 +3235,39 @@ impl Trail {
         })
     }
 
+    fn preferred_agent_session_id(
+        &self,
+        review: &LaneReviewPacketReport,
+    ) -> Result<Option<String>> {
+        let mut native_sessions = self
+            .list_lane_agent_sessions(None, None, 10_000)?
+            .into_iter()
+            .filter(|session| session.lane_id == review.lane.record.lane_id)
+            .collect::<Vec<_>>();
+        native_sessions.sort_by(|left, right| {
+            right
+                .status
+                .eq(&AgentCapturePhase::Active)
+                .cmp(&left.status.eq(&AgentCapturePhase::Active))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.created_at.cmp(&left.created_at))
+        });
+        if let Some(session) = native_sessions.first() {
+            return Ok(Some(session.trail_session_id.clone()));
+        }
+
+        let mut sessions = review.recent_sessions.clone();
+        sessions.sort_by(|left, right| {
+            right
+                .status
+                .eq("active")
+                .cmp(&left.status.eq("active"))
+                .then_with(|| right.started_at.cmp(&left.started_at))
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        Ok(sessions.first().map(|session| session.session_id.clone()))
+    }
+
     fn resolve_agent_selector(&self, selector: &str) -> Result<Option<String>> {
         if selector == "latest" {
             return self.latest_agent_lane();
@@ -3294,6 +3277,9 @@ impl Trail {
         }
         if let Some(acp) = self.try_lane_acp_session(selector)? {
             return self.resolve_lane_handle(&acp.lane_id).map(Some);
+        }
+        if let Some(native) = self.try_lane_agent_session_by_native_id(selector)? {
+            return self.resolve_lane_handle(&native.lane_id).map(Some);
         }
         if let Some(session) = self.try_lane_session(selector)? {
             return self.resolve_lane_handle(&session.lane_id).map(Some);
@@ -3975,17 +3961,20 @@ impl Trail {
         view: &AgentTaskViewReport,
         change_id: &str,
     ) -> Result<AgentResolvedDiffTarget> {
+        let canonical_change_id = ChangeId::from_checkpoint_alias(change_id)
+            .map(|change| change.0)
+            .unwrap_or_else(|| change_id.to_string());
         if let Some(transcript) = &view.transcript {
             if let Some(turn) = transcript.turns.iter().find(|turn| {
                 turn.checkpoint
                     .as_ref()
                     .or(turn.turn.after_change.as_ref())
-                    .is_some_and(|checkpoint| checkpoint.0 == change_id)
+                    .is_some_and(|checkpoint| checkpoint.0 == canonical_change_id)
             }) {
                 return self.agent_diff_target_from_turn(turn, "checkpoint", change_id.to_string());
             }
         }
-        self.agent_diff_target_for_operation(view, change_id, "checkpoint")
+        self.agent_diff_target_for_operation(view, &canonical_change_id, "checkpoint")
     }
 
     fn resolve_agent_rewind_target(&self, lane: &str, target: &str) -> Result<String> {
@@ -3994,6 +3983,9 @@ impl Trail {
             return Err(Error::InvalidInput(
                 "agent rewind target cannot be empty".to_string(),
             ));
+        }
+        if let Some(change_id) = ChangeId::from_checkpoint_alias(target) {
+            return Ok(change_id.0);
         }
         let normalized = target.to_ascii_lowercase();
         if !agent_rewind_target_needs_resolution(&normalized) {
@@ -4123,46 +4115,35 @@ impl Trail {
         Ok(normalized)
     }
 
-    fn current_git_branch(&self) -> Result<Option<String>> {
-        if self.current_git_state()?.is_none() {
-            return Ok(None);
+    fn ensure_git_head_matches_root(&self, root_id: &ObjectId, git_head: &str) -> Result<()> {
+        if self.git_clean_head_matches_root_mapping(git_head, root_id)? {
+            return Ok(());
         }
-        let branch = self.git_output(&["branch".to_string(), "--show-current".to_string()])?;
-        Ok((!branch.trim().is_empty()).then_some(branch))
+        Err(Error::GitMappingRequired(format!(
+            "clean Git HEAD `{git_head}` has no mapping for Trail root `{}`",
+            root_id.0
+        )))
     }
 
-    fn ensure_git_head_matches_root(
-        &self,
-        change_id: &ChangeId,
-        root_id: &ObjectId,
-        git_head: Option<&str>,
-        crab_branch: &str,
-    ) -> Result<()> {
-        let Some(git_head) = git_head else {
-            return Err(Error::Git(
-                "agent apply requires a Git HEAD commit before it can fast-forward".to_string(),
-            ));
-        };
-        if self.ensure_git_clean_head_root_mapping(crab_branch, change_id, root_id, git_head)? {
+    fn ensure_git_identity_unchanged(&self, expected: &GitIdentity) -> Result<()> {
+        let current = self.current_git_identity()?;
+        if current.as_ref().is_some_and(|identity| {
+            identity.head == expected.head && identity.branch == expected.branch
+        }) {
             return Ok(());
         }
-        let files = self.load_root_files(root_id)?;
-        let crab_tree = self.git_write_tree(&files)?;
-        let git_tree =
-            self.git_output(&["rev-parse".to_string(), format!("{git_head}^{{tree}}")])?;
-        if crab_tree == git_tree {
-            self.insert_git_mapping_for_state(
-                "verify",
-                crab_branch,
-                change_id,
-                root_id,
-                Some(git_head.to_string()),
-                false,
-            )?;
-            return Ok(());
-        }
-        Err(Error::Git(format!(
-            "current Git HEAD does not match Trail branch `{crab_branch}`; run `trail git import-update --branch {crab_branch}` or apply from a Git branch that matches Trail `{crab_branch}`"
+        Err(Error::GitHeadChanged(format!(
+            "expected Git HEAD `{}` on branch `{}`, found `{}` on branch `{}`",
+            expected.head,
+            expected.branch.as_deref().unwrap_or("<detached>"),
+            current
+                .as_ref()
+                .map(|identity| identity.head.as_str())
+                .unwrap_or("<unborn>"),
+            current
+                .as_ref()
+                .and_then(|identity| identity.branch.as_deref())
+                .unwrap_or("<detached>")
         )))
     }
 
@@ -5196,7 +5177,7 @@ fn agent_empty_action_palette_value() -> serde_json::Value {
         "task": null,
         "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
         "next": {
-            "command": "trail agent setup",
+            "command": "trail agent acp setup claude-code --editor vscode",
             "reason": "print a stable editor config that creates fresh Trail tasks automatically"
         },
         "actions": agent_empty_action_palette_actions()
@@ -5206,10 +5187,10 @@ fn agent_empty_action_palette_value() -> serde_json::Value {
 fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
     vec![
         agent_static_action(
-            "setup_vscode",
+            "acp_setup_vscode",
             "Set up VS Code",
             "setup",
-            "trail agent setup",
+            "trail agent acp setup claude-code --editor vscode",
             "print a copyable ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5218,16 +5199,16 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_claude_code",
             "Check Claude Code",
             "doctor",
-            "trail agent doctor --provider claude-code",
+            "trail agent doctor claude-code",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         agent_static_action(
-            "setup_codex_vscode",
+            "acp_setup_codex_vscode",
             "Set up VS Code for Codex",
             "setup",
-            "trail agent setup --provider codex",
+            "trail agent acp setup codex --editor vscode",
             "print a copyable Codex ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5236,16 +5217,16 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_codex",
             "Check Codex",
             "doctor",
-            "trail agent doctor --provider codex",
+            "trail agent doctor codex",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         agent_static_action(
-            "setup_cursor_vscode",
+            "acp_setup_cursor_vscode",
             "Set up VS Code for Cursor",
             "setup",
-            "trail agent setup --provider cursor",
+            "trail agent acp setup cursor --editor vscode",
             "print a copyable Cursor ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5254,7 +5235,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_cursor",
             "Check Cursor",
             "doctor",
-            "trail agent doctor --provider cursor",
+            "trail agent doctor cursor",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
@@ -5263,7 +5244,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_terminal_task",
             "Start terminal task",
             "start",
-            "trail agent start --provider claude-code",
+            "trail agent start claude-code",
             "launch a fresh materialized terminal task when you are not using an editor",
             "open_world",
             true,
@@ -5272,7 +5253,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_gemini_task",
             "Start Gemini task",
             "start",
-            "trail agent start --provider gemini",
+            "trail agent start gemini",
             "launch Gemini CLI in a fresh materialized Trail task lane",
             "open_world",
             true,
@@ -5572,7 +5553,7 @@ fn agent_inbox_next_for_task(task: &AgentTaskReport) -> StatusSuggestion {
     let lane = &task.lane;
     match &task.status {
         AgentTaskStatus::Empty => StatusSuggestion {
-            command: "trail agent setup".to_string(),
+            command: "trail agent acp setup claude-code --editor vscode".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         },
         AgentTaskStatus::Active => StatusSuggestion {
@@ -5858,7 +5839,10 @@ fn agent_guide_current_state(task: Option<&AgentTaskReport>, next: &AgentNextRep
             task.tool_events,
             next.primary.reason
         ),
-        None => format!("No agent task is recorded yet. Next: {}.", next.primary.reason),
+        None => format!(
+            "No agent task is recorded yet. Next: {}.",
+            next.primary.reason
+        ),
     }
 }
 
@@ -5870,19 +5854,19 @@ fn agent_guide_steps(
         return vec![
             agent_guide_step(
                 "Connect an editor",
-                "trail agent setup",
+                "trail agent acp setup claude-code --editor vscode",
                 "print a stable ACP editor config that creates fresh Trail tasks automatically",
                 "once per editor setup",
             ),
             agent_guide_step(
                 "Check the provider",
-                "trail agent doctor --provider claude-code",
+                "trail agent doctor claude-code",
                 "verify Trail and the provider before the first real session",
                 "before or after setup when something does not connect",
             ),
             agent_guide_step(
                 "Start in terminal",
-                "trail agent start --provider claude-code",
+                "trail agent start claude-code",
                 "launch a fresh materialized terminal task when you are not using an ACP editor",
                 "when you want to work from the shell",
             ),
@@ -7433,33 +7417,35 @@ fn agent_confidence_factors(
 ) -> Vec<AgentConfidenceFactor> {
     let mut factors = Vec::new();
 
-    let (review_state, review_delta, review_message, review_command) =
-        match progress.status.as_str() {
-            "up_to_date" => (
-                "pass",
-                0,
-                "current checkpoint has been marked reviewed".to_string(),
-                Some(format!("trail agent review-flow {lane}")),
+    let (review_state, review_delta, review_message, review_command) = match progress
+        .status
+        .as_str()
+    {
+        "up_to_date" => (
+            "pass",
+            0,
+            "current checkpoint has been marked reviewed".to_string(),
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+        "new_changes" => (
+            "warn",
+            -18,
+            format!(
+                "{} changed file(s) and {} changed line(s) have not been reviewed since the last marker",
+                progress.changed_paths, progress.changed_lines
             ),
-            "new_changes" => (
-                "warn",
-                -18,
-                format!(
-                    "{} changed file(s) and {} changed line(s) have not been reviewed since the last marker",
-                    progress.changed_paths, progress.changed_lines
-                ),
-                Some(format!("trail agent review-flow {lane}")),
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+        _ => (
+            "warn",
+            -22,
+            format!(
+                "{} changed file(s) and {} changed line(s) have not been marked reviewed yet",
+                progress.changed_paths, progress.changed_lines
             ),
-            _ => (
-                "warn",
-                -22,
-                format!(
-                    "{} changed file(s) and {} changed line(s) have not been marked reviewed yet",
-                    progress.changed_paths, progress.changed_lines
-                ),
-                Some(format!("trail agent review-flow {lane}")),
-            ),
-        };
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+    };
     factors.push(agent_confidence_factor(
         "review",
         review_state,
@@ -8716,7 +8702,10 @@ fn agent_diagnosis_assessment(
         evidence.push(format!("Git preflight failed: {error}"));
     }
     if let Some(checkpoint) = &ready.task.latest_checkpoint {
-        evidence.push(format!("latest checkpoint `{}`", checkpoint.0));
+        evidence.push(format!(
+            "latest checkpoint `{}`",
+            checkpoint.checkpoint_alias()
+        ));
     }
     evidence.push(format!(
         "{} friendly checkpoint target(s) available",
@@ -10105,7 +10094,7 @@ fn agent_new_summary(
             return match reviewed {
                 Some(marker) => format!(
                     "No new changes touched `{path}` since reviewed checkpoint `{}`.",
-                    marker.checkpoint.0
+                    marker.checkpoint.checkpoint_alias()
                 ),
                 None => format!(
                     "`{path}` has no recorded changes in {}.",
@@ -10127,7 +10116,7 @@ fn agent_new_summary(
                 format!(
                     "{} has no new changes{scope} since reviewed checkpoint `{}`.",
                     agent_task_label(task),
-                    marker.checkpoint.0
+                    marker.checkpoint.checkpoint_alias()
                 )
             })
             .unwrap_or_else(|| {
@@ -10138,8 +10127,8 @@ fn agent_new_summary(
             }),
         "new_changes" => {
             let checkpoint = reviewed
-                .map(|marker| marker.checkpoint.0.as_str())
-                .unwrap_or("task start");
+                .map(|marker| marker.checkpoint.checkpoint_alias())
+                .unwrap_or_else(|| "task start".to_string());
             format!(
                 "{} has {} new changed file(s){scope} and {} changed line(s) since `{checkpoint}`. {}",
                 agent_task_label(task),
@@ -10266,18 +10255,18 @@ fn agent_mark_reviewed_summary(
         Some(previous) if previous.checkpoint == marker.checkpoint => format!(
             "{} was already reviewed at checkpoint `{}`; refreshed the reviewed marker.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
         Some(previous) => format!(
             "{} marked reviewed at checkpoint `{}`; previous reviewed checkpoint was `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0,
-            previous.checkpoint.0
+            marker.checkpoint.checkpoint_alias(),
+            previous.checkpoint.checkpoint_alias()
         ),
         None => format!(
             "{} marked reviewed at checkpoint `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
     }
 }
@@ -10305,18 +10294,18 @@ fn agent_mark_file_reviewed_summary(
         Some(previous) if previous.checkpoint == marker.checkpoint => format!(
             "`{path}` in {} was already marked reviewed at checkpoint `{}`; refreshed the file marker.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
         Some(previous) => format!(
             "`{path}` in {} marked reviewed at checkpoint `{}`; previous file marker was `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0,
-            previous.checkpoint.0
+            marker.checkpoint.checkpoint_alias(),
+            previous.checkpoint.checkpoint_alias()
         ),
         None => format!(
             "`{path}` in {} marked reviewed at checkpoint `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
     }
 }
@@ -10345,10 +10334,18 @@ fn agent_archive_summary(
 ) -> String {
     let label = agent_task_label(task);
     match (archived, previous_archived) {
-        (true, true) => format!("{label} was already archived; it remains hidden from the default agent inbox."),
-        (true, false) => format!("{label} archived; it is hidden from the default agent inbox and can be restored with `agent unarchive`."),
-        (false, true) => format!("{label} restored; it will appear in the default agent inbox again."),
-        (false, false) => format!("{label} was not archived; it remains visible in the default agent inbox."),
+        (true, true) => {
+            format!("{label} was already archived; it remains hidden from the default agent inbox.")
+        }
+        (true, false) => format!(
+            "{label} archived; it is hidden from the default agent inbox and can be restored with `agent unarchive`."
+        ),
+        (false, true) => {
+            format!("{label} restored; it will appear in the default agent inbox again.")
+        }
+        (false, false) => {
+            format!("{label} was not archived; it remains visible in the default agent inbox.")
+        }
     }
 }
 
@@ -10850,7 +10847,10 @@ fn agent_report_markdown(
         view.task.turns, view.task.tool_events
     ));
     if let Some(checkpoint) = &view.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!(
         "- Risk: {:?} ({}/100)\n\n",
@@ -10916,7 +10916,10 @@ fn agent_report_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -10965,7 +10968,10 @@ fn agent_receipt_markdown(
         report.task.turns, report.task.tool_events
     ));
     if let Some(checkpoint) = &report.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!(
         "- Risk: {:?} ({}/100)\n\n",
@@ -11059,7 +11065,10 @@ fn agent_receipt_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -11132,7 +11141,10 @@ fn agent_handoff_markdown(
         report.task.tool_events
     ));
     if let Some(checkpoint) = &report.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     if let Some(workdir) = &report.task.workdir {
         out.push_str(&format!("- Workdir: `{workdir}`\n"));
@@ -11236,7 +11248,10 @@ fn agent_handoff_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -11291,7 +11306,10 @@ fn agent_pr_body(receipt: &AgentReceiptReport) -> String {
         receipt.risk.level, receipt.risk.score
     ));
     if let Some(checkpoint) = &receipt.latest_checkpoint {
-        out.push_str(&format!("- Trail checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Trail checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!("- Agent task: `{}`\n\n", receipt.task.name));
 
@@ -11362,7 +11380,10 @@ fn agent_pr_body(receipt: &AgentReceiptReport) -> String {
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
         }
         out.push('\n');
@@ -11397,7 +11418,7 @@ fn agent_checkpoint_entry(lane: &str, group: &AgentChangeGroup) -> AgentCheckpoi
         if is_turn {
             format!("turn:{}", group.index)
         } else {
-            checkpoint.0.clone()
+            checkpoint.checkpoint_alias()
         }
     });
     let rewind_before_command = before_target
@@ -11692,7 +11713,7 @@ fn agent_risk_summary(level: &AgentRiskLevel, score: u8, task: &AgentTaskReport)
 fn agent_task_suggestions(lane: &str, status: &AgentTaskStatus) -> Vec<StatusSuggestion> {
     match status {
         AgentTaskStatus::Empty => vec![StatusSuggestion {
-            command: "trail agent setup".to_string(),
+            command: "trail agent acp setup claude-code --editor vscode".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         }],
         AgentTaskStatus::Dirty => vec![StatusSuggestion {
@@ -11735,7 +11756,7 @@ fn agent_next_report_from_view(
             "setup",
             "No agent task is available.",
             StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             },
         ),
@@ -11983,66 +12004,6 @@ fn agent_brief_suggestions(lane: &str, next: &AgentNextReport) -> Vec<StatusSugg
         }
     }
     suggestions
-}
-
-fn agent_editor_snippet(editor: &str, provider: &str, command: &[String]) -> String {
-    match editor {
-        "vscode" => serde_json::to_string_pretty(&serde_json::json!({
-            (format!("Trail {}", provider_display_name(provider))): {
-                "command": command.first().cloned().unwrap_or_default(),
-                "args": command.iter().skip(1).cloned().collect::<Vec<_>>(),
-                "env": {}
-            }
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-        "zed" => serde_json::to_string_pretty(&serde_json::json!({
-            "agent_servers": {
-                (format!("trail-{}", provider)): {
-                    "type": "custom",
-                    "command": command.first().cloned().unwrap_or_default(),
-                    "args": command.iter().skip(1).cloned().collect::<Vec<_>>()
-                }
-            }
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-        _ => format!("ACP command:\n{}", shell_join(command)),
-    }
-}
-
-fn agent_terminal_setup_snippet(
-    profile: &AcpProviderProfile,
-    command: &[String],
-    mcp_command: &[String],
-) -> String {
-    let mut snippet = format!(
-        "Terminal command:\n{}\n\nTrail MCP server command:\n{}",
-        shell_join(command),
-        shell_join(mcp_command)
-    );
-    if profile.supports_mcp {
-        snippet.push_str(&format!(
-            "\n\nRegister the MCP command in {} if you want direct Trail context tools inside the agent.",
-            profile.display_name
-        ));
-    } else {
-        snippet.push_str(&format!(
-            "\n\n{} is configured here as a terminal agent; use the terminal command to run it in an isolated Trail task lane.",
-            profile.display_name
-        ));
-    }
-    snippet
-}
-
-fn provider_display_name(provider: &str) -> String {
-    match provider {
-        "claude-code" | "claude" => "Claude Code".to_string(),
-        "codex" | "codex-cli" | "openai-codex" => "Codex".to_string(),
-        "cursor" | "cursor-agent" => "Cursor".to_string(),
-        "gemini" | "gemini-cli" => "Gemini CLI".to_string(),
-        "aider" => "Aider".to_string(),
-        "opencode" | "open-code" => "OpenCode".to_string(),
-        other => other.to_string(),
-    }
 }
 
 fn sanitize_agent_ref_component(value: &str) -> String {

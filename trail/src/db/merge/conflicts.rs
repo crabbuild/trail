@@ -165,9 +165,9 @@ impl Trail {
             "UPDATE conflict_sets SET status = 'resolved' WHERE conflict_set_id = ?1",
             params![conflict_set_id],
         )?;
-        if let Some(queue_id) = pending.queue_id {
+        if let Some(queue_id) = pending.lane_queue_id {
             self.conn.execute(
-                "UPDATE merge_queue SET status = 'merged', updated_at = ?1 WHERE queue_id = ?2",
+                "UPDATE lane_merge_queue SET status = 'merged', updated_at = ?1 WHERE queue_id = ?2",
                 params![now_ts(), queue_id],
             )?;
         }
@@ -266,7 +266,7 @@ impl Trail {
         Ok(Some(ConflictExplanation {
             merge: ConflictMergeContext {
                 merge_id: pending.merge_id,
-                queue_id: pending.queue_id,
+                lane_queue_id: pending.lane_queue_id,
                 source_ref: pending.source_ref,
                 target_ref: pending.target_ref,
                 base_change: pending.base_change,

@@ -18,13 +18,24 @@ fn resource_read_response(db: &mut Trail, args: ResourceReadArgs) -> Result<Valu
         ),
         RESOURCE_DOCTOR => ("application/json", pretty_json(&db.doctor()?)?),
         RESOURCE_LANES => ("application/json", pretty_json(&db.list_lanes()?)?),
-        RESOURCE_MERGE_QUEUE => ("application/json", pretty_json(&db.list_merge_queue()?)?),
+        RESOURCE_LANE_MERGE_QUEUE => (
+            "application/json",
+            pretty_json(&db.list_lane_merge_queue()?)?,
+        ),
         RESOURCE_CONFLICTS => ("application/json", pretty_json(&db.list_conflicts()?)?),
         RESOURCE_OPENAPI => (
             "application/json",
             serde_json::to_string_pretty(&crate::server::openapi_spec())?,
         ),
         RESOURCE_AGENT_INBOX => ("application/json", pretty_json(&db.agent_inbox()?)?),
+        RESOURCE_AGENT_INTEGRATIONS => {
+            let registry = crate::agent_hooks::AgentProviderRegistry::built_in()?;
+            ("application/json", pretty_json(&registry.list())?)
+        }
+        RESOURCE_AGENT_HOOK_RECEIPTS => (
+            "application/json",
+            pretty_json(&db.list_agent_hook_receipts(None, None, 100)?)?,
+        ),
         RESOURCE_AGENT_LATEST_SUMMARY => (
             "application/json",
             pretty_json(&db.agent_summary("latest")?)?,

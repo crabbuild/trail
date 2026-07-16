@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -13,8 +17,9 @@ use rusqlite::Connection;
 use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
-    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, OperationKind, PatchDocument,
-    ShowResult, TextContent, TextRepresentation, Trail, WorktreeState,
+    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, MaterializationFallbackReason,
+    ObjectId, OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
+    WorkdirBackend, WorktreeRoot, WorktreeState, WORKTREE_ROOT_KIND,
 };
 
 fn git_available() -> bool {
@@ -58,6 +63,34 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn git_output_raw(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_object_count(cwd: &Path) -> u64 {
+    let output = git_output(cwd, &["count-objects", "-v"]);
+    let counts = output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect::<BTreeMap<_, _>>();
+    let loose = counts.get("count:").unwrap().parse::<u64>().unwrap();
+    let packed = counts.get("in-pack:").unwrap().parse::<u64>().unwrap();
+    loose + packed
+}
+
 fn trail_bin() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_trail")
         .map(PathBuf::from)
@@ -76,6 +109,902 @@ fn cli_reports_package_version() {
         String::from_utf8_lossy(&output.stdout).trim(),
         format!("trail {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn agent_default_provider_is_a_typed_workspace_config_value() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let set = run_trail_json(
+        temp.path(),
+        &["config", "set", "agent.default_provider", "codex"],
+    );
+    assert_eq!(set["key"], "agent.default_provider");
+    assert_eq!(set["new_value"], "codex");
+
+    let get = run_trail_json(temp.path(), &["config", "get", "agent.default_provider"]);
+    assert_eq!(get["value"], "codex");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_uses_configured_provider_when_argument_is_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "agent.default_provider", "custom"],
+    );
+
+    let report = run_trail_json(temp.path(), &["agent", "start", "--", "/usr/bin/true"]);
+    assert_eq!(report["provider"], "custom");
+}
+
+#[test]
+fn agent_acp_setup_plan_uses_the_hidden_run_command() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let report = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "acp", "setup", "codex", "--editor", "generic", "--print",
+        ],
+    );
+    assert_eq!(report["transport"], "acp");
+    assert_eq!(report["provider"], "codex");
+    assert_eq!(report["editor"], "generic");
+    assert_eq!(report["applied"], false);
+    assert_eq!(
+        report["command"],
+        serde_json::json!([
+            trail_bin().canonicalize().unwrap(),
+            "--workspace",
+            temp.path().canonicalize().unwrap(),
+            "agent",
+            "acp",
+            "run",
+            "codex"
+        ])
+    );
+}
+
+#[test]
+fn agent_acp_setup_falls_back_to_a_generic_entry_for_unknown_editors() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let report = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "acp", "setup", "codex", "--editor", "neovim", "--print",
+        ],
+    );
+    assert_eq!(report["editor"], "neovim");
+    assert_eq!(report["action"], "print");
+    assert!(report["snippet"].as_str().unwrap().contains("ACP command:"));
+    assert!(report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("generic entry")));
+}
+
+#[test]
+fn agent_acp_setup_merges_the_owned_zed_entry() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let settings = test_zed_settings_path(home.path());
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "{\"theme\":\"One Dark\"}\n").unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(workspace.path())
+        .arg("--json")
+        .args(["agent", "acp", "setup", "codex", "--editor", "zed", "--yes"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ACP setup failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["action"], "update");
+    let configured: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(configured["theme"], "One Dark");
+    assert_eq!(
+        configured["agent_servers"]["trail-codex"]["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "codex"
+    );
+
+    let repeated = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(workspace.path())
+        .arg("--json")
+        .args(["agent", "acp", "setup", "codex", "--editor", "zed", "--yes"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["action"], "noop");
+    assert_eq!(repeated["applied"], true);
+}
+
+fn test_zed_settings_path(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/Zed/settings.json")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".config/zed/settings.json")
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "context",
+            "--workdir-mode",
+            "native-cow",
+            "--",
+            "/usr/bin/env",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = report["workdir"].as_str().unwrap();
+    let workspace = temp.path().canonicalize().unwrap();
+    let environment = String::from_utf8_lossy(&output.stderr);
+    assert!(environment
+        .lines()
+        .any(|line| line == format!("PWD={workdir}")));
+    assert!(environment
+        .lines()
+        .any(|line| line == format!("TRAIL_WORKSPACE={}", workspace.display())));
+    assert!(environment
+        .lines()
+        .any(|line| line.starts_with("TRAIL_LANE=lane_")));
+    assert!(environment
+        .lines()
+        .any(|line| line.starts_with("TRAIL_SOURCE_ROOT=object_")));
+    assert!(environment.lines().any(|line| {
+        line.strip_prefix("GIT_CEILING_DIRECTORIES=")
+            .is_some_and(|value| {
+                value
+                    .split(':')
+                    .any(|path| path == workspace.to_string_lossy())
+            })
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let install = run_trail_json(
+        temp.path(),
+        &[
+            "agent",
+            "hooks",
+            "setup",
+            "claude-code",
+            "--scope",
+            "project",
+            "--yes",
+        ],
+    );
+    let settings = install["config_path"].as_str().unwrap().to_string();
+
+    let bin = tempfile::tempdir().unwrap();
+    let fake_claude = bin.path().join("claude");
+    fs::write(
+        &fake_claude,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > CLAUDE_ARGS.txt\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_claude, permissions).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("PATH", path)
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "hook-settings",
+            "--workdir-mode",
+            "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("CLAUDE_ARGS.txt")).unwrap(),
+        format!("--settings\n{settings}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_native_cow_does_not_discover_or_write_the_parent_git_checkout() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-qm", "baseline"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nset -eu\nprintf 'lane change\\n' > LANE_ONLY.md\nif root=$(git rev-parse --show-toplevel 2>/dev/null); then\n  printf 'escaped\\n' > \"$root/ESCAPED.md\"\nfi\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "containment",
+            "--workdir-mode",
+            "native-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "root baseline\n"
+    );
+    assert!(!temp.path().join("ESCAPED.md").exists());
+    assert_eq!(
+        fs::read_to_string(workdir.join("LANE_ONLY.md")).unwrap(),
+        "lane change\n"
+    );
+    assert!(report["recorded"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "LANE_ONLY.md"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_agent_native_cow_denies_explicit_writes_to_the_original_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nprintf 'lane change\\n' > LANE_ONLY.md\nif printf 'escaped\\n' > \"$1/ESCAPED.md\"; then\n  printf 'workspace write was allowed\\n' > CONTAINMENT.txt\nelse\n  printf 'workspace write was blocked\\n' > CONTAINMENT.txt\nfi\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "explicit-containment",
+            "--workdir-mode",
+            "native-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert!(!temp.path().join("ESCAPED.md").exists());
+    assert_eq!(
+        fs::read_to_string(workdir.join("LANE_ONLY.md")).unwrap(),
+        "lane change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("CONTAINMENT.txt")).unwrap(),
+        "workspace write was blocked\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_native_hooks_enrich_the_existing_task_without_duplication() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nset -eu\nsend() {\n  event=$1\n  payload=$2\n  printf '%s' \"$payload\" | \"$TRAIL_TEST_BIN\" --workspace \"$TRAIL_WORKSPACE\" agent hook receive claude-code \"$event\" >/dev/null\n}\ncwd=$(pwd)\nsend SessionStart \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\"}\"\nsend UserPromptSubmit \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\",\\\"prompt\\\":\\\"edit lane\\\"}\"\nprintf 'hooked change\\n' > HOOKED.md\nsend Stop \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\",\\\"last_assistant_message\\\":\\\"done\\\"}\"\nsend SessionEnd \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\"}\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("TRAIL_TEST_BIN", trail_bin())
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "hooked-terminal",
+            "--workdir-mode",
+            "native-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let task_id = report["task"]["task_id"].as_str().unwrap();
+    let list = run_trail_json(temp.path(), &["agent", "list", "--all"]);
+    assert_eq!(list["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(list["tasks"][0]["task_id"], task_id);
+    assert_eq!(list["tasks"][0]["turns"], 1);
+    assert!(list["tasks"][0]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "HOOKED.md"));
+    let view = run_trail_json(temp.path(), &["agent", "view", task_id]);
+    assert_eq!(
+        view["review"]["recent_sessions"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(view["transcript"]["turns"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn native_hook_cli_journals_codex_stop_and_returns_required_success_json() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "codex-session-1",
+        "turn_id": "codex-turn-1",
+        "hook_event_name": "Stop",
+        "last_assistant_message": "done"
+    })
+    .to_string();
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hook", "receive", "codex", "Stop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook ingress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{\"continue\":true}"
+    );
+    let db = Trail::open(temp.path()).unwrap();
+    let receipts = db
+        .list_agent_hook_receipts(Some("codex"), Some("processed"), 10)
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].native_session_id.as_deref(),
+        Some("codex-session-1")
+    );
+    assert_eq!(receipts[0].native_turn_id.as_deref(), Some("codex-turn-1"));
+}
+
+#[test]
+fn agent_hook_http_openapi_and_mcp_surfaces_share_durable_receipts() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "codex-http-session",
+        "turn_id": "codex-http-turn",
+        "hook_event_name": "Stop"
+    });
+
+    let unauthenticated = trail::server::handle_http_request(
+        &mut db,
+        &api_request("POST", "/v1/agent-hooks/codex/Stop", payload.clone()),
+    );
+    assert_eq!(unauthenticated.status, 401);
+
+    let auth = trail::server::ServerAuth::bearer("agent-hook-test-token").unwrap();
+    let ingested = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "POST",
+            "/v1/agent-hooks/codex/Stop",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            payload,
+        ),
+        &auth,
+    );
+    assert_eq!(ingested.status, 200);
+    let ingested: serde_json::Value = ingested.body_json().unwrap();
+    assert_eq!(ingested["continue"], true);
+
+    let receipts = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "GET",
+            "/v1/agent-hooks/receipts?provider=codex",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            serde_json::Value::Null,
+        ),
+        &auth,
+    );
+    assert_eq!(receipts.status, 200);
+    let receipts: serde_json::Value = receipts.body_json().unwrap();
+    assert_eq!(receipts.as_array().unwrap().len(), 1);
+    let receipt_id = receipts[0]["receipt_id"].as_str().unwrap().to_string();
+    let cli_receipts = run_trail_json(
+        temp.path(),
+        &["agent", "hooks", "events", "codex", "--last", "10"],
+    );
+    assert_eq!(cli_receipts[0]["receipt_id"], receipt_id);
+    let cli_receipts_after_first = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "hooks", "events", "codex", "--offset", "1", "--last", "1",
+        ],
+    );
+    assert_eq!(cli_receipts_after_first, serde_json::json!([]));
+
+    let receipts_after_first = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "GET",
+            "/v1/agent-hooks/receipts?provider=codex&offset=1&limit=1",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            serde_json::Value::Null,
+        ),
+        &auth,
+    );
+    assert_eq!(receipts_after_first.status, 200);
+    let receipts_after_first: serde_json::Value = receipts_after_first.body_json().unwrap();
+    assert_eq!(receipts_after_first, serde_json::json!([]));
+
+    let capabilities = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_integrations",
+                "arguments": {"provider": "codex"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(capabilities["result"]["isError"], false);
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["provider"],
+        "codex"
+    );
+
+    let mcp_receipts = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_hook_receipts",
+                "arguments": {"provider": "codex"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_receipts["result"]["isError"], false);
+    assert_eq!(
+        mcp_receipts["result"]["structuredContent"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        mcp_receipts["result"]["structuredContent"][0]["receipt_id"],
+        receipt_id
+    );
+    let mcp_receipts_after_first = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_hook_receipts",
+                "arguments": {"provider": "codex", "offset": 1, "limit": 1}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_receipts_after_first["result"]["isError"], false);
+    assert_eq!(
+        mcp_receipts_after_first["result"]["structuredContent"],
+        serde_json::json!([])
+    );
+
+    let resource = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": {"uri": "trail://workspace/agent-hooks/receipts"}
+        }),
+    )
+    .unwrap();
+    assert!(resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("codex-http-session"));
+
+    let spec = trail::server::openapi_spec();
+    assert!(spec["paths"]["/v1/agent-hooks/{provider}/{event}"]["post"].is_object());
+    assert!(spec["paths"]["/v1/agent-sessions/{id}/provenance"]["get"].is_object());
+    assert_eq!(
+        spec["components"]["schemas"]["AgentCaptureRunRequest"]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
+fn native_hook_management_cli_installs_reports_and_removes_owned_config() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let setup = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "setup", "codex", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "hook install failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let setup: serde_json::Value = serde_json::from_slice(&setup.stdout).unwrap();
+    assert_eq!(setup["provider"], "codex");
+    let hooks_path = temp.path().join(".codex/hooks.json");
+    let hooks = fs::read_to_string(&hooks_path).unwrap();
+    assert!(hooks.contains(" agent hook receive codex Stop --installation hook_"));
+
+    let db = Trail::open(temp.path()).unwrap();
+    let records = db.list_agent_hook_installations(Some("codex")).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, "installed");
+    drop(db);
+
+    let status = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "status", "codex"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["installations"][0]["filesystem_status"], "installed");
+
+    let remove = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hooks", "remove", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "hook removal failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let remaining: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    assert!(remaining.get("hooks").is_none());
+    let db = Trail::open(temp.path()).unwrap();
+    assert_eq!(
+        db.list_agent_hook_installations(Some("codex")).unwrap()[0].status,
+        "removed"
+    );
+}
+
+#[test]
+fn native_hook_cli_spools_during_database_failure_and_replays_after_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let index = temp.path().join(".trail/index/trail.sqlite");
+    let backup = temp.path().join(".trail/index/trail.sqlite.saved");
+    fs::rename(&index, &backup).unwrap();
+    fs::create_dir(&index).unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "spooled-session-1",
+        "turn_id": "spooled-turn-1",
+        "hook_event_name": "Stop"
+    })
+    .to_string();
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hook", "receive", "codex", "Stop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{\"continue\":true}"
+    );
+    let spool = temp.path().join(".trail/runtime/agent-hooks-spool");
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 1);
+
+    fs::remove_dir(&index).unwrap();
+    fs::rename(&backup, &index).unwrap();
+    let replay = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "replay", "--pending"])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "spool replay failed: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["spool"]["imported"], 1);
+    assert_eq!(replay["replayed"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+}
+
+#[test]
+fn agent_capture_and_portable_evidence_cli_surface_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let begin = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "capture",
+            "begin",
+            "--owner",
+            "codex",
+            "--session",
+            "owner-1",
+            "--workdir",
+        ])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        begin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    let begin: serde_json::Value = serde_json::from_slice(&begin.stdout).unwrap();
+    let run_id = begin["capture_run_id"].as_str().unwrap();
+    let status = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "capture", "status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status[0]["capture_run_id"], run_id);
+    let end = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "capture",
+            "end",
+            run_id,
+            "--owner",
+            "codex",
+            "--session",
+            "owner-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        end.status.success(),
+        "{}",
+        String::from_utf8_lossy(&end.stderr)
+    );
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("portable", None, false, Some("codex".to_string()), None)
+        .unwrap();
+    let session = db
+        .start_lane_session("portable", Some("portable".to_string()), None)
+        .unwrap()
+        .session;
+    let turn = db
+        .begin_lane_session_turn("portable", &session.session_id, None)
+        .unwrap()
+        .turn;
+    db.add_lane_turn_message(&turn.turn_id, "user", "portable trace")
+        .unwrap();
+    db.end_lane_turn(&turn.turn_id, "completed").unwrap();
+    db.create_turn_evidence_manifest(&turn.turn_id).unwrap();
+    let attestation = db
+        .create_session_attestation(&session.session_id, "test", None)
+        .unwrap();
+    drop(db);
+
+    let verify = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "attest", "verify", &attestation.attestation_id])
+        .output()
+        .unwrap();
+    assert!(verify.status.success());
+    let verify: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify["valid"], true);
+
+    let export = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "export", &session.session_id])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let trace = trail::PortableAgentTrace::from_json(&export.stdout).unwrap();
+    assert_eq!(trace.session_id, session.session_id);
+    assert!(trace.verify().valid);
 }
 
 #[cfg(unix)]
@@ -241,6 +1170,390 @@ fn apply_lane_patch_at_head(
     db.apply_lane_patch(lane, patch)
 }
 
+fn ready_agent_lane_with_mode(mode: InitImportMode) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", mode, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "one changed path",
+        "edits": [{"op": "write", "path": "AGENT.md", "content": "agent change\n"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
+fn ready_agent_lane_with_changed_paths(changed_path_count: usize) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let edits = (0..changed_path_count)
+        .map(|index| {
+            serde_json::json!({
+                "op": "write",
+                "path": format!("agent-{index:03}.md"),
+                "content": format!("agent change {index}\n"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "many changed paths",
+        "edits": edits,
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
+#[test]
+fn agent_apply_reports_one_tracked_status_query() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let dry_run = db.agent_apply("apply-bot", true, None).unwrap();
+    assert_eq!(dry_run.performance.tracked_status_count, 1);
+    assert_eq!(dry_run.performance.full_root_file_count, 0);
+    assert_eq!(dry_run.performance.export_mode, "mapped_delta");
+}
+
+#[test]
+fn agent_apply_actual_reports_mapped_delta_metrics() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.tracked_status_count, 1);
+    assert_eq!(applied.performance.full_root_file_count, 0);
+    assert_eq!(applied.performance.export_mode, "mapped_delta");
+    assert_eq!(applied.performance.changed_path_count, 1);
+    assert_eq!(applied.performance.blob_write_count, 1);
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_for_many_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_changed_paths(100);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.changed_path_count, 100);
+    assert_eq!(applied.performance.blob_write_count, 100);
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        applied
+            .git_export
+            .as_ref()
+            .unwrap()
+            .performance
+            .git_plumbing_command_count,
+        5
+    );
+    let tmp = temp.path().join(".trail/tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
+}
+
+#[test]
+fn agent_apply_batch_preserves_modes_deletions_and_safe_special_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("delete-me.txt"), "remove me\n").unwrap();
+    fs::write(temp.path().join("mode-change.sh"), "echo old\n").unwrap();
+    run_git(temp.path(), &["add", "delete-me.txt", "mode-change.sh"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let special_path = "dir with space/-leading-ünicode.sh";
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "mixed Git index batch",
+        "edits": [
+            {"op": "delete", "path": "delete-me.txt"},
+            {
+                "op": "write",
+                "path": "mode-change.sh",
+                "content": "echo changed\n",
+                "executable": true
+            },
+            {
+                "op": "write",
+                "path": special_path,
+                "content": "echo special\n",
+                "executable": true
+            }
+        ]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "delete-me.txt"]),
+        ""
+    );
+    for path in ["mode-change.sh", special_path] {
+        let entry = git_output(temp.path(), &["ls-tree", "HEAD", "--", path]);
+        assert!(
+            entry.starts_with("100755 blob "),
+            "expected executable Git entry for {path:?}, got {entry:?}"
+        );
+    }
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:mode-change.sh"]),
+        "echo changed\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", &format!("HEAD:{special_path}")]),
+        "echo special\n"
+    );
+}
+
+#[test]
+fn agent_apply_batch_hashes_exact_trail_bytes_without_git_filters() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.clean", "tr a-z A-Z"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.smudge", "cat"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.required", "true"],
+    );
+    fs::write(
+        temp.path().join(".gitattributes"),
+        "* filter=trail-uppercase\n.gitattributes -filter\n",
+    )
+    .unwrap();
+    run_git(temp.path(), &["add", ".gitattributes"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "preserve exact bytes",
+        "edits": [{
+            "op": "write",
+            "path": "payload.txt",
+            "content": "Exact Trail bytes\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:payload.txt"]),
+        "Exact Trail bytes\n"
+    );
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_with_external_db_dir() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    #[cfg(target_os = "linux")]
+    let external_db = temp
+        .path()
+        .join(OsString::from_vec(b"external-trail-db-\xff".to_vec()));
+    #[cfg(not(target_os = "linux"))]
+    let external_db = temp.path().join("external-trail-db");
+    fs::create_dir(&workspace).unwrap();
+    run_git(&workspace, &["init"]);
+    run_git(&workspace, &["config", "user.email", "trail@example.test"]);
+    run_git(&workspace, &["config", "user.name", "Trail Test"]);
+    fs::write(workspace.join("README.md"), "base\n").unwrap();
+    run_git(&workspace, &["add", "README.md"]);
+    run_git(&workspace, &["commit", "-m", "initial"]);
+    Trail::init(&workspace, "main", InitImportMode::GitTracked, false).unwrap();
+    fs::rename(workspace.join(".trail"), &external_db).unwrap();
+
+    let mut db = Trail::open_with_db_dir(&workspace, &external_db).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "apply with external database",
+        "edits": [{
+            "op": "write",
+            "path": "external-db.txt",
+            "content": "external database path\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output_raw(&workspace, &["show", "HEAD:external-db.txt"]),
+        "external database path\n"
+    );
+    let tmp = external_db.join("tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
+}
+
+#[test]
+fn agent_apply_requires_mapping_before_git_or_trail_mutation() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::WorkingTree);
+    let git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    assert!(db.git_mappings(10).unwrap().is_empty());
+
+    let err = db.agent_apply("apply-bot", true, None).unwrap_err();
+    assert!(matches!(err, Error::GitMappingRequired(_)));
+    assert!(db.git_mappings(10).unwrap().is_empty());
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), git_head);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_apply_preserves_git_only_symlinks() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("target.md"), "target\n").unwrap();
+    std::os::unix::fs::symlink("target.md", temp.path().join("link.md")).unwrap();
+    run_git(temp.path(), &["add", "target.md", "link.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    let link_tree_entry_before = git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]);
+    assert!(
+        link_tree_entry_before.starts_with("120000 blob "),
+        "expected a Git symlink entry, got {link_tree_entry_before:?}"
+    );
+
+    let init = Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let root = db.inspect_root(&init.root_id.0).unwrap();
+    assert!(!root.files.iter().any(|file| file.path == "link.md"));
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "add readme",
+        "edits": [{"op": "write", "path": "README.md", "content": "agent change"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]),
+        link_tree_entry_before
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:link.md"]),
+        "target.md"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:target.md"]),
+        "target\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:README.md"]),
+        "agent change"
+    );
+}
+
+#[test]
+fn agent_apply_dry_run_writes_no_git_or_mapping_state() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let head_before = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    let index_before = fs::read(temp.path().join(".git/index")).unwrap();
+    let mappings_before = db.git_mappings(100).unwrap().len();
+    let objects_before = git_object_count(temp.path());
+
+    let report = db.agent_apply("apply-bot", true, None).unwrap();
+    assert!(report.dry_run);
+
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(db.git_mappings(100).unwrap().len(), mappings_before);
+    assert_eq!(git_object_count(temp.path()), objects_before);
+}
+
 fn only_conflict_path_class(db: &Trail) -> (String, String) {
     let conflicts = db.list_conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);
@@ -269,6 +1582,52 @@ fn run_trail_json(workspace: &Path, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn make_current_branch_root_legacy(workspace: &Path) -> ObjectId {
+    let sqlite_path = workspace.join(".trail/index/trail.sqlite");
+    let conn = Connection::open(sqlite_path).unwrap();
+    let root_id: String = conn
+        .query_row(
+            "SELECT root_id FROM refs WHERE name = 'refs/branches/main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (version, bytes): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT version, bytes FROM objects WHERE object_id = ?1 AND kind = ?2",
+            rusqlite::params![root_id, WORKTREE_ROOT_KIND],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut root: WorktreeRoot = serde_cbor::from_slice(&bytes).unwrap();
+    assert!(root.file_count > 0);
+    assert!(root.case_fold_map_root.take().is_some());
+    let legacy_bytes = serde_cbor::to_vec(&root).unwrap();
+    let legacy_root = ObjectId::for_bytes(
+        WORKTREE_ROOT_KIND,
+        u16::try_from(version).unwrap(),
+        &legacy_bytes,
+    );
+    conn.execute(
+        "INSERT INTO objects (object_id, kind, version, codec, hash_alg, size_bytes, bytes, created_at) \
+         VALUES (?1, ?2, ?3, 'cbor', 'sha256', ?4, ?5, 0)",
+        rusqlite::params![
+            legacy_root.0.as_str(),
+            WORKTREE_ROOT_KIND,
+            version,
+            legacy_bytes.len() as i64,
+            legacy_bytes
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE refs SET root_id = ?1 WHERE name = 'refs/branches/main'",
+        rusqlite::params![legacy_root.0.as_str()],
+    )
+    .unwrap();
+    legacy_root
 }
 
 fn run_trail_json_daemon(workspace: &Path, daemon_url: &str, args: &[&str]) -> serde_json::Value {
@@ -333,7 +1692,7 @@ fn free_loopback_port() -> u16 {
 }
 
 fn wait_for_daemon_health(port: u16) {
-    for _ in 0..100 {
+    for _ in 0..400 {
         if daemon_health_ok(port) {
             return;
         }
@@ -398,8 +1757,8 @@ fn conflicted_readme_workspace(
         false,
     )
     .unwrap();
-    db.enqueue_merge("manual-bot", "main", 0).unwrap();
-    let run = db.run_merge_queue(None).unwrap();
+    db.enqueue_lane_merge("manual-bot", "main", 0).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert!(run.stopped_on_conflict);
     let conflict_id = db.list_conflicts().unwrap()[0].conflict_set_id.clone();
     (temp, db, conflict_id)
@@ -444,7 +1803,7 @@ fn cli_json_errors_are_machine_readable() {
     assert!(parse_output.stdout.is_empty());
     let parse_stderr: serde_json::Value = serde_json::from_slice(&parse_output.stderr).unwrap();
     assert_eq!(parse_stderr["error"]["code"], "INVALID_INPUT");
-    assert_eq!(parse_stderr["error"]["exit_code"], 2);
+    assert_eq!(parse_stderr["error"]["exit"], 2);
     assert!(parse_stderr["error"]["message"]
         .as_str()
         .unwrap()
@@ -462,7 +1821,7 @@ fn cli_json_errors_are_machine_readable() {
     assert!(output.stdout.is_empty());
     let stderr: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(stderr["error"]["code"], "WORKSPACE_NOT_FOUND");
-    assert_eq!(stderr["error"]["exit_code"], 3);
+    assert_eq!(stderr["error"]["exit"], 3);
     assert!(stderr["error"]["message"]
         .as_str()
         .unwrap()
@@ -494,6 +1853,144 @@ fn cli_json_errors_are_machine_readable() {
         .as_str()
         .unwrap()
         .contains("still-not-a-command"));
+}
+
+#[test]
+fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let legacy_root = make_current_branch_root_legacy(temp.path());
+
+    let status = run_trail_json(temp.path(), &["status"]);
+    assert_eq!(status["head"]["root_id"], legacy_root.0);
+    assert_eq!(status["worktree_state"], "Clean");
+    fs::write(temp.path().join("README.md"), "changed\n").unwrap();
+
+    let human = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(9));
+    let human_stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(
+        human_stderr.contains("Trail workspace upgrade is required"),
+        "{human_stderr}"
+    );
+    assert!(
+        human_stderr.contains("trail index rebuild"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains("trail --help"), "{human_stderr}");
+
+    let json = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(9));
+    assert!(json.stdout.is_empty());
+    let json_error: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(json_error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert_eq!(json_error["error"]["exit"], 9);
+    assert!(json_error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("trail index rebuild"));
+
+    let rebuilt = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert_eq!(
+        rebuilt["path_index_repaired_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"][0]["old_root"],
+        legacy_root.0
+    );
+    let repaired_root = rebuilt["path_index_repaired_refs"][0]["new_root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    let load_root = |root_id: &str| -> WorktreeRoot {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT bytes FROM objects WHERE object_id = ?1",
+                rusqlite::params![root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_cbor::from_slice(&bytes).unwrap()
+    };
+    let legacy = load_root(&legacy_root.0);
+    let repaired = load_root(&repaired_root);
+    assert_eq!(repaired.path_map_root, legacy.path_map_root);
+    assert_eq!(repaired.file_index_map_root, legacy.file_index_map_root);
+    assert_eq!(repaired.file_count, legacy.file_count);
+    assert_eq!(repaired.total_text_bytes, legacy.total_text_bytes);
+    assert_eq!(repaired.created_by, legacy.created_by);
+    assert!(repaired.case_fold_map_root.is_some());
+    drop(conn);
+
+    let recorded = run_trail_json(temp.path(), &["record", "-m", "after upgrade"]);
+    assert_eq!(recorded["changed_paths"].as_array().unwrap().len(), 1);
+    let second = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert!(second["path_index_repaired_roots"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(second["path_index_repaired_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_doctor_and_relay_preflight_report_legacy_path_index() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    make_current_branch_root_legacy(temp.path());
+
+    let doctor = run_trail_json(temp.path(), &["agent", "acp", "doctor", "claude-code"]);
+    assert_eq!(doctor["status"], "failed");
+    assert!(doctor["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "path_invariant_index"
+            && check["status"] == "failed"
+            && check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("trail index rebuild"))
+    }));
+
+    let relay = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["acp", "relay", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(relay.status.code(), Some(9));
+    assert!(relay.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&relay.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("trail index rebuild")));
 }
 
 #[test]
@@ -553,7 +2050,72 @@ fn cli_env_defaults_select_workspace_db_branch_and_format() {
         .unwrap();
     assert!(!invalid_format.status.success());
     assert!(String::from_utf8_lossy(&invalid_format.stderr)
-        .contains("TRAIL_FORMAT must be human, json, or ndjson"));
+        .contains("TRAIL_FORMAT must be human, plain, json, or ndjson"));
+}
+
+#[test]
+fn ndjson_rejects_single_report_commands_with_a_structured_diagnostic() {
+    let output = Command::new(trail_bin())
+        .args(["--format", "ndjson", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("streaming watch commands"));
+}
+
+#[test]
+fn plain_redirected_and_quiet_output_follow_terminal_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let plain = Command::new(trail_bin())
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "plain",
+            "--color",
+            "always",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let plain_stdout = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain_stdout.contains("Worktree clean"));
+    assert!(!plain_stdout.contains("\u{1b}["));
+
+    let quiet = Command::new(trail_bin())
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "--quiet",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success());
+    assert!(quiet.stdout.is_empty());
+    assert!(quiet.stderr.is_empty());
+}
+
+#[test]
+fn clap_diagnostics_keep_usage_on_separate_lines() {
+    let output = Command::new(trail_bin())
+        .args(["agent", "hook", "receive"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("the following required arguments were not provided:\n  <PROVIDER>"));
+    assert!(stderr.contains("\nUsage: trail agent hook receive <PROVIDER> <NATIVE_EVENT>\n"));
+    assert!(!stderr.contains(r"\nUsage:"));
 }
 
 #[test]
@@ -573,8 +2135,21 @@ fn agent_help_is_curated_and_hidden_commands_still_work() {
     assert!(stdout.contains("trail agent ask what should I do"));
     assert!(stdout.contains("  action"));
     assert!(stdout.contains("  changes"));
+    assert!(stdout.contains("  acp"));
+    assert!(stdout.contains("  hooks"));
+    assert!(!stdout.contains("  setup "));
     assert!(!stdout.contains("review-data"));
     assert!(!stdout.contains("turn-diff"));
+
+    let acp_help = Command::new(trail_bin())
+        .args(["agent", "acp", "--help"])
+        .output()
+        .unwrap();
+    assert!(acp_help.status.success());
+    let acp_stdout = String::from_utf8_lossy(&acp_help.stdout);
+    assert!(acp_stdout.contains("  setup"));
+    assert!(acp_stdout.contains("  status"));
+    assert!(!acp_stdout.contains("  run"));
 
     let hidden_help = Command::new(trail_bin())
         .args(["agent", "review-data", "--help"])
@@ -596,6 +2171,9 @@ fn init_record_why_and_fsck_work() {
 
     let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
     assert_eq!(init.imported.files, 1);
+    assert!(init.workspace_id.0.starts_with("workspace_"));
+    assert!(init.operation.0.starts_with("change_"));
+    assert!(init.root_id.0.starts_with("object_"));
 
     fs::write(temp.path().join("README.md"), "hello\nTrail\n").unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
@@ -608,6 +2186,8 @@ fn init_record_why_and_fsck_work() {
         )
         .unwrap();
     assert!(record.operation.is_some());
+    assert!(record.operation.as_ref().unwrap().0.starts_with("change_"));
+    assert!(record.root_id.0.starts_with("object_"));
     assert_eq!(record.changed_paths.len(), 1);
 
     let why = db.why("README.md:2", Some("main")).unwrap();
@@ -635,7 +2215,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 4
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 18
         }));
     }
 
@@ -708,6 +2288,110 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
 }
 
 #[test]
+fn environment_component_report_keeps_component_and_adapter_identities_separate_json() {
+    let report = trail::EnvironmentComponentStateReport {
+        view_id: "view-1".to_string(),
+        component: trail::EnvironmentComponentIdentityReport {
+            component_id: "web.dependencies".to_string(),
+            kind: "dependency".to_string(),
+        },
+        adapter: trail::EnvironmentAdapterIdentityReport {
+            namespace: "trail".to_string(),
+            name: "node".to_string(),
+            contract_major: 1,
+            implementation_version: "0.5.0".to_string(),
+            distribution_digest: Some("builtin".to_string()),
+        },
+        expected_key: "expected".to_string(),
+        attached_key: Some("attached".to_string()),
+        status: "stale".to_string(),
+        reason: Some("lock changed".to_string()),
+        updated_at: 7,
+    };
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["component"]["component_id"], "web.dependencies");
+    assert_eq!(json["adapter"]["namespace"], "trail");
+    assert_eq!(json["adapter"]["contract_major"], 1);
+    assert!(json["component"].get("adapter").is_none());
+}
+
+#[test]
+fn environment_component_report_keeps_component_and_adapter_identities_separate() {
+    let report = trail::EnvironmentComponentStateReport {
+        view_id: "view-1".to_string(),
+        component: trail::EnvironmentComponentIdentityReport {
+            component_id: "web.dependencies".to_string(),
+            kind: "dependency".to_string(),
+        },
+        adapter: trail::EnvironmentAdapterIdentityReport {
+            namespace: "trail".to_string(),
+            name: "node".to_string(),
+            contract_major: 1,
+            implementation_version: "0.5.0".to_string(),
+            distribution_digest: Some("builtin".to_string()),
+        },
+        expected_key: "expected".to_string(),
+        attached_key: Some("attached".to_string()),
+        status: "stale".to_string(),
+        reason: Some("lock changed".to_string()),
+        updated_at: 7,
+    };
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["component"]["component_id"], "web.dependencies");
+    assert_eq!(json["adapter"]["namespace"], "trail");
+    assert_eq!(json["adapter"]["contract_major"], 1);
+    assert!(json["component"].get("adapter").is_none());
+}
+
+#[test]
+fn environment_plugin_publisher_trust_cli_is_append_only_and_catalogued() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+    Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let key = workspace.path().join("publisher-key.toml");
+    fs::write(
+        &key,
+        r#"schema = "trail.environment-adapter-publisher-key/v1"
+publisher = "rfc8032-test"
+public_key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+"#,
+    )
+    .unwrap();
+    let key_path = key.to_string_lossy().into_owned();
+
+    let added = run_trail_json(
+        workspace.path(),
+        &["env", "plugin", "trust", "add", &key_path],
+    );
+    assert_eq!(added["action"], "trust");
+    assert_eq!(added["publisher"], "rfc8032-test");
+    let key_id = added["key_id"].as_str().unwrap().to_string();
+    assert!(key_id.starts_with("sha256:"));
+
+    let listed = run_trail_json(workspace.path(), &["env", "plugin", "trust", "list"]);
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["keys"][0]["key_id"], key_id);
+
+    let catalog = run_trail_json(workspace.path(), &["env", "adapters"]);
+    assert!(catalog["adapters"].as_array().unwrap().iter().all(|entry| {
+        entry["trust"] == "builtin"
+            && entry["publisher"] == "trail"
+            && entry["certification_tier"].as_str().is_some()
+    }));
+
+    let removed = run_trail_json(
+        workspace.path(),
+        &["env", "plugin", "trust", "remove", &key_id],
+    );
+    assert_eq!(removed["action"], "remove");
+    assert_eq!(removed["key_id"], key_id);
+    let listed = run_trail_json(workspace.path(), &["env", "plugin", "trust", "list"]);
+    assert!(listed["keys"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn trail_refuses_workspaces_with_newer_schema_versions() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -770,12 +2454,12 @@ fn init_creates_lane_observability_indexes() {
 }
 
 #[test]
-fn acp_setup_commands_report_profiles_install_and_doctor() {
+fn agent_acp_doctor_reports_status_setup_and_verifiable_evidence() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
-    let profiles = run_trail_json(temp.path(), &["acp", "list"]);
+    let profiles = run_trail_json(temp.path(), &["agent", "acp", "status"]);
     assert!(profiles
         .as_array()
         .unwrap()
@@ -799,68 +2483,115 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .iter()
         .any(|profile| profile["agent"] == "fake"));
 
-    let install = run_trail_json(
+    let setup = run_trail_json(
         temp.path(),
         &[
+            "agent",
             "acp",
-            "install",
-            "--agent",
+            "setup",
             "claude-code",
             "--editor",
             "generic",
-            "--dry-run",
+            "--print",
         ],
     );
-    assert_eq!(install["agent"], "claude-code");
-    assert_eq!(
-        install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "claude-code"])
-    );
-    assert!(install["snippet"]
+    assert_eq!(setup["transport"], "acp");
+    assert_eq!(setup["provider"], "claude-code");
+    assert_eq!(setup["editor"], "generic");
+    assert!(setup["snippet"]
         .as_str()
         .unwrap()
-        .contains("trail acp relay claude-code"));
-
-    let zed_install = run_trail_json(
-        temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "claude-code",
-            "--editor",
-            "zed",
-            "--dry-run",
-        ],
-    );
-    let zed_snippet: serde_json::Value =
-        serde_json::from_str(zed_install["snippet"].as_str().unwrap()).unwrap();
-    let zed_agent = &zed_snippet["agent_servers"]["trail-claude-code"];
-    assert_eq!(zed_agent["type"], "custom");
-    assert_eq!(zed_agent["command"], "trail");
-    assert!(zed_agent["args"]
+        .contains("agent acp run claude-code"));
+    assert!(setup["command"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|part| part == "relay"));
+        .any(|part| part == "run"));
 
-    let doctor = run_trail_json(temp.path(), &["acp", "doctor", "--agent", "claude-code"]);
+    let doctor = run_trail_json(temp.path(), &["agent", "acp", "doctor", "claude-code"]);
     let checks = doctor["checks"].as_array().unwrap();
     assert!(checks
         .iter()
         .any(|check| check["name"] == "workspace" && check["status"] == "ok"));
     assert!(checks
         .iter()
-        .any(|check| check["name"] == "capture" && check["status"] == "skipped"));
+        .any(|check| { check["name"] == "capture_journal" && check["status"] == "ok" }));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "path_mapping" && check["status"] == "ok"));
+    assert_eq!(doctor["conformance"]["wire_version"], 1);
+    assert_eq!(
+        doctor["conformance"]["schema_commit"],
+        "64cbd71ae520b89aac54164d8c1d364333c8ee5f"
+    );
+    assert_eq!(
+        doctor["conformance"]["schema_sha256"],
+        "92c1dfcda10dd47e99127500a3763da2b471f9ac61e12b9bf0430c32cf953796"
+    );
+    assert_eq!(
+        doctor["conformance"]["meta_sha256"],
+        "e0bf36f8123b2544b499174197fdc371ec49a1b4572a35114513d56492741599"
+    );
+    assert_eq!(doctor["conformance"]["transport"], "stdio");
+    assert_eq!(doctor["conformance"]["method_count"], 23);
+    let source_revision = option_env!("TRAIL_SOURCE_REVISION")
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or("unverified");
+    let expected_evidence = if source_revision != "unverified"
+        && option_env!("TRAIL_ACP_V1_CONFORMANCE_VERIFIED") == Some(source_revision)
+    {
+        "verified"
+    } else {
+        "unverified"
+    };
+    assert_eq!(doctor["conformance"]["evidence_status"], expected_evidence);
+    assert!(doctor["conformance"]["build_identifier"]
+        .as_str()
+        .unwrap()
+        .starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
+    assert_eq!(
+        doctor["conformance"]["exclusions"],
+        serde_json::json!(["ACP v2", "draft remote HTTP transport"])
+    );
     assert!(doctor["lane"].is_null());
     assert!(doctor["session_id"].is_null());
+
+    let human = Command::new(trail_bin())
+        .current_dir(temp.path())
+        .args(["agent", "acp", "doctor", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    for expected in [
+        "Wire version",
+        "Schema commit",
+        "Schema SHA-256",
+        "Metadata SHA-256",
+        "Transport",
+        "Evidence",
+        "ACP v2",
+        "draft remote HTTP transport",
+        "capture_journal",
+        "path_mapping",
+    ] {
+        assert!(
+            human.contains(expected),
+            "missing `{expected}` in:\n{human}"
+        );
+    }
+    if expected_evidence == "unverified" {
+        assert!(!human.contains("ACP v1 conformant"));
+    } else {
+        assert!(human.contains("ACP v1 conformant"));
+    }
 
     let custom_doctor = run_trail_json(
         temp.path(),
         &[
+            "agent",
             "acp",
             "doctor",
-            "--agent",
             "custom-acp",
             "--relay-command",
             "trail",
@@ -877,47 +2608,30 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .iter()
         .any(|check| check["name"] == "relay" && check["status"] == "ok"));
 
-    let codex_install = run_trail_json(
-        temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "codex",
-            "--editor",
-            "zed",
-            "--dry-run",
-        ],
-    );
-    assert_eq!(codex_install["agent"], "codex");
-    assert_eq!(
-        codex_install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "codex"])
-    );
-    let codex_zed_snippet: serde_json::Value =
-        serde_json::from_str(codex_install["snippet"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        codex_zed_snippet["agent_servers"]["trail-codex"]["command"],
-        "trail"
-    );
+    let codex = run_trail_json(temp.path(), &["agent", "acp", "status", "codex"]);
+    assert_eq!(codex.as_array().unwrap().len(), 1);
+    assert_eq!(codex[0]["agent"], "codex");
+}
 
-    let cursor_install = run_trail_json(
+#[test]
+fn agent_hooks_setup_is_read_only_until_yes_is_passed() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let config_path = temp.path().join(".codex/hooks.json");
+    let preview = run_trail_json(
         temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "cursor",
-            "--editor",
-            "generic",
-            "--dry-run",
-        ],
+        &["agent", "hooks", "setup", "codex", "--print"],
     );
-    assert_eq!(cursor_install["agent"], "cursor");
-    assert_eq!(
-        cursor_install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "cursor"])
-    );
+    assert_eq!(preview["provider"], "codex");
+    assert_eq!(preview["dry_run"], true);
+    assert!(!config_path.exists());
+
+    let applied = run_trail_json(temp.path(), &["agent", "hooks", "setup", "codex", "--yes"]);
+    assert_eq!(applied["provider"], "codex");
+    assert_eq!(applied["dry_run"], false);
+    assert!(config_path.is_file());
 }
 
 #[cfg(unix)]
@@ -943,150 +2657,37 @@ fn acp_relay_accepts_a_built_in_agent_shortcut() {
 
 #[cfg(unix)]
 #[test]
-fn agent_setup_and_stub_acp_use_fresh_lanes() {
+fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
-
-    let default_setup = run_trail_json(temp.path(), &["agent", "setup"]);
-    assert_eq!(default_setup["provider"], "claude-code");
-    assert_eq!(default_setup["editor"], "vscode");
-    assert_eq!(default_setup["mode"], "acp");
-    assert_eq!(default_setup["supports_acp"], true);
-    assert_eq!(default_setup["supports_terminal"], true);
-    assert!(default_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Claude Code"));
-    assert!(default_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"] == "trail agent"));
-    assert!(default_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"]
-            .as_str()
-            .unwrap()
-            .contains("agent doctor")));
-
-    let generic_setup = run_trail_json(temp.path(), &["agent", "setup", "--editor", "generic"]);
-    assert_eq!(generic_setup["editor"], "generic");
-    assert!(generic_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("ACP command:"));
-    assert!(generic_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"] == "trail agent action"));
-
-    let codex_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "codex",
-            "--editor",
-            "vscode",
-        ],
-    );
-    assert_eq!(codex_setup["provider"], "codex");
-    assert!(codex_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Codex"));
-
-    let cursor_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "cursor",
-            "--editor",
-            "vscode",
-        ],
-    );
-    assert_eq!(cursor_setup["provider"], "cursor");
-    assert_eq!(cursor_setup["mode"], "acp");
-    assert!(cursor_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Cursor"));
-
-    let gemini_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "gemini",
-            "--editor",
-            "generic",
-        ],
-    );
-    assert_eq!(gemini_setup["provider"], "gemini");
-    assert_eq!(gemini_setup["mode"], "terminal");
-    assert_eq!(gemini_setup["supports_acp"], false);
-    assert_eq!(gemini_setup["supports_mcp"], true);
-    assert!(gemini_setup["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "start"));
-    assert!(gemini_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Terminal command:"));
-    assert!(gemini_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail MCP server command:"));
-    let gemini_doctor = run_trail_json(temp.path(), &["agent", "doctor", "--provider", "gemini"]);
-    assert_eq!(gemini_doctor["provider"], "gemini");
-    assert_eq!(gemini_doctor["capabilities"]["terminal"], true);
-    assert_eq!(gemini_doctor["capabilities"]["mcp"], true);
-    assert!(gemini_doctor["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|check| check["name"] == "acp" && check["status"] == "skipped"));
 
     let setup = run_trail_json(
         temp.path(),
         &[
             "agent",
+            "acp",
             "setup",
-            "--provider",
             "claude-code",
             "--editor",
             "vscode",
+            "--print",
         ],
     );
+    assert_eq!(setup["transport"], "acp");
     assert_eq!(setup["provider"], "claude-code");
-    let command = setup["command"].as_array().unwrap();
-    assert!(command.iter().any(|part| part == "agent"));
-    assert!(command.iter().any(|part| part == "acp"));
-    assert!(!command.iter().any(|part| part == "--lane"));
-    let snippet: serde_json::Value =
-        serde_json::from_str(setup["snippet"].as_str().unwrap()).unwrap();
-    let vscode_entry = &snippet["Trail Claude Code"];
-    assert_eq!(vscode_entry["command"], "trail");
-    assert!(vscode_entry["args"]
+    assert_eq!(setup["editor"], "vscode");
+    assert_eq!(setup["applied"], false);
+    assert!(setup["command"]
         .as_array()
         .unwrap()
-        .iter()
-        .any(|part| part == "agent"));
-    assert!(!vscode_entry["args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "--lane"));
+        .windows(3)
+        .any(|parts| parts == ["acp", "run", "claude-code"]));
+
+    let gemini_doctor = run_trail_json(temp.path(), &["agent", "doctor", "gemini"]);
+    assert_eq!(gemini_doctor["provider"], "gemini");
+    assert_eq!(gemini_doctor["capabilities"]["terminal"], true);
+    assert_eq!(gemini_doctor["capabilities"]["mcp"], true);
 
     {
         let mut db = Trail::open(temp.path()).unwrap();
@@ -1099,34 +2700,41 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(empty_status["status"], "empty");
     let empty_next = run_trail_json(temp.path(), &["agent", "next"]);
     assert_eq!(empty_next["focus"], "setup");
-    assert_eq!(empty_next["primary"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_next["primary"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_actions = run_trail_json(temp.path(), &["agent", "action"]);
-    assert_eq!(empty_actions["status"], "empty");
+    assert_eq!(empty_actions["status"], "empty", "{empty_actions}");
     assert!(empty_actions["task"].is_null());
-    assert_eq!(empty_actions["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_actions["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_vscode" && action["command"] == "trail agent setup"));
+        .any(|action| action["id"] == "acp_setup_vscode"
+            && action["command"] == "trail agent acp setup claude-code --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_codex_vscode"
-            && action["command"] == "trail agent setup --provider codex"));
+        .any(|action| action["id"] == "acp_setup_codex_vscode"
+            && action["command"] == "trail agent acp setup codex --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
         .any(|action| action["id"] == "doctor_codex"
-            && action["command"] == "trail agent doctor --provider codex"));
+            && action["command"] == "trail agent doctor codex"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_cursor_vscode"
-            && action["command"] == "trail agent setup --provider cursor"));
+        .any(|action| action["id"] == "acp_setup_cursor_vscode"
+            && action["command"] == "trail agent acp setup cursor --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
@@ -1138,7 +2746,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|action| action["id"] == "start_gemini_task"
-            && action["command"] == "trail agent start --provider gemini"));
+            && action["command"] == "trail agent start gemini"));
     let empty_ask_actions = run_trail_json(temp.path(), &["agent", "ask", "show", "actions"]);
     assert_eq!(empty_ask_actions["status"], "empty");
     assert!(empty_ask_actions["task"].is_null());
@@ -1146,8 +2754,8 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_vscode"));
-    let empty_setup_action = run_trail_json(temp.path(), &["agent", "action", "setup_vscode"]);
+        .any(|action| action["id"] == "acp_setup_vscode"));
+    let empty_setup_action = run_trail_json(temp.path(), &["agent", "action", "acp_setup_vscode"]);
     assert_eq!(empty_setup_action["provider"], "claude-code");
     assert_eq!(empty_setup_action["editor"], "vscode");
     assert!(empty_setup_action["command"]
@@ -1205,25 +2813,37 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
             .as_str()
             .unwrap()
             .contains("to changes"));
-        assert_eq!(empty_hint["next"]["command"], "trail agent setup");
+        assert_eq!(
+            empty_hint["next"]["command"],
+            "trail agent acp setup claude-code --editor vscode"
+        );
         assert!(empty_hint["actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action["id"] == "setup_vscode"));
+            .any(|action| action["id"] == "acp_setup_vscode"));
     }
     let empty_dashboard = run_trail_json(temp.path(), &["agent", "dashboard"]);
     assert_eq!(empty_dashboard["status"], "empty");
     assert!(empty_dashboard["task"].is_null());
-    assert_eq!(empty_dashboard["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_dashboard["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_inbox = run_trail_json(temp.path(), &["agent", "inbox"]);
     assert_eq!(empty_inbox["total"], 0);
     assert_eq!(empty_inbox["attention_count"], 0);
     assert_eq!(empty_inbox["items"].as_array().unwrap().len(), 0);
-    assert_eq!(empty_inbox["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_inbox["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_bare_agent = run_trail_json(temp.path(), &["agent"]);
     assert_eq!(empty_bare_agent["total"], 0);
-    assert_eq!(empty_bare_agent["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_bare_agent["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
 
     let doctor = run_trail_json(
         temp.path(),
@@ -1235,7 +2855,10 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|check| { check["name"] == "workspace" && check["status"] == "ok" }));
-    assert_eq!(doctor["suggestions"][0]["command"], "trail agent setup");
+    assert_eq!(
+        doctor["suggestions"][0]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
 
     let first_agent = write_stub_acp_agent(
         temp.path(),
@@ -1388,16 +3011,14 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|command| command == "write_file"));
-    assert!(agent_tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "write README"
+    assert!(agent_tools["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["name"] == "write README"
             && tool["turns"][0]["changed_paths"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|path| path["path"] == "README.md")));
+                .any(|path| path["path"] == "README.md")
+    }));
     let impact = run_trail_json(temp.path(), &["agent", "impact", "latest"]);
     assert_eq!(impact["task"]["lane"], view["task"]["lane"]);
     assert_eq!(impact["highest_impact"], "low");
@@ -1859,14 +3480,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|item| item.as_str().unwrap().contains("Git preflight failed")));
-    assert!(diagnose["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item
-            .as_str()
+    assert!(diagnose["evidence"].as_array().unwrap().iter().any(|item| {
+        item.as_str()
             .unwrap()
-            .contains("friendly checkpoint target")));
+            .contains("friendly checkpoint target")
+    }));
     assert!(diagnose["recovery_options"]
         .as_array()
         .unwrap()
@@ -1918,9 +3536,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&diagnose_text.stderr)
     );
     let diagnose_stdout = String::from_utf8_lossy(&diagnose_text.stdout);
-    assert!(diagnose_stdout.contains("Agent diagnose:"));
-    assert!(diagnose_stdout.contains("Likely issue:"));
-    assert!(diagnose_stdout.contains("Recovery options:"));
+    assert!(
+        diagnose_stdout.contains("Agent diagnosis: git blocked"),
+        "{diagnose_stdout}"
+    );
+    assert!(diagnose_stdout.contains("Likely Issue"));
+    assert!(diagnose_stdout.contains("Recovery Options"));
     assert!(diagnose_stdout.contains("requires a Git working tree"));
     let report = run_trail_json(temp.path(), &["agent", "report", "latest"]);
     assert_eq!(report["task"]["lane"], lane);
@@ -2141,7 +3762,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&open_launch.stdout),
         String::from_utf8_lossy(&open_launch.stderr)
     );
-    assert!(String::from_utf8_lossy(&open_launch.stdout).contains("Opened:"));
+    assert!(
+        String::from_utf8_lossy(&open_launch.stdout).contains("Opened agent focus"),
+        "{}",
+        String::from_utf8_lossy(&open_launch.stdout)
+    );
     let ask_dashboard = run_trail_json(
         temp.path(),
         &["agent", "ask", "show", "me", "the", "dashboard"],
@@ -2298,7 +3923,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     );
     let summary_stdout = String::from_utf8_lossy(&summary_text.stdout);
     assert!(summary_stdout.contains("Agent summary:"));
-    assert!(summary_stdout.contains("PR title:"));
+    assert!(summary_stdout.contains("Pr Title"), "{summary_stdout}");
     let compare = run_trail_json(temp.path(), &["agent", "compare", first, second]);
     assert_eq!(compare["left"]["lane"], first);
     assert_eq!(compare["right"]["lane"], second);
@@ -2414,9 +4039,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&change_text.stderr)
     );
     let change_stdout = String::from_utf8_lossy(&change_text.stdout);
-    assert!(change_stdout.contains("Agent change set:"));
+    assert!(
+        change_stdout.contains("Agent change set"),
+        "{change_stdout}"
+    );
     assert!(change_stdout.contains("Docs and getting-started"));
-    assert!(change_stdout.contains("Files:"));
+    assert!(change_stdout.contains("Files"));
 
     let timeline = run_trail_json(temp.path(), &["agent", "timeline", "latest"]);
     assert_eq!(timeline["task"]["lane"], lane);
@@ -2470,9 +4098,9 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&timeline_text.stderr)
     );
     let timeline_stdout = String::from_utf8_lossy(&timeline_text.stdout);
-    assert!(timeline_stdout.contains("Agent timeline:"));
-    assert!(timeline_stdout.contains("Timeline:"));
-    assert!(timeline_stdout.contains("Rewind before:"));
+    assert!(timeline_stdout.contains("Agent timeline"));
+    assert!(timeline_stdout.contains("Items"), "{timeline_stdout}");
+    assert!(timeline_stdout.contains("Before Change"));
 
     let delta = run_trail_json(temp.path(), &["agent", "delta", "latest"]);
     assert_eq!(delta["task"]["lane"], lane);
@@ -2535,8 +4163,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&delta_text.stderr)
     );
     let delta_stdout = String::from_utf8_lossy(&delta_text.stdout);
-    assert!(delta_stdout.contains("Agent delta:"));
-    assert!(delta_stdout.contains("Newest delta:"));
+    assert!(delta_stdout.contains("Agent delta"));
+    assert!(
+        delta_stdout.contains("Latest turn 1 changed 1 file(s)"),
+        "{delta_stdout}"
+    );
     let last_alias = run_trail_json(temp.path(), &["agent", "last", "latest"]);
     assert_eq!(last_alias["task"]["lane"], lane);
     assert_eq!(last_alias["mode"], delta["mode"]);
@@ -2654,8 +4285,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&new_text.stderr)
     );
     let new_stdout = String::from_utf8_lossy(&new_text.stdout);
-    assert!(new_stdout.contains("Agent new:"));
-    assert!(new_stdout.contains("Status: up_to_date"));
+    assert!(
+        new_stdout.contains("Created agent task: up to date"),
+        "{new_stdout}"
+    );
+    assert!(new_stdout.contains("Status"));
+    assert!(new_stdout.contains("up to date"));
     let next_after_reviewed = run_trail_json(temp.path(), &["agent", "next", "latest"]);
     assert_eq!(next_after_reviewed["focus"], "preview_apply");
     assert_eq!(
@@ -2777,9 +4412,10 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&file_text.stderr)
     );
     let file_stdout = String::from_utf8_lossy(&file_text.stdout);
-    assert!(file_stdout.contains("Agent file: README.md"));
-    assert!(file_stdout.contains("Change sets:"));
-    assert!(file_stdout.contains("Changed in:"));
+    assert!(file_stdout.contains("Agent file"), "{file_stdout}");
+    assert!(file_stdout.contains("Path   : README.md"));
+    assert!(file_stdout.contains("Change Cards"));
+    assert!(file_stdout.contains("Touched By"));
 
     let checkpoints = run_trail_json(temp.path(), &["agent", "checkpoints", "latest"]);
     assert_eq!(checkpoints["task"]["lane"], lane);
@@ -2865,7 +4501,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         turn_latest["turn_envelope"]["schema"],
         "trail.turn_envelope"
     );
-    assert_eq!(turn_latest["turn_envelope"]["version"], 1);
+    assert_eq!(turn_latest["turn_envelope"]["version"], 2);
     assert_eq!(turn_latest["turn_envelope"]["provider"], "claude-code");
     assert_eq!(turn_latest["turn_envelope"]["kind"], "acp_prompt");
     assert_eq!(turn_latest["turn_envelope"]["protocol"], "acp");
@@ -3008,10 +4644,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
             .contains("agent why")));
 
     let checkpoint = changes["groups"][0]["checkpoint"].as_str().unwrap();
+    let checkpoint_alias = checkpoint.replacen("change_", "checkpoint_", 1);
     let before_turn = changes["groups"][0]["before_change"].as_str().unwrap();
     let checkpoint_diff = run_trail_json(
         temp.path(),
-        &["agent", "diff", "latest", "--checkpoint", checkpoint],
+        &["agent", "diff", "latest", "--checkpoint", &checkpoint_alias],
     );
     assert_eq!(checkpoint_diff["after_change"], checkpoint);
 
@@ -3041,7 +4678,7 @@ fn run_agent_acp_stub_session(workspace: &Path, agent: &Path) {
         .arg(workspace)
         .arg("agent")
         .arg("acp")
-        .arg("--provider")
+        .arg("run")
         .arg("claude-code")
         .arg("--no-mcp")
         .arg("--")
@@ -3130,7 +4767,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|step| step["command"] == "trail agent setup"));
+        .any(|step| step["command"] == "trail agent acp setup claude-code --editor vscode"));
     let edit_script = temp.path().join("edit-readme.sh");
     fs::write(
         &edit_script,
@@ -3187,14 +4824,12 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .iter()
         .any(|step| step["command"] == format!("trail agent action {task_name}")));
-    assert!(task_guide["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|step| step["command"]
+    assert!(task_guide["steps"].as_array().unwrap().iter().any(|step| {
+        step["command"]
             .as_str()
             .unwrap()
-            .contains("trail agent ask --selector")));
+            .contains("trail agent ask --selector")
+    }));
     assert!(task_guide["concepts"]
         .as_array()
         .unwrap()
@@ -3717,7 +5352,7 @@ fn acp_relay_captures_session_prompt_mcp_and_workdir_edits() {
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let stub_agent = temp.path().join("stub-acp-agent.sh");
-    let session_request_log = temp.path().join("session-new.jsonl");
+    let session_request_log = temp.path().join(".trail/session-new.jsonl");
     let lane_workdir = temp
         .path()
         .canonicalize()
@@ -3886,13 +5521,29 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .operations
         .iter()
         .any(|operation| operation.kind == OperationKind::LaneRecord));
+    let envelope = turn
+        .turn_envelope
+        .as_ref()
+        .expect("ACP prompt must have a typed turn envelope");
+    assert_eq!(envelope.outcome.status.as_deref(), Some("completed"));
+    assert!(!envelope.outcome.no_changes);
+    assert!(envelope.outcome.checkpoint.is_some());
+    assert_eq!(envelope.outcome.checkpoint, turn.turn.after_change);
+    assert!(turn
+        .events
+        .iter()
+        .any(|event| event.event_type == "workdir_recorded"));
     let status = db.lane_status("acp-test").unwrap();
+    assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
     assert!(status
         .changed_paths
         .iter()
         .any(|path| path.path == "README.md"));
 
-    let acp_sessions = run_trail_json(temp.path(), &["acp", "sessions", "--lane", "acp-test"]);
+    let acp_sessions = run_trail_json(
+        temp.path(),
+        &["agent", "acp", "sessions", "--lane", "acp-test"],
+    );
     assert_eq!(acp_sessions["sessions"][0]["acp_session_id"], "sess_stub");
 
     let transcript = run_trail_json(temp.path(), &["transcript", "acp-test"]);
@@ -3909,6 +5560,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .unwrap()
         .iter()
         .any(|summary| summary.as_str().unwrap().contains("write README")));
+    assert_eq!(
+        transcript["turns"][0]["checkpoint"],
+        transcript["turns"][0]["turn_envelope"]["outcome"]["checkpoint"]
+    );
 
     let turn_alias = run_trail_json(
         temp.path(),
@@ -3925,6 +5580,231 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
             .as_str()
             .unwrap()
             .contains("trail transcript acp-test")));
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_remaps_workspace_file_resources_into_lane() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let stub_agent = temp.path().join("resource-acp-agent.sh");
+    let forwarded_prompt_log = temp.path().join(".trail/forwarded-resource-prompt.jsonl");
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".trail/worktrees/acp-resource-test");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_resource_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' "$prompt" > "{}"
+resource_uri=${{prompt#*\"uri\":\"}}
+resource_uri=${{resource_uri%%\"*}}
+case "$resource_uri" in
+  file://*) resource_path=${{resource_uri#file://}} ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' 'changed through forwarded resource' > "$resource_path"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            forwarded_prompt_log.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-resource-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = std::io::BufReader::new(stdout);
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_resource_stub","prompt":[{{"type":"resource","resource":{{"uri":"file://{}/README.md","text":"hello"}}}},{{"type":"resource_link","name":"source","uri":"file://{}/src/lib.rs"}},{{"type":"resource_link","name":"external","uri":"file:///outside/shared.md"}},{{"type":"resource_link","name":"remote","uri":"https://example.com/context"}}]}}}}"#,
+        temp.path().display(),
+        temp.path().display(),
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":2"#), "unexpected relay frame: {line}");
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "relay failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let forwarded_prompt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&forwarded_prompt_log).unwrap()).unwrap();
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][0]["resource"]["uri"],
+        format!("file://{}/README.md", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][1]["uri"],
+        format!("file://{}/src/lib.rs", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][2]["uri"],
+        "file:///outside/shared.md"
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][3]["uri"],
+        "https://example.com/context"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "hello\n",
+        "the ACP agent must not edit the main workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(lane_workdir.join("README.md")).unwrap(),
+        "changed through forwarded resource\n"
+    );
+
+    let db = Trail::open(temp.path()).unwrap();
+    let status = db.lane_status("acp-resource-test").unwrap();
+    assert!(status
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "README.md"));
+    let mapping = db
+        .try_lane_acp_session("sess_resource_stub")
+        .unwrap()
+        .unwrap();
+    let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+    let turn = db.show_lane_turn(&session.turns[0].turn_id).unwrap();
+    assert!(turn
+        .operations
+        .iter()
+        .any(|operation| operation.kind == OperationKind::LaneRecord));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acp_relay_blocks_materialized_agent_writes_to_main_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let escaped_path = temp.path().join("ESCAPED.md");
+    let stub_agent = temp.path().join("escaping-acp-agent.sh");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_escape_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' 'escaped' > "{}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            escaped_path.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-escape-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_escape_stub","prompt":[{{"type":"text","text":"escape"}}]}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "relay unexpectedly allowed an ACP agent to write the main workspace"
+    );
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
+        "relay failed for an unexpected reason:\n{stderr}"
+    );
+    assert!(
+        !escaped_path.exists(),
+        "materialized ACP agent escaped its Trail lane"
+    );
 }
 
 #[cfg(unix)]
@@ -3990,14 +5870,13 @@ fn acp_relay_closes_failed_turn_on_malformed_upstream_json() {
         .unwrap();
     let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
     assert_eq!(session.turns[0].status, "failed");
-    assert!(session
-        .events
-        .iter()
-        .any(|event| event.event_type == "acp_relay_turn_closed"
+    assert!(session.events.iter().any(|event| {
+        event.event_type == "acp_relay_turn_closed"
             && event
                 .payload
                 .as_ref()
-                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))));
+                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))
+    }));
 }
 
 #[cfg(unix)]
@@ -4363,14 +6242,20 @@ fn run_stub_acp_relay_scenario_with_session_id(
 
 #[cfg(unix)]
 #[test]
-fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
+fn acp_relay_runs_three_synchronized_relays_on_distinct_lanes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let workspace_a = temp.path().to_path_buf();
+    let barrier_a = std::sync::Arc::clone(&barrier);
     let workspace_b = temp.path().to_path_buf();
+    let barrier_b = std::sync::Arc::clone(&barrier);
+    let workspace_c = temp.path().to_path_buf();
+    let barrier_c = std::sync::Arc::clone(&barrier);
     let relay_a = thread::spawn(move || {
+        barrier_a.wait();
         run_stub_acp_relay_scenario_with_session_id(
             &workspace_a,
             "acp-parallel-a",
@@ -4380,6 +6265,7 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
         )
     });
     let relay_b = thread::spawn(move || {
+        barrier_b.wait();
         run_stub_acp_relay_scenario_with_session_id(
             &workspace_b,
             "acp-parallel-b",
@@ -4388,9 +6274,20 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
             true,
         )
     });
+    let relay_c = thread::spawn(move || {
+        barrier_c.wait();
+        run_stub_acp_relay_scenario_with_session_id(
+            &workspace_c,
+            "acp-parallel-c",
+            "sess_parallel_c",
+            &["--sleep-before-result-ms", "100"],
+            true,
+        )
+    });
 
     let output_a = relay_a.join().unwrap();
     let output_b = relay_b.join().unwrap();
+    let output_c = relay_c.join().unwrap();
     assert!(
         output_a.status.success(),
         "relay a failed\nstdout:\n{}\nstderr:\n{}",
@@ -4403,11 +6300,18 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
         String::from_utf8_lossy(&output_b.stdout),
         String::from_utf8_lossy(&output_b.stderr)
     );
+    assert!(
+        output_c.status.success(),
+        "relay c failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output_c.stdout),
+        String::from_utf8_lossy(&output_c.stderr)
+    );
 
     let db = Trail::open(temp.path()).unwrap();
     for (lane, session_id) in [
         ("acp-parallel-a", "sess_parallel_a"),
         ("acp-parallel-b", "sess_parallel_b"),
+        ("acp-parallel-c", "sess_parallel_c"),
     ] {
         let mapping = db.try_lane_acp_session(session_id).unwrap().unwrap();
         let lane_details = db.lane_details(lane).unwrap();
@@ -4422,6 +6326,115 @@ fn acp_relay_runs_two_concurrent_relays_on_distinct_lanes() {
             .any(|message| message.role == "assistant"
                 && message.body.contains("diagnostic complete")));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_drains_delayed_terminal_frames_and_spill_before_finalizing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let lane = "acp-finalization-order";
+    let session_id = "sess_finalization_order";
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(format!(".trail/worktrees/{lane}"));
+    let mut options = StubAcpAgentOptions::new(session_id);
+    options.lane_workdir = Some(&lane_workdir);
+    options.sleep_before_result_ms = Some(100);
+    let stub_agent = write_stub_acp_agent(temp.path(), "finalization-order-agent.sh", options);
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args([
+            "acp",
+            "relay",
+            "--lane",
+            lane,
+            "--materialize",
+            "--provider",
+            "test-stub",
+            "--",
+        ])
+        .arg(stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":0"#));
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(session_id));
+
+    let lock_path = temp.path().join(".trail/lock");
+    fs::write(
+        &lock_path,
+        format!("pid={} created_at=0", std::process::id()),
+    )
+    .unwrap();
+    let lock_remover = {
+        let lock_path = lock_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            match fs::remove_file(lock_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to release capture writer lock: {error}"),
+            }
+        })
+    };
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"{session_id}","prompt":[{{"type":"text","text":"finish after drain"}}]}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let mut remaining_stdout = String::new();
+    stdout.read_to_string(&mut remaining_stdout).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+    lock_remover.join().unwrap();
+    assert!(
+        status.success(),
+        "relay failed\nstdout:\n{remaining_stdout}\nstderr:\n{stderr}"
+    );
+    assert!(remaining_stdout.contains(r#""id":2"#));
+
+    let db = Trail::open(temp.path()).unwrap();
+    let mapping = db.try_lane_acp_session(session_id).unwrap().unwrap();
+    let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+    assert_eq!(session.turns.len(), 1);
+    assert_eq!(session.turns[0].status, "completed");
+    assert!(session.messages.iter().any(|message| {
+        message.role == "assistant" && message.body.contains("diagnostic complete")
+    }));
 }
 
 #[cfg(unix)]
@@ -4492,7 +6505,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
         let lock_path = lock_path.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            fs::remove_file(lock_path).unwrap();
+            match fs::remove_file(lock_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to release transient writer lock: {error}"),
+            }
         })
     };
 
@@ -4584,19 +6601,119 @@ fn backup_create_verify_and_restore_roundtrip() {
         false,
     )
     .unwrap();
-    db.spawn_lane("backup-bot", Some("main"), true, None, None)
-        .unwrap();
-    drop(db);
-
     let backup_parent = tempfile::tempdir().unwrap();
     let backup_path = backup_parent.path().join("trail-backup");
-    let created = run_trail_json(
-        temp.path(),
-        &["backup", "create", backup_path.to_str().unwrap()],
-    );
-    assert_eq!(created["branch"], "main");
-    assert!(created["sqlite_bytes"].as_u64().unwrap() > 0);
-    assert!(created["worktree_bytes"].as_u64().unwrap() > 0);
+    let external_workdirs = tempfile::tempdir().unwrap();
+    let external_workdir = external_workdirs.path().join("backup-bot");
+    let spawned = db
+        .spawn_lane_with_workdir(
+            "backup-bot",
+            Some("main"),
+            true,
+            None,
+            None,
+            Some(external_workdir.clone()),
+        )
+        .unwrap();
+    let lane_head = db.lane_details("backup-bot").unwrap().branch;
+    let manifest_path = PathBuf::from(spawned.workdir.unwrap())
+        .join(".trail")
+        .join("workdir-manifest.json");
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    legacy_manifest["root_id"] = serde_json::Value::String("object_backup_pending_old".into());
+    let legacy_manifest_bytes = serde_json::to_vec_pretty(&legacy_manifest).unwrap();
+    fs::write(&manifest_path, &legacy_manifest_bytes).unwrap();
+    let source_view_dir = temp.path().join(".trail/views/source-backup-view");
+    let source_view_meta = source_view_dir.join("meta");
+    fs::create_dir_all(&source_view_meta).unwrap();
+    let source_checkpoint_path = source_view_meta.join("clean-checkpoint.json");
+    let source_checkpoint_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "view_id": "source-backup-view",
+        "operation": lane_head.head_change.0,
+        "root_id": "object_backup_checkpoint_old",
+        "journal_sequence": 0,
+    }))
+    .unwrap();
+    fs::write(&source_checkpoint_path, &source_checkpoint_bytes).unwrap();
+    let pending_conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO workspace_views \
+             (view_id, lane_id, base_change, base_root, backend, mountpoint, \
+              source_upper, generated_upper, scratch_upper, meta_dir, journal_path, \
+              generation, checkpoint_seq, checkpoint_root, status, created_at, updated_at) \
+             VALUES ('source-backup-view', ?1, ?2, ?3, 'test-cow', ?4, ?5, ?6, ?7, ?8, ?9, \
+                     1, 0, ?3, 'unmounted', 1, 1)",
+            rusqlite::params![
+                lane_head.lane_id,
+                lane_head.head_change.0,
+                lane_head.head_root.0,
+                external_workdir.to_string_lossy(),
+                source_view_dir.join("source-upper").to_string_lossy(),
+                source_view_dir.join("generated-upper").to_string_lossy(),
+                source_view_dir.join("scratch-upper").to_string_lossy(),
+                source_view_meta.to_string_lossy(),
+                source_view_meta
+                    .join("mutation-journal.jsonl")
+                    .to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'lane_manifest', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_pending_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'workspace_checkpoint', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_checkpoint_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    drop(pending_conn);
+    let created = db.create_backup(&backup_path, false).unwrap();
+    assert_eq!(created.branch, "main");
+    assert!(created.sqlite_bytes > 0);
+    let backed_up_workdir = backup_path.join("worktrees/backup-bot");
+    fs::create_dir_all(backed_up_workdir.join(".trail")).unwrap();
+    fs::copy(
+        external_workdir.join("README.md"),
+        backed_up_workdir.join("README.md"),
+    )
+    .unwrap();
+    fs::copy(
+        &manifest_path,
+        backed_up_workdir.join(".trail/workdir-manifest.json"),
+    )
+    .unwrap();
+    drop(db);
+
+    let backup_conn = Connection::open(backup_path.join("index/trail.sqlite")).unwrap();
+    let backed_up_pending: i64 = backup_conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backed_up_pending, 2);
+    drop(backup_conn);
 
     let verified = run_trail_json(
         temp.path(),
@@ -4620,16 +6737,43 @@ fn backup_create_verify_and_restore_roundtrip() {
     assert_eq!(restored_report["rewritten_workdirs"], 1);
 
     let restored_db = Trail::open(restored.path()).unwrap();
+    let restored_conn =
+        Connection::open(restored.path().join(".trail/index/trail.sqlite")).unwrap();
+    assert_eq!(
+        restored_conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(restored_conn);
+    assert_eq!(fs::read(&manifest_path).unwrap(), legacy_manifest_bytes);
+    assert_eq!(
+        fs::read(&source_checkpoint_path).unwrap(),
+        source_checkpoint_bytes
+    );
     let why = restored_db.why("README.md:2", Some("main")).unwrap();
     assert_eq!(why.current_text, "backup");
     let fsck = restored_db.fsck().unwrap();
     assert!(fsck.errors.is_empty(), "{:?}", fsck.errors);
 
     let lane = restored_db.lane_details("backup-bot").unwrap();
+    assert!(restored_db
+        .lane_workspace_view("backup-bot")
+        .unwrap()
+        .is_none());
     let workdir = lane.branch.workdir.as_ref().unwrap();
     let restored_db_dir = restored.path().canonicalize().unwrap().join(".trail");
     assert!(workdir.starts_with(&restored_db_dir.to_string_lossy().to_string()));
     assert!(PathBuf::from(workdir).is_dir());
+    let restored_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(workdir).join(".trail/workdir-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored_manifest["root_id"], lane_head.head_root.0);
     let status = restored_db.lane_status("backup-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
 }
@@ -5266,7 +7410,7 @@ fn lane_patch_requires_base_change_unless_allow_stale() {
     assert!(err.to_string().contains("allow_stale=true"));
 
     let stale_base: PatchDocument = serde_json::from_value(serde_json::json!({
-        "base_change": "ch_stale",
+        "base_change": "change_stale",
         "edits": [
             {"op": "write", "path": "README.md", "content": "stale base\n"}
         ]
@@ -5334,6 +7478,13 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
             .branch
             .head_change
             .clone();
+        let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+        let objects_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let prolly_nodes_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
         let patch: PatchDocument = serde_json::from_value(serde_json::json!({
             "edits": [
                 {"op": "write", "path": colliding_path, "content": "case collision\n"}
@@ -5348,6 +7499,18 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
         assert_eq!(
             db.lane_details("policy-bot").unwrap().branch.head_change,
             before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            objects_before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
         );
     }
 
@@ -5386,6 +7549,38 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "policy-bot", oversized_payload).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(message) if message.contains("max_patch_bytes")));
+}
+
+#[test]
+fn lane_patch_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("case-rename-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "edits": [
+            {"op": "rename", "from": "README.md", "to": "readme.md"}
+        ]
+    }))
+    .unwrap();
+
+    let report = apply_lane_patch_at_head(&mut db, "case-rename-bot", patch).unwrap();
+    assert_eq!(report.changed_paths.len(), 1);
+    assert_eq!(report.changed_paths[0].kind, trail::FileChangeKind::Renamed);
+    assert_eq!(
+        report.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(report.changed_paths[0].path, "readme.md");
+    assert_eq!(
+        db.why("readme.md:1", Some("refs/lanes/case-rename-bot"))
+            .unwrap()
+            .current_text,
+        "hello"
+    );
 }
 
 #[test]
@@ -6048,6 +8243,9 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     ] {
         assert!(tool_list.iter().any(|tool| tool["name"] == name), "{name}");
     }
+    assert!(!tool_list
+        .iter()
+        .any(|tool| tool["name"] == "trail.merge_queue_add"));
 
     let mcp_run_show = trail::mcp::handle_json_rpc(
         &mut db,
@@ -7403,7 +9601,7 @@ fn mutation_json_payloads_reject_unknown_fields() {
 }
 
 #[test]
-fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
+fn external_patch_payloads_accept_explicit_empty_and_reject_missing_or_ambiguous_sources() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -7423,22 +9621,37 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
     assert_eq!(http_turn.status, 201);
     let http_turn: LaneTurnStartReport = http_turn.body_json().unwrap();
 
+    let http_missing_patch = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            &format!("/v1/lane/turns/{}/patches", http_turn.turn.turn_id),
+            serde_json::json!({
+                "message": "missing patch source"
+            }),
+        ),
+    );
+    assert_eq!(http_missing_patch.status, 400);
+    let body: serde_json::Value = http_missing_patch.body_json().unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("requires exactly one explicit edit source"));
+
     let http_empty_patch = trail::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
             &format!("/v1/lane/turns/{}/patches", http_turn.turn.turn_id),
             serde_json::json!({
-                "message": "empty patch"
+                "message": "empty patch",
+                "edits": []
             }),
         ),
     );
-    assert_eq!(http_empty_patch.status, 400);
-    let body: serde_json::Value = http_empty_patch.body_json().unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("requires at least one edit"));
+    assert_eq!(http_empty_patch.status, 200);
+    let http_empty_report: LanePatchReport = http_empty_patch.body_json().unwrap();
+    assert!(http_empty_report.changed_paths.is_empty());
 
     let http_ambiguous_patch = trail::server::handle_http_request(
         &mut db,
@@ -7513,7 +9726,7 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
         .unwrap()
         .to_string();
 
-    let mcp_empty_patch = trail::mcp::handle_json_rpc(
+    let mcp_missing_patch = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -7523,17 +9736,40 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
                 "name": "trail.apply_patch",
                 "arguments": {
                     "turn_id": mcp_turn_id.clone(),
-                    "message": "empty patch"
+                    "message": "missing patch source"
                 }
             }
         }),
     )
     .unwrap();
-    assert_eq!(mcp_empty_patch["result"]["isError"], true);
-    assert!(mcp_empty_patch["result"]["content"][0]["text"]
+    assert_eq!(mcp_missing_patch["result"]["isError"], true);
+    assert!(mcp_missing_patch["result"]["content"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("requires at least one edit"));
+        .contains("requires exactly one explicit edit source"));
+
+    let mcp_empty_patch = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.apply_patch",
+                "arguments": {
+                    "turn_id": mcp_turn_id.clone(),
+                    "message": "empty patch",
+                    "edits": []
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_empty_patch["result"]["isError"], false);
+    assert_eq!(
+        mcp_empty_patch["result"]["structuredContent"]["changed_paths"],
+        serde_json::json!([])
+    );
 
     let mcp_ambiguous_patch = trail::mcp::handle_json_rpc(
         &mut db,
@@ -7575,7 +9811,9 @@ fn external_patch_payloads_reject_empty_or_ambiguous_edit_sources() {
                 .summary
                 .as_ref()
                 .and_then(|summary| summary["error"].as_str())
-                .is_some_and(|message| message.contains("requires at least one edit"))
+                .is_some_and(|message| {
+                    message.contains("requires exactly one explicit edit source")
+                })
     }));
     assert!(audits.iter().any(|audit| {
         audit.surface == "http"
@@ -7770,9 +10008,9 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
             "id": 7,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_add",
+                "name": "trail.lane_merge_queue_add",
                 "arguments": {
-                    "source": "refs/lanes/audit-mcp",
+                    "lane": "audit-mcp",
                     "target": "main",
                     "unexpected": true
                 }
@@ -7852,7 +10090,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
     assert!(audits.iter().any(|audit| {
         audit.actor == "mcp:stdio"
             && audit.surface == "mcp"
-            && audit.command == "trail.merge_queue_add"
+            && audit.command == "trail.lane_merge_queue_add"
             && audit.status == "error"
             && audit.lane_id.as_deref() == Some(mcp_lane_id.as_str())
             && audit.target_ref.as_deref() == Some("refs/heads/main")
@@ -7864,7 +10102,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
     }));
     assert!(!audits.iter().any(|audit| {
         audit.actor == "mcp:stdio"
-            && audit.command == "trail.merge_queue_add"
+            && audit.command == "trail.lane_merge_queue_add"
             && audit.status == "error"
             && audit.target_ref.as_deref() == Some("main")
     }));
@@ -8177,14 +10415,12 @@ fn local_api_and_mcp_patch_payloads_respect_ignore_policy() {
         edit_source_modes[1]["not"]["required"],
         serde_json::json!(["edits"])
     );
-    assert_eq!(
-        apply_patch_schema["properties"]["edits"]["minItems"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        apply_patch_schema["properties"]["files"]["minItems"],
-        serde_json::json!(1)
-    );
+    assert!(apply_patch_schema["properties"]["edits"]
+        .get("minItems")
+        .is_none());
+    assert!(apply_patch_schema["properties"]["files"]
+        .get("minItems")
+        .is_none());
     let edit_variants = apply_patch_schema["properties"]["edits"]["items"]["oneOf"]
         .as_array()
         .unwrap();
@@ -8508,9 +10744,12 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
         .unwrap();
     assert!(cli_review_text.status.success());
     let cli_review_stdout = String::from_utf8_lossy(&cli_review_text.stdout);
-    assert!(cli_review_stdout.contains("Lane review: api-branch-lane"));
-    assert!(cli_review_stdout.contains("Evidence:"));
-    assert!(cli_review_stdout.contains("Next steps:"));
+    assert!(
+        cli_review_stdout.contains("Lane api-branch-lane is ready for review"),
+        "{cli_review_stdout}"
+    );
+    assert!(cli_review_stdout.contains("Operations: 1"));
+    assert!(cli_review_stdout.contains("Next:"));
 
     let readiness_response = trail::server::handle_http_request(
         &mut db,
@@ -8586,9 +10825,9 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
+            &format!("/v1/lanes/{lane_id}/merge"),
             serde_json::json!({
-                "lane_id": lane_id,
+                "into": "main",
                 "strategy": "line_id_aware",
                 "direct": true
             }),
@@ -8632,8 +10871,10 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "surface",
@@ -8699,6 +10940,22 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         .unwrap()
         .is_empty());
 
+    let http_environment = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/surface/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_environment.status, 200);
+    assert!(http_environment
+        .body_json::<serde_json::Value>()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
     let http_checkpoint = trail::server::handle_http_request(
         &mut db,
         &api_request(
@@ -8752,6 +11009,16 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         ),
     );
     assert_eq!(http_sync_error.status, 400);
+
+    let http_environment_sync_error = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http_environment_sync_error.status, 400);
 
     let http_cache = trail::server::handle_http_request(
         &mut db,
@@ -8821,6 +11088,26 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         .as_array()
         .unwrap()
         .is_empty());
+    let mcp_environment = mcp_call(
+        &mut db,
+        32,
+        "trail.env_status",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert!(mcp_environment["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mcp_environment = mcp_call(
+        &mut db,
+        32,
+        "trail.env_status",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert!(mcp_environment["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let mcp_unmount = mcp_call(
         &mut db,
         31,
@@ -8866,11 +11153,57 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         "refs/branches/main"
     );
 
+    let http_adapters = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/environment/adapters", serde_json::Value::Null),
+    );
+    assert_eq!(http_adapters.status, 200);
+    let http_adapters: serde_json::Value = http_adapters.body_json().unwrap();
+    assert_eq!(http_adapters["contract_major"], 1);
+    let adapter_identities = http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|adapter| adapter["canonical_identity"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        adapter_identities,
+        BTreeSet::from([
+            "trail/cargo-target-seed@1",
+            "trail/cmake-build@1",
+            "trail/command@1",
+            "trail/go-vendor@1",
+            "trail/node@1",
+            "trail/oci-image@1",
+            "trail/python-venv@1",
+        ])
+    );
+    assert!(http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|adapter| {
+            adapter["canonical_identity"] == "trail/node@1"
+                && adapter["discovery_markers"][0] == "package.json"
+        }));
+    assert!(http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|adapter| {
+            adapter["canonical_identity"] == "trail/cmake-build@1"
+                && adapter["kind"] == "build"
+                && adapter["discovery_markers"][0] == "CMakeLists.txt"
+        }));
+    let mcp_adapters = mcp_call(&mut db, 8, "trail.env_adapters", serde_json::json!({}));
+    assert_eq!(mcp_adapters["result"]["isError"], false);
+    assert_eq!(mcp_adapters["result"]["structuredContent"], http_adapters);
+
     let tools = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 9,
             "method": "tools/list",
             "params": {}
         }),
@@ -8885,6 +11218,17 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         ("trail.lane_update", false, false, false),
         ("trail.lane_exec", false, false, true),
         ("trail.deps_sync", false, false, true),
+        ("trail.env_adapters", true, false, false),
+        ("trail.env_status", true, false, false),
+        ("trail.env_discover", true, false, false),
+        ("trail.env_graph", true, false, false),
+        ("trail.env_generation", true, false, false),
+        ("trail.env_explain", true, false, false),
+        ("trail.env_plan", true, false, false),
+        ("trail.env_sync", false, false, true),
+        ("trail.env_sync_all", false, false, true),
+        ("trail.env_status", true, false, false),
+        ("trail.env_sync", false, false, true),
         ("trail.cache_gc", false, true, false),
     ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
@@ -8899,6 +11243,7 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
     );
     let openapi: serde_json::Value = openapi.body_json().unwrap();
     for path in [
+        "/v1/environment/adapters",
         "/v1/lanes/{lane_or_id}/workspace",
         "/v1/lanes/{lane_or_id}/mount",
         "/v1/lanes/{lane_or_id}/unmount",
@@ -8908,6 +11253,14 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         "/v1/lanes/{lane_or_id}/exec",
         "/v1/lanes/{lane_or_id}/dependencies",
         "/v1/lanes/{lane_or_id}/dependencies/sync",
+        "/v1/lanes/{lane_or_id}/environment",
+        "/v1/lanes/{lane_or_id}/environment/discover",
+        "/v1/lanes/{lane_or_id}/environment/graph",
+        "/v1/lanes/{lane_or_id}/environment/generation",
+        "/v1/lanes/{lane_or_id}/environment/explain",
+        "/v1/lanes/{lane_or_id}/environment/plan",
+        "/v1/lanes/{lane_or_id}/environment/sync",
+        "/v1/lanes/{lane_or_id}/environment/sync-all",
         "/v1/cache/layers",
         "/v1/cache/gc",
     ] {
@@ -8916,6 +11269,729 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
             "missing OpenAPI path {path}"
         );
     }
+}
+
+#[test]
+fn environment_graph_has_cli_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "graph\n").unwrap();
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[[component]]
+id = "graph.a"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt" }]
+outputs = [{ source = "generated-a", target = ".trail-generated/a" }]
+[component.build]
+command = ["git", "--version"]
+
+[[component]]
+id = "graph.b"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["graph.a"]
+inputs = [{ path = "input.txt" }]
+outputs = [{ source = "generated-b", target = ".trail-generated/b" }]
+[component.build]
+command = ["git", "--version"]
+"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "graph",
+        Some("main"),
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        },
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let rust = db.workspace_environment_graph("graph", None).unwrap();
+    let expected = serde_json::to_value(&rust).unwrap();
+    assert_eq!(rust.nodes.len(), 2);
+    assert_eq!(rust.edges.len(), 1);
+    assert_eq!(rust.nodes[0].component_id, "graph.a");
+    assert_eq!(rust.nodes[1].component_id, "graph.b");
+    assert_eq!(
+        rust.edges[0].source_component_key,
+        rust.nodes[0].component_key
+    );
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/graph/environment/graph",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http.status, 200);
+    assert_eq!(http.body_json::<serde_json::Value>().unwrap(), expected);
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_graph",
+                "arguments": {"lane": "graph"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], expected);
+
+    let cli = run_trail_json(temp.path(), &["env", "graph", "graph"]);
+    assert_eq!(cli, expected);
+    let openapi = trail::server::openapi_spec();
+    assert_eq!(
+        openapi["paths"]["/v1/lanes/{lane_or_id}/environment/graph"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EnvironmentGraphReport"
+    );
+    assert!(db.list_workspace_layers().unwrap().is_empty());
+}
+
+#[test]
+fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fs::write(
+        temp.path().join("trail.oci.toml"),
+        format!(
+            "schema = \"trail.oci-images/v1\"\n\n[[image]]\nname = \"web\"\nreference = \"ghcr.io/example/web@{digest}\"\nplatform = \"linux/amd64\"\n"
+        ),
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "oci-surfaces",
+        Some("main"),
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        },
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let http_plan = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/oci-surfaces/environment/plan?adapter=oci-image",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_plan.status, 200);
+    let plan: serde_json::Value = http_plan.body_json().unwrap();
+    assert_eq!(plan["component_id"], "oci-images");
+    assert_eq!(plan["kind"], "external");
+    assert!(plan["outputs"].as_array().unwrap().is_empty());
+    assert!(plan["commands"].as_array().unwrap().is_empty());
+    assert_eq!(plan["external_artifacts"][0]["digest"], digest);
+    assert_eq!(
+        plan["capabilities"]["sandbox"],
+        "not-applicable-metadata-only"
+    );
+    assert_eq!(
+        run_trail_json(
+            temp.path(),
+            &[
+                "env",
+                "plan",
+                "oci-surfaces",
+                "--adapter",
+                "trail/oci-image@1",
+            ],
+        ),
+        plan
+    );
+
+    let sync = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/oci-surfaces/environment/sync",
+            serde_json::json!({"adapter": "trail/oci-image@1"}),
+        ),
+    );
+    assert_eq!(sync.status, 200);
+    let sync: serde_json::Value = sync.body_json().unwrap();
+    assert!(sync["layers"].as_array().unwrap().is_empty());
+    assert!(sync["generation"]["components"][0]["outputs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(sync["generation"]["components"][0]["layer_id"].is_null());
+    assert!(sync["generation"]["components"][0]["mount_path"].is_null());
+    assert_eq!(
+        sync["generation"]["components"][0]["external_artifacts"][0]["reference"],
+        format!("ghcr.io/example/web@{digest}")
+    );
+    assert_eq!(
+        sync["generation"]["components"][0]["external_artifacts"][0]["cleanup_owner"],
+        "external"
+    );
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_generation",
+                "arguments": {"lane": "oci-surfaces"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], sync["generation"]);
+
+    let gc = db.workspace_cache_gc(false, Some(0)).unwrap();
+    assert!(gc
+        .deleted
+        .iter()
+        .all(|entry| entry.kind != "external_artifact"));
+    let active = db
+        .active_environment_generation("oci-surfaces")
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.components[0].external_artifacts[0].digest, digest);
+    assert!(db.list_workspace_layers().unwrap().is_empty());
+
+    let openapi = trail::server::openapi_spec();
+    assert!(openapi["components"]["schemas"]
+        .get("EnvironmentExternalArtifactReport")
+        .is_some());
+    assert!(
+        openapi["components"]["schemas"]["EnvironmentPlanReport"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "external_artifacts")
+    );
+}
+
+#[test]
+fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
+    if Command::new("npm").arg("--version").output().is_err()
+        || Command::new("node").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"name":"env-surface","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
+    } else {
+        LaneWorkdirMode::FuseCow
+    };
+    for lane in ["env-http", "env-mcp", "env-all-http", "env-all-mcp"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            mode.clone(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http_plan = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/plan",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_plan.status, 200);
+    let http_plan: serde_json::Value = http_plan.body_json().unwrap();
+    assert_eq!(http_plan["component_id"], "node");
+    assert_eq!(http_plan["capabilities"]["sandbox"], "trusted-builtin");
+    assert!(http_plan["dependencies"].as_array().unwrap().is_empty());
+    let mcp_plan = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_plan",
+                "arguments": {"lane": "env-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_plan["result"]["isError"], false);
+    assert_eq!(
+        mcp_plan["result"]["structuredContent"]["component_key"],
+        http_plan["component_key"]
+    );
+
+    let discovery = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/discover",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(discovery.status, 200);
+    let discovery: serde_json::Value = discovery.body_json().unwrap();
+    assert_eq!(discovery["components"][0]["component_id"], "node");
+    assert!(discovery["conflicts"].as_array().unwrap().is_empty());
+    let mcp_discovery = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_discover",
+                "arguments": {"lane": "env-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_discovery["result"]["isError"], false);
+    assert_eq!(
+        mcp_discovery["result"]["structuredContent"]["source_root"],
+        discovery["source_root"]
+    );
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-http/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http_report: serde_json::Value = http.body_json().unwrap();
+    let http_layer = &http_report["layers"][0];
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "env-mcp", "adapter": "auto"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+
+    let status = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    let status: serde_json::Value = status.body_json().unwrap();
+    assert_eq!(status[0]["component"]["component_id"], "node");
+    assert_eq!(status[0]["adapter"]["name"], "node");
+    assert_eq!(status[0]["status"], "ready");
+    assert_eq!(
+        status[0]["adapter"]["distribution_digest"],
+        "builtin:node-plan-v1"
+    );
+
+    let generation = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/generation",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(generation.status, 200);
+    let generation: serde_json::Value = generation.body_json().unwrap();
+    assert_eq!(generation["generation_sequence"], 1);
+    assert_eq!(generation["components"][0]["component_id"], "node");
+    assert!(generation["components"][0]["dependencies"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        generation["components"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+    let mcp_generation = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_generation",
+                "arguments": {"lane": "env-http"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_generation["result"]["isError"], false);
+    assert_eq!(
+        mcp_generation["result"]["structuredContent"]["generation_id"],
+        generation["generation_id"]
+    );
+
+    let view = db.lane_workspace_view("env-http").unwrap().unwrap();
+    fs::write(
+        Path::new(&view.source_upper).join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.1","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.1"}}}"#,
+    )
+    .unwrap();
+    db.checkpoint_lane_workspace("env-http", Some("change lock".to_string()))
+        .unwrap();
+    db.lane_readiness("env-http").unwrap();
+    let explained = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/explain?component=node",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(explained.status, 200);
+    let explained: serde_json::Value = explained.body_json().unwrap();
+    assert_eq!(explained["status"], "stale");
+    assert_eq!(explained["complete"], true);
+    assert!(explained["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| {
+            change["dimension"] == "input"
+                && change["name"] == "package-lock.json"
+                && change["change"] == "modified"
+        }));
+    let mcp_explained = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_explain",
+                "arguments": {"lane": "env-http", "component": "node"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_explained["result"]["isError"], false);
+    assert_eq!(mcp_explained["result"]["structuredContent"], explained);
+    let cli_explained = run_trail_json(
+        temp.path(),
+        &["env", "explain", "env-http", "--component", "node"],
+    );
+    assert_eq!(cli_explained, explained);
+
+    let all_http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-all-http/environment/sync-all",
+            serde_json::json!({}),
+        ),
+    );
+    assert_eq!(all_http.status, 200);
+    let all_http: serde_json::Value = all_http.body_json().unwrap();
+    assert_eq!(all_http["generation"]["generation_sequence"], 1);
+    assert_eq!(all_http["layers"][0]["layer_id"], http_layer["layer_id"]);
+    let all_mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync_all",
+                "arguments": {"lane": "env-all-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(all_mcp["result"]["isError"], false);
+    assert_eq!(
+        all_mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn writable_private_environment_sync_has_cli_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "private input\n").unwrap();
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "generated.private"
+adapter = "trail/command@1"
+root = "."
+kind = "generated"
+
+[[component.input]]
+path = "input.txt"
+role = "identity"
+format = "bytes"
+
+[component.build]
+command = ["cp", "input.txt", "generated/copied.txt"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.output]]
+name = "private"
+source = "generated"
+target = ".trail-generated/private"
+policy = "writable_private"
+portability = "host"
+"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    for lane in ["private-http", "private-mcp", "private-cli"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::NfsCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/private-http/environment/sync",
+            serde_json::json!({"adapter": "trail/command@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http: serde_json::Value = http.body_json().unwrap();
+    assert!(http["layers"].as_array().unwrap().is_empty());
+    let http_output = &http["generation"]["components"][0]["outputs"][0];
+    assert_eq!(http_output["policy"], "writable_private");
+    assert!(http_output["layer_id"].is_null());
+    assert!(http_output["storage_identity"]
+        .as_str()
+        .unwrap()
+        .starts_with("private_"));
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "private-mcp", "adapter": "trail/command@1"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    let mcp = &mcp["result"]["structuredContent"];
+    assert!(mcp["layers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        mcp["generation"]["components"][0]["outputs"][0]["policy"],
+        http_output["policy"]
+    );
+    assert!(mcp["generation"]["components"][0]["outputs"][0]["layer_id"].is_null());
+
+    let cli = run_trail_json(
+        temp.path(),
+        &["env", "sync", "private-cli", "--adapter", "trail/command@1"],
+    );
+    assert!(cli["layers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        cli["generation"]["components"][0]["outputs"][0]["policy"],
+        "writable_private"
+    );
+    assert!(cli["generation"]["components"][0]["outputs"][0]["layer_id"].is_null());
+
+    let openapi = trail::server::openapi_spec();
+    assert_eq!(
+        openapi["paths"]["/v1/lanes/{lane_or_id}/environment/sync"]["post"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EnvironmentSyncReport"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentGenerationOutputReport"]["properties"]
+            ["policy"]["enum"][1],
+        "writable_private"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentPlanReport"]["properties"]["dependencies"]
+            ["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentGenerationComponentReport"]["properties"]
+            ["dependencies"]["items"]["$ref"],
+        "#/components/schemas/EnvironmentGenerationDependencyReport"
+    );
+}
+
+#[test]
+fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
+    if Command::new("npm").arg("--version").output().is_err()
+        || Command::new("node").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"name":"env-surface","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
+    } else {
+        LaneWorkdirMode::FuseCow
+    };
+    for lane in ["env-http", "env-mcp"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            mode.clone(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-http/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http_report: serde_json::Value = http.body_json().unwrap();
+    let http_layer = &http_report["layers"][0];
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "env-mcp", "adapter": "auto"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+
+    let status = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    let status: serde_json::Value = status.body_json().unwrap();
+    assert_eq!(status[0]["component"]["component_id"], "node");
+    assert_eq!(status[0]["adapter"]["name"], "node");
+    assert_eq!(status[0]["status"], "ready");
+    assert_eq!(
+        status[0]["adapter"]["distribution_digest"],
+        "builtin:node-plan-v1"
+    );
 }
 
 #[test]
@@ -9419,11 +12495,15 @@ fn daemon_no_auth_prints_loud_stderr_warning() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let daemon_url = format!("http://127.0.0.1:{port}");
-    assert!(stdout.contains(&format!("Trail API listening on {daemon_url}")));
+    assert!(stdout.contains("Trail API daemon listening"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Endpoint: {daemon_url}")),
+        "{stdout}"
+    );
     assert!(stderr.contains("WARNING"), "{stderr}");
     assert!(stderr.contains("daemon auth is disabled"), "{stderr}");
     assert!(
-        stderr.contains("any local process can mutate this workspace"),
+        stderr.contains("Any local process can mutate this workspace"),
         "{stderr}"
     );
     assert!(stderr.contains(&daemon_url), "{stderr}");
@@ -10022,7 +13102,7 @@ fn cli_daemon_url_routes_hot_lane_commands() {
     let merge = run_trail_json_daemon(
         temp.path(),
         &daemon_url,
-        &["merge-lane", "rpc-bot", "--into", "main", "--dry-run"],
+        &["lane", "merge", "rpc-bot", "--into", "main", "--dry-run"],
     );
     assert_eq!(merge["dry_run"], true);
     assert!(merge["changed_paths"]
@@ -10062,8 +13142,8 @@ fn cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint()
     assert_eq!(endpoint["url"], format!("http://127.0.0.1:{port}"));
     assert_eq!(endpoint["auth"], true);
 
-    let status = run_trail_json(temp.path(), &["status"]);
-    assert_eq!(status["branch"], "main");
+    let lanes = run_trail_json(temp.path(), &["lane", "list"]);
+    assert!(lanes.as_array().unwrap().is_empty());
     wait_for_child_exit(&mut daemon.child);
     assert!(!endpoint_path.exists());
 
@@ -10078,8 +13158,8 @@ fn cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint()
         .unwrap(),
     )
     .unwrap();
-    let fallback = run_trail_json(temp.path(), &["status"]);
-    assert_eq!(fallback["branch"], "main");
+    let fallback = run_trail_json(temp.path(), &["lane", "list"]);
+    assert!(fallback.as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -10091,12 +13171,42 @@ fn local_api_and_cli_export_openapi_contract() {
     let cli = run_trail_json(temp.path(), &["api", "openapi"]);
     assert_eq!(cli["openapi"], "3.1.0");
     assert!(cli["paths"].get("/v1/openapi.json").is_some());
+    assert!(cli["paths"].get("/v1/index/reconcile").is_some());
+    assert_eq!(
+        cli["paths"]["/v1/index/reconcile"]["post"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ChangeLedgerReconcileReport"
+    );
     assert!(cli["paths"]["/v1/lanes"]["get"].is_object());
     assert!(cli["paths"]["/v1/lanes/{lane_or_id}"]["delete"].is_object());
     assert!(cli["paths"]
         .get("/v1/lanes/{lane_or_id}/read-file")
         .is_some());
+    assert_eq!(
+        cli["paths"]["/v1/lanes/{lane}/merge"]["post"]["operationId"],
+        "laneMerge"
+    );
+    assert!(cli["paths"]
+        .get("/v1/branches/{branch}/merge-lane")
+        .is_none());
+    assert_eq!(
+        cli["components"]["schemas"]["LaneMergeRequest"]["required"],
+        serde_json::json!(["into"])
+    );
+    assert!(cli["components"]["schemas"]
+        .get("MergeLaneRequest")
+        .is_none());
     assert!(cli["components"]["schemas"]["LaneReadFileRequest"].is_object());
+    let workdir_modes = cli["components"]["schemas"]["SpawnLaneRequest"]["properties"]
+        ["workdir_mode"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(workdir_modes.iter().any(|mode| mode == "native-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "portable-copy"));
+    assert!(workdir_modes.iter().any(|mode| mode == "fuse-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "dokan-cow"));
+    assert!(!workdir_modes.iter().any(|mode| mode == "full-cow"));
+    assert!(!workdir_modes.iter().any(|mode| mode == "overlay-cow"));
     assert!(cli["paths"].get("/v1/lane/events").is_some());
     assert!(cli["paths"].get("/v1/lane/spans").is_some());
     assert!(cli["paths"].get("/v1/lane/turns/{turn_id}/spans").is_some());
@@ -10178,14 +13288,12 @@ fn local_api_and_cli_export_openapi_contract() {
         patch_request_modes[1]["not"]["required"],
         serde_json::json!(["edits"])
     );
-    assert_eq!(
-        patch_request["properties"]["edits"]["minItems"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        patch_request["properties"]["files"]["minItems"],
-        serde_json::json!(1)
-    );
+    assert!(patch_request["properties"]["edits"]
+        .get("minItems")
+        .is_none());
+    assert!(patch_request["properties"]["files"]
+        .get("minItems")
+        .is_none());
     assert_eq!(
         patch_request["properties"]["edits"]["items"]["$ref"],
         "#/components/schemas/PatchEdit"
@@ -10567,6 +13675,12 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(resources_list
         .iter()
         .any(|resource| resource["uri"] == "trail://workspace/status"));
+    assert!(resources_list
+        .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/lane-merge-queue"));
+    assert!(!resources_list
+        .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/merge-queue"));
     assert!(resources_list
         .iter()
         .any(|resource| resource["uri"] == "trail://workspace/agent-tasks"));
@@ -11167,12 +14281,16 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_bool()
             .unwrap()
     };
-    assert!(tool_annotation("trail.status", "readOnlyHint"));
+    assert!(!tool_annotation("trail.status", "readOnlyHint"));
     assert!(!tool_annotation("trail.status", "destructiveHint"));
+    assert!(tool_annotation("trail.status", "idempotentHint"));
     assert!(!tool_annotation("trail.apply_patch", "readOnlyHint"));
     assert!(tool_annotation("trail.apply_patch", "destructiveHint"));
     assert!(tool_annotation("trail.lane_rewind", "destructiveHint"));
-    assert!(tool_annotation("trail.merge_queue_run", "destructiveHint"));
+    assert!(tool_annotation(
+        "trail.lane_merge_queue_run",
+        "destructiveHint"
+    ));
     assert!(tool_annotation("trail.run_test", "openWorldHint"));
     assert!(tool_annotation("trail.guardrail_check", "readOnlyHint"));
     assert!(tool_annotation("trail.lane_review", "readOnlyHint"));
@@ -14858,7 +17976,7 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         }),
     )
     .unwrap();
-    assert_eq!(sync["result"]["isError"], false);
+    assert_eq!(sync["result"]["isError"], false, "{sync:#}");
     assert_eq!(sync["result"]["structuredContent"]["forced"], true);
 
     let test = trail::mcp::handle_json_rpc(
@@ -14982,7 +18100,7 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
 }
 
 #[test]
-fn mcp_status_read_only_does_not_refresh_worktree_index() {
+fn mcp_status_refreshes_index_while_status_resource_remains_read_only() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("a.txt"), "a1\n").unwrap();
     fs::write(temp.path().join("b.txt"), "b1\n").unwrap();
@@ -15024,7 +18142,7 @@ fn mcp_status_read_only_does_not_refresh_worktree_index() {
     assert!(changed_paths.iter().any(|path| path["path"] == "a.txt"));
     assert!(changed_paths.iter().any(|path| path["path"] == "c.txt"));
 
-    assert_eq!(count_rows("worktree_file_index"), index_before);
+    assert_eq!(count_rows("worktree_file_index"), index_before + 1);
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
 
@@ -15048,9 +18166,24 @@ fn mcp_status_read_only_does_not_refresh_worktree_index() {
     assert!(resource_paths.iter().any(|path| path["path"] == "a.txt"));
     assert!(resource_paths.iter().any(|path| path["path"] == "c.txt"));
 
-    assert_eq!(count_rows("worktree_file_index"), index_before);
+    assert_eq!(count_rows("worktree_file_index"), index_before + 1);
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+}
+
+#[test]
+fn changed_path_activation_is_checked_and_linux_macos_only() {
+    let evidence = trail::test_support::changed_path_activation_evidence().unwrap();
+    assert!(evidence["schema_hard_cutover"].as_bool().unwrap());
+    assert!(evidence["producer_inventory_complete"].as_bool().unwrap());
+    assert!(evidence["crash_matrix"].as_bool().unwrap());
+    assert!(evidence["corruption_matrix"].as_bool().unwrap());
+    assert!(evidence["scale_gates"].as_bool().unwrap());
+    assert_eq!(
+        trail::test_support::changed_path_production_authority_default(),
+        cfg!(any(target_os = "linux", target_os = "macos"))
+    );
+    assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
 }
 
 #[test]
@@ -15753,10 +18886,7 @@ fn same_position_rewrite_preserves_line_identity() {
         .iter()
         .any(|entry| entry.kind == trail::LineChangeKind::Modified));
 
-    let line_id = format!(
-        "{}:{}",
-        before.line_id.origin_change.0, before.line_id.local_seq
-    );
+    let line_id = before.line_id.alias();
     let cli_by_line = run_trail_json(temp.path(), &["why", "--line-id", &line_id, "--at", "main"]);
     assert_eq!(cli_by_line["current_text"], "lane rewrote this line");
     let cli_at_root = run_trail_json(
@@ -16085,6 +19215,7 @@ fn anchors_follow_stable_line_identity() {
     let created = db
         .create_anchor("note.txt:2", "important line", Some("main"))
         .unwrap();
+    assert!(created.anchor.id.0.starts_with("anchor_"));
     assert_eq!(db.list_anchors().unwrap().len(), 1);
     let resolved = db
         .resolve_anchor(&created.anchor.id.0, Some("main"))
@@ -16146,8 +19277,12 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
     let why: serde_json::Value = why.body_json().unwrap();
     assert_eq!(why["current_text"], "lane");
     let line_id = format!(
-        "{}:{}",
-        why["line_id"]["origin_change"].as_str().unwrap(),
+        "line_{}:{}",
+        why["line_id"]["origin_change"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("change_")
+            .unwrap(),
         why["line_id"]["local_seq"].as_u64().unwrap()
     );
 
@@ -16405,6 +19540,14 @@ fn refish_aliases_accept_branch_lane_and_root_selectors() {
     assert!(root_preview.dry_run);
     assert_eq!(root_preview.change_id, branch.from);
     assert_eq!(root_preview.root_id, branch.root_id);
+
+    let checkpoint_selector = branch.from.checkpoint_alias();
+    let checkpoint_preview = db
+        .checkout_with_options(&checkpoint_selector, true, true, None, false)
+        .unwrap();
+    assert!(checkpoint_preview.dry_run);
+    assert_eq!(checkpoint_preview.change_id, branch.from);
+    assert_eq!(checkpoint_preview.root_id, branch.root_id);
 
     let raw_root = branch.root_id.0.clone();
     drop(db);
@@ -16756,7 +19899,8 @@ fn merge_dry_run_reports_without_mutating_refs() {
     let cli = run_trail_json(
         temp.path(),
         &[
-            "merge-lane",
+            "lane",
+            "merge",
             "doc-bot",
             "--strategy",
             "line-id-aware",
@@ -16770,9 +19914,9 @@ fn merge_dry_run_reports_without_mutating_refs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
+            "/v1/lanes/doc-bot/merge",
             serde_json::json!({
-                "lane": "doc-bot",
+                "into": "main",
                 "dry_run": true
             }),
         ),
@@ -16780,6 +19924,19 @@ fn merge_dry_run_reports_without_mutating_refs() {
     assert_eq!(api_response.status, 200);
     let api: serde_json::Value = api_response.body_json().unwrap();
     assert_eq!(api["dry_run"], true);
+
+    let legacy_response = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/branches/main/merge-lane",
+            serde_json::json!({
+                "lane": "doc-bot",
+                "dry_run": true
+            }),
+        ),
+    );
+    assert_eq!(legacy_response.status, 400);
 
     let dry_run = db.merge_lane_with_options("doc-bot", "main", true).unwrap();
     assert!(dry_run.dry_run);
@@ -16809,7 +19966,7 @@ fn merge_dry_run_reports_without_mutating_refs() {
 }
 
 #[test]
-fn user_facing_merge_lane_prefers_queue_for_default_branch() {
+fn user_facing_lane_merge_prefers_queue_for_default_branch() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -16829,7 +19986,7 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
-        .args(["merge-lane", "cli-bot", "--into", "main"])
+        .args(["lane", "merge", "cli-bot", "--into", "main"])
         .output()
         .unwrap();
     assert!(!blocked.status.success());
@@ -16837,12 +19994,12 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
     assert!(blocked_stderr["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("merge-queue add cli-bot --into main"));
+        .contains("lane merge-queue add cli-bot --into main"));
     assert_eq!(db.status(Some("main")).unwrap().changed_paths.len(), 0);
 
     let direct = run_trail_json(
         temp.path(),
-        &["merge-lane", "cli-bot", "--into", "main", "--direct"],
+        &["lane", "merge", "cli-bot", "--into", "main", "--direct"],
     );
     assert_eq!(direct["dry_run"], false);
     assert_eq!(direct["changed_paths"][0]["path"], "docs/cli.md");
@@ -16860,8 +20017,8 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane": "api-bot" }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main" }),
         ),
     );
     assert_eq!(blocked_api.status, 400);
@@ -16869,14 +20026,14 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
     assert!(blocked_api_body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("merge-queue add api-bot --into main"));
+        .contains("lane merge-queue add api-bot --into main"));
 
     let direct_api = trail::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane": "api-bot", "direct": true }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main", "direct": true }),
         ),
     );
     assert_eq!(direct_api.status, 200);
@@ -16918,12 +20075,9 @@ fn lane_diff_cli_renders_scannable_overview() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Lane diff: doc-bot"));
-    assert!(stdout.contains("from:"));
-    assert!(stdout.contains("to:"));
-    assert!(stdout.contains("2 file(s) changed, +2 -0"));
-    assert!(stdout.contains("M modified    README.md (+1 -0) +"));
-    assert!(stdout.contains("A added       docs/guide.md (+1 -0) +"));
-    assert!(stdout.contains("2 files changed, 2 additions, 0 deletions"));
+    assert!(stdout.contains("M  README.md  +1 -0"), "{stdout}");
+    assert!(stdout.contains("A  docs/guide.md  +1 -0"), "{stdout}");
+    assert!(stdout.contains("2 files changed, 2 insertions, 0 deletions"));
 }
 
 #[test]
@@ -16934,8 +20088,10 @@ fn layered_lane_update_preserves_lane_changes_and_advances_its_pinned_base() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "updatable",
@@ -17205,7 +20361,7 @@ fn lane_status_surfaces_stale_base_lag() {
     assert!(cli_text.status.success());
     let stdout = String::from_utf8_lossy(&cli_text.stdout);
     assert!(
-        stdout.contains("Lane started 2 operations behind main"),
+        stdout.contains("Base: 2 operation(s) behind main"),
         "{stdout}"
     );
 }
@@ -17245,7 +20401,7 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
     );
     assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "active");
 
-    let cli = run_trail_json(temp.path(), &["merge-lane", "doc-bot", "--dry-run"]);
+    let cli = run_trail_json(temp.path(), &["lane", "merge", "doc-bot", "--dry-run"]);
     assert_eq!(cli["dry_run"], true);
     assert_eq!(cli["conflicts"][0], "both changed `README.md` differently");
     assert!(db.list_conflicts().unwrap().is_empty());
@@ -17319,13 +20475,14 @@ fn local_api_direct_merge_lane_conflict_records_conflict_set() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane_id": "api-bot", "direct": true }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main", "direct": true }),
         ),
     );
     assert_eq!(response.status, 409);
     let body: serde_json::Value = response.body_json().unwrap();
-    assert_eq!(body["error"]["code"], 6);
+    assert_eq!(body["error"]["code"], "MERGE_CONFLICT");
+    assert_eq!(body["error"]["exit"], 6);
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
@@ -17352,7 +20509,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
     db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
-    let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+    let line_id = why.line_id.alias();
     let missing_expected: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "line-id patch without guard",
         "edits": [{
@@ -17403,7 +20560,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
         "edits": [{
             "op": "replace_line",
             "path": "README.md",
-            "line_id": format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq),
+            "line_id": why.line_id.alias(),
             "expected_text": "two",
             "new_text": "stale"
         }]
@@ -17411,7 +20568,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "doc-bot", stale_patch).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(_)));
-    assert!(err.to_string().contains("expected text mismatch"));
+    assert!(err.to_string().contains("expected text mismatch"), "{err}");
 }
 
 #[test]
@@ -17429,14 +20586,8 @@ fn lane_patch_rejected_line_id_batch_rolls_back_candidate_objects() {
     let second = db
         .why("README.md:2", Some("refs/lanes/atomic-line-bot"))
         .unwrap();
-    let first_line_id = format!(
-        "{}:{}",
-        first.line_id.origin_change.0, first.line_id.local_seq
-    );
-    let second_line_id = format!(
-        "{}:{}",
-        second.line_id.origin_change.0, second.line_id.local_seq
-    );
+    let first_line_id = first.line_id.alias();
+    let second_line_id = second.line_id.alias();
 
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let count_rows = |table: &str| -> i64 {
@@ -17470,7 +20621,7 @@ fn lane_patch_rejected_line_id_batch_rolls_back_candidate_objects() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "atomic-line-bot", patch).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(_)));
-    assert!(err.to_string().contains("expected text mismatch"));
+    assert!(err.to_string().contains("expected text mismatch"), "{err}");
 
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
@@ -17557,7 +20708,7 @@ fn lane_patch_replace_line_fuzzes_batch_expected_text_edits() {
                 Some("refs/lanes/line-fuzz-bot"),
             )
             .unwrap();
-        let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+        let line_id = why.line_id.alias();
         expected_ids.push(why.line_id);
         edits.push(serde_json::json!({
             "op": "replace_line",
@@ -18748,6 +21899,42 @@ fn materialized_lane_status_and_record_handle_workdir_renames() {
 }
 
 #[test]
+fn materialized_lane_record_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane("record-case-rename", Some("main"), true, None, None)
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    fs::rename(workdir.join("README.md"), workdir.join("rename-staging")).unwrap();
+    fs::rename(workdir.join("rename-staging"), workdir.join("readme.md")).unwrap();
+
+    let preview = db
+        .preview_lane_workdir_record("record-case-rename")
+        .unwrap();
+    assert!(preview.policy.allowed, "{:?}", preview.policy.error);
+    let recorded = db
+        .record_lane_workdir(
+            "record-case-rename",
+            Some("record case-only rename".to_string()),
+        )
+        .unwrap();
+    assert_eq!(recorded.changed_paths.len(), 1);
+    assert_eq!(
+        recorded.changed_paths[0].kind,
+        trail::FileChangeKind::Renamed
+    );
+    assert_eq!(
+        recorded.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(recorded.changed_paths[0].path, "readme.md");
+}
+
+#[test]
 fn lane_workdir_record_preview_reports_risks_and_oversized_files() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -18964,10 +22151,11 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         &["lane", "spawn", "default-bot", "--from", "main"],
     );
     assert!(default_spawn["workdir"].is_null());
+    assert_eq!(default_spawn["requested_workdir_mode"], "virtual");
     assert_eq!(default_spawn["workdir_mode"], "virtual");
-    assert!(default_spawn["cow_backend"].is_null());
+    assert_eq!(default_spawn["workdir_backend"], "virtual");
     assert_eq!(default_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-    assert_eq!(default_spawn["overlay_available"], false);
+    assert_eq!(default_spawn["transparent_cow_available"], false);
 
     let cli_workdir = workdir_parent.path().join("cli-bot");
     let cli_spawn = run_trail_json(
@@ -18982,8 +22170,16 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             cli_workdir.to_str().unwrap(),
         ],
     );
-    assert_eq!(cli_spawn["workdir_mode"], "full-cow");
-    assert_eq!(cli_spawn["cow_backend"], "filesystem-clone");
+    assert_eq!(cli_spawn["requested_workdir_mode"], "auto");
+    assert_eq!(cli_spawn["workdir_mode"], "native-cow");
+    assert_eq!(cli_spawn["workdir_backend"], "clone");
+    assert_eq!(cli_spawn["materialization"]["copied_files"], 0);
+    assert!(
+        cli_spawn["materialization"]["cloned_files"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert_eq!(
         PathBuf::from(cli_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -18994,6 +22190,46 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         fs::read_to_string(cli_workdir.join("README.md")).unwrap(),
         "hello\n"
     );
+
+    let native_workdir = workdir_parent.path().join("native-bot");
+    let native_spawn = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "native-bot",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "native-cow",
+            "--workdir",
+            native_workdir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(native_spawn["requested_workdir_mode"], "native-cow");
+    assert_eq!(native_spawn["workdir_mode"], "native-cow");
+    assert_eq!(native_spawn["workdir_backend"], "clone");
+    assert_eq!(native_spawn["materialization"]["copied_files"], 0);
+
+    let portable_workdir = workdir_parent.path().join("portable-bot");
+    let portable_spawn = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "portable-bot",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "portable-copy",
+            "--workdir",
+            portable_workdir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(portable_spawn["requested_workdir_mode"], "portable-copy");
+    assert_eq!(portable_spawn["workdir_mode"], "portable-copy");
+    assert_eq!(portable_spawn["workdir_backend"], "clone");
+    assert_eq!(portable_spawn["materialization"]["copied_files"], 0);
 
     let headless_spawn = run_trail_json(
         temp.path(),
@@ -19023,36 +22259,51 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert!(no_materialize_spawn["workdir"].is_null());
     assert_eq!(no_materialize_spawn["workdir_mode"], "virtual");
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "windows",
-        all(target_os = "macos", feature = "macfuse")
-    ))]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
     {
-        let overlay_spawn = run_trail_json(
+        let fuse_spawn = run_trail_json(
             temp.path(),
             &[
                 "lane",
                 "spawn",
-                "overlay-bot",
+                "fuse-bot",
                 "--from",
                 "main",
                 "--workdir-mode",
-                "overlay-cow",
+                "fuse-cow",
             ],
         );
-        assert_eq!(overlay_spawn["workdir_mode"], "overlay-cow");
-        assert_eq!(overlay_spawn["cow_backend"], "overlay");
-        assert_eq!(overlay_spawn["overlay_available"], true);
-        assert_eq!(overlay_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-        let overlay_workdir = PathBuf::from(overlay_spawn["workdir"].as_str().unwrap());
-        assert!(overlay_workdir.is_dir());
-        assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
-        assert!(!overlay_workdir.join("README.md").exists());
+        assert_eq!(fuse_spawn["workdir_mode"], "fuse-cow");
+        assert_eq!(fuse_spawn["workdir_backend"], "fuse");
+        assert_eq!(fuse_spawn["transparent_cow_available"], true);
+        assert_eq!(fuse_spawn["sparse_paths"].as_array().unwrap().len(), 0);
+        let fuse_workdir = PathBuf::from(fuse_spawn["workdir"].as_str().unwrap());
+        assert!(fuse_workdir.is_dir());
+        assert!(fs::read_dir(&fuse_workdir).unwrap().next().is_none());
+        assert!(!fuse_workdir.join("README.md").exists());
         let db = Trail::open(temp.path()).unwrap();
-        let view = db.lane_workspace_view("overlay-bot").unwrap().unwrap();
+        let view = db.lane_workspace_view("fuse-bot").unwrap().unwrap();
         assert!(Path::new(&view.source_upper).is_dir());
         assert!(Path::new(&view.meta_dir).is_dir());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let dokan_spawn = run_trail_json(
+            temp.path(),
+            &[
+                "lane",
+                "spawn",
+                "dokan-bot",
+                "--from",
+                "main",
+                "--workdir-mode",
+                "dokan-cow",
+            ],
+        );
+        assert_eq!(dokan_spawn["workdir_mode"], "dokan-cow");
+        assert_eq!(dokan_spawn["workdir_backend"], "dokan");
+        assert_eq!(dokan_spawn["transparent_cow_available"], true);
     }
 
     #[cfg(target_os = "macos")]
@@ -19070,8 +22321,8 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             ],
         );
         assert_eq!(nfs_spawn["workdir_mode"], "nfs-cow");
-        assert_eq!(nfs_spawn["cow_backend"], "nfs-overlay");
-        assert_eq!(nfs_spawn["overlay_available"], true);
+        assert_eq!(nfs_spawn["workdir_backend"], "nfs");
+        assert_eq!(nfs_spawn["transparent_cow_available"], true);
         let db = Trail::open(temp.path()).unwrap();
         let view = db.lane_workspace_view("nfs-bot").unwrap().unwrap();
         assert!(Path::new(&view.source_upper).is_dir());
@@ -19083,6 +22334,17 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         db.lane_status("cli-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
+    let persisted_workdir = db.lane_workdir("cli-bot").unwrap();
+    assert_eq!(
+        persisted_workdir.requested_workdir_mode,
+        LaneWorkdirMode::Auto
+    );
+    assert_eq!(persisted_workdir.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(
+        persisted_workdir.workdir_backend,
+        Some(WorkdirBackend::Clone)
+    );
+    assert!(persisted_workdir.materialization.is_some());
 
     let sparse_spawn = run_trail_json(
         temp.path(),
@@ -19097,7 +22359,9 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert_eq!(sparse_spawn["workdir_mode"], "sparse");
-    assert_eq!(sparse_spawn["cow_backend"], "filesystem-clone");
+    assert_eq!(sparse_spawn["workdir_backend"], "clone");
+    assert_eq!(sparse_spawn["materialization"]["cloned_files"], 1);
+    assert_eq!(sparse_spawn["materialization"]["copied_files"], 0);
     assert_eq!(
         sparse_spawn["sparse_paths"]
             .as_array()
@@ -19295,7 +22559,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(sparse_hydrated.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_hydrated.workdir_changed_paths.is_empty());
     let sparse_manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(sparse_workdir.join(".trail/sparse-workdir.json")).unwrap(),
+        &fs::read_to_string(sparse_workdir.join(".trail/sparse-selection.json")).unwrap(),
     )
     .unwrap();
     let sparse_manifest_paths = sparse_manifest["materialized_paths"]
@@ -19394,14 +22658,14 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             serde_json::json!({
                 "name": "api-bot",
                 "from_ref": "main",
-                "workdir_mode": "full-cow",
+                "workdir_mode": "native-cow",
                 "workdir": api_workdir
             }),
         ),
     );
     assert_eq!(api_response.status, 201);
     let api_spawn: serde_json::Value = api_response.body_json().unwrap();
-    assert_eq!(api_spawn["workdir_mode"], "full-cow");
+    assert_eq!(api_spawn["workdir_mode"], "native-cow");
     assert_eq!(
         PathBuf::from(api_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -19513,7 +22777,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
                 "arguments": {
                     "name": "mcp-bot",
                     "from_ref": "main",
-                    "workdir_mode": "full-cow",
+                    "workdir_mode": "native-cow",
                     "workdir": mcp_workdir
                 }
             }
@@ -19523,7 +22787,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(mcp_spawn["result"]["isError"], false);
     assert_eq!(
         mcp_spawn["result"]["structuredContent"]["workdir_mode"],
-        "full-cow"
+        "native-cow"
     );
     assert_eq!(
         PathBuf::from(
@@ -19646,19 +22910,15 @@ fn sparse_lane_path_sync_rolls_back_hydrated_files_when_manifest_update_fails() 
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
 
-    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-selection.json");
     let clean_manifest_path = sparse_workdir.join(".trail/workdir-manifest.json");
     let sparse_manifest_before = fs::read(&sparse_manifest_path).unwrap();
     let clean_manifest_before = fs::read(&clean_manifest_path).unwrap();
 
-    let metadata_dir = sparse_workdir.join(".trail");
-    let original_permissions = fs::metadata(&metadata_dir).unwrap().permissions();
-    let mut readonly_permissions = original_permissions.clone();
-    readonly_permissions.set_mode(0o555);
-    fs::set_permissions(&metadata_dir, readonly_permissions).unwrap();
+    trail::test_support::set_sparse_selection_write_failure_for_current_thread(true);
     let sync_result =
         db.sync_lane_workdir_with_paths("sparse-rollback", false, &["src/lib.rs".to_string()]);
-    fs::set_permissions(&metadata_dir, original_permissions).unwrap();
+    trail::test_support::set_sparse_selection_write_failure_for_current_thread(false);
 
     let err = sync_result.unwrap_err();
     assert!(matches!(err, Error::Io(_)));
@@ -19704,7 +22964,7 @@ fn sparse_lane_path_sync_recovers_when_sparse_manifest_is_missing() {
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
 
-    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest_path = sparse_workdir.join(".trail/sparse-selection.json");
     fs::remove_file(&sparse_manifest_path).unwrap();
     let report = db
         .sync_lane_workdir_with_paths(
@@ -19812,6 +23072,16 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
     let spawned = db
         .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
+    assert_eq!(spawned.requested_workdir_mode, LaneWorkdirMode::Auto);
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::PortableCopy);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Copy));
+    assert_eq!(
+        spawned
+            .materialization
+            .as_ref()
+            .and_then(|report| report.fallback_reason),
+        Some(MaterializationFallbackReason::NativeSourceUnavailable)
+    );
     let workdir = PathBuf::from(spawned.workdir.unwrap());
 
     assert_eq!(
@@ -19822,6 +23092,183 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
         "hello\ndirty\n"
     );
+}
+
+#[test]
+fn auto_reports_mixed_when_portable_restart_can_clone_only_clean_files() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+    fs::write(temp.path().join("dirty.txt"), "recorded\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join("dirty.txt"), "changed\n").unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane("mixed-bot", Some("main"), true, None, None)
+        .unwrap();
+    let report = spawned.materialization.unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::PortableCopy);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Mixed));
+    assert_eq!(report.cloned_files, 1);
+    assert_eq!(report.copied_files, 1);
+    assert_eq!(
+        report.fallback_reason,
+        Some(MaterializationFallbackReason::NativeSourceUnavailable)
+    );
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("clean.txt")).unwrap(),
+        "clean\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("dirty.txt")).unwrap(),
+        "recorded\n"
+    );
+}
+
+#[test]
+fn strict_native_cow_refuses_an_unvalidated_source_without_copying() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join("README.md"), "hello\ndirty\n").unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let workdir_parent = tempfile::tempdir().unwrap();
+    let destination = workdir_parent.path().join("strict-workdir");
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "strict-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            Some(destination.clone()),
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, Error::NativeCowSourceUnavailable));
+    assert!(!destination.exists());
+    assert!(db.lane_details("strict-bot").is_err());
+}
+
+#[test]
+fn strict_native_cow_reuses_a_complete_clean_lane_source() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("source-bot", Some("main"), true, None, None)
+        .unwrap();
+    fs::write(temp.path().join("README.md"), "hello\ndirty\n").unwrap();
+    assert_eq!(
+        db.lane_status("source-bot").unwrap().workdir_state,
+        Some(WorktreeState::Clean)
+    );
+
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "strict-from-lane",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    assert_eq!(
+        fs::read_to_string(PathBuf::from(spawned.workdir.unwrap()).join("README.md")).unwrap(),
+        "hello\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_native_cow_does_not_preserve_source_hardlink_aliasing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("a.txt"), "shared\n").unwrap();
+    fs::hard_link(temp.path().join("a.txt"), temp.path().join("b.txt")).unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "hardlink-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    let a = fs::metadata(workdir.join("a.txt")).unwrap();
+    let b = fs::metadata(workdir.join("b.txt")).unwrap();
+    assert_ne!(a.ino(), b.ino());
+    fs::write(workdir.join("a.txt"), "changed\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(workdir.join("b.txt")).unwrap(),
+        "shared\n"
+    );
+}
+
+#[test]
+fn strict_native_cow_probes_an_empty_root() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "empty-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    assert_eq!(spawned.materialization.unwrap().cloned_files, 0);
+}
+
+#[test]
+fn legacy_cow_backend_is_not_treated_as_strict_clone_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("legacy-bot", Some("main"), true, None, None)
+        .unwrap();
+    drop(db);
+
+    let connection = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE lanes SET metadata_json = ?1 WHERE name = 'legacy-bot'",
+            [r#"{"workdir_mode":"native-cow","cow_backend":"clone"}"#],
+        )
+        .unwrap();
+    drop(connection);
+
+    let db = Trail::open(temp.path()).unwrap();
+    let report = db.lane_workdir("legacy-bot").unwrap();
+    assert_eq!(report.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(report.requested_workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(report.workdir_backend, None);
+    assert_eq!(report.materialization, None);
 }
 
 #[test]
@@ -20083,8 +23530,8 @@ fn dirty_lane_workdir_must_be_recorded_before_merge() {
     assert!(matches!(err, Error::DirtyWorktreeWithMessage(_)));
     assert!(err.to_string().contains("lane record doc-bot"));
 
-    db.enqueue_merge("doc-bot", "main", 0).unwrap();
-    let run = db.run_merge_queue(None).unwrap();
+    db.enqueue_lane_merge("doc-bot", "main", 0).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "failed");
     assert!(run.stopped_on_failure);
@@ -20364,7 +23811,7 @@ fn sparse_lane_path_enforcement_blocks_patch_and_record_outside_selected_paths()
     let err = apply_lane_patch_at_head(&mut db, "sparse-bot", blocked_rename).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(message) if message.contains("src/renamed.md")));
 
-    let sparse_manifest = workdir.join(".trail/sparse-workdir.json");
+    let sparse_manifest = workdir.join(".trail/sparse-selection.json");
     fs::remove_file(&sparse_manifest).unwrap();
     let blocked_without_manifest: PatchDocument = serde_json::from_value(serde_json::json!({
         "edits": [
@@ -21049,7 +24496,7 @@ fn local_http_bodyless_mutations_reject_request_bodies() {
         .create_anchor("README.md:1", "stable readme", Some("main"))
         .unwrap()
         .anchor;
-    let queued = db.enqueue_merge("doc-bot", "main", 0).unwrap().entry;
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 0).unwrap().entry;
 
     let assert_rejected = |response: &trail::server::HttpResponse, endpoint: &str| {
         assert_eq!(response.status, 400);
@@ -21096,13 +24543,16 @@ fn local_http_bodyless_mutations_reject_request_bodies() {
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/merge-queue/{}", queued.queue_id),
+            &format!("/v1/lanes/merges/queue/{}", queued.queue_id),
             serde_json::json!({ "unexpected": true }),
         ),
     );
-    assert_rejected(&bad_queue_remove, "DELETE /v1/merge-queue/{queue_id}");
+    assert_rejected(
+        &bad_queue_remove,
+        "DELETE /v1/lanes/merges/queue/{selector}",
+    );
     assert!(db
-        .list_merge_queue()
+        .list_lane_merge_queue()
         .unwrap()
         .iter()
         .any(|item| item.queue_id == queued.queue_id && item.status == "queued"));
@@ -21156,8 +24606,8 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
     assert!(direct_err.to_string().contains("not merge-ready"));
     assert!(direct_err.to_string().contains("pending_approvals"));
 
-    db.enqueue_merge("approval-bot", "main", 0).unwrap();
-    let explain = db.explain_merge_queue("approval-bot").unwrap();
+    db.enqueue_lane_merge("approval-bot", "main", 0).unwrap();
+    let explain = db.explain_lane_merge_queue("approval-bot").unwrap();
     assert!(explain
         .blockers
         .iter()
@@ -21170,7 +24620,7 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
             ))
     }));
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "failed");
     assert!(run.stopped_on_failure);
@@ -21191,7 +24641,9 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
     }))
     .unwrap();
     apply_lane_patch_at_head(&mut db, "late-approval-bot", late_patch).unwrap();
-    let late_queue = db.enqueue_merge("late-approval-bot", "main", 0).unwrap();
+    let late_queue = db
+        .enqueue_lane_merge("late-approval-bot", "main", 0)
+        .unwrap();
     assert!(db.lane_readiness("late-approval-bot").unwrap().ready);
     db.request_lane_approval(
         "late-approval-bot",
@@ -21202,7 +24654,7 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
         None,
     )
     .unwrap();
-    let late_run = db.run_merge_queue(None).unwrap();
+    let late_run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(late_run.processed.len(), 1);
     assert_eq!(late_run.processed[0].queue_id, late_queue.entry.queue_id);
     assert_eq!(late_run.processed[0].status, "failed");
@@ -21406,7 +24858,7 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
 }
 
 #[test]
-fn merge_queue_runs_lane_branch_into_main() {
+fn lane_merge_queue_runs_lane_branch_into_main() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -21425,11 +24877,12 @@ fn merge_queue_runs_lane_branch_into_main() {
     .unwrap();
     apply_lane_patch_at_head(&mut db, "doc-bot", patch).unwrap();
 
-    let queued = db.enqueue_merge("doc-bot", "main", 10).unwrap();
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 10).unwrap();
     assert_eq!(queued.entry.status, "queued");
-    assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+    assert_eq!(queued.entry.lane, "doc-bot");
+    assert_eq!(db.list_lane_merge_queue().unwrap().len(), 1);
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "merged");
     assert!(!run.stopped_on_conflict);
@@ -21444,7 +24897,7 @@ fn merge_queue_runs_lane_branch_into_main() {
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )
@@ -21457,7 +24910,87 @@ fn merge_queue_runs_lane_branch_into_main() {
 }
 
 #[test]
-fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state() {
+fn lane_merge_queue_rejects_branch_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let error = db.enqueue_lane_merge("main", "main", 0).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(error.to_string().contains("lane"));
+}
+
+#[test]
+fn local_api_drives_lane_merge_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("api-bot", Some("main"), false, None, None)
+        .unwrap();
+    let add = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/merges/queue",
+            serde_json::json!({
+                "lane": "api-bot",
+                "into": "main",
+                "priority": 10
+            }),
+        ),
+    );
+    assert_eq!(add.status, 201);
+    let add: serde_json::Value = add.body_json().unwrap();
+    assert_eq!(add["entry"]["lane"], "api-bot");
+    assert!(add["entry"]["queue_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("lmq_"));
+
+    let list = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/lanes/merges/queue", serde_json::Value::Null),
+    );
+    assert_eq!(list.status, 200);
+    assert_eq!(
+        list.body_json::<serde_json::Value>().unwrap()[0]["lane"],
+        "api-bot"
+    );
+
+    let aliased_body = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/merges/queue",
+            serde_json::json!({"source": "api-bot", "target": "main"}),
+        ),
+    );
+    assert_eq!(aliased_body.status, 400);
+
+    let legacy = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/merge-queue",
+            serde_json::json!({"source": "api-bot", "target": "main"}),
+        ),
+    );
+    assert_eq!(legacy.status, 400);
+
+    let openapi = trail::server::openapi_spec();
+    assert!(openapi["paths"].get("/v1/lanes/merges/queue").is_some());
+    assert!(openapi["paths"].get("/v1/merge-queue").is_none());
+    assert_eq!(
+        openapi["components"]["schemas"]["LaneMergeQueueAddRequest"]["required"],
+        serde_json::json!(["lane", "into"])
+    );
+}
+
+#[test]
+fn lane_merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -21480,10 +25013,10 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         false,
     )
     .unwrap();
-    let queued = db.enqueue_merge("explain-bot", "main", 0).unwrap();
+    let queued = db.enqueue_lane_merge("explain-bot", "main", 0).unwrap();
     let queue_id = queued.entry.queue_id.clone();
 
-    let explain = db.explain_merge_queue("explain-bot").unwrap();
+    let explain = db.explain_lane_merge_queue("explain-bot").unwrap();
     assert!(explain
         .blockers
         .iter()
@@ -21498,7 +25031,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/merge-queue/{queue_id}/explain"),
+            &format!("/v1/lanes/merges/queue/{queue_id}/explain"),
             serde_json::Value::Null,
         ),
     );
@@ -21515,16 +25048,13 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         &mut db,
         &api_request(
             "GET",
-            "/v1/merge-queue/explain?selector=refs/lanes/explain-bot",
+            "/v1/lanes/merges/queue/explain-bot/explain",
             serde_json::Value::Null,
         ),
     );
     assert_eq!(api_ref_explain.status, 200);
     let api_ref_explain: serde_json::Value = api_ref_explain.body_json().unwrap();
-    assert_eq!(
-        api_ref_explain["entry"]["source_ref"],
-        "refs/lanes/explain-bot"
-    );
+    assert_eq!(api_ref_explain["entry"]["lane"], "explain-bot");
 
     let tools = trail::mcp::handle_json_rpc(
         &mut db,
@@ -21540,7 +25070,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "trail.merge_queue_explain"));
+        .any(|tool| tool["name"] == "trail.lane_merge_queue_explain"));
 
     let mcp_explain = trail::mcp::handle_json_rpc(
         &mut db,
@@ -21549,7 +25079,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_explain",
+                "name": "trail.lane_merge_queue_explain",
                 "arguments": {
                     "selector": "explain-bot"
                 }
@@ -21565,8 +25095,11 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
     assert!(db.list_conflicts().unwrap().is_empty());
     drop(db);
 
-    let cli = run_trail_json(temp.path(), &["merge-queue", "explain", "explain-bot"]);
-    assert_eq!(cli["entry"]["source_ref"], "refs/lanes/explain-bot");
+    let cli = run_trail_json(
+        temp.path(),
+        &["lane", "merge-queue", "explain", "explain-bot"],
+    );
+    assert_eq!(cli["entry"]["lane"], "explain-bot");
     assert!(cli["blockers"]
         .as_array()
         .unwrap()
@@ -21600,7 +25133,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
     let daemon_cli = run_trail_json_daemon(
         temp.path(),
         &daemon_url,
-        &["merge-queue", "explain", "refs/lanes/explain-bot"],
+        &["lane", "merge-queue", "explain", "explain-bot"],
     );
     assert_eq!(daemon_cli["entry"]["queue_id"], queue_id);
     assert!(daemon_cli["blockers"]
@@ -21615,7 +25148,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
 }
 
 #[test]
-fn merge_queue_pauses_on_conflict() {
+fn lane_merge_queue_pauses_on_conflict() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -21642,9 +25175,9 @@ fn merge_queue_pauses_on_conflict() {
         false,
     )
     .unwrap();
-    let queued = db.enqueue_merge("doc-bot", "main", 0).unwrap();
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 0).unwrap();
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "conflicted");
     assert!(run.stopped_on_conflict);
@@ -21653,7 +25186,7 @@ fn merge_queue_pauses_on_conflict() {
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )
@@ -21715,7 +25248,7 @@ fn merge_queue_pauses_on_conflict() {
 
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )
@@ -22251,7 +25784,7 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
 }
 
 #[test]
-fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
+fn local_api_and_mcp_drive_lane_merge_queue_and_conflicts() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -22283,10 +25816,10 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/merge-queue",
+            "/v1/lanes/merges/queue",
             serde_json::json!({
-                "source": "api-queue-bot",
-                "target": "main",
+                "lane": "api-queue-bot",
+                "into": "main",
                 "priority": 5
             }),
         ),
@@ -22298,7 +25831,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
 
     let listed = trail::server::handle_http_request(
         &mut db,
-        &api_request("GET", "/v1/merge-queue", serde_json::Value::Null),
+        &api_request("GET", "/v1/lanes/merges/queue", serde_json::Value::Null),
     );
     assert_eq!(listed.status, 200);
     let listed: serde_json::Value = listed.body_json().unwrap();
@@ -22320,11 +25853,11 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     .unwrap();
     let tool_list = tools["result"]["tools"].as_array().unwrap();
     for name in [
-        "trail.merge_queue_add",
-        "trail.merge_queue_list",
-        "trail.merge_queue_run",
-        "trail.merge_queue_explain",
-        "trail.merge_queue_remove",
+        "trail.lane_merge_queue_add",
+        "trail.lane_merge_queue_list",
+        "trail.lane_merge_queue_run",
+        "trail.lane_merge_queue_explain",
+        "trail.lane_merge_queue_remove",
         "trail.conflict_list",
         "trail.conflict_show",
         "trail.conflict_resolve",
@@ -22365,7 +25898,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
 
     let run = trail::server::handle_http_request(
         &mut db,
-        &api_request("POST", "/v1/merge-queue/run", serde_json::json!({})),
+        &api_request("POST", "/v1/lanes/merges/queue/run", serde_json::json!({})),
     );
     assert_eq!(run.status, 200);
     let run: serde_json::Value = run.body_json().unwrap();
@@ -22467,7 +26000,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_list",
+                "name": "trail.lane_merge_queue_list",
                 "arguments": {}
             }
         }),
@@ -22489,9 +26022,9 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
             "id": 5,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_add",
+                "name": "trail.lane_merge_queue_add",
                 "arguments": {
-                    "source": "cancel-queue-bot",
+                    "lane": "cancel-queue-bot",
                     "target": "main",
                     "priority": 1
                 }
@@ -22509,7 +26042,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/merge-queue/{cancel_queue_id}"),
+            &format!("/v1/lanes/merges/queue/{cancel_queue_id}"),
             serde_json::Value::Null,
         ),
     );
@@ -22987,6 +26520,10 @@ fn show_history_and_code_from_use_recorded_indexes() {
         }
         other => panic!("expected operation show result, got {other:?}"),
     }
+    match db.show(&applied.operation.checkpoint_alias()).unwrap() {
+        ShowResult::Operation { value } => assert_eq!(value.operation.change_id, applied.operation),
+        other => panic!("expected checkpoint alias to show operation, got {other:?}"),
+    }
 
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let message_id: String = conn
@@ -22994,6 +26531,7 @@ fn show_history_and_code_from_use_recorded_indexes() {
             row.get(0)
         })
         .unwrap();
+    assert!(message_id.starts_with("message_"));
     match db.show(&message_id).unwrap() {
         ShowResult::Message { value } => assert_eq!(value.body, "lane adds line"),
         other => panic!("expected message show result, got {other:?}"),
@@ -23003,7 +26541,8 @@ fn show_history_and_code_from_use_recorded_indexes() {
     assert!(file_history.file_history.len() >= 2);
 
     let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
-    let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+    let line_id = why.line_id.alias();
+    assert!(line_id.starts_with("line_"));
     let line_history = db.history_for_line_id(&line_id).unwrap();
     assert!(!line_history.line_history.is_empty());
 
@@ -23101,7 +26640,7 @@ fn gc_prunes_unreachable_known_objects_and_preserves_reachable_roots() {
     conn.execute(
         "INSERT INTO objects \
          (object_id, kind, version, codec, hash_alg, size_bytes, bytes, created_at) \
-         VALUES ('obj_unreachable_test', 'Blob', 1, 'cbor', 'sha256', 0, x'', 0)",
+         VALUES ('object_unreachable_test', 'Blob', 1, 'cbor', 'sha256', 0, x'', 0)",
         [],
     )
     .unwrap();
@@ -23115,7 +26654,7 @@ fn gc_prunes_unreachable_known_objects_and_preserves_reachable_roots() {
     assert!(report.pruned_objects >= 1);
     let still_exists: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM objects WHERE object_id = 'obj_unreachable_test'",
+            "SELECT COUNT(*) FROM objects WHERE object_id = 'object_unreachable_test'",
             [],
             |row| row.get(0),
         )

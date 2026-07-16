@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use super::{openapi_operation, openapi_path_param, openapi_query};
+use super::{
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+};
 
 pub(super) fn turn_paths() -> Value {
     json!({
@@ -88,9 +90,9 @@ pub(super) fn turn_paths() -> Value {
             ], Some("StartSpanRequest"), true)
         },
         "/v1/lane/turns/{turn_id}/patches": {
-            "post": openapi_operation("turnApplyPatch", "Apply turn patch", "Apply a patch linked to a durable turn.", vec![
+            "post": openapi_operation_with_response_schema("turnApplyPatch", "Apply turn patch", "Apply a patch linked to a durable turn.", vec![
                 openapi_path_param("turn_id", "string")
-            ], Some("PatchRequest"), true)
+            ], Some("PatchRequest"), "LanePatchReport", true)
         },
         "/v1/lane/turns/{turn_id}/end": {
             "post": openapi_operation("turnEnd", "End turn", "End a durable lane turn.", vec![

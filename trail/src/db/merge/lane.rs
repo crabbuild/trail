@@ -1,6 +1,49 @@
 use super::*;
 use crate::db::lane::ViewMutationBarrier;
 
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static FAIL_LAYERED_UPDATE_POSTCOMMIT_BOUNDARY: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_layered_update_postcommit_failure_for_current_thread(boundary: Option<&'static str>) {
+    FAIL_LAYERED_UPDATE_POSTCOMMIT_BOUNDARY.with(|selected| *selected.borrow_mut() = boundary);
+}
+
+#[cfg(debug_assertions)]
+fn fail_layered_update_postcommit_if_requested(boundary: &'static str) -> Result<()> {
+    if FAIL_LAYERED_UPDATE_POSTCOMMIT_BOUNDARY.with(|selected| *selected.borrow() == Some(boundary))
+    {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("injected layered update post-commit failure at {boundary}"),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn fail_layered_update_postcommit_if_requested(_boundary: &'static str) -> Result<()> {
+    Ok(())
+}
+
+fn layered_update_committed_repair(
+    operation: &ObjectId,
+    repair: &'static str,
+    error: Error,
+) -> Error {
+    match error {
+        Error::CommittedRepairRequired { .. } => error,
+        error => Error::CommittedRepairRequired {
+            operation: operation.0.clone(),
+            repair: repair.into(),
+            reason: error.to_string(),
+        },
+    }
+}
+
 impl Trail {
     pub fn merge_lane(&mut self, lane: &str, into: &str) -> Result<MergeReport> {
         self.merge_lane_with_options(lane, into, false)
@@ -62,13 +105,19 @@ impl Trail {
         source_branch: &str,
         checkpoint: bool,
     ) -> Result<MergeReport> {
+        // TRAIL_FS_PRODUCER: layered_lane_update RestoreProjection controlled
         if checkpoint {
             self.checkpoint_lane_workspace(
                 lane,
                 Some(format!("Checkpoint before updating from {source_branch}")),
             )?;
         }
-        let _lock = self.acquire_write_lock()?;
+        let ledger_authority = crate::db::change_ledger::command_authority_enabled();
+        let _lock = if ledger_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         validate_ref_segment(lane)?;
         validate_ref_segment(source_branch)?;
         let lane_branch = self.lane_branch(lane)?;
@@ -78,14 +127,25 @@ impl Trail {
             .is_transparent_cow()
         {
             return Err(Error::InvalidInput(format!(
-                "lane update requires a layered workspace view; lane {lane} is not overlay-cow or nfs-cow"
+                "lane update requires a layered workspace view; lane {lane} is not fuse-cow, nfs-cow, or dokan-cow"
             )));
         }
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        let view_hint = self.lane_workspace_view(lane)?.ok_or_else(|| {
             Error::Corrupt(format!(
                 "layered lane {lane} has no persisted workspace view"
             ))
         })?;
+        let mut barrier = ViewMutationBarrier::exclusive(Path::new(&view_hint.meta_dir))?;
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "layered lane {lane} lost its persisted workspace view while acquiring the mutation barrier"
+            ))
+        })?;
+        if view.view_id != view_hint.view_id || view.meta_dir != view_hint.meta_dir {
+            return Err(Error::InvalidInput(format!(
+                "workspace view for lane {lane} changed while acquiring its mutation barrier"
+            )));
+        }
         if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
             if process_matches_start_token(pid, token) {
                 return Err(Error::InvalidInput(format!(
@@ -94,7 +154,6 @@ impl Trail {
                 )));
             }
         }
-        let _barrier = ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?;
         let lane_head = self.get_ref(&lane_branch.ref_name)?;
         self.ensure_lane_workdir_clean(&lane_branch, &lane_head)?;
         let source_ref_name = branch_ref(source_branch);
@@ -139,42 +198,140 @@ impl Trail {
             after_root: root_id.clone(),
             branch: lane_branch.ref_name.clone(),
             actor,
-            session_id: lane_branch.session_id,
+            session_id: lane_branch.session_id.clone(),
             message: Some(format!("Update lane {lane} from {source_branch}")),
             changes: diff.changes,
             created_at: now_ts(),
         };
-        let operation_id = self.store_operation(&operation)?;
-        self.advance_ref_cas(&lane_head, &change_id, &root_id, &operation_id)?;
-        self.conn.execute(
-            "UPDATE lane_branches SET base_change = ?1, base_root = ?2, head_change = ?3, head_root = ?4, status = 'active', updated_at = ?5 WHERE lane_id = ?6",
-            params![
-                source_ref.change_id.0,
-                source_ref.root_id.0,
-                change_id.0,
-                root_id.0,
-                now_ts(),
-                lane_branch.lane_id
-            ],
-        )?;
-        self.conn.execute(
-            "UPDATE workspace_views SET base_change = ?1, base_root = ?2, generation = generation + 1, updated_at = ?3 WHERE view_id = ?4",
-            params![change_id.0, root_id.0, now_ts(), view.view_id],
-        )?;
-        self.complete_workspace_checkpoint(lane, &root_id, Some(&change_id))?;
-        self.refresh_workspace_environment_staleness(lane)?;
-        self.insert_lane_event(
-            &lane_branch.lane_id,
-            "workspace_view_updated",
-            Some(&change_id),
-            None,
-            &serde_json::json!({
-                "view_id": view.view_id,
-                "source_branch": source_branch,
-                "source_change": source_ref.change_id.0,
-                "root_id": root_id.0,
-            }),
-        )?;
+        self.invalidate_lane_marker_if_materialized(&lane_branch)?;
+        let committed_operation_id = if ledger_authority {
+            let checkpoint_sequence = self.workspace_view_last_journal_sequence(&view)?;
+            let unaligned_scope = crate::db::change_ledger::ExpectedScope {
+                scope_id: crate::db::change_ledger::materialized_lane_scope_id(
+                    &self.config.workspace.id.0,
+                    &lane_branch.lane_id,
+                ),
+                epoch: 0,
+                ref_name: lane_head.name.clone(),
+                ref_generation: u64::try_from(lane_head.generation)
+                    .map_err(|_| Error::Corrupt("negative lane ref generation".into()))?,
+                baseline_root: lane_head.root_id.clone(),
+                policy_fingerprint: [0; 32],
+                policy_generation: 0,
+                filesystem_identity: Vec::new(),
+                provider_identity: Vec::new(),
+            };
+            let evidence = crate::db::change_ledger::IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: Vec::new(),
+            };
+            crate::db::change_ledger::run_ref_advancing_projection(
+                self,
+                &unaligned_scope,
+                &lane_head,
+                &lane_branch.lane_id,
+                crate::db::change_ledger::IntentProducer::RestoreProjection,
+                &operation,
+                &evidence,
+                crate::db::change_ledger::RefAdvancingProjectionMode::LayeredUpdateReconcileRequired {
+                    reason: "layered_view_update_requires_task12_reconciliation",
+                    lane_base_change: &source_ref.change_id,
+                    lane_base_root: &source_ref.root_id,
+                    view_id: &view.view_id,
+                    checkpoint_sequence,
+                },
+                |_, _| {
+                    Err(Error::InvalidInput(
+                        "layered view update cannot use a native lane observer".into(),
+                    ))
+                },
+                |_, _| Ok(()),
+            )?
+            .operation_id
+        } else {
+            crate::db::change_ledger::commit_lane_operation_atomic(
+                self,
+                &lane_head,
+                &lane_branch.lane_id,
+                &operation,
+                None,
+            )?
+        };
+        if !ledger_authority {
+            (|| -> Result<()> {
+                self.conn.execute(
+                    "UPDATE lane_branches SET base_change=?1,base_root=?2,status='active',updated_at=?3
+                     WHERE lane_id=?4 AND head_change=?5 AND head_root=?6",
+                    params![
+                        source_ref.change_id.0,
+                        source_ref.root_id.0,
+                        now_ts(),
+                        lane_branch.lane_id,
+                        change_id.0,
+                        root_id.0,
+                    ],
+                )?;
+                self.conn.execute(
+                    "UPDATE workspace_views SET base_change = ?1, base_root = ?2, generation = generation + 1, updated_at = ?3 WHERE view_id = ?4",
+                    params![change_id.0, root_id.0, now_ts(), view.view_id],
+                )?;
+                Ok(())
+            })()
+            .map_err(|error| {
+                layered_update_committed_repair(
+                    &committed_operation_id,
+                    "layered update association",
+                    error,
+                )
+            })?;
+        }
+        (|| {
+            fail_layered_update_postcommit_if_requested("checkpoint")?;
+            self.complete_workspace_checkpoint(lane, &root_id, Some(&change_id), &mut barrier)
+        })()
+        .map_err(|error| {
+            layered_update_committed_repair(
+                &committed_operation_id,
+                "layered update workspace checkpoint",
+                error,
+            )
+        })?;
+        (|| {
+            fail_layered_update_postcommit_if_requested("environment")?;
+            self.refresh_workspace_environment_staleness(lane)
+        })()
+        .map_err(|error| {
+            layered_update_committed_repair(
+                &committed_operation_id,
+                "layered update environment staleness",
+                error,
+            )
+        })?;
+        (|| {
+            fail_layered_update_postcommit_if_requested("event")?;
+            self.insert_lane_event(
+                &lane_branch.lane_id,
+                "workspace_view_updated",
+                Some(&change_id),
+                None,
+                &serde_json::json!({
+                    "view_id": view.view_id,
+                    "source_branch": source_branch,
+                    "source_change": source_ref.change_id.0,
+                    "root_id": root_id.0,
+                }),
+            )
+        })()
+        .map_err(|error| {
+            layered_update_committed_repair(&committed_operation_id, "layered update event", error)
+        })?;
+        (|| {
+            fail_layered_update_postcommit_if_requested("marker")?;
+            self.publish_lane_marker_if_materialized(lane)
+        })()
+        .map_err(|error| {
+            layered_update_committed_repair(&committed_operation_id, "layered update marker", error)
+        })?;
         Ok(MergeReport {
             operation: change_id,
             source_ref: source_ref_name,
@@ -421,11 +578,28 @@ impl Trail {
         if !workdir_path.is_dir() {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
-        Ok(Some(self.lane_workdir_record_changed_paths(
-            branch,
-            head,
-            &workdir_path,
-        )?))
+        let lane_record = self.lane_record(&branch.lane_id)?;
+        let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
+        if workdir_mode.is_transparent_cow() {
+            return Ok(Some(self.lane_workdir_record_changed_paths(
+                branch,
+                head,
+                &workdir_path,
+            )?));
+        }
+        if crate::db::change_ledger::command_authority_enabled() {
+            let (comparison, _) = self.compare_materialized_lane_candidates(
+                &branch.lane_id,
+                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+            )?;
+            Ok(Some(comparison.summaries))
+        } else {
+            Ok(Some(self.lane_workdir_record_changed_paths(
+                branch,
+                head,
+                &workdir_path,
+            )?))
+        }
     }
 
     fn ensure_direct_lane_merge_allowed(
@@ -439,7 +613,7 @@ impl Trail {
             return Ok(());
         }
         Err(Error::InvalidInput(format!(
-            "direct merge into shared target `{into}` is disabled by default; run `trail merge-queue add {lane} --into {into}` and `trail merge-queue run`, or pass `--direct` to merge immediately"
+            "direct merge into shared target `{into}` is disabled by default; run `trail lane merge-queue add {lane} --into {into}` and `trail lane merge-queue run`, or pass `--direct` to merge immediately"
         )))
     }
 }
@@ -461,7 +635,7 @@ fn lane_refresh_preview_next_steps(
         )];
     }
     vec![format!(
-        "Review the changed paths, then merge via `trail merge-queue add {lane} --into {target_branch}` when ready."
+        "Review the changed paths, then merge via `trail lane merge-queue add {lane} --into {target_branch}` when ready."
     )]
 }
 
@@ -469,17 +643,33 @@ fn lane_refresh_preview_next_steps(
 mod tests {
     use super::*;
 
+    static LAYERED_UPDATE_AUTHORITY_TEST: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct AuthorityReset;
+
+    impl Drop for AuthorityReset {
+        fn drop(&mut self) {
+            crate::db::set_command_authority_override(false);
+        }
+    }
+
+    fn layered_mode() -> LaneWorkdirMode {
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        }
+    }
+
     #[test]
     fn layered_lane_update_refuses_an_active_workspace_writer() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
         Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let mut db = Trail::open(temp.path()).unwrap();
-        let mode = if cfg!(target_os = "macos") {
-            LaneWorkdirMode::NfsCow
-        } else {
-            LaneWorkdirMode::OverlayCow
-        };
+        let mode = layered_mode();
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "active-update",
             Some("main"),
@@ -507,5 +697,60 @@ mod tests {
         drop(lease);
         db.update_layered_lane_from("active-update", "main", false)
             .unwrap();
+    }
+
+    #[test]
+    fn layered_update_postcommit_failures_keep_the_committed_projection() {
+        let _lock = LAYERED_UPDATE_AUTHORITY_TEST
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::db::set_command_authority_override(true);
+        let _authority_reset = AuthorityReset;
+
+        for boundary in ["checkpoint", "environment", "event", "marker"] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                &format!("repair-{boundary}"),
+                Some("main"),
+                layered_mode(),
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let lane = format!("repair-{boundary}");
+            let before = db.get_ref(&lane_ref(&lane)).unwrap();
+            let source = db.get_ref(&branch_ref("main")).unwrap();
+
+            set_layered_update_postcommit_failure_for_current_thread(Some(boundary));
+            let result = db.update_layered_lane_from(&lane, "main", false);
+            set_layered_update_postcommit_failure_for_current_thread(None);
+
+            let error = result.unwrap_err();
+            let after = db.get_ref(&lane_ref(&lane)).unwrap();
+            assert_ne!(after.change_id, before.change_id, "boundary {boundary}");
+            let branch = db.lane_branch(&lane).unwrap();
+            assert_eq!(branch.base_change, source.change_id, "boundary {boundary}");
+            let view = db.lane_workspace_view(&lane).unwrap().unwrap();
+            assert_eq!(view.base_change, after.change_id, "boundary {boundary}");
+            match error {
+                Error::CommittedRepairRequired {
+                    operation,
+                    repair,
+                    reason,
+                } => {
+                    assert_eq!(operation, after.operation_id.0, "boundary {boundary}");
+                    assert!(repair.contains(boundary), "{repair}");
+                    assert!(reason.contains(boundary), "{reason}");
+                }
+                other => panic!("expected committed repair error at {boundary}, got {other:?}"),
+            }
+        }
     }
 }
