@@ -38,6 +38,18 @@ pub mod test_support {
         crate::db::clear_schema_v19_migration_failure(db_path);
     }
 
+    pub fn install_schema_v19_backfill_times(times: Vec<i64>) {
+        crate::db::install_schema_v19_backfill_times(times);
+    }
+
+    pub fn clear_schema_v19_backfill_times() {
+        crate::db::clear_schema_v19_backfill_times();
+    }
+
+    pub fn schema_v19_backfill_times_remaining() -> usize {
+        crate::db::schema_v19_backfill_times_remaining()
+    }
+
     pub fn changed_path_command_flow() -> std::result::Result<(), String> {
         crate::db::run_command_flow()
     }

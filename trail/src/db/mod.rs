@@ -4173,8 +4173,9 @@ mod core;
 mod lane;
 #[cfg(debug_assertions)]
 pub(crate) use lane::{
-    install_lane_record_after_c2_write_for_current_thread, run_changed_path_view_flow,
-    set_lane_record_postcommit_failure_for_current_thread,
+    clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,
+    install_schema_v19_backfill_times, run_changed_path_view_flow,
+    schema_v19_backfill_times_remaining, set_lane_record_postcommit_failure_for_current_thread,
     set_sparse_selection_write_failure_for_current_thread,
 };
 mod merge;

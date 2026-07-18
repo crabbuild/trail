@@ -215,6 +215,83 @@ fn table_columns(path: &Path) -> Vec<String> {
         .unwrap()
 }
 
+fn complete_legacy_metadata(sparse_paths: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "requested_workdir_mode": "portable-copy",
+        "workdir_mode": "portable-copy",
+        "workdir_backend": "copy",
+        "materialization": {
+            "cloned_files": 0,
+            "cloned_bytes": 0,
+            "copied_files": 1,
+            "copied_bytes": 7
+        },
+        "sparse_paths": sparse_paths,
+        "include_neighbors": false,
+        "transparent_cow_available": false
+    })
+}
+
+fn insert_legacy_lane(
+    fixture: &Schema18Fixture,
+    name: &str,
+    lane_id: &str,
+    metadata: &serde_json::Value,
+) {
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    let (change_id, root_id, operation_id, generation): (String, String, String, i64) = conn
+        .query_row(
+            "SELECT change_id,root_id,operation_id,generation FROM refs
+             WHERE name='refs/branches/main'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let ref_name = format!("refs/lanes/{name}");
+    let workdir = fixture.workspace().join(".trail/worktrees").join(name);
+    fs::create_dir_all(workdir.join(".trail")).unwrap();
+    let workdir = workdir.to_string_lossy().to_string();
+    conn.execute(
+        "INSERT INTO refs(name,change_id,root_id,operation_id,generation,updated_at)
+         VALUES(?1,?2,?3,?4,?5,100)",
+        params![ref_name, change_id, root_id, operation_id, generation],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO lanes(lane_id,name,kind,provider,model,created_at,metadata_json)
+         VALUES(?1,?2,'coding-lane','test-provider','test-model',100,?3)",
+        params![lane_id, name, metadata.to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO lane_branches(
+             lane_id,ref_name,base_change,head_change,base_root,head_root,
+             session_id,workdir,status,created_at,updated_at)
+         VALUES(?1,?2,?3,?3,?4,?4,NULL,?5,'active',100,100)",
+        params![lane_id, ref_name, change_id, root_id, workdir],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO lane_events(
+             event_id,lane_id,turn_id,session_id,event_type,change_id,
+             message_id,payload_json,created_at)
+         VALUES(?1,?2,NULL,NULL,'lane_spawned',?3,NULL,'{}',100)",
+        params![format!("event_{lane_id}"), lane_id, change_id],
+    )
+    .unwrap();
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap();
+}
+
+fn migrate_single_legacy_lane(metadata: &serde_json::Value) -> trail::LaneInitializationReport {
+    let fixture = Schema18Fixture::clean();
+    insert_legacy_lane(&fixture, "legacy", "lane_legacy", metadata);
+    let db = Trail::open(fixture.workspace()).unwrap();
+    db.lane_initialization("legacy").unwrap().unwrap()
+}
+
 #[test]
 fn fresh_schema_19_has_the_exact_lane_initialization_contract() {
     let temp = tempfile::tempdir().unwrap();
@@ -258,10 +335,13 @@ fn schema_18_migrates_once_and_backfills_every_existing_lane() {
     let fixture = Schema18Fixture::with_clean_and_inconsistent_lanes();
     let db = Trail::open(fixture.workspace()).unwrap();
     assert_eq!(sqlite_user_version(fixture.db_path()), 19);
-    assert_eq!(
-        db.lane_initialization("clean").unwrap().unwrap().phase,
-        LaneInitializationPhase::ObserverReady
-    );
+    let conservative = db.lane_initialization("clean").unwrap().unwrap();
+    assert_eq!(conservative.phase, LaneInitializationPhase::RepairRequired);
+    assert!(conservative
+        .last_error_message
+        .as_deref()
+        .unwrap()
+        .contains("authenticated observer"));
     let repair = db.lane_initialization("missing-marker").unwrap().unwrap();
     assert_eq!(repair.phase, LaneInitializationPhase::RepairRequired);
     assert_eq!(
@@ -272,7 +352,7 @@ fn schema_18_migrates_once_and_backfills_every_existing_lane() {
         .last_error_message
         .as_deref()
         .unwrap()
-        .contains("clean checkpoint"));
+        .contains("authenticated observer"));
     assert_eq!(
         repair.repair_command.as_deref(),
         Some("trail lane repair-initialization missing-marker")
@@ -289,6 +369,209 @@ fn schema_18_migrates_once_and_backfills_every_existing_lane() {
             ))
             .unwrap(),
         2
+    );
+}
+
+#[test]
+fn equivalent_legacy_sparse_selections_share_one_request_fingerprint() {
+    let reordered = complete_legacy_metadata(serde_json::json!([
+        "src/lib.rs",
+        "./docs/guide.md",
+        "src/lib.rs"
+    ]));
+    let canonical = complete_legacy_metadata(serde_json::json!(["docs/guide.md", "src/lib.rs"]));
+
+    let first = Schema18Fixture::clean();
+    insert_legacy_lane(&first, "legacy", "lane_legacy", &reordered);
+    let second = Schema18Fixture::clean();
+    fs::copy(first.db_path(), second.db_path()).unwrap();
+    let conn = Connection::open(second.db_path()).unwrap();
+    conn.execute(
+        "UPDATE lanes SET metadata_json=?1 WHERE lane_id='lane_legacy'",
+        [canonical.to_string()],
+    )
+    .unwrap();
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap();
+    drop(conn);
+
+    let first_db = Trail::open(first.workspace()).unwrap();
+    let second_db = Trail::open(second.workspace()).unwrap();
+    assert_eq!(
+        first_db
+            .lane_initialization("legacy")
+            .unwrap()
+            .unwrap()
+            .request_fingerprint,
+        second_db
+            .lane_initialization("legacy")
+            .unwrap()
+            .unwrap()
+            .request_fingerprint
+    );
+}
+
+#[test]
+fn malformed_legacy_modes_neighbors_and_sparse_paths_require_repair() {
+    let cases = [
+        (
+            "requested_workdir_mode",
+            serde_json::json!({
+                "requested_workdir_mode": "made-up",
+                "workdir_mode": "portable-copy",
+                "workdir_backend": "copy",
+                "materialization": {"cloned_files": 0, "cloned_bytes": 0, "copied_files": 1, "copied_bytes": 7},
+                "sparse_paths": [],
+                "include_neighbors": false,
+                "transparent_cow_available": false
+            }),
+        ),
+        (
+            "include_neighbors",
+            serde_json::json!({
+                "requested_workdir_mode": "portable-copy",
+                "workdir_mode": "portable-copy",
+                "workdir_backend": "copy",
+                "materialization": {"cloned_files": 0, "cloned_bytes": 0, "copied_files": 1, "copied_bytes": 7},
+                "sparse_paths": [],
+                "include_neighbors": "false",
+                "transparent_cow_available": false
+            }),
+        ),
+        (
+            "sparse_paths",
+            serde_json::json!({
+                "requested_workdir_mode": "portable-copy",
+                "workdir_mode": "portable-copy",
+                "workdir_backend": "copy",
+                "materialization": {"cloned_files": 0, "cloned_bytes": 0, "copied_files": 1, "copied_bytes": 7},
+                "sparse_paths": ["/outside/workspace"],
+                "include_neighbors": false,
+                "transparent_cow_available": false
+            }),
+        ),
+    ];
+
+    for (field, metadata) in cases {
+        let report = migrate_single_legacy_lane(&metadata);
+        assert_eq!(report.phase, LaneInitializationPhase::RepairRequired);
+        assert_eq!(
+            report.last_error_code.as_deref(),
+            Some("LANE_INITIALIZATION_INCOMPLETE")
+        );
+        assert!(
+            report
+                .last_error_message
+                .as_deref()
+                .unwrap()
+                .contains(field),
+            "unexpected repair reason for {field}: {:?}",
+            report.last_error_message
+        );
+    }
+}
+
+#[test]
+fn database_only_observer_rows_and_incomplete_materialization_cannot_qualify() {
+    let fixture = Schema18Fixture::with_clean_and_inconsistent_lanes();
+    let db = Trail::open(fixture.workspace()).unwrap();
+    let synthetic = db.lane_initialization("clean").unwrap().unwrap();
+    assert_eq!(synthetic.phase, LaneInitializationPhase::RepairRequired);
+    assert!(synthetic
+        .last_error_message
+        .as_deref()
+        .unwrap()
+        .contains("authenticated observer"));
+    drop(db);
+
+    let incomplete = Schema18Fixture::with_clean_and_inconsistent_lanes();
+    let conn = Connection::open(incomplete.db_path()).unwrap();
+    conn.execute(
+        "UPDATE lanes
+         SET metadata_json=json_set(metadata_json,'$.materialization',json('{\"copied_files\":1}'))
+         WHERE name='clean'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let db = Trail::open(incomplete.workspace()).unwrap();
+    let report = db.lane_initialization("clean").unwrap().unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::RepairRequired);
+    assert!(report
+        .last_error_message
+        .as_deref()
+        .unwrap()
+        .contains("materialization"));
+}
+
+#[test]
+fn expiry_boundary_cannot_split_phase_from_repair_fields() {
+    let fixture = Schema18Fixture::with_clean_and_inconsistent_lanes();
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    conn.execute(
+        "UPDATE changed_path_observer_owners SET expires_at=500 WHERE scope_id='scope_clean'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    trail::test_support::install_schema_v19_backfill_times(vec![499, 501, 502]);
+    let db = Trail::open(fixture.workspace()).unwrap();
+    let remaining_times = trail::test_support::schema_v19_backfill_times_remaining();
+    trail::test_support::clear_schema_v19_backfill_times();
+    let report = db.lane_initialization("clean").unwrap().unwrap();
+    assert_eq!(
+        remaining_times, 1,
+        "backfill must snapshot time once per lane"
+    );
+
+    match report.phase {
+        LaneInitializationPhase::ObserverReady => {
+            assert_eq!(report.last_error_code, None);
+            assert_eq!(report.last_error_message, None);
+            assert_eq!(report.repair_command, None);
+        }
+        LaneInitializationPhase::RepairRequired => {
+            assert_eq!(
+                report.last_error_code.as_deref(),
+                Some("LANE_INITIALIZATION_INCOMPLETE")
+            );
+            assert!(report.last_error_message.is_some());
+            assert!(report.repair_command.is_some());
+        }
+        phase => panic!("legacy backfill wrote nonterminal phase {phase:?}"),
+    }
+}
+
+#[test]
+fn lane_initialization_exact_name_wins_over_lane_id_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let conn = Connection::open(Schema18Fixture::db_path_for(temp.path())).unwrap();
+    for (initialization_id, lane_name, lane_id) in [
+        ("id-match", "other-name", "collision"),
+        ("name-match", "collision", "other-id"),
+    ] {
+        conn.execute(
+            "INSERT INTO lane_initializations(
+                 initialization_id,lane_name,lane_id,request_fingerprint,operation_id,
+                 phase,created_at,updated_at)
+             VALUES(?1,?2,?3,'fingerprint','operation','repair_required',1,1)",
+            params![initialization_id, lane_name, lane_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let db = Trail::open(temp.path()).unwrap();
+    assert_eq!(
+        db.lane_initialization("collision")
+            .unwrap()
+            .unwrap()
+            .initialization_id,
+        "name-match"
     );
 }
 

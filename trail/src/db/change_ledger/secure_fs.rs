@@ -568,7 +568,7 @@ impl SecureDirectory {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn verify_private(&self) -> Result<()> {
+    pub(crate) fn verify_private(&self) -> Result<()> {
         use rustix::fs::{fstat, FileType};
 
         let metadata = fstat(&self.file).map_err(|error| Error::Io(error.into()))?;
@@ -581,6 +581,14 @@ impl SecureDirectory {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn verify_private(&self) -> Result<()> {
+        let _ = self;
+        Err(Error::InvalidInput(
+            "secure private marker directory is unsupported".into(),
+        ))
     }
 }
 

@@ -17,6 +17,10 @@ mod view_core;
 mod view_journal;
 mod view_layout;
 
+pub(crate) use marker::{
+    actual_sparse_selection_fingerprint_read_only, materialized_lane_root_identity,
+    read_materialized_lane_marker_v2,
+};
 pub(crate) use materialize::*;
 #[cfg(debug_assertions)]
 pub(crate) use record::{
