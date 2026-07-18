@@ -211,6 +211,13 @@ enum EndpointState {
     Stale(VerifiedStaleOwnerHandoff),
 }
 
+fn is_canonical_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn classify_endpoint(
     workspace: &Path,
     authority: &SecureAuthority,
@@ -237,7 +244,7 @@ fn classify_endpoint(
     if endpoint.workspace_identity != expected_workspace {
         invalid.push("workspace");
     }
-    if endpoint.executable_identity.len() != 64 {
+    if !is_canonical_sha256_hex(&endpoint.executable_identity) {
         invalid.push("executable_identity");
     }
     if endpoint.url != format!("unix://{}", expected_socket.display()) {
@@ -1148,7 +1155,7 @@ fn recover_stale_starting_publication(
     if starting.process_start_identity.is_empty() {
         invalid.push("process_start_identity");
     }
-    if starting.executable_identity.len() != 64 {
+    if !is_canonical_sha256_hex(&starting.executable_identity) {
         invalid.push("executable_identity");
     }
     if starting.workspace_identity != workspace_identity(workspace)? {

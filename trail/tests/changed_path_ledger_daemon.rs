@@ -866,6 +866,28 @@ fn dead_daemon_from_previous_executable_is_replaced_after_upgrade() {
 }
 
 #[test]
+fn dead_daemon_rejects_non_hex_executable_identity() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let endpoint = fixture.endpoint();
+    kill_and_wait(endpoint.pid);
+
+    let mut malformed: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.endpoint_path()).unwrap()).unwrap();
+    malformed["executable_identity"] = serde_json::json!("g".repeat(64));
+    write_owner_file(
+        &fixture.endpoint_path(),
+        &serde_json::to_vec_pretty(&malformed).unwrap(),
+    );
+
+    assert_status_failed_for(
+        &fixture.status(),
+        "dead daemon with a non-hex executable identity",
+    );
+    assert!(fixture.endpoint_path().exists());
+}
+
+#[test]
 fn killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change() {
     let fixture = Fixture::new();
     assert!(fixture.status().status.success());
@@ -1829,6 +1851,31 @@ fn dead_starting_publication_from_previous_executable_recovers_after_upgrade() {
         "upgrade startup recovery failed: {}",
         String::from_utf8_lossy(&recovered.stderr)
     );
+}
+
+#[test]
+fn dead_starting_publication_rejects_non_hex_executable_identity() {
+    let fixture = Fixture::new();
+    let crashed = fixture.status_with_env(&[(
+        "TRAIL_TEST_WORKSPACE_DAEMON_EXIT_AFTER_OWNER_ACQUIRE_BEFORE_BOUND_PUBLICATION",
+        "1",
+    )]);
+    assert_status_failed(&crashed);
+
+    let starting_path = fixture.authority().join("daemon.starting.json");
+    let mut malformed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&starting_path).unwrap()).unwrap();
+    malformed["executable_identity"] = serde_json::json!("g".repeat(64));
+    write_owner_file(
+        &starting_path,
+        &serde_json::to_vec_pretty(&malformed).unwrap(),
+    );
+
+    assert_status_failed_for(
+        &fixture.status(),
+        "dead starting publication with a non-hex executable identity",
+    );
+    assert!(starting_path.exists());
 }
 
 #[test]

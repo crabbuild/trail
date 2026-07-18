@@ -495,7 +495,9 @@ impl Trail {
 
     pub fn refresh_worktree_index(&self) -> Result<WorktreeIndexReport> {
         let started = Instant::now();
-        let refresh = self.refresh_worktree_index_streaming_report()?;
+        let branch = self.current_branch()?;
+        let head = self.resolve_branch_ref(&branch)?;
+        let refresh = self.refresh_worktree_index_streaming_report(&head.root_id)?;
         Ok(WorktreeIndexReport {
             files: refresh.files,
             indexed_entries: self.worktree_index_count()?,
@@ -503,10 +505,15 @@ impl Trail {
         })
     }
 
-    pub(crate) fn refresh_worktree_index_streaming_report(&self) -> Result<WorktreeIndexRefresh> {
+    pub(crate) fn refresh_worktree_index_streaming_report(
+        &self,
+        root_id: &ObjectId,
+    ) -> Result<WorktreeIndexRefresh> {
+        let preserved_paths = self.workspace_preserved_paths(root_id)?;
         let scan_id = worktree_scan_id();
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = self.refresh_worktree_index_streaming_in_transaction(scan_id);
+        let result =
+            self.refresh_worktree_index_streaming_in_transaction(scan_id, &preserved_paths);
         match result {
             Ok(count) => {
                 self.conn.execute_batch("COMMIT;")?;
@@ -522,6 +529,7 @@ impl Trail {
     fn refresh_worktree_index_streaming_in_transaction(
         &self,
         scan_id: i64,
+        preserved_paths: &BTreeSet<String>,
     ) -> Result<WorktreeIndexRefresh> {
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),
@@ -597,40 +605,39 @@ impl Trail {
             });
             count += 1;
         }
-        if let Some(tracked_paths) = self.scan_git_tracked_paths_impl(false)? {
-            for rel in tracked_paths {
-                if seen_paths.contains(&rel) {
-                    continue;
-                }
-                let path = safe_join(&root, &rel)?;
-                filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
-                    .delta
-                    .filesystem_stat_count
-                    .saturating_add(1);
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(Error::Io(error)),
-                };
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    continue;
-                }
-                seen_paths.insert(rel.clone());
-                let stamp = WorktreeFileStamp::from_metadata(&metadata);
-                if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
-                    indexed_seen += 1;
-                    if cached_stamp == stamp {
-                        count += 1;
-                        continue;
-                    }
-                }
-                read_candidates.push(WorktreeIndexReadCandidate {
-                    path: rel,
-                    abs_path: path,
-                    stamp,
-                });
-                count += 1;
+        for rel in preserved_paths {
+            let rel = rel.clone();
+            if seen_paths.contains(&rel) {
+                continue;
             }
+            let path = safe_join(&root, &rel)?;
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(Error::Io(error)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            seen_paths.insert(rel.clone());
+            let stamp = WorktreeFileStamp::from_metadata(&metadata);
+            if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
+                indexed_seen += 1;
+                if cached_stamp == stamp {
+                    count += 1;
+                    continue;
+                }
+            }
+            read_candidates.push(WorktreeIndexReadCandidate {
+                path: rel,
+                abs_path: path,
+                stamp,
+            });
+            count += 1;
         }
         drop(cached_stmt);
 

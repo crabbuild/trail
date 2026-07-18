@@ -714,7 +714,7 @@ impl Trail {
     pub(crate) fn git_qualification_full_scan_oracle_for_test(&self) -> Result<Vec<String>> {
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;
-        let disk_files = self.scan_workspace_files_preserving_git_tracked()?;
+        let disk_files = self.scan_workspace_files_preserving_root_paths(&head.root_id)?;
         let manifest = self.disk_manifest(&disk_files);
         Ok(self
             .diff_root_to_disk_manifest(&head.root_id, &manifest)?

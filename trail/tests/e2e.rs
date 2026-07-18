@@ -23226,6 +23226,38 @@ fn strict_native_cow_accepts_a_git_tracked_file_inside_an_ignored_directory() {
 }
 
 #[test]
+fn non_git_ignore_cannot_hide_a_trail_baseline_file() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("generated")).unwrap();
+    fs::write(temp.path().join("generated/tracked.txt"), "baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join(".trailignore"), "generated/\n").unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+
+    let status = db.status(None).unwrap();
+    assert!(
+        status.changed_paths.is_empty(),
+        "a present immutable Trail baseline file must not become a deletion when ignored: {:?}",
+        status.changed_paths
+    );
+
+    let recorded = db
+        .record(
+            None,
+            Some("ignore existing baseline".into()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+    assert!(recorded.operation.is_none());
+    assert!(recorded.changed_paths.is_empty());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("generated/tracked.txt")).unwrap(),
+        "baseline\n"
+    );
+}
+
+#[test]
 fn strict_native_cow_reuses_a_complete_clean_lane_source() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();

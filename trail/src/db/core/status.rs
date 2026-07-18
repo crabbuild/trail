@@ -183,7 +183,7 @@ impl Trail {
                     .summaries);
             }
         }
-        let refresh = self.refresh_worktree_index_streaming_report()?;
+        let refresh = self.refresh_worktree_index_streaming_report(root_id)?;
         let baseline = self.worktree_index_baseline_root()?;
         if !refresh.changed && self.clean_baseline_matches_visible_root(baseline.as_ref(), root_id)
         {
@@ -215,7 +215,7 @@ impl Trail {
                     .summaries);
             }
         }
-        let disk_files = self.scan_workspace_files_preserving_git_tracked()?;
+        let disk_files = self.scan_workspace_files_preserving_root_paths(root_id)?;
         let disk_manifest = self.disk_manifest(&disk_files);
         self.diff_root_to_disk_manifest(root_id, &disk_manifest)
     }

@@ -466,11 +466,16 @@ mod tests {
 
     #[test]
     fn git_root_and_nested_policy_changes_force_full_fallback_before_filtering() {
-        for (policy_path, pattern) in [
-            ("nested/.trailignore", "hidden.txt\n"),
-            ("nested/.gitignore", "hidden.txt\n"),
-            (".trailignore", "nested/hidden.txt\n"),
-            (".gitignore", "nested/hidden.txt\n"),
+        // Exact counts come from the raw Git policy candidates for each
+        // fixture followed by component-aware selection compaction. Nested
+        // policy files retain their policy path in addition to the affected
+        // baseline path; the root .trailignore is itself the single compact
+        // selection, while a root .gitignore remains a second selection.
+        for (policy_path, pattern, expected_input, expected_canonical) in [
+            ("nested/.trailignore", "hidden.txt\n", 4, 1),
+            ("nested/.gitignore", "hidden.txt\n", 4, 2),
+            (".trailignore", "nested/hidden.txt\n", 3, 1),
+            (".gitignore", "nested/hidden.txt\n", 4, 2),
         ] {
             let temp = init_git_policy_visibility_workspace(policy_path, pattern);
             fs::write(temp.path().join(policy_path), "").unwrap();
@@ -496,13 +501,10 @@ mod tests {
             let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
             assert_eq!(report.git_global_work_count, 2, "{policy_path}");
             assert_eq!(report.full_filesystem_walk_count, 1, "{policy_path}");
-            assert!(
-                (3..=4).contains(&report.input_path_count),
-                "{policy_path}: {report:?}"
-            );
-            assert!(
-                (1..=4).contains(&report.canonical_path_count),
-                "{policy_path}: {report:?}"
+            assert_eq!(report.input_path_count, expected_input, "{policy_path}");
+            assert_eq!(
+                report.canonical_path_count, expected_canonical,
+                "{policy_path}"
             );
             assert_eq!(report.policy_build_count, 1, "{policy_path}");
         }

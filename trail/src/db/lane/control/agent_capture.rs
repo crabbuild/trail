@@ -1826,7 +1826,7 @@ impl Trail {
         // Refreshing a native workspace index walks the repository-shaped
         // checkout rather than an explicitly bounded sparse selection.
         self.note_full_filesystem_path_scan();
-        self.refresh_worktree_index_streaming_report()?;
+        self.refresh_worktree_index_streaming_report(&head.root_id)?;
         let summaries = self.diff_root_to_worktree_index(&head.root_id)?;
         if summaries.is_empty() {
             self.set_worktree_index_baseline(&head.root_id)?;

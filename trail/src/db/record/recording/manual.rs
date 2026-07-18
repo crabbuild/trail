@@ -291,7 +291,7 @@ impl Trail {
             build_selection_set = Some(selections.clone());
             record_generation = None;
         } else {
-            let refresh = self.refresh_worktree_index_streaming_report()?;
+            let refresh = self.refresh_worktree_index_streaming_report(&head.root_id)?;
             let baseline = self.worktree_index_baseline_root()?;
             if !refresh.changed
                 && self.clean_baseline_matches_visible_root(baseline.as_ref(), &head.root_id)
