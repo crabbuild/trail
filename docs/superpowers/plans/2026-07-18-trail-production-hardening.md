@@ -64,7 +64,7 @@ Run:
 
 ```bash
 cargo test -p trail --test changed_path_ledger_activation tracked_gitignored_file_remains_clean_after_git_import -- --exact --nocapture
-cargo test -p trail --test changed_path_ledger_activation trail_full_scan_policy_oracle_matches_nested_untracked_and_ignored_candidates -- --exact --nocapture
+cargo test -p trail --test changed_path_ledger_git trail_full_scan_policy_oracle_matches_nested_untracked_and_ignored_candidates -- --exact --nocapture
 cargo test -p trail --test e2e lane_workdir_local_ignore_cannot_hide_materialized_tracked_files -- --exact --nocapture
 ```
 
@@ -259,15 +259,15 @@ pub(crate) fn create_schema_v18_for_test(conn: &Connection) -> Result<()>;
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn create_schema_v18_fixture_for_test(workspace: &Path) -> Result<()>;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) enum SchemaV19MigrationBoundary { AfterDdlBeforeUserVersion }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn install_schema_v19_migration_failure(
     db_path: &Path, boundary: SchemaV19MigrationBoundary,
 );
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn clear_schema_v19_migration_failure(db_path: &Path);
 ```
 
@@ -321,7 +321,7 @@ Expected: PASS; the old suite now explicitly treats 18 as the only migratable pr
 - [ ] **Step 7: Commit schema 19 independently**
 
 ```bash
-git add trail/src/db trail/tests/schema_v19_lane_initializations.rs trail/tests/schema_v18_hard_cutover.rs
+git add trail/src/db trail/src/model/reports/lane.rs trail/src/lib.rs trail/tests/schema_v19_lane_initializations.rs trail/tests/schema_v18_hard_cutover.rs
 git commit -m "feat: add durable lane initialization schema"
 ```
 
@@ -798,6 +798,8 @@ pub(crate) fn recovery_state(upperdir: &Path) -> Result<ViewJournalRecoveryState
 
 Populate it only after validating state, both journal files, and tail anchor identity. Do not infer hashes from an unauthenticated mirror.
 
+Extend `clean-checkpoint.json` with authenticated `mutation_cut_hash` and `whiteout_cut_hash` fields when the marker is first written. A crash-after-rotation recovery accepts a journal one generation newer only when its base sequence and both base hashes equal this marker; if the marker is missing, legacy, or contradictory, fail closed instead of reconstructing authority from the newer journal itself.
+
 - [ ] **Step 4: Implement the exact recovery decision table**
 
 In `recover_workspace_checkpoint_markers`:
@@ -866,7 +868,7 @@ git commit -m "fix: preserve dirty workspace journal tails"
 Run with `RUST_TEST_THREADS=1`:
 
 ```bash
-cargo test -p trail changed_path_producer_inventory_matches_reviewed_fixture -- --exact --nocapture
+cargo test -p trail --test changed_path_ledger_activation authority_requires_every_checked_gate_and_supported_platform -- --exact --nocapture
 cargo test -p trail db::change_ledger::policy::tests::missing_and_empty_legacy_git_config_selectors_are_persisted --lib -- --exact --nocapture
 cargo test -p trail db::change_ledger::daemon::tests::persistent_startup_policy_churn_exhausts_the_bound_and_fails_closed --lib -- --exact --nocapture
 cargo test -p trail db::change_ledger::recovery::harness::subprocess_kill_and_reopen_covers_intent_durability_boundaries --lib -- --exact --nocapture
@@ -986,7 +988,7 @@ impl<K: Eq + Hash + Clone + 'static, V: 'static> Drop for ScopedTestState<K, V> 
 }
 ```
 
-Inside the existing debug-only `test_support` module in `trail/src/lib.rs`, declare `#[path = "scoped_state.rs"] pub(crate) mod scoped_state;` so the new file resolves as `trail/src/test_support/scoped_state.rs` without moving the existing public test-support API.
+Inside the existing debug-only `test_support` module in `trail/src/lib.rs`, declare `pub(crate) mod scoped_state { include!("test_support/scoped_state.rs"); }` so the new file resolves relative to `trail/src/lib.rs` without moving the existing public test-support API.
 
 Use canonical temp workspace path plus a unique test nonce as the key. Environment overrides must use the existing serialized scoped-environment helper and restore the prior value on drop. Runtime sockets/locks must live below each fixture’s `.trail/tmp/tests/<nonce>` rather than a shared process path. The specific isolated regressions are `queue_overflow_spills_every_frame_and_shutdown_is_bounded`, `production_server_start_does_not_rendezvous_with_the_spawned_thread`, `generation_replacement_does_not_wait_for_the_old_server`, `schema_validation_leader_failure_propagates_and_next_open_retries`, and `one_hundred_concurrent_duplicate_receipts_create_one_journal_row`.
 
