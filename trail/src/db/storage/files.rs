@@ -2917,7 +2917,9 @@ mod tests {
         let record = db.record_lane_workdir("metric-full-record", None).unwrap();
         assert_eq!(record.path_index.mode, "indexed");
         assert_eq!(record.path_index.lookup_count, 1);
-        assert_eq!(record.path_index.full_root_path_load_count, 1);
+        // A missing workdir manifest requires one pinned-baseline load before
+        // the ordinary record root traversal.
+        assert_eq!(record.path_index.full_root_path_load_count, 2);
         assert_eq!(record.path_index.full_filesystem_path_scan_count, 1);
     }
 
@@ -3086,7 +3088,7 @@ mod tests {
         let metrics = db.case_fold_index_metrics_report();
         assert_eq!(metrics.mode, "indexed");
         assert!(metrics.lookup_count <= 1, "{metrics:?}");
-        assert_eq!(metrics.full_root_path_load_count, 1);
+        assert_eq!(metrics.full_root_path_load_count, 2);
         assert_eq!(count_rows("objects"), objects_before);
         assert_eq!(count_rows("prolly_nodes"), prolly_before);
     }

@@ -253,6 +253,7 @@ impl Trail {
         root: &PinnedWorktreeRoot,
         matcher: &CompiledRecordingMatcher,
         prefixes: &[String],
+        baseline_paths: &BTreeSet<String>,
         retain_bytes: bool,
         mut visitor: F,
     ) -> Result<()>
@@ -265,7 +266,9 @@ impl Trail {
 
         let prefixes = minimal_component_selections(prefixes);
         for prefix in prefixes {
-            if matcher.is_ignored(&prefix, false)? {
+            if matcher.is_ignored(&prefix, false)?
+                && !baseline_paths_intersect(baseline_paths, &prefix)
+            {
                 continue;
             }
             if let Some(file) = read_reconciliation_file_no_follow(
@@ -308,7 +311,9 @@ impl Trail {
                     };
                     match FileType::from_raw_mode(stat.st_mode) {
                         FileType::Directory => {
-                            if matcher.is_ignored(&relative, true)? {
+                            if matcher.is_ignored(&relative, true)?
+                                && !baseline_paths_intersect(baseline_paths, &relative)
+                            {
                                 continue;
                             }
                             let child = openat(
@@ -324,7 +329,9 @@ impl Trail {
                             pending.push((fs::File::from(child), relative));
                         }
                         FileType::RegularFile => {
-                            if matcher.is_ignored(&relative, false)? {
+                            if matcher.is_ignored(&relative, false)?
+                                && !baseline_paths.contains(&relative)
+                            {
                                 continue;
                             }
                             if let Some(file) = read_reconciliation_file_no_follow(
@@ -350,6 +357,7 @@ impl Trail {
         _root: &PinnedWorktreeRoot,
         _matcher: &CompiledRecordingMatcher,
         _prefixes: &[String],
+        _baseline_paths: &BTreeSet<String>,
         _retain_bytes: bool,
         _visitor: F,
     ) -> Result<()>
@@ -536,6 +544,7 @@ impl Trail {
         let walker = builder.build();
         let mut count = 0u64;
         let mut indexed_seen = 0u64;
+        let mut seen_paths = BTreeSet::new();
         let mut read_candidates = Vec::new();
         let mut cached_stmt = self.conn.prepare(
             "SELECT size_bytes, modified_ns, changed_ns, device_id, inode, executable \
@@ -565,6 +574,8 @@ impl Trail {
                 continue;
             }
 
+            seen_paths.insert(rel.clone());
+
             filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
                 .delta
                 .filesystem_stat_count
@@ -586,6 +597,41 @@ impl Trail {
             });
             count += 1;
         }
+        if let Some(tracked_paths) = self.scan_git_tracked_paths_impl(false)? {
+            for rel in tracked_paths {
+                if seen_paths.contains(&rel) {
+                    continue;
+                }
+                let path = safe_join(&root, &rel)?;
+                filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                    .delta
+                    .filesystem_stat_count
+                    .saturating_add(1);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(Error::Io(error)),
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    continue;
+                }
+                seen_paths.insert(rel.clone());
+                let stamp = WorktreeFileStamp::from_metadata(&metadata);
+                if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
+                    indexed_seen += 1;
+                    if cached_stamp == stamp {
+                        count += 1;
+                        continue;
+                    }
+                }
+                read_candidates.push(WorktreeIndexReadCandidate {
+                    path: rel,
+                    abs_path: path,
+                    stamp,
+                });
+                count += 1;
+            }
+        }
         drop(cached_stmt);
 
         let has_deleted_index_entries = indexed_seen < indexed_entries;
@@ -604,8 +650,7 @@ impl Trail {
             )?;
         }
         if has_deleted_index_entries {
-            let seen = self.scan_visible_worktree_paths()?;
-            self.prune_worktree_index(&seen)?;
+            self.prune_worktree_index(&seen_paths)?;
         }
         if changed {
             self.clear_worktree_index_baseline()?;
@@ -706,6 +751,65 @@ impl Trail {
                     stamp,
                 },
             );
+        }
+        if let Some(tracked_paths) = self.scan_git_tracked_paths_impl(false)? {
+            for rel in tracked_paths {
+                if seen.contains(&rel) {
+                    continue;
+                }
+                let path = safe_join(&root, &rel)?;
+                filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                    .delta
+                    .filesystem_stat_count
+                    .saturating_add(1);
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(Error::Io(error)),
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    continue;
+                }
+                let stamp = WorktreeFileStamp::from_metadata(&metadata);
+                let disk_manifest =
+                    if let Some(cached) = self.cached_worktree_manifest(&rel, stamp)? {
+                        cached
+                    } else {
+                        filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
+                            .delta
+                            .filesystem_read_count
+                            .saturating_add(1);
+                        let bytes = fs::read(&path)?;
+                        let bytes_len = saturating_u64_from_usize(bytes.len());
+                        filesystem_metrics.delta.filesystem_read_bytes = filesystem_metrics
+                            .delta
+                            .filesystem_read_bytes
+                            .saturating_add(bytes_len);
+                        filesystem_metrics.delta.filesystem_hash_count = filesystem_metrics
+                            .delta
+                            .filesystem_hash_count
+                            .saturating_add(1);
+                        filesystem_metrics.delta.filesystem_hash_bytes = filesystem_metrics
+                            .delta
+                            .filesystem_hash_bytes
+                            .saturating_add(bytes_len);
+                        let disk_manifest = DiskManifest {
+                            kind: classify_file_kind(&bytes, &self.config.text),
+                            executable: stamp.executable,
+                            content_hash: sha256_hex(&bytes),
+                        };
+                        self.upsert_worktree_index_manifest(&rel, stamp, &disk_manifest)?;
+                        disk_manifest
+                    };
+                seen.insert(rel.clone());
+                manifest.insert(
+                    rel,
+                    IndexedDiskManifest {
+                        manifest: disk_manifest,
+                        stamp,
+                    },
+                );
+            }
         }
         self.prune_worktree_index(&seen)?;
         Ok(manifest)
@@ -831,54 +935,6 @@ impl Trail {
             }
         }
         Ok(indexed)
-    }
-
-    fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
-        let mut filesystem_metrics = OperationMetricsAccumulator::new(
-            self.operation_metrics.as_ref(),
-            OperationMetricsDelta {
-                full_filesystem_walk_count: 1,
-                ..OperationMetricsDelta::default()
-            },
-        );
-        let root = self.workspace_root.canonicalize()?;
-        let mut builder = WalkBuilder::new(&root);
-        builder
-            .hidden(false)
-            .git_ignore(self.config.recording.ignore_gitignored)
-            .git_exclude(self.config.recording.ignore_gitignored)
-            .git_global(self.config.recording.ignore_gitignored)
-            .add_custom_ignore_filename(".trailignore");
-
-        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
-        let walker = builder.build();
-        let mut paths = BTreeSet::new();
-        for item in walker {
-            let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
-            let path = entry.path();
-            if path == root {
-                continue;
-            }
-            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
-                .delta
-                .filesystem_entry_count
-                .saturating_add(1);
-            let rel = path
-                .strip_prefix(&root)
-                .map_err(|err| Error::InvalidInput(err.to_string()))?;
-            let rel = normalize_relative_path(&rel.to_string_lossy())?;
-            if entry.file_type().is_some_and(|kind| kind.is_dir()) && is_default_ignored(&rel) {
-                continue;
-            }
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                continue;
-            }
-            if is_default_ignored(&rel) {
-                continue;
-            }
-            paths.insert(rel);
-        }
-        Ok(paths)
     }
 
     pub(crate) fn update_worktree_index_from_disk_files_and_manifest(
@@ -1628,6 +1684,17 @@ fn minimal_component_selections(selections: &[String]) -> Vec<String> {
         }
     }
     minimal.into_iter().collect()
+}
+
+fn baseline_paths_intersect(paths: &BTreeSet<String>, selection: &str) -> bool {
+    if paths.contains(selection) {
+        return true;
+    }
+    let descendant_prefix = format!("{selection}/");
+    paths
+        .range(descendant_prefix.clone()..)
+        .next()
+        .is_some_and(|path| path.starts_with(&descendant_prefix))
 }
 
 fn selected_path_descendant_bounds(selection: &str) -> (String, String) {
@@ -2718,7 +2785,7 @@ mod tests {
             status.changed_paths
         );
         let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
-        assert_eq!(report.git_global_work_count, 1);
+        assert_eq!(report.git_global_work_count, 2);
         assert_eq!(report.full_filesystem_walk_count, 1);
     }
 

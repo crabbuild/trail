@@ -239,9 +239,6 @@ impl crate::Trail {
         )?;
         let mut exact = BTreeSet::new();
         for path in &snapshot.exact_paths {
-            if matcher.is_ignored(path.as_str(), false)? {
-                continue;
-            }
             if transient_case_probes.contains(path.as_str())
                 && !baseline_case_probes.contains_key(path.as_str())
                 && self
@@ -257,8 +254,28 @@ impl crate::Trail {
             .iter()
             .filter(|prefix| prefix.complete)
             .map(|prefix| prefix.path.as_str().to_string())
+            .collect::<Vec<_>>();
+        let mut candidate_selections = exact.iter().cloned().collect::<Vec<_>>();
+        candidate_selections.extend(prefixes.iter().cloned());
+        candidate_selections.sort();
+        candidate_selections.dedup();
+        let baseline_files = self.load_root_files_for_selections(root_id, &candidate_selections)?;
+        let mut exact = exact
+            .into_iter()
+            .filter_map(|path| match matcher.is_ignored(&path, false) {
+                Ok(false) => Some(Ok(path)),
+                Ok(true) if baseline_files.contains_key(&path) => Some(Ok(path)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let prefixes = prefixes
+            .into_iter()
             .filter_map(|prefix| match matcher.is_ignored(&prefix, false) {
                 Ok(false) => Some(Ok(prefix)),
+                Ok(true) if baseline_contains_path_or_descendant(&baseline_files, &prefix) => {
+                    Some(Ok(prefix))
+                }
                 Ok(true) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -279,7 +296,6 @@ impl crate::Trail {
             authoritative_candidate_count: selections.len().try_into().unwrap_or(u64::MAX),
             ..OperationMetricsDelta::default()
         });
-        let baseline_files = self.load_root_files_for_selections(root_id, &selections)?;
         if selections.is_empty() {
             if !self.verify_pinned_worktree_root(&pinned)? {
                 return Err(crate::Error::ChangeLedgerReconcileRequired {
@@ -300,9 +316,6 @@ impl crate::Trail {
         let mut disk_manifest = BTreeMap::new();
         let mut disk_files = materialization.retains_bytes().then(Vec::new);
         for path in exact {
-            if matcher.is_ignored(&path, false)? {
-                continue;
-            }
             if let Some(file) = self.read_pinned_candidate_path(
                 &pinned,
                 policy,
@@ -339,6 +352,7 @@ impl crate::Trail {
             &pinned,
             &matcher,
             &prefixes,
+            &baseline_files.keys().cloned().collect(),
             materialization.retains_bytes(),
             |file| {
                 let bytes = file.bytes;
@@ -391,6 +405,20 @@ impl crate::Trail {
     }
 }
 
+fn baseline_contains_path_or_descendant(
+    baseline_files: &BTreeMap<String, FileEntry>,
+    path: &str,
+) -> bool {
+    if baseline_files.contains_key(path) {
+        return true;
+    }
+    let descendant_prefix = format!("{path}/");
+    baseline_files
+        .range(descendant_prefix.clone()..)
+        .next()
+        .is_some_and(|(candidate, _)| candidate.starts_with(&descendant_prefix))
+}
+
 #[cfg(debug_assertions)]
 pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
     run_command_flow_inner(false)
@@ -399,6 +427,103 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
 #[cfg(debug_assertions)]
 pub(crate) fn run_command_long_lock_flow() -> std::result::Result<(), String> {
     run_command_flow_inner(true)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_tracked_ignored_candidate_flow() -> std::result::Result<(), String> {
+    use crate::model::Actor;
+    use crate::{InitImportMode, Trail};
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    static FLOW: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = FLOW
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct OverrideReset;
+    impl Drop for OverrideReset {
+        fn drop(&mut self) {
+            set_command_authority_override(false);
+        }
+    }
+
+    let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false)
+        .map_err(|error| error.to_string())?;
+    fs::create_dir(temp.path().join("tree")).map_err(|error| error.to_string())?;
+    fs::write(temp.path().join("tree/tracked.txt"), b"tracked\n")
+        .map_err(|error| error.to_string())?;
+    let mut db = Trail::open(temp.path()).map_err(|error| error.to_string())?;
+    db.record(None, Some("baseline".into()), Actor::human(), false)
+        .map_err(|error| error.to_string())?;
+
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(temp.path())
+        .args(["init", "--quiet"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !git.status.success() {
+        return Err(format!(
+            "initialize tracked-ignore candidate fixture: {}",
+            String::from_utf8_lossy(&git.stderr)
+        ));
+    }
+    fs::write(temp.path().join(".git/info/exclude"), b"tree/\n")
+        .map_err(|error| error.to_string())?;
+    fs::write(temp.path().join("tree/untracked.txt"), b"ignored\n")
+        .map_err(|error| error.to_string())?;
+
+    super::prepare_workspace_daemon(&mut db, false).map_err(|error| error.to_string())?;
+    set_command_authority_override(true);
+    let _reset = OverrideReset;
+    let (scope_id, provider_id): (String, String) = db
+        .conn
+        .query_row(
+            "SELECT scope_id,provider_id FROM changed_path_scopes
+             WHERE scope_kind='workspace'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    db.conn
+        .execute(
+            "INSERT INTO changed_path_prefixes(
+                 scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                 first_sequence,last_sequence,provider_id,provider_sequence,created_at,updated_at
+             ) VALUES(?1,'tree','provider_complete',?2,?3,1,1,?4,1,
+                      strftime('%s','now'),strftime('%s','now'))",
+            params![
+                scope_id,
+                super::EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0,
+                super::EvidenceSource::Observer.mask(),
+                provider_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let (comparison, _) = db
+        .with_workspace_authoritative_snapshot(|db, policy, candidates| {
+            db.compare_authoritative_candidates(
+                policy,
+                candidates,
+                &candidates.expected.baseline_root,
+                CandidateMaterialization::ManifestOnly,
+            )
+        })
+        .map_err(|error| format!("tracked-ignore candidate comparison: {error}"))?;
+    if !comparison.summaries.is_empty()
+        || !comparison.disk_manifest.contains_key("tree/tracked.txt")
+        || comparison.disk_manifest.contains_key("tree/untracked.txt")
+    {
+        return Err(format!(
+            "tracked-ignore candidate filtering mismatch: summaries={:?}, paths={:?}",
+            comparison.summaries,
+            comparison.disk_manifest.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(debug_assertions)]

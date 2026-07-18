@@ -108,6 +108,8 @@ reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|fs::rename|2
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|fs::write|3
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|OpenOptions::append|1
+reviewed|db/change_ledger/snapshot.rs|run_tracked_ignored_candidate_flow|fs::create_dir|1
+reviewed|db/change_ledger/snapshot.rs|run_tracked_ignored_candidate_flow|fs::write|3
 reviewed|db/core/backup/create.rs|create_backup_inner|fs::copy|3
 reviewed|db/core/backup/create.rs|create_backup_inner|fs::create_dir_all|3
 reviewed|db/core/backup/create.rs|create_backup_inner|fs::write|3

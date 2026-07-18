@@ -566,7 +566,17 @@ impl Trail {
                 )
             }
             CachedWorkdirManifestStatus::Missing => {
-                let disk_files = self.scan_files_under(&workdir_path)?;
+                let pinned_paths = if let Some(selected_paths) = sparse_paths.as_ref() {
+                    self.load_root_files_for_selections(&head.root_id, selected_paths)?
+                        .into_keys()
+                        .collect::<Vec<_>>()
+                } else {
+                    self.load_root_files(&head.root_id)?
+                        .into_keys()
+                        .collect::<Vec<_>>()
+                };
+                let disk_files =
+                    self.scan_files_under_preserving_pinned_paths(&workdir_path, &pinned_paths)?;
                 if let Some(mut selected_paths) = sparse_paths.clone() {
                     selected_paths.extend(disk_files.iter().map(|file| file.path.clone()));
                     selected_paths.sort();
@@ -1131,7 +1141,17 @@ impl Trail {
                 }
             }
             CachedWorkdirManifestStatus::Missing => {
-                let disk_files = self.scan_files_under(workdir_path)?;
+                let pinned_paths = if let Some(selected_paths) = sparse_paths.as_ref() {
+                    self.load_root_files_for_selections(&head.root_id, selected_paths)?
+                        .into_keys()
+                        .collect::<Vec<_>>()
+                } else {
+                    self.load_root_files(&head.root_id)?
+                        .into_keys()
+                        .collect::<Vec<_>>()
+                };
+                let disk_files =
+                    self.scan_files_under_preserving_pinned_paths(workdir_path, &pinned_paths)?;
                 let disk_manifest = self.disk_manifest(&disk_files);
                 if let Some(mut selected_paths) = sparse_paths {
                     selected_paths.extend(disk_files.iter().map(|file| file.path.clone()));

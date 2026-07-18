@@ -28,7 +28,8 @@ pub(crate) use snapshot::{
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
     run_command_flow, run_command_long_lock_flow, run_materialized_candidate_lifecycle_flow,
-    run_materialized_lane_snapshot_flow, set_command_authority_override,
+    run_materialized_lane_snapshot_flow, run_tracked_ignored_candidate_flow,
+    set_command_authority_override,
 };
 
 #[allow(unused_imports)]

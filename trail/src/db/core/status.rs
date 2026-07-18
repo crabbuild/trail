@@ -215,7 +215,7 @@ impl Trail {
                     .summaries);
             }
         }
-        let disk_files = self.scan_files_under(&self.workspace_root)?;
+        let disk_files = self.scan_workspace_files_preserving_git_tracked()?;
         let disk_manifest = self.disk_manifest(&disk_files);
         self.diff_root_to_disk_manifest(root_id, &disk_manifest)
     }

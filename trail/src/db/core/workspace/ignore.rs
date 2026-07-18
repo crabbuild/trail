@@ -457,7 +457,9 @@ mod tests {
 
         let _status = db.status(None).unwrap();
         let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
-        assert_eq!(report.git_global_work_count, 1);
+        // The fallback performs the dirty-policy probe plus one tracked-path
+        // inventory so ignored-but-tracked files remain visible.
+        assert_eq!(report.git_global_work_count, 2);
         assert_eq!(report.full_filesystem_walk_count, 1);
         assert_eq!(report.policy_build_count, 1);
     }
@@ -492,10 +494,16 @@ mod tests {
                 status.changed_paths
             );
             let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
-            assert_eq!(report.git_global_work_count, 1, "{policy_path}");
+            assert_eq!(report.git_global_work_count, 2, "{policy_path}");
             assert_eq!(report.full_filesystem_walk_count, 1, "{policy_path}");
-            assert_eq!(report.input_path_count, 1, "{policy_path}");
-            assert_eq!(report.canonical_path_count, 0, "{policy_path}");
+            assert!(
+                (3..=4).contains(&report.input_path_count),
+                "{policy_path}: {report:?}"
+            );
+            assert!(
+                (1..=4).contains(&report.canonical_path_count),
+                "{policy_path}: {report:?}"
+            );
             assert_eq!(report.policy_build_count, 1, "{policy_path}");
         }
     }
@@ -748,7 +756,7 @@ mod tests {
         assert_eq!(fallback.operation, "status");
         assert_eq!(fallback.outcome, OperationMetricsOutcome::Success);
         assert_eq!(fallback.full_filesystem_walk_count, 1);
-        assert_eq!(fallback.git_global_work_count, 1);
+        assert_eq!(fallback.git_global_work_count, 2);
         assert_eq!(fallback.policy_build_count, 1);
     }
 

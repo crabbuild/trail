@@ -237,8 +237,8 @@ fn classify_endpoint(
     if endpoint.workspace_identity != expected_workspace {
         invalid.push("workspace");
     }
-    if endpoint.executable_identity != expected_executable {
-        invalid.push("executable");
+    if endpoint.executable_identity.len() != 64 {
+        invalid.push("executable_identity");
     }
     if endpoint.url != format!("unix://{}", expected_socket.display()) {
         invalid.push("url");
@@ -293,6 +293,12 @@ fn classify_endpoint(
             endpoint.pid
         )));
     };
+    if endpoint.executable_identity != expected_executable {
+        return Err(Error::DaemonUnavailable(
+            "live workspace daemon was published by a different executable; refusing replacement"
+                .into(),
+        ));
+    }
     let published_token = read_secure_owner_text(authority, TOKEN_FILE, 4096)?;
     if published_token.trim_end() != endpoint.auth_token {
         return Err(Error::DaemonUnavailable(
@@ -1142,8 +1148,8 @@ fn recover_stale_starting_publication(
     if starting.process_start_identity.is_empty() {
         invalid.push("process_start_identity");
     }
-    if starting.executable_identity != executable_identity(&std::env::current_exe()?)? {
-        invalid.push("executable");
+    if starting.executable_identity.len() != 64 {
+        invalid.push("executable_identity");
     }
     if starting.workspace_identity != workspace_identity(workspace)? {
         invalid.push("workspace");

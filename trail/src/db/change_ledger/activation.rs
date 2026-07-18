@@ -2,16 +2,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const APPROVED_PRODUCER_INVENTORY_SHA256: &str =
-    "67027c4bcfba0f3105833978637fe5e81c9cbdb43ba51cbd1a58026a2e067185";
+    "a13fa0330d89ad442a4f796a5fd37b55177ab4fdf7805354925b99fc18199d0e";
 const APPROVED_RAW_MUTATION_INVENTORY_SHA256: &str =
-    "668a39497a58335e57b02a0c6fff3e0a0c127b06e0aa63d4cf93255f3942c943";
+    "cc7ee1525ede98b278c347e79f10e635666b3034d758451e76afa2f5a2a64cf2";
 const APPROVED_ACTIVATION_AUDIT_SHA256: &str =
-    "f538c5750f234ed5b164536ce0603dc92df17324429c7487e225f789a0e27c70";
+    "ff6f33f034a8a22d73ddc0c77fe0409ae8548a7746f74e076c67097d6630c503";
 const ACTIVATION_AUDIT_MANIFEST: &str = concat!(
     "trail-changed-path-activation-v1\n",
     "schema=18\n",
-    "producer=67027c4bcfba0f3105833978637fe5e81c9cbdb43ba51cbd1a58026a2e067185\n",
-    "raw=668a39497a58335e57b02a0c6fff3e0a0c127b06e0aa63d4cf93255f3942c943\n",
+    "producer=a13fa0330d89ad442a4f796a5fd37b55177ab4fdf7805354925b99fc18199d0e\n",
+    "raw=cc7ee1525ede98b278c347e79f10e635666b3034d758451e76afa2f5a2a64cf2\n",
     "linux_suite=changed_path_ledger_linux\n",
     "macos_suite=changed_path_ledger_macos\n",
     "recovery_suite=changed_path_ledger_recovery\n",

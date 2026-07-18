@@ -2973,6 +2973,7 @@ pub(crate) enum GitExportMode {
     #[default]
     Unknown,
     MappedDelta,
+    VerifiedRangeDelta,
     FullSnapshot,
 }
 
@@ -2981,6 +2982,7 @@ impl GitExportMode {
         match self {
             Self::Unknown => "unknown",
             Self::MappedDelta => "mapped_delta",
+            Self::VerifiedRangeDelta => "verified_range_delta",
             Self::FullSnapshot => "full_snapshot",
         }
     }
@@ -4056,6 +4058,8 @@ pub(crate) use change_ledger::run_materialized_candidate_lifecycle_flow;
 pub(crate) use change_ledger::run_materialized_lane_snapshot_flow;
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
+#[cfg(debug_assertions)]
+pub(crate) use change_ledger::run_tracked_ignored_candidate_flow;
 #[cfg(debug_assertions)]
 #[allow(unused_imports)]
 pub(crate) use change_ledger::set_command_authority_override;

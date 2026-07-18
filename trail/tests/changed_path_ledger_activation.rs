@@ -51,15 +51,15 @@ fn authority_requires_every_checked_gate_and_supported_platform() {
     }
     assert_eq!(
         complete["producer_inventory_sha256"],
-        "67027c4bcfba0f3105833978637fe5e81c9cbdb43ba51cbd1a58026a2e067185"
+        "a13fa0330d89ad442a4f796a5fd37b55177ab4fdf7805354925b99fc18199d0e"
     );
     assert_eq!(
         complete["raw_mutation_inventory_sha256"],
-        "668a39497a58335e57b02a0c6fff3e0a0c127b06e0aa63d4cf93255f3942c943"
+        "cc7ee1525ede98b278c347e79f10e635666b3034d758451e76afa2f5a2a64cf2"
     );
     assert_eq!(
         complete["activation_audit_sha256"],
-        "f538c5750f234ed5b164536ce0603dc92df17324429c7487e225f789a0e27c70"
+        "ff6f33f034a8a22d73ddc0c77fe0409ae8548a7746f74e076c67097d6630c503"
     );
     assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
     assert!(!trail::test_support::changed_path_authority_enabled_for("freebsd").unwrap());
@@ -141,6 +141,49 @@ fn first_authoritative_status_starts_and_reconciles_the_workspace_daemon() {
             .any(|change| change.path == "tracked.txt"),
         "automatic reconciliation omitted the pre-start change"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn tracked_gitignored_file_remains_clean_after_git_import() {
+    let _guard = serial();
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "--quiet"]);
+    git(temp.path(), &["config", "user.name", "Trail Activation"]);
+    git(
+        temp.path(),
+        &["config", "user.email", "trail-activation@example.invalid"],
+    );
+    fs::create_dir(temp.path().join("generated")).unwrap();
+    fs::write(temp.path().join("generated/tracked.txt"), b"tracked\n").unwrap();
+    fs::write(temp.path().join(".gitignore"), b".trail/\ngenerated/\n").unwrap();
+    git(temp.path(), &["add", ".gitignore"]);
+    git(temp.path(), &["add", "--force", "generated/tracked.txt"]);
+    git(temp.path(), &["commit", "--quiet", "-m", "base"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+
+    trail::test_support::set_changed_path_authority_override(true);
+    let result = db.status(None);
+    trail::test_support::set_changed_path_authority_override(false);
+
+    let status = result.unwrap();
+    assert!(
+        status.changed_paths.is_empty(),
+        "clean Git-tracked ignored files must remain visible to Trail: {:?}",
+        status.changed_paths
+    );
+    assert!(db.diff_dirty(false, false).unwrap().files.is_empty());
+    assert!(db
+        .record(
+            None,
+            Some("clean tracked-ignore record".into()),
+            Actor::human(),
+            false,
+        )
+        .unwrap()
+        .operation
+        .is_none());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

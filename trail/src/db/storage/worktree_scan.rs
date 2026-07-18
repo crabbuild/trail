@@ -314,6 +314,44 @@ impl Trail {
         Ok(files)
     }
 
+    pub(crate) fn scan_workspace_files_preserving_git_tracked(&self) -> Result<Vec<DiskFile>> {
+        let mut files = self.scan_files_under(&self.workspace_root)?;
+        let Some(tracked_paths) = self.scan_git_tracked_paths_impl(false)? else {
+            return Ok(files);
+        };
+        let visible = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+        let hidden_tracked = tracked_paths
+            .into_iter()
+            .filter(|path| !visible.contains(path.as_str()))
+            .collect::<Vec<_>>();
+        files.extend(self.scan_files_under_for_paths(&self.workspace_root, &hidden_tracked)?);
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
+    }
+
+    pub(crate) fn scan_files_under_preserving_pinned_paths(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+    ) -> Result<Vec<DiskFile>> {
+        let mut files = self.scan_files_under(root)?;
+        let visible = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<HashSet<_>>();
+        let hidden_pinned = pinned_paths
+            .iter()
+            .filter(|path| !visible.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        files.extend(self.scan_files_under_for_paths(root, &hidden_pinned)?);
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
+    }
+
     fn scan_file_paths_under(&self, root: &Path) -> Result<WorktreePathScan> {
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),

@@ -839,6 +839,33 @@ fn dead_daemon_does_not_replace_a_statically_invalid_endpoint() {
 }
 
 #[test]
+fn dead_daemon_from_previous_executable_is_replaced_after_upgrade() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+
+    let mut previous_executable: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.endpoint_path()).unwrap()).unwrap();
+    previous_executable["executable_identity"] = serde_json::json!("2".repeat(64));
+    write_owner_file(
+        &fixture.endpoint_path(),
+        &serde_json::to_vec_pretty(&previous_executable).unwrap(),
+    );
+
+    let restarted = fixture.status();
+    assert!(
+        restarted.status.success(),
+        "upgrade restart failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let second = fixture.endpoint();
+    assert_ne!(second.pid, first.pid);
+    assert_ne!(second.executable_identity, "2".repeat(64));
+    assert!(second.epoch > first.epoch);
+}
+
+#[test]
 fn killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change() {
     let fixture = Fixture::new();
     assert!(fixture.status().status.success());
@@ -1774,6 +1801,32 @@ fn crash_after_owner_acquisition_before_bound_starting_publication_recovers() {
     assert!(
         recovered.status.success(),
         "pre-publication crash recovery failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+}
+
+#[test]
+fn dead_starting_publication_from_previous_executable_recovers_after_upgrade() {
+    let fixture = Fixture::new();
+    let crashed = fixture.status_with_env(&[(
+        "TRAIL_TEST_WORKSPACE_DAEMON_EXIT_AFTER_OWNER_ACQUIRE_BEFORE_BOUND_PUBLICATION",
+        "1",
+    )]);
+    assert_status_failed(&crashed);
+
+    let starting_path = fixture.authority().join("daemon.starting.json");
+    let mut previous_executable: serde_json::Value =
+        serde_json::from_slice(&fs::read(&starting_path).unwrap()).unwrap();
+    previous_executable["executable_identity"] = serde_json::json!("2".repeat(64));
+    write_owner_file(
+        &starting_path,
+        &serde_json::to_vec_pretty(&previous_executable).unwrap(),
+    );
+
+    let recovered = fixture.status();
+    assert!(
+        recovered.status.success(),
+        "upgrade startup recovery failed: {}",
         String::from_utf8_lossy(&recovered.stderr)
     );
 }

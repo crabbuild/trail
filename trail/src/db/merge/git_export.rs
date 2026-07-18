@@ -92,6 +92,21 @@ impl Trail {
             }
             self.ensure_lane_merge_readiness(lane)?;
         }
+        let mut patch_left = BTreeMap::new();
+        let mut patch_right = BTreeMap::new();
+        let diff = self.diff_root_file_maps(
+            &left_ref.root_id,
+            &right_ref.root_id,
+            &mut patch_left,
+            &mut patch_right,
+        )?;
+        self.set_git_changed_path_count(diff.summaries.len() as u64);
+        let changed_paths = diff
+            .summaries
+            .iter()
+            .map(|summary| summary.path.clone())
+            .collect::<Vec<_>>();
+        let mut verified_range_delta = false;
         let can_export_delta = match (git_state.head.as_deref(), git_state.dirty) {
             (Some(head), false) => {
                 if self.git_clean_head_matches_root_mapping(head, &left_ref.root_id)? {
@@ -104,13 +119,25 @@ impl Trail {
                                 left_ref.root_id.0
                             )));
                         }
-                        GitExportPolicy::AllowFullSnapshot => self
-                            .ensure_git_clean_head_root_mapping(
+                        GitExportPolicy::AllowFullSnapshot => {
+                            let fully_mapped = self.ensure_git_clean_head_root_mapping(
                                 &branch,
                                 &left_ref.change_id,
                                 &left_ref.root_id,
                                 head,
-                            )?,
+                            )?;
+                            if fully_mapped {
+                                true
+                            } else if self.git_clean_worktree_index_matches_root_at_paths(
+                                &left_ref.root_id,
+                                &changed_paths,
+                            )? {
+                                verified_range_delta = true;
+                                true
+                            } else {
+                                false
+                            }
+                        }
                     }
                 }
             }
@@ -124,17 +151,12 @@ impl Trail {
                 GitExportPolicy::AllowFullSnapshot => false,
             },
         };
-        let mut patch_left = BTreeMap::new();
-        let mut patch_right = BTreeMap::new();
-        let diff = self.diff_root_file_maps(
-            &left_ref.root_id,
-            &right_ref.root_id,
-            &mut patch_left,
-            &mut patch_right,
-        )?;
-        self.set_git_changed_path_count(diff.summaries.len() as u64);
         let tree_oid = if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
-            self.set_git_export_mode(GitExportMode::MappedDelta);
+            self.set_git_export_mode(if verified_range_delta {
+                GitExportMode::VerifiedRangeDelta
+            } else {
+                GitExportMode::MappedDelta
+            });
             self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?
         } else {
             let files = self.load_root_files(&right_ref.root_id)?;
@@ -303,6 +325,21 @@ mod tests {
         );
     }
 
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     #[test]
     fn mapped_git_export_requires_preexisting_clean_mapping() {
         if Command::new("git").arg("--version").output().is_err() {
@@ -380,5 +417,60 @@ mod tests {
         let report = db.git_export_commit(&range, "full snapshot").unwrap();
 
         assert_eq!(report.performance.export_mode, "full_snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_git_export_uses_verified_range_delta_without_a_full_root_mapping() {
+        use std::os::unix::fs::symlink;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+        run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+        fs::write(temp.path().join("README.md"), "one\n").unwrap();
+        symlink("README.md", temp.path().join("README.link")).unwrap();
+        run_git(temp.path(), &["add", "README.md", "README.link"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        fs::write(temp.path().join("preexisting-untracked.txt"), "untracked\n").unwrap();
+
+        let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::write(temp.path().join("agent-output.txt"), "agent\n").unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let record = db
+            .record(
+                Some("main"),
+                Some("agent output".into()),
+                Actor::human(),
+                false,
+            )
+            .unwrap();
+        fs::remove_file(temp.path().join("agent-output.txt")).unwrap();
+        let range = format!("{}..{}", init.operation.0, record.operation.unwrap().0);
+
+        let report = db
+            .git_export_commit(&range, "verified range delta")
+            .unwrap();
+
+        assert_eq!(report.performance.export_mode, "verified_range_delta");
+        let paths = git_output(
+            temp.path(),
+            &["ls-tree", "-r", "--name-only", &report.commit],
+        );
+        assert!(paths.lines().any(|path| path == "README.md"));
+        assert!(paths.lines().any(|path| path == "README.link"));
+        assert!(paths.lines().any(|path| path == "agent-output.txt"));
+        assert!(!paths
+            .lines()
+            .any(|path| path == "preexisting-untracked.txt"));
+        assert_eq!(
+            git_output(temp.path(), &["ls-tree", &report.commit, "README.link"])
+                .split_whitespace()
+                .next(),
+            Some("120000")
+        );
     }
 }

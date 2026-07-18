@@ -31,6 +31,10 @@ pub mod test_support {
         crate::db::run_command_long_lock_flow()
     }
 
+    pub fn changed_path_tracked_ignored_candidate_flow() -> std::result::Result<(), String> {
+        crate::db::run_tracked_ignored_candidate_flow()
+    }
+
     pub fn changed_path_materialized_lane_snapshot_flow() -> std::result::Result<(), String> {
         crate::db::run_materialized_lane_snapshot_flow()
     }

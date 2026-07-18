@@ -268,6 +268,52 @@ impl Trail {
         Ok(true)
     }
 
+    pub(crate) fn git_clean_worktree_index_matches_root_at_paths(
+        &self,
+        root_id: &ObjectId,
+        paths: &[String],
+    ) -> Result<bool> {
+        let Some(git_paths) = self.scan_git_tracked_paths_impl(true)? else {
+            return Ok(false);
+        };
+        let git_paths = git_paths.into_iter().collect::<BTreeSet<_>>();
+        let root_files = self.load_root_files_for_paths(root_id, paths)?;
+        let indexed = self.cached_worktree_index_entries_for_paths(paths)?;
+        for path in paths {
+            let Some(root_entry) = root_files.get(path) else {
+                if git_paths.contains(path) {
+                    return Ok(false);
+                }
+                continue;
+            };
+            if !git_paths.contains(path) {
+                return Ok(false);
+            }
+            let Some(indexed_entry) = indexed.get(path) else {
+                return Ok(false);
+            };
+            if indexed_entry.manifest.kind != root_entry.kind
+                || indexed_entry.manifest.executable != root_entry.executable
+                || indexed_entry.manifest.content_hash != root_entry.content_hash
+            {
+                return Ok(false);
+            }
+            let abs = self.workspace_root.join(path_from_rel(path));
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(Error::Io(error)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Ok(false);
+            }
+            if WorktreeFileStamp::from_metadata(&metadata) != indexed_entry.stamp {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn git_write_tree_from_head_delta(
         &self,
         head: &str,
@@ -668,7 +714,7 @@ impl Trail {
     pub(crate) fn git_qualification_full_scan_oracle_for_test(&self) -> Result<Vec<String>> {
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;
-        let disk_files = self.scan_files_under(&self.workspace_root)?;
+        let disk_files = self.scan_workspace_files_preserving_git_tracked()?;
         let manifest = self.disk_manifest(&disk_files);
         Ok(self
             .diff_root_to_disk_manifest(&head.root_id, &manifest)?

@@ -23154,6 +23154,77 @@ fn strict_native_cow_refuses_an_unvalidated_source_without_copying() {
     assert!(db.lane_details("strict-bot").is_err());
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn strict_native_cow_accepts_a_git_tracked_file_inside_an_ignored_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init", "--quiet"]);
+    run_git(temp.path(), &["config", "user.name", "Trail COW"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "trail-cow@example.invalid"],
+    );
+    fs::create_dir(temp.path().join("generated")).unwrap();
+    fs::write(temp.path().join("generated/tracked.txt"), "tracked\n").unwrap();
+    fs::write(temp.path().join(".gitignore"), ".trail/\ngenerated/\n").unwrap();
+    run_git(temp.path(), &["add", ".gitignore"]);
+    run_git(temp.path(), &["add", "--force", "generated/tracked.txt"]);
+    run_git(temp.path(), &["commit", "--quiet", "-m", "base"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "tracked-ignore-cow",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("generated/tracked.txt")).unwrap(),
+        "tracked\n"
+    );
+
+    fs::write(workdir.join("agent-output.txt"), "agent output\n").unwrap();
+    fs::remove_file(workdir.join(".trail/workdir-manifest.json")).unwrap();
+    let preview = db
+        .preview_lane_workdir_record("tracked-ignore-cow")
+        .unwrap();
+    assert_eq!(
+        preview
+            .changed_paths
+            .iter()
+            .map(|path| (path.path.as_str(), path.kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![("agent-output.txt", trail::FileChangeKind::Added)],
+        "the authoritative lane comparison must retain ignored baseline files"
+    );
+
+    let recorded = db
+        .record_lane_workdir(
+            "tracked-ignore-cow",
+            Some("record agent output after marker loss".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded
+            .changed_paths
+            .iter()
+            .map(|path| (path.path.as_str(), path.kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![("agent-output.txt", trail::FileChangeKind::Added)],
+        "the mutating lane record path must retain ignored baseline files"
+    );
+}
+
 #[test]
 fn strict_native_cow_reuses_a_complete_clean_lane_source() {
     let temp = tempfile::tempdir().unwrap();
