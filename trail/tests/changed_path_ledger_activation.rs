@@ -59,7 +59,7 @@ fn authority_requires_every_checked_gate_and_supported_platform() {
     );
     assert_eq!(
         complete["activation_audit_sha256"],
-        "ff6f33f034a8a22d73ddc0c77fe0409ae8548a7746f74e076c67097d6630c503"
+        "4ab0b441355b9a7a55f53ead7317da77b314f5dc3afb0b9c51aae79a3b87e75e"
     );
     assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
     assert!(!trail::test_support::changed_path_authority_enabled_for("freebsd").unwrap());

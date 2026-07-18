@@ -4,6 +4,8 @@ use crate::db::util::*;
 mod control;
 mod gates;
 mod identity;
+mod initialization;
+pub(crate) use initialization::backfill_lane_initializations_v19;
 mod leases;
 mod lifecycle;
 mod patch_diff;

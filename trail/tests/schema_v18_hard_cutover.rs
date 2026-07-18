@@ -16,6 +16,15 @@ struct SchemaFixture {
 }
 
 impl SchemaFixture {
+    fn predecessor_v18() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        trail::test_support::create_schema_v18_fixture(temp.path()).unwrap();
+        Self {
+            temp,
+            wal_writer: None,
+        }
+    }
+
     fn versioned(version: i64) -> Self {
         let fixture = Self::fresh_v18();
         let conn = Connection::open(fixture.sqlite_path()).unwrap();
@@ -355,18 +364,18 @@ fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
         trail::Error::SchemaReinitializeRequired { found, guidance } => {
             assert_eq!(
                 found,
-                "database corrupt: found version 17; expected version 18"
+                "database corrupt: found version 17; expected version 19"
             );
             assert_eq!(
                 guidance,
-                "back up this workspace, then run `trail init --force` to create schema v18"
+                "back up this workspace, then run `trail init --force` to create schema v19"
             );
         }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(
         err.to_string(),
-        "workspace schema database corrupt: found version 17; expected version 18 cannot be opened; back up this workspace, then run `trail init --force` to create schema v18"
+        "workspace schema database corrupt: found version 17; expected version 19 cannot be opened; back up this workspace, then run `trail init --force` to create schema v19"
     );
     assert_tree_unchanged(&fixture, &before);
 }
@@ -448,8 +457,18 @@ fn partial_v18_is_rejected_without_repair() {
 }
 
 #[test]
-fn existing_v0_v17_and_v19_are_rejected_without_mutation() {
-    for version in [0, 17, 19] {
+fn schema_v18_is_the_only_migratable_predecessor() {
+    let predecessor = SchemaFixture::predecessor_v18();
+    Trail::open(predecessor.root()).unwrap();
+    assert_eq!(
+        Connection::open(predecessor.sqlite_path())
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        19
+    );
+
+    for version in [0, 17, 20] {
         let fixture = SchemaFixture::versioned(version);
         let before = fixture.snapshot_tree_bytes();
         let err = open_error(fixture.root());
@@ -460,17 +479,17 @@ fn existing_v0_v17_and_v19_are_rejected_without_mutation() {
 }
 
 #[test]
-fn fresh_init_creates_the_exact_v18_ledger_shape() {
+fn fresh_init_creates_the_exact_v19_ledger_shape() {
     let fixture = SchemaFixture::fresh_v18();
     let conn = Connection::open(fixture.sqlite_path()).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        18
+        19
     );
 
     let metadata = [
-        ("schema.version", "18"),
+        ("schema.version", "19"),
         ("changed_path.observer_log_format_min", "1"),
         ("changed_path.observer_log_format_max", "1"),
     ];

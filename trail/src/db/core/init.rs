@@ -373,7 +373,11 @@ impl Trail {
             SchemaOpenMode::Existing if writer_exclusion_held => None,
             SchemaOpenMode::Existing => {
                 Some(Self::with_write_lock_wait(Duration::from_secs(10), || {
-                    preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)
+                    preflight_existing_schema_with_migration(
+                        &db_dir,
+                        &sqlite_path,
+                        &config.storage.prolly_backend,
+                    )
                 })?)
             }
         };
@@ -442,7 +446,7 @@ impl Trail {
             operation_metrics,
         };
         if schema_mode == SchemaOpenMode::FreshCreate {
-            db.create_schema_v18()?;
+            db.create_schema_v19()?;
         }
         Ok(db)
     }
@@ -568,6 +572,60 @@ impl Trail {
         let mut lock = acquire_workspace_lock(&self.db_dir)?;
         lock.observer_write_exclusion = Some(exclusion);
         Ok(lock)
+    }
+}
+
+fn preflight_existing_schema_with_migration(
+    db_dir: &Path,
+    db_path: &Path,
+    prolly_backend: &str,
+) -> Result<ValidatedSchemaGeneration> {
+    let original_error = match preflight_existing_schema(db_path, prolly_backend) {
+        Ok(validated) => return Ok(validated),
+        Err(error) => error,
+    };
+    if inspect_existing_schema_version(db_path, prolly_backend)? != SCHEMA_V18_VERSION {
+        return Err(original_error);
+    }
+
+    migrate_existing_schema_v18(db_dir, db_path, prolly_backend)?;
+    preflight_existing_schema(db_path, prolly_backend)
+}
+
+fn migrate_existing_schema_v18(db_dir: &Path, db_path: &Path, prolly_backend: &str) -> Result<()> {
+    let _lock = acquire_workspace_lock_for_database(db_dir, db_path)?;
+    let mut conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(schema_reinitialize_error)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(schema_reinitialize_error)?;
+    let current = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map_err(schema_reinitialize_error)?;
+    match current {
+        TRAIL_SCHEMA_VERSION => {
+            storage::validate_schema_v19(&conn).map_err(schema_reinitialize_error)
+        }
+        SCHEMA_V18_VERSION => {
+            storage::validate_schema_v18_for_migration(&conn).map_err(schema_reinitialize_error)?;
+            match prolly_backend {
+                "sqlite" => storage::validate_prolly_sqlite_schema_v18(&conn)
+                    .map_err(schema_reinitialize_error)?,
+                "slatedb" => storage::validate_no_prolly_sqlite_schema_v18(&conn)
+                    .map_err(schema_reinitialize_error)?,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
+                    )))
+                }
+            }
+            storage::migrate_schema_v18_to_v19(&mut conn).map_err(schema_reinitialize_error)
+        }
+        found => Err(schema_reinitialize_error(format!(
+            "database corrupt: found version {found}; expected version {TRAIL_SCHEMA_VERSION}"
+        ))),
     }
 }
 

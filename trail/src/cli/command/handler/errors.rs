@@ -192,7 +192,7 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             );
             diagnostic.recovery = Some(UiNextAction {
                 command: "trail init --force".to_string(),
-                reason: "Back up the workspace, then create the required schema v18.".to_string(),
+                reason: "Back up the workspace, then create the required schema v19.".to_string(),
             });
             diagnostic
         }

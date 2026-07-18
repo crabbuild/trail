@@ -427,7 +427,7 @@ fn reconcile_cli_failure_preserves_lane_recovery_in_every_format() {
 fn schema_reinitialize_guidance_requires_backup_and_force_init() {
     let error = Error::SchemaReinitializeRequired {
         found: "schema 17".into(),
-        guidance: "back up this workspace, then run `trail init --force` to create schema v18"
+        guidance: "back up this workspace, then run `trail init --force` to create schema v19"
             .into(),
     };
     let value = serde_json::to_value(StructuredErrorEnvelope::from_error(&error)).unwrap();

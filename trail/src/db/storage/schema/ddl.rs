@@ -1077,26 +1077,59 @@ CREATE INDEX workspace_view_layers_layer_idx ON workspace_view_layers(layer_id);
 CREATE INDEX workspace_views_status_idx ON workspace_views(status, updated_at);
 "#;
 
+pub(super) const LANE_INITIALIZATIONS_V19: &str = r#"
+CREATE TABLE lane_initializations (
+    initialization_id TEXT PRIMARY KEY,
+    lane_name TEXT NOT NULL UNIQUE,
+    lane_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN
+        ('reserved','materialized','associated','observer_ready','repair_required')),
+    workdir TEXT,
+    materialization_json TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    repair_command TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX lane_initializations_phase_updated_idx
+    ON lane_initializations(phase, updated_at);
+"#;
+
 impl Trail {
-    pub(crate) fn create_schema_v18(&self) -> Result<()> {
-        create_schema_v18(&self.conn)
+    pub(crate) fn create_schema_v19(&self) -> Result<()> {
+        create_schema_v19(&self.conn)
     }
 }
 
-pub(crate) fn create_schema_v18(conn: &Connection) -> Result<()> {
+pub(crate) fn create_schema_v19(conn: &Connection) -> Result<()> {
+    create_schema(conn, TRAIL_SCHEMA_VERSION, true)
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn create_schema_v18_for_test(conn: &Connection) -> Result<()> {
+    create_schema(conn, SCHEMA_V18_VERSION, false)
+}
+
+fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) -> Result<()> {
     if conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? != 0 {
         return Err(Error::Corrupt(
             "fresh schema connection is not empty".into(),
         ));
     }
-    conn.execute_batch("SAVEPOINT create_v18;")?;
+    conn.execute_batch("SAVEPOINT create_schema;")?;
     let result = (|| {
         conn.execute_batch(BASE_SCHEMA_V18)?;
         super::changed_path_ledger::create_changed_path_ledger_schema(conn)?;
+        if lane_initializations {
+            conn.execute_batch(LANE_INITIALIZATIONS_V19)?;
+        }
         validate_schema_v18_shape(conn)?;
         let now = now_ts();
         for (key, value) in [
-            (SCHEMA_META_VERSION_KEY, TRAIL_SCHEMA_VERSION.to_string()),
+            (SCHEMA_META_VERSION_KEY, version.to_string()),
             (
                 SCHEMA_META_APP_VERSION_KEY,
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -1109,18 +1142,53 @@ pub(crate) fn create_schema_v18(conn: &Connection) -> Result<()> {
                 params![key, value, now],
             )?;
         }
-        conn.pragma_update(None, "user_version", TRAIL_SCHEMA_VERSION)?;
-        Trail::validate_schema_v18(conn)
+        conn.pragma_update(None, "user_version", version)?;
+        if lane_initializations {
+            validate_schema_v19(conn)
+        } else {
+            validate_schema_v18_for_migration(conn)
+        }
     })();
     match result {
         Ok(()) => conn
-            .execute_batch("RELEASE create_v18;")
+            .execute_batch("RELEASE create_schema;")
             .map_err(Into::into),
         Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK TO create_v18; RELEASE create_v18;");
+            let _ = conn.execute_batch("ROLLBACK TO create_schema; RELEASE create_schema;");
             Err(err)
         }
     }
+}
+
+pub(super) fn validate_lane_initializations_v19_shape(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(LANE_INITIALIZATIONS_V19)?;
+    let actual = lane_initialization_objects(conn)?;
+    let wanted = lane_initialization_objects(&expected)?;
+    if actual != wanted {
+        return Err(Error::Corrupt(
+            "lane initialization schema v19 sqlite_master shape does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lane_initialization_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
+         WHERE name LIKE 'lane_initializations%'
+         ORDER BY type,name",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                normalize_sql(&row.get::<_, String>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub(super) fn validate_schema_v18_shape(conn: &Connection) -> Result<()> {
@@ -1135,7 +1203,10 @@ pub(super) fn validate_schema_v18_shape(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn base_schema_v18_complete(conn: &Connection) -> Result<bool> {
+pub(super) fn base_schema_complete_for_version(
+    conn: &Connection,
+    expected_version: i64,
+) -> Result<bool> {
     if validate_schema_v18_shape(conn).is_err() {
         return Ok(false);
     }
@@ -1164,7 +1235,7 @@ pub(super) fn base_schema_v18_complete(conn: &Connection) -> Result<bool> {
             ),
             (
                 SCHEMA_META_VERSION_KEY.to_string(),
-                TRAIL_SCHEMA_VERSION.to_string(),
+                expected_version.to_string(),
             ),
         ]
         && conn
@@ -1177,12 +1248,17 @@ pub(super) fn base_schema_v18_complete(conn: &Connection) -> Result<bool> {
             == Some(true))
 }
 
+pub(super) fn lane_initialization_objects_absent(conn: &Connection) -> Result<bool> {
+    Ok(lane_initialization_objects(conn)?.is_empty())
+}
+
 fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
         "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
          WHERE name NOT LIKE 'sqlite_%'
            AND name NOT LIKE 'prolly_%'
            AND name NOT LIKE 'changed_path_%'
+           AND name NOT LIKE 'lane_initializations%'
          ORDER BY type, name",
     )?;
     let objects = statement
@@ -1233,7 +1309,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
 
-        assert!(create_schema_v18(&conn).is_err());
+        assert!(create_schema_v19(&conn).is_err());
 
         assert_eq!(master_objects(&conn), before);
         assert_eq!(

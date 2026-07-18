@@ -143,6 +143,32 @@ pub struct LaneSpawnReport {
     pub transparent_cow_available: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneInitializationPhase {
+    Reserved,
+    Materialized,
+    Associated,
+    ObserverReady,
+    RepairRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LaneInitializationReport {
+    pub initialization_id: String,
+    pub lane_name: String,
+    pub lane_id: String,
+    pub request_fingerprint: String,
+    pub operation_id: String,
+    pub phase: LaneInitializationPhase,
+    pub workdir: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub repair_command: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaneWorkspaceViewReport {
     pub view_id: String,

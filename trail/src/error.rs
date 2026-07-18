@@ -224,14 +224,14 @@ mod tests {
     fn schema_and_ledger_recovery_errors_have_stable_contracts() {
         let schema = Error::SchemaReinitializeRequired {
             found: "version 17".into(),
-            guidance: "back up this workspace, then run `trail init --force` to create schema v18"
+            guidance: "back up this workspace, then run `trail init --force` to create schema v19"
                 .into(),
         };
         assert_eq!(schema.code(), "SCHEMA_REINITIALIZE_REQUIRED");
         assert_eq!(schema.exit_code(), 15);
         assert_eq!(
             schema.to_string(),
-            "workspace schema version 17 cannot be opened; back up this workspace, then run `trail init --force` to create schema v18"
+            "workspace schema version 17 cannot be opened; back up this workspace, then run `trail init --force` to create schema v19"
         );
 
         let reconcile = Error::ChangeLedgerReconcileRequired {

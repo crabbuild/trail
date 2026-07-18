@@ -400,7 +400,10 @@ pub(super) fn create_changed_path_ledger_schema(conn: &Connection) -> Result<()>
         .map_err(Into::into)
 }
 
-pub(super) fn changed_path_ledger_schema_complete(conn: &Connection) -> Result<bool> {
+pub(super) fn changed_path_ledger_schema_complete(
+    conn: &Connection,
+    expected_schema_version: i64,
+) -> Result<bool> {
     let foreign_keys = conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?;
     if foreign_keys != 1
         || CHANGED_PATH_LEDGER_SCHEMA_VERSION != 1
@@ -409,7 +412,7 @@ pub(super) fn changed_path_ledger_schema_complete(conn: &Connection) -> Result<b
         return Ok(false);
     }
     let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != TRAIL_SCHEMA_VERSION {
+    if user_version != expected_schema_version {
         return Ok(false);
     }
     let schema_meta_exists = conn.query_row(
@@ -420,7 +423,7 @@ pub(super) fn changed_path_ledger_schema_complete(conn: &Connection) -> Result<b
     if !schema_meta_exists {
         return Ok(false);
     }
-    let expected_version = TRAIL_SCHEMA_VERSION.to_string();
+    let expected_version = expected_schema_version.to_string();
     let meta_version = conn
         .query_row(
             "SELECT value FROM schema_meta WHERE key = ?1",

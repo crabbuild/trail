@@ -23,6 +23,21 @@ pub use model::*;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod test_support {
+    pub fn create_schema_v18_fixture(workspace: &std::path::Path) -> Result<(), String> {
+        crate::db::create_schema_v18_fixture_for_test(workspace).map_err(|error| error.to_string())
+    }
+
+    pub fn fail_schema_v19_migration_after_ddl(db_path: &std::path::Path) {
+        crate::db::install_schema_v19_migration_failure(
+            db_path,
+            crate::db::SchemaV19MigrationBoundary::AfterDdlBeforeUserVersion,
+        );
+    }
+
+    pub fn clear_schema_v19_migration_failure(db_path: &std::path::Path) {
+        crate::db::clear_schema_v19_migration_failure(db_path);
+    }
+
     pub fn changed_path_command_flow() -> std::result::Result<(), String> {
         crate::db::run_command_flow()
     }
