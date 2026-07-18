@@ -668,8 +668,9 @@ impl Trail {
         })
     }
 
-    pub(crate) fn scan_worktree_manifest_indexed_with_stamps(
+    pub(crate) fn scan_worktree_manifest_indexed_with_stamps<'a>(
         &self,
+        immutable_paths: impl IntoIterator<Item = &'a String>,
     ) -> Result<BTreeMap<String, IndexedDiskManifest>> {
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),
@@ -759,64 +760,64 @@ impl Trail {
                 },
             );
         }
-        if let Some(tracked_paths) = self.scan_git_tracked_paths_impl(false)? {
-            for rel in tracked_paths {
-                if seen.contains(&rel) {
-                    continue;
-                }
-                let path = safe_join(&root, &rel)?;
-                filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
-                    .delta
-                    .filesystem_stat_count
-                    .saturating_add(1);
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(Error::Io(error)),
-                };
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    continue;
-                }
-                let stamp = WorktreeFileStamp::from_metadata(&metadata);
-                let disk_manifest =
-                    if let Some(cached) = self.cached_worktree_manifest(&rel, stamp)? {
-                        cached
-                    } else {
-                        filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
-                            .delta
-                            .filesystem_read_count
-                            .saturating_add(1);
-                        let bytes = fs::read(&path)?;
-                        let bytes_len = saturating_u64_from_usize(bytes.len());
-                        filesystem_metrics.delta.filesystem_read_bytes = filesystem_metrics
-                            .delta
-                            .filesystem_read_bytes
-                            .saturating_add(bytes_len);
-                        filesystem_metrics.delta.filesystem_hash_count = filesystem_metrics
-                            .delta
-                            .filesystem_hash_count
-                            .saturating_add(1);
-                        filesystem_metrics.delta.filesystem_hash_bytes = filesystem_metrics
-                            .delta
-                            .filesystem_hash_bytes
-                            .saturating_add(bytes_len);
-                        let disk_manifest = DiskManifest {
-                            kind: classify_file_kind(&bytes, &self.config.text),
-                            executable: stamp.executable,
-                            content_hash: sha256_hex(&bytes),
-                        };
-                        self.upsert_worktree_index_manifest(&rel, stamp, &disk_manifest)?;
-                        disk_manifest
-                    };
-                seen.insert(rel.clone());
-                manifest.insert(
-                    rel,
-                    IndexedDiskManifest {
-                        manifest: disk_manifest,
-                        stamp,
-                    },
-                );
+        // Ignore policies may hide immutable-root files. Restore only the
+        // pinned paths needed to qualify the source; ignored untracked files
+        // must remain outside the indexed manifest.
+        for rel in immutable_paths {
+            if seen.contains(rel) {
+                continue;
             }
+            let path = safe_join(&root, rel)?;
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(Error::Io(error)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            let stamp = WorktreeFileStamp::from_metadata(&metadata);
+            let disk_manifest = if let Some(cached) = self.cached_worktree_manifest(rel, stamp)? {
+                cached
+            } else {
+                filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
+                    .delta
+                    .filesystem_read_count
+                    .saturating_add(1);
+                let bytes = fs::read(&path)?;
+                let bytes_len = saturating_u64_from_usize(bytes.len());
+                filesystem_metrics.delta.filesystem_read_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_read_bytes
+                    .saturating_add(bytes_len);
+                filesystem_metrics.delta.filesystem_hash_count = filesystem_metrics
+                    .delta
+                    .filesystem_hash_count
+                    .saturating_add(1);
+                filesystem_metrics.delta.filesystem_hash_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_hash_bytes
+                    .saturating_add(bytes_len);
+                let disk_manifest = DiskManifest {
+                    kind: classify_file_kind(&bytes, &self.config.text),
+                    executable: stamp.executable,
+                    content_hash: sha256_hex(&bytes),
+                };
+                self.upsert_worktree_index_manifest(rel, stamp, &disk_manifest)?;
+                disk_manifest
+            };
+            seen.insert(rel.clone());
+            manifest.insert(
+                rel.clone(),
+                IndexedDiskManifest {
+                    manifest: disk_manifest,
+                    stamp,
+                },
+            );
         }
         self.prune_worktree_index(&seen)?;
         Ok(manifest)
@@ -826,7 +827,7 @@ impl Trail {
         &self,
         files: &BTreeMap<String, FileEntry>,
     ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
-        let indexed_manifest = self.scan_worktree_manifest_indexed_with_stamps()?;
+        let indexed_manifest = self.scan_worktree_manifest_indexed_with_stamps(files.keys())?;
         // A native source only needs every immutable-root file to be present
         // and exact. Unrelated untracked files are never cloned and therefore
         // do not make an otherwise complete source unsafe.

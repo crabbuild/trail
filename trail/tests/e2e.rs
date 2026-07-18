@@ -23225,6 +23225,42 @@ fn strict_native_cow_accepts_a_git_tracked_file_inside_an_ignored_directory() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn strict_native_cow_accepts_a_non_git_baseline_file_inside_an_ignored_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("generated")).unwrap();
+    fs::write(temp.path().join("generated/baseline.txt"), "baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join(".trailignore"), "generated/\n").unwrap();
+    fs::write(temp.path().join("generated/untracked.txt"), "untracked\n").unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "non-git-ignore-cow",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("generated/baseline.txt")).unwrap(),
+        "baseline\n"
+    );
+    assert!(
+        !workdir.join("generated/untracked.txt").exists(),
+        "ignored untracked files must remain outside the immutable materialization root"
+    );
+}
+
 #[test]
 fn non_git_ignore_cannot_hide_a_trail_baseline_file() {
     let temp = tempfile::tempdir().unwrap();
