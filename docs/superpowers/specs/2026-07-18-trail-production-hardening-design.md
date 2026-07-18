@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-18
 
-**Status:** Approved architecture; written-spec review pending
+**Status:** Approved architecture and written specification
 
 **Scope:** Trail lane initialization, observer coordination, recovery, native-COW observability, build reproducibility, and production release gates for large repositories.
 
