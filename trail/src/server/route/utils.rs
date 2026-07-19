@@ -151,6 +151,7 @@ pub(crate) fn json_response<T: Serialize>(
         reason,
         extra_headers: Vec::new(),
         body: serde_json::to_vec(value)?,
+        retire_after_response: false,
     })
 }
 
@@ -286,6 +287,7 @@ pub(crate) fn error_response(err: &Error) -> HttpResponse {
         reason,
         extra_headers: Vec::new(),
         body,
+        retire_after_response: false,
     }
 }
 
@@ -335,6 +337,7 @@ fn static_error_response(status: u16, code: &str, exit: i32, message: &str) -> H
         reason: reason_for_status(status),
         extra_headers: Vec::new(),
         body,
+        retire_after_response: false,
     }
 }
 

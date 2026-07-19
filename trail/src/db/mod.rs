@@ -4646,10 +4646,10 @@ pub(crate) use change_ledger::run_tracked_ignored_candidate_flow;
 #[allow(unused_imports)]
 pub(crate) use change_ledger::set_command_authority_override;
 pub(crate) use change_ledger::{
-    command_authority_enabled, prepare_workspace_daemon_launch,
+    command_authority_enabled, persisted_workspace_daemon_owner, prepare_workspace_daemon_launch,
     verified_stale_workspace_owner_for_launch, workspace_daemon_fence,
-    workspace_daemon_ready_proof, workspace_daemon_reconcile, VerifiedStaleWorkspaceOwner,
-    WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,
+    workspace_daemon_ready_proof, workspace_daemon_reconcile, PersistedWorkspaceDaemonOwner,
+    VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,
 };
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::{

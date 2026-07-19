@@ -38,15 +38,15 @@ pub(crate) use daemon::{
     materialized_lane_daemon_fence, materialized_lane_daemon_full_reconcile,
     materialized_lane_daemon_marker_cut, materialized_lane_daemon_matches_target,
     materialized_lane_daemon_ready_proof, materialized_lane_daemon_reconcile,
-    materialized_lane_scope_id, policy_runtime_restart_required,
+    materialized_lane_scope_id, persisted_workspace_daemon_owner, policy_runtime_restart_required,
     prepare_materialized_lane_controlled_projection, prepare_materialized_lane_daemon,
     prepare_workspace_controlled_projection, prepare_workspace_daemon,
     prepare_workspace_daemon_launch, prepare_workspace_daemon_verified_replacement,
     verified_stale_workspace_owner_for_launch, with_materialized_lane_controlled_interval,
     with_workspace_controlled_interval, workspace_daemon_fence, workspace_daemon_full_reconcile,
     workspace_daemon_ready_proof, workspace_daemon_reconcile, ChangedPathDaemonRegistry,
-    VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,
-    WorkspaceDaemonRuntime,
+    PersistedWorkspaceDaemonOwner, VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity,
+    WorkspaceDaemonProof, WorkspaceDaemonRuntime,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{

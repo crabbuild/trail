@@ -66,7 +66,7 @@ pub fn prepare_workspace_changed_path_daemon(
             "workspace daemon launch nonce is malformed".into(),
         ));
     }
-    let stale = std::env::var("TRAIL_WORKSPACE_DAEMON_VERIFIED_STALE_OWNER")
+    let published_stale = std::env::var("TRAIL_WORKSPACE_DAEMON_VERIFIED_STALE_OWNER")
         .ok()
         .map(|value| serde_json::from_str::<StaleDaemonPublicationEvidence>(&value))
         .transpose()
@@ -75,9 +75,9 @@ pub fn prepare_workspace_changed_path_daemon(
                 "workspace daemon stale publication evidence is malformed".into(),
             )
         })?;
-    let verified_stale_owner = match stale {
+    let verified_stale_owner = match published_stale {
         Some(stale) => verify_stale_workspace_owner_publication(db, stale)?,
-        None => None,
+        None => verify_persisted_workspace_owner(db)?,
     };
     crate::db::prepare_workspace_daemon_launch(
         db,
@@ -89,6 +89,41 @@ pub fn prepare_workspace_changed_path_daemon(
         verified_stale_owner,
     )
     .and_then(public_workspace_proof)
+}
+
+fn verify_persisted_workspace_owner(
+    db: &crate::Trail,
+) -> crate::Result<Option<crate::db::VerifiedStaleWorkspaceOwner>> {
+    let owner: Option<crate::db::PersistedWorkspaceDaemonOwner> =
+        crate::db::persisted_workspace_daemon_owner(db)?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    if workspace_daemon_process_is_alive(owner.stale_pid) {
+        match workspace_daemon_process_start_identity(owner.stale_pid) {
+            Some(actual) if actual == owner.process_start_identity => {
+                return Err(crate::Error::DaemonUnavailable(
+                    "persisted workspace daemon owner process is still live; refusing owner replacement"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                return Err(crate::Error::DaemonUnavailable(
+                    "persisted workspace daemon owner PID is live but its start identity cannot be verified; refusing owner replacement"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(Some(crate::db::VerifiedStaleWorkspaceOwner {
+        stale_pid: owner.stale_pid,
+        process_start_identity: owner.process_start_identity,
+        scope_id: owner.scope_id,
+        epoch: owner.epoch,
+        observer_owner_token: owner.observer_owner_token,
+        daemon_launch_nonce: owner.daemon_launch_nonce,
+    }))
 }
 
 fn verify_stale_workspace_owner_publication(

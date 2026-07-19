@@ -56,6 +56,16 @@ pub(crate) struct VerifiedStaleWorkspaceOwner {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PersistedWorkspaceDaemonOwner {
+    pub(crate) stale_pid: u32,
+    pub(crate) process_start_identity: String,
+    pub(crate) scope_id: String,
+    pub(crate) epoch: u64,
+    pub(crate) observer_owner_token: String,
+    pub(crate) daemon_launch_nonce: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct WorkspaceDaemonLaunchIdentity {
     pub(crate) nonce: String,
     pub(crate) pid: u32,
@@ -253,6 +263,66 @@ pub(crate) fn verified_stale_workspace_owner_for_launch(
         observer_owner_token: owner_token,
         daemon_launch_nonce: daemon_launch_nonce.to_string(),
     }))
+}
+
+pub(crate) fn persisted_workspace_daemon_owner(
+    db: &Trail,
+) -> Result<Option<PersistedWorkspaceDaemonOwner>> {
+    let scope_id = workspace_daemon_target(db)?.identity.scope_id;
+    let Some(stored) = load_existing_scope(db, scope_id)? else {
+        return Ok(None);
+    };
+    let Some(owner) = stored.observer_owner else {
+        if stored.observer_owner_token.is_some() {
+            return Err(daemon_owner_authority_inconsistent(scope_id));
+        }
+        return Ok(None);
+    };
+    if stored.scope_kind != ScopeKind::Workspace.as_str()
+        || owner.epoch != stored.epoch
+        || stored.observer_owner_token.as_deref() != Some(owner.owner_token.as_str())
+    {
+        return Err(daemon_owner_authority_inconsistent(scope_id));
+    }
+    let (Some(daemon_launch_nonce), Some(daemon_pid), Some(process_start_identity)) = (
+        owner.daemon_launch_nonce,
+        owner.daemon_pid,
+        owner.daemon_process_start_identity,
+    ) else {
+        return Err(Error::DaemonUnavailable(
+            "persisted workspace daemon owner lacks an exact launch binding".into(),
+        ));
+    };
+    let stale_pid = u32::try_from(daemon_pid).map_err(|_| {
+        Error::DaemonUnavailable(
+            "persisted workspace daemon owner launch binding is malformed".into(),
+        )
+    })?;
+    if stale_pid == 0
+        || stale_pid > i32::MAX as u32
+        || process_start_identity.is_empty()
+        || !is_canonical_authority_token(&daemon_launch_nonce)
+        || !is_canonical_authority_token(&owner.owner_token)
+    {
+        return Err(Error::DaemonUnavailable(
+            "persisted workspace daemon owner launch binding is malformed".into(),
+        ));
+    }
+    Ok(Some(PersistedWorkspaceDaemonOwner {
+        stale_pid,
+        process_start_identity,
+        scope_id: scope_id.to_text(),
+        epoch: stored.epoch,
+        observer_owner_token: owner.owner_token,
+        daemon_launch_nonce,
+    }))
+}
+
+fn is_canonical_authority_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) fn prepare_workspace_controlled_projection(db: &mut Trail) -> Result<ExpectedScope> {

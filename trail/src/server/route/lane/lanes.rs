@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::model::LaneGateOptions;
+use crate::model::{LaneGateOptions, LaneInitializationPhase};
 use crate::server::request_types::{
     DependencySyncRequest, EnvironmentSyncRequest, LaneClaimRequest, LaneReadFileRequest,
     LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest,
@@ -40,7 +40,7 @@ pub(super) fn handle_lane_resources(
             body.workdir.is_some(),
             &body.paths,
         )?;
-        let report = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        let report = db.spawn_lane_with_deferred_initial_ledger(
             &body.name,
             body.from.as_deref(),
             workdir_mode,
@@ -50,12 +50,25 @@ pub(super) fn handle_lane_resources(
             &body.paths,
             body.include_neighbors,
         )?;
+        let resumed = report.resumed;
+        let external_materialization =
+            report.workdir.is_some() && !report.workdir_mode.is_transparent_cow();
+        let deferred = report.phase == LaneInitializationPhase::Associated;
+        let retire_after_response = external_materialization && (!resumed || deferred);
+        let mut report = if deferred {
+            db.resume_deferred_initial_lane_ledger(&body.name)?
+        } else {
+            report
+        };
+        report.resumed = resumed;
         let (status, reason) = if report.resumed {
             (200, "OK")
         } else {
             (201, "Created")
         };
-        return Ok(Some(json_response(status, reason, &report)?));
+        let mut response = json_response(status, reason, &report)?;
+        response.retire_after_response = retire_after_response;
+        return Ok(Some(response));
     }
 
     if parts.len() == 4

@@ -136,6 +136,7 @@ pub struct HttpResponse {
     pub(crate) reason: &'static str,
     pub(crate) extra_headers: Vec<(&'static str, String)>,
     pub(crate) body: Vec<u8>,
+    pub(crate) retire_after_response: bool,
 }
 
 pub fn serve_listener(
@@ -225,7 +226,17 @@ pub fn serve_unix_listener_with_auth_and_timeout(
     }
     loop {
         let (mut stream, _) = listener.accept()?;
-        let _ = handle_unix_connection(db, &mut stream, &auth, connection_timeout);
+        let retire_after_response =
+            handle_unix_connection(db, &mut stream, &auth, connection_timeout).unwrap_or(false);
+        if retire_after_response {
+            let signaled = unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+            if signaled != 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            return Err(Error::DaemonUnavailable(
+                "workspace daemon observer health retirement requested".into(),
+            ));
+        }
         if std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some()
             && super::workspace_changed_path_ready_proof(db).is_err()
         {
@@ -245,7 +256,7 @@ fn handle_unix_connection(
     stream: &mut UnixStream,
     auth: &ServerAuth,
     connection_timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     stream.set_read_timeout(Some(connection_timeout))?;
     stream.set_write_timeout(Some(connection_timeout))?;
     let request = match read_unix_request(stream) {
@@ -255,7 +266,7 @@ fn handle_unix_connection(
             let _ = stream
                 .write_all(&response.to_http_bytes())
                 .and_then(|_| stream.flush());
-            return Ok(());
+            return Ok(false);
         }
     };
     #[cfg(debug_assertions)]
@@ -263,11 +274,14 @@ fn handle_unix_connection(
     #[cfg(debug_assertions)]
     let request_path = request.path.clone();
     let response = route::route_request(db, request, auth);
+    let retire_after_response = response.retire_after_response;
     #[cfg(debug_assertions)]
-    delay_daemon_response_for_test(&request_method, &request_path);
+    if !retire_after_response {
+        delay_daemon_response_for_test(&request_method, &request_path);
+    }
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()?;
-    Ok(())
+    Ok(retire_after_response)
 }
 
 pub fn handle_http_request(db: &mut Trail, raw: &[u8]) -> HttpResponse {
@@ -394,6 +408,7 @@ fn rate_limited_response(retry_after_secs: u64) -> HttpResponse {
         reason: "Too Many Requests",
         extra_headers: vec![("Retry-After", retry_after_secs.to_string())],
         body,
+        retire_after_response: false,
     }
 }
 
@@ -413,6 +428,7 @@ fn request_read_error_response(err: &Error, timeout: Duration) -> HttpResponse {
             reason: "Request Timeout",
             extra_headers: Vec::new(),
             body,
+            retire_after_response: false,
         };
     }
     route::error_response(err)

@@ -1758,6 +1758,137 @@ fn crash_after_persisting_ledger_owner_is_automatically_recovered() {
 }
 
 #[test]
+fn dead_durable_daemon_owner_without_publication_is_automatically_recovered() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let first_owner: (i64, String) = conn
+        .query_row(
+            "SELECT epoch,owner_token FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+
+    kill_and_wait(first.pid);
+    fs::remove_file(fixture.endpoint_path()).unwrap();
+    fs::remove_file(fixture.socket_path()).unwrap();
+    assert!(!fixture.authority().join("daemon.starting.json").exists());
+
+    let recovered = fixture.status();
+    assert!(
+        recovered.status.success(),
+        "durable-owner recovery without publication failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let second = fixture.endpoint();
+    assert_ne!(second.daemon_launch_nonce, first.daemon_launch_nonce);
+    assert!(second.epoch > first.epoch);
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let second_owner: (i64, String) = conn
+        .query_row(
+            "SELECT epoch,owner_token FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(second_owner.0 > first_owner.0);
+    assert_ne!(second_owner.1, first_owner.1);
+}
+
+#[test]
+fn live_durable_daemon_owner_without_publication_is_not_replaced() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+
+    let live_daemon = Fixture::new();
+    assert!(live_daemon.status().status.success());
+    let live = live_daemon.endpoint();
+
+    kill_and_wait(first.pid);
+    fs::remove_file(fixture.endpoint_path()).unwrap();
+    fs::remove_file(fixture.socket_path()).unwrap();
+    assert!(!fixture.authority().join("daemon.starting.json").exists());
+
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET daemon_launch_nonce=?1,daemon_pid=?2,daemon_process_start_identity=?3
+             WHERE scope_id=(SELECT scope_id FROM changed_path_scopes)",
+            params![
+                &live.daemon_launch_nonce,
+                i64::from(live.pid),
+                &live.process_start_identity
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    let before: (i64, String, String, String, i64, String) = conn
+        .query_row(
+            "SELECT owner.epoch,owner.owner_token,owner.lease_state,
+                    owner.daemon_launch_nonce,owner.daemon_pid,
+                    owner.daemon_process_start_identity
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope
+               ON scope.scope_id=owner.scope_id
+              AND scope.epoch=owner.epoch
+              AND scope.observer_owner_token=owner.owner_token",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(conn);
+
+    assert_status_failed_for(
+        &fixture.status(),
+        "live durable daemon owner without publication",
+    );
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let after: (i64, String, String, String, i64, String) = conn
+        .query_row(
+            "SELECT owner.epoch,owner.owner_token,owner.lease_state,
+                    owner.daemon_launch_nonce,owner.daemon_pid,
+                    owner.daemon_process_start_identity
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope
+               ON scope.scope_id=owner.scope_id
+              AND scope.epoch=owner.epoch
+              AND scope.observer_owner_token=owner.owner_token",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn crash_after_owner_acquisition_before_bound_starting_publication_recovers() {
     let fixture = Fixture::new();
     let crashed = fixture.status_with_env(&[(

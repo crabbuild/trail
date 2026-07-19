@@ -58,6 +58,7 @@ impl HttpIdempotency {
             reason: reason_for_status(entry.status),
             extra_headers: Vec::new(),
             body: entry.body,
+            retire_after_response: false,
         }))
     }
 
