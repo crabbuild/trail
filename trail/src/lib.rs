@@ -28,6 +28,36 @@ pub mod test_support {
         include!("test_support/scoped_state.rs");
     }
 
+    pub fn run_workspace_lock_holder(workspace: &std::path::Path) -> Result<(), String> {
+        let db = crate::Trail::open(workspace).map_err(|error| error.to_string())?;
+        let _lock = crate::Trail::with_write_lock_wait(std::time::Duration::from_secs(10), || {
+            db.acquire_write_lock()
+        })
+        .map_err(|error| error.to_string())?;
+        let mut stdout = std::io::stdout().lock();
+        std::io::Write::write_all(&mut stdout, b"READY\n").map_err(|error| error.to_string())?;
+        std::io::Write::flush(&mut stdout).map_err(|error| error.to_string())?;
+
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let result = std::io::copy(&mut stdin, &mut std::io::sink())
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = released_tx.send(result);
+        });
+        match released_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err("workspace lock holder exceeded its maximum hold time".to_string());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("workspace lock holder release monitor disconnected".to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_schema_v18_fixture(workspace: &std::path::Path) -> Result<(), String> {
         crate::db::create_schema_v18_fixture_for_test(workspace).map_err(|error| error.to_string())
     }

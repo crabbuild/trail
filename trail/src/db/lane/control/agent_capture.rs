@@ -778,6 +778,13 @@ impl Trail {
         input: AgentHookReceiptInput,
     ) -> Result<AgentHookReceiptIngestReport> {
         let _lock = self.acquire_write_lock()?;
+        self.persist_agent_hook_receipt_under_write_lock(input)
+    }
+
+    fn persist_agent_hook_receipt_under_write_lock(
+        &self,
+        input: AgentHookReceiptInput,
+    ) -> Result<AgentHookReceiptIngestReport> {
         validate_agent_receipt_input(&input)?;
 
         let workspace_id = self.config.workspace.id.0.clone();
@@ -913,6 +920,45 @@ impl Trail {
         })
     }
 
+    pub(crate) fn persist_agent_hook_receipt_processed(
+        &mut self,
+        input: AgentHookReceiptInput,
+    ) -> Result<AgentHookReceiptIngestReport> {
+        let _lock = self.acquire_write_lock()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let inner = (|| {
+            let mut report = self.persist_agent_hook_receipt_under_write_lock(input)?;
+            report.receipt = self
+                .mark_agent_hook_receipt_processed_under_write_lock(&report.receipt.receipt_id)?;
+            Ok(report)
+        })();
+        let result = match inner {
+            Ok(report) => transaction.commit().map(|()| report).map_err(Error::from),
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(Error::Corrupt(format!(
+                    "processed receipt transaction failed: {error}; rollback failed: {cleanup_error}"
+                ))),
+            },
+        };
+        if result.is_err() {
+            self.object_cache
+                .lock()
+                .expect("object cache poisoned")
+                .clear();
+        }
+        if !self.conn.is_autocommit() {
+            self.object_cache
+                .lock()
+                .expect("object cache poisoned")
+                .clear();
+            return Err(Error::Corrupt(
+                "processed receipt transaction did not return to autocommit".to_string(),
+            ));
+        }
+        result
+    }
+
     pub fn agent_hook_receipt(&self, receipt_id: &str) -> Result<AgentHookReceipt> {
         validate_agent_capture_id("receipt id", receipt_id, 256)?;
         self.conn
@@ -938,6 +984,13 @@ impl Trail {
         receipt_id: &str,
     ) -> Result<AgentHookReceipt> {
         let _lock = self.acquire_write_lock()?;
+        self.mark_agent_hook_receipt_processed_under_write_lock(receipt_id)
+    }
+
+    fn mark_agent_hook_receipt_processed_under_write_lock(
+        &self,
+        receipt_id: &str,
+    ) -> Result<AgentHookReceipt> {
         let now = now_millis();
         self.conn.execute(
             "UPDATE agent_hook_receipts
@@ -1022,6 +1075,68 @@ impl Trail {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)?;
         Ok(receipts)
+    }
+
+    pub fn count_agent_hook_receipts_for_connection(
+        &self,
+        connection_id: &str,
+        status: Option<&str>,
+    ) -> Result<usize> {
+        validate_agent_capture_id("connection id", connection_id, 256)?;
+        if let Some(status) = status {
+            validate_agent_receipt_status(status)?;
+        }
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_hook_receipts
+             WHERE workspace_id = ?1 AND connection_id = ?2
+               AND (?3 IS NULL OR status = ?3)",
+            params![self.config.workspace.id.0, connection_id, status],
+            |row| row.get::<_, i64>(0),
+        )?;
+        usize::try_from(count).map_err(|_| {
+            Error::Corrupt(format!(
+                "agent hook receipt count for connection `{connection_id}` is invalid"
+            ))
+        })
+    }
+
+    pub fn list_agent_hook_receipts_for_connection_page(
+        &self,
+        connection_id: &str,
+        status: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<AgentHookReceipt>> {
+        validate_agent_capture_id("connection id", connection_id, 256)?;
+        if let Some(status) = status {
+            validate_agent_receipt_status(status)?;
+        }
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT receipt_id, workspace_id, installation_id, mapping_id, provider,
+                    native_event, native_session_id, native_turn_id, transport, dedupe_key,
+                    payload_digest, raw_object_id, raw_artifact_id, receive_sequence,
+                    connection_id, direction, connection_sequence, status,
+                    attempt_count, next_attempt_at, diagnostic, occurred_at, received_at,
+                    processed_at, updated_at
+             FROM agent_hook_receipts
+             WHERE workspace_id = ?1 AND connection_id = ?2
+               AND (?3 IS NULL OR status = ?3)
+             ORDER BY connection_sequence ASC, direction ASC, receipt_id ASC
+             LIMIT ?4 OFFSET ?5",
+        )?;
+        stmt.query_map(
+            params![
+                self.config.workspace.id.0,
+                connection_id,
+                status,
+                limit,
+                i64::try_from(offset.min(1_000_000)).unwrap_or(1_000_000)
+            ],
+            agent_hook_receipt_row,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
     }
 
     pub fn recover_stale_agent_hook_receipts(&mut self, stale_after_ms: u64) -> Result<usize> {
@@ -3450,6 +3565,172 @@ mod tests {
                 .unwrap(),
             first.receipt
         );
+    }
+
+    #[test]
+    fn processed_receipt_ingress_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let input = AgentHookReceiptInput {
+            installation_id: None,
+            provider: "trail-acp".to_string(),
+            native_event: "acp/frame".to_string(),
+            native_session_id: None,
+            native_turn_id: None,
+            transport: AgentCaptureTransport::Acp,
+            connection_id: Some("connection-1".to_string()),
+            direction: Some("agent_to_client".to_string()),
+            connection_sequence: Some(1),
+            dedupe_key: "acp:connection-1:agent_to_client:1".to_string(),
+            payload: serde_json::json!({"message": {"jsonrpc": "2.0"}}),
+            occurred_at: Some(1),
+        };
+
+        let first = db
+            .persist_agent_hook_receipt_processed(input.clone())
+            .unwrap();
+        assert!(!first.duplicate);
+        assert_eq!(first.receipt.status, "processed");
+        assert!(db.conn.is_autocommit());
+        assert!(db
+            .get_object::<AgentHookReceiptObject>(
+                AGENT_HOOK_RECEIPT_OBJECT_KIND,
+                &first.receipt.raw_object_id,
+            )
+            .is_ok());
+        let second = db.persist_agent_hook_receipt_processed(input).unwrap();
+        assert!(second.duplicate);
+        assert_eq!(second.receipt.receipt_id, first.receipt.receipt_id);
+        assert_eq!(second.receipt.status, "processed");
+        assert_eq!(second.receipt.processed_at, first.receipt.processed_at);
+        assert!(db.conn.is_autocommit());
+        assert_eq!(
+            db.list_agent_hook_receipts(Some("trail-acp"), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn receipt_queries_filter_count_and_pages_by_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let input = |connection_id: &str, sequence: u64| AgentHookReceiptInput {
+            installation_id: None,
+            provider: "trail-acp".to_string(),
+            native_event: "acp/frame".to_string(),
+            native_session_id: None,
+            native_turn_id: None,
+            transport: AgentCaptureTransport::Acp,
+            connection_id: Some(connection_id.to_string()),
+            direction: Some("agent_to_client".to_string()),
+            connection_sequence: Some(sequence),
+            dedupe_key: format!("acp:{connection_id}:agent_to_client:{sequence}"),
+            payload: serde_json::json!({"sequence": sequence}),
+            occurred_at: Some(i64::try_from(sequence).unwrap()),
+        };
+        db.persist_agent_hook_receipt_processed(input("connection-a", 1))
+            .unwrap();
+        db.persist_agent_hook_receipt(input("connection-a", 2))
+            .unwrap();
+        db.persist_agent_hook_receipt_processed(input("connection-b", 1))
+            .unwrap();
+
+        assert_eq!(
+            db.count_agent_hook_receipts_for_connection("connection-a", None)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.count_agent_hook_receipts_for_connection("connection-a", Some("processed"))
+                .unwrap(),
+            1
+        );
+        let page = db
+            .list_agent_hook_receipts_for_connection_page("connection-a", Some("processed"), 0, 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].connection_id.as_deref(), Some("connection-a"));
+        assert_eq!(page[0].status, "processed");
+    }
+
+    #[test]
+    fn processed_receipt_ingress_rolls_back_when_marking_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_processed_receipt
+                 BEFORE UPDATE OF status ON agent_hook_receipts
+                 WHEN NEW.status = 'processed'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected processed receipt failure');
+                 END;",
+            )
+            .unwrap();
+        let baseline_object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let payload = serde_json::json!({"message": {"jsonrpc": "2.0"}});
+        let stored = AgentHookReceiptObject {
+            version: AGENT_HOOK_RECEIPT_OBJECT_VERSION,
+            provider: "trail-acp".to_string(),
+            native_event: "acp/frame".to_string(),
+            payload_digest: format!(
+                "sha256:{}",
+                sha256_hex(&serde_json::to_vec(&payload).unwrap())
+            ),
+            redaction_profile: "trail-sensitive-json/v1".to_string(),
+            payload: payload.clone(),
+        };
+        let raw_object_id = ObjectId::for_bytes(
+            AGENT_HOOK_RECEIPT_OBJECT_KIND,
+            AGENT_HOOK_RECEIPT_OBJECT_VERSION,
+            &cbor(&stored).unwrap(),
+        );
+        let result = db.persist_agent_hook_receipt_processed(AgentHookReceiptInput {
+            installation_id: None,
+            provider: "trail-acp".to_string(),
+            native_event: "acp/frame".to_string(),
+            native_session_id: None,
+            native_turn_id: None,
+            transport: AgentCaptureTransport::Acp,
+            connection_id: Some("connection-rollback".to_string()),
+            direction: Some("agent_to_client".to_string()),
+            connection_sequence: Some(1),
+            dedupe_key: "acp:connection-rollback:agent_to_client:1".to_string(),
+            payload,
+            occurred_at: Some(1),
+        });
+
+        assert!(result.is_err());
+        assert!(db.conn.is_autocommit());
+        assert!(db
+            .list_agent_hook_receipts(Some("trail-acp"), None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            baseline_object_count
+        );
+        assert!(db.object_cache.lock().unwrap().entries.is_empty());
+        assert!(matches!(
+            db.get_object::<AgentHookReceiptObject>(AGENT_HOOK_RECEIPT_OBJECT_KIND, &raw_object_id),
+            Err(Error::ObjectNotFound { .. })
+        ));
     }
 
     #[test]

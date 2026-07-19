@@ -2658,6 +2658,12 @@ impl ObjectCache {
             }
         }
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.total_bytes = 0;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

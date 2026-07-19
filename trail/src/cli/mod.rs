@@ -3,6 +3,24 @@ pub mod command;
 mod environment_sandbox;
 
 pub(crate) fn run() {
+    #[cfg(debug_assertions)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("__test-workspace-lock-holder"))
+    {
+        let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
+        let result = if let [workspace] = arguments.as_slice() {
+            trail::test_support::run_workspace_lock_holder(std::path::Path::new(workspace))
+        } else {
+            Err("expected workspace path".to_string())
+        };
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("trail test workspace lock holder: {error}");
+                std::process::exit(126);
+            }
+        }
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__process-watchdog")) {
         let arguments = std::env::args().skip(2).collect::<Vec<_>>();
         let result = (|| -> std::result::Result<(), String> {

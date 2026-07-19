@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use trail::{AgentCaptureTransport, AgentHookReceiptInput, InitImportMode, Trail};
 
@@ -73,23 +73,28 @@ fn receipt_payload(connection_id: &str, sequence: u64) -> serde_json::Value {
     })
 }
 
-fn connection_receipts(workspace: &Path, connection_id: &str) -> Vec<trail::AgentHookReceipt> {
-    let db = Trail::open(workspace).unwrap();
+fn connection_receipts(db: &Trail, connection_id: &str) -> Vec<trail::AgentHookReceipt> {
     let mut receipts = Vec::new();
     for offset in (0..3_000).step_by(1_000) {
         let page = db
-            .list_agent_hook_receipts_page(Some("trail-acp"), None, offset, 1_000)
+            .list_agent_hook_receipts_for_connection_page(connection_id, None, offset, 1_000)
             .unwrap();
         let page_len = page.len();
-        receipts.extend(
-            page.into_iter()
-                .filter(|receipt| receipt.connection_id.as_deref() == Some(connection_id)),
-        );
+        receipts.extend(page);
         if page_len < 1_000 {
             break;
         }
     }
     receipts
+}
+
+fn live_capture_connection_id(workspace: &Path) -> String {
+    fs::read_dir(workspace.join(".trail/acp-ingress"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find_map(|name| name.strip_suffix(".owner").map(str::to_string))
+        .expect("relay did not publish its capture connection owner")
 }
 
 #[test]
@@ -125,38 +130,22 @@ fn forwarding_never_waits_for_database_writer() {
     let mut session_response = String::new();
     stdout.read_line(&mut session_response).unwrap();
     assert!(session_response.contains("capture-session"));
+    let connection_id = live_capture_connection_id(temp.path());
+    let receipt_reader = Trail::open(temp.path()).unwrap();
 
-    let lock = temp.path().join(".trail/lock");
-    let lock_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(mut file) => {
-                writeln!(
-                    file,
-                    "pid={} created_at={}",
-                    std::process::id(),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                )
-                .unwrap();
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                assert!(
-                    Instant::now() < lock_deadline,
-                    "writer lock never became idle"
-                );
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("failed to acquire test writer lock: {error}"),
-        }
-    }
+    let mut lock_holder = Command::new(trail_bin())
+        .arg("__test-workspace-lock-holder")
+        .arg(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lock_stdin = lock_holder.stdin.take().unwrap();
+    let mut lock_stdout = BufReader::new(lock_holder.stdout.take().unwrap());
+    let mut lock_ready = String::new();
+    lock_stdout.read_line(&mut lock_ready).unwrap();
+    assert_eq!(lock_ready, "READY\n", "workspace lock holder was not ready");
     writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"capture-session","prompt":[{{"type":"text","text":"stress capture"}}]}}}}"#).unwrap();
     let mut prompt_echo = String::new();
     stdout.read_line(&mut prompt_echo).unwrap();
@@ -185,9 +174,48 @@ fn forwarding_never_waits_for_database_writer() {
     });
 
     let within_budget = done_rx.recv_timeout(Duration::from_millis(250)).ok();
-    fs::remove_file(&lock).unwrap();
+    drop(lock_stdin);
+    let lock_status = lock_holder.wait().unwrap();
+    let mut lock_stderr = String::new();
+    lock_holder
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut lock_stderr)
+        .unwrap();
+    assert!(
+        lock_status.success(),
+        "workspace lock holder failed\nstderr:\n{lock_stderr}"
+    );
     let stdin = writer.join().unwrap();
     reader.join().unwrap();
+    let expected_receipts = FRAME_COUNT * 2 + 6;
+    let processed_deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_processed = 0;
+    loop {
+        let processed = receipt_reader
+            .count_agent_hook_receipts_for_connection(&connection_id, Some("processed"))
+            .unwrap();
+        assert!(
+            processed >= last_processed,
+            "processed capture receipt count regressed: {processed} after {last_processed}"
+        );
+        if processed == expected_receipts {
+            break;
+        }
+        assert!(
+            Instant::now() < processed_deadline,
+            "capture did not process every forwarded receipt: {processed} of {}",
+            expected_receipts
+        );
+        last_processed = processed;
+        thread::sleep(Duration::from_millis(50));
+    }
+    let processed_receipts = connection_receipts(&receipt_reader, &connection_id);
+    assert_eq!(processed_receipts.len(), expected_receipts);
+    assert!(processed_receipts
+        .iter()
+        .all(|receipt| receipt.status == "processed"));
     let shutdown_started = Instant::now();
     drop(stdin);
     let mut stderr = String::new();
@@ -283,19 +311,30 @@ fn pending_receipts_and_spill_replay_once_in_connection_order() {
     stdout.read_line(&mut initialize_response).unwrap();
     assert!(initialize_response.contains(r#""protocolVersion":1"#));
 
+    let receipt_reader = Trail::open(temp.path()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(45);
-    let receipts = loop {
-        let receipts = connection_receipts(temp.path(), CONNECTION_ID);
-        if receipts.len() == TOTAL && receipts.iter().all(|receipt| receipt.status == "processed") {
-            break receipts;
+    let mut last_processed = 0;
+    loop {
+        let processed = receipt_reader
+            .count_agent_hook_receipts_for_connection(CONNECTION_ID, Some("processed"))
+            .unwrap();
+        assert!(
+            processed >= last_processed,
+            "processed replay receipt count regressed: {processed} after {last_processed}"
+        );
+        if processed == TOTAL {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out replaying capture journal: {} of {TOTAL} receipts",
-            receipts.len()
+            "timed out replaying capture journal: {processed} of {TOTAL} receipts"
         );
+        last_processed = processed;
         thread::sleep(Duration::from_millis(50));
-    };
+    }
+    let receipts = connection_receipts(&receipt_reader, CONNECTION_ID);
+    assert_eq!(receipts.len(), TOTAL);
+    assert!(receipts.iter().all(|receipt| receipt.status == "processed"));
     let mut sequences = receipts
         .iter()
         .map(|receipt| receipt.connection_sequence.unwrap())

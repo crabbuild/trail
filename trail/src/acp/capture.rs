@@ -908,7 +908,7 @@ fn process_frame(
             capture.open_db()?
         };
         let direction = direction_name(frame.direction);
-        let report = db.persist_agent_hook_receipt(AgentHookReceiptInput {
+        let input = AgentHookReceiptInput {
             installation_id: None,
             provider: "trail-acp".to_string(),
             native_event: "acp/frame".to_string(),
@@ -931,7 +931,12 @@ fn process_frame(
                 "project": frame.project
             }),
             occurred_at: Some(frame.received_at),
-        })?;
+        };
+        if !frame.project {
+            db.persist_agent_hook_receipt_processed(input)?;
+            return Ok(());
+        }
+        let report = db.persist_agent_hook_receipt(input)?;
         if frame.project && report.receipt.status != "processed" {
             let mut message = frame.redacted_message.clone();
             let mut capture = coordinator.lock().map_err(|_| {
