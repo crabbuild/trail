@@ -2951,7 +2951,7 @@ fn macos_filesystem_is_supported(filesystem: &str) -> bool {
     filesystem == "apfs"
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn cross_device_workspace_candidate_is_compatible(
     is_directory: bool,
     is_distinct_device: bool,
