@@ -2038,10 +2038,6 @@ impl Trail {
                 )?;
             }
             self.record_environment_generation(lane, &view.view_id)?;
-            self.conn.execute(
-                "UPDATE workspace_views SET generation = generation + 1, updated_at = ?1 WHERE view_id = ?2",
-                params![now_ts(), &view.view_id],
-            )?;
             Ok(())
         })();
         let activation = activation.and_then(|()| {
@@ -2195,10 +2191,6 @@ impl Trail {
                 )?;
                 self.record_environment_generation(lane, &view.view_id)?;
             }
-            self.conn.execute(
-                "UPDATE workspace_views SET generation = generation + 1, updated_at = ?1 WHERE view_id = ?2",
-                params![now_ts(), &view.view_id],
-            )?;
             Ok(())
         })();
         let activation = activation.and_then(|()| {

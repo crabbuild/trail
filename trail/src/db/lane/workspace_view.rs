@@ -409,6 +409,9 @@ impl Trail {
             fs::create_dir_all(dir)?;
         }
         ViewMutationJournal::initialize_storage(&paths.source_upper)?;
+        ViewMutationJournal::rotate_after_checkpoint(&paths.source_upper, 0, 1)?;
+        let mut barrier = ViewMutationBarrier::exclusive(&paths.meta_dir)?;
+        barrier.record_checkpoint_cut(0, 1)?;
         let now = now_ts();
         self.conn.execute(
             "INSERT INTO workspace_views \
@@ -754,7 +757,10 @@ impl Trail {
                 }
                 _ => {
                     return Err(Error::Corrupt(format!(
-                        "workspace checkpoint/journal cut is contradictory for `{view_id}`"
+                        "workspace checkpoint/journal cut is contradictory for `{view_id}`: checkpoint=({checkpoint_seq}, {generation}), journal=({}, {}, {})",
+                        journal.base_sequence,
+                        journal.last_sequence,
+                        journal.generation,
                     )))
                 }
             };
@@ -1387,8 +1393,11 @@ impl Trail {
             true
         } else {
             return Err(Error::Corrupt(format!(
-                "workspace checkpoint/journal cut is contradictory for `{}`",
-                view.view_id
+                "workspace checkpoint/journal cut is contradictory for `{}`: checkpoint=({sequence}, {generation}), journal=({}, {}, {})",
+                view.view_id,
+                journal.base_sequence,
+                journal.last_sequence,
+                journal.generation,
             )));
         };
         let (mutation_cut_hash, whiteout_cut_hash) =
