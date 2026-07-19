@@ -143,8 +143,6 @@ elif command in (["doctor"],["fsck"]):
     if command == ["doctor"] and os.environ.get("FAKE_LEAK_JOURNAL"):
         journal=trail/"materialization-operations"; journal.mkdir(parents=True,exist_ok=True)
         (journal/os.environ["FAKE_LEAK_JOURNAL"]).write_text('{"state":"preparing"}\n')
-    if command == ["doctor"] and os.environ.get("FAKE_MUTATE_FAULT_DRIVER"):
-        pathlib.Path(os.environ["TRAIL_SCALE_FAULT_DRIVER"]).write_text("#!/bin/sh\nexit 97\n")
     emit({"status":"ok","checks":[]} if command == ["doctor"] else {"checked_refs":1,"checked_roots":1,"checked_texts":1,"errors":[]})
 else:
     print("unsupported fake command: "+repr(command),file=sys.stderr); raise SystemExit(64)
@@ -153,6 +151,12 @@ else:
 FAULT_DRIVER = r'''#!/usr/bin/env python3
 import json,os,pathlib,platform,sqlite3,sys
 scenario=sys.argv[-1]; phase=scenario.removeprefix("after_") if scenario.startswith("after_") else "control"
+mutated_original=bool(os.environ.get("FAKE_MUTATE_FAULT_DRIVER_DURING_PROBES") and scenario=="after_reservation")
+if mutated_original:
+ pathlib.Path(os.environ["TRAIL_SCALE_FAULT_DRIVER"]).write_text("#!/bin/sh\nexit 97\n")
+if os.environ.get("FAKE_FAULT_PROBE_LOG"):
+ with open(os.environ["FAKE_FAULT_PROBE_LOG"],"a",encoding="utf-8") as stream:
+  stream.write(json.dumps({"scenario":scenario,"executed_path":str(pathlib.Path(sys.argv[0]).resolve()),"mutated_original":mutated_original},sort_keys=True)+"\n")
 tests={
  "daemon_death":("changed_path_ledger_daemon","killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change"),
  "response_loss_after_association":("changed_path_ledger_daemon","external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback"),
@@ -436,12 +440,23 @@ class HarnessContractTests(unittest.TestCase):
         self.assertTrue(all(row["binary_sha256"] == environment["binary"]["sha256"] for row in faults))
         self.assertTrue(all(row["test_count"] == "1" for row in faults if row["evidence_kind"] != "harness_control"))
 
-    def test_mutated_original_fault_driver_does_not_change_executed_verified_bytes(self) -> None:
+    def test_fault_probes_keep_using_digest_bound_copy_after_original_mutates(self) -> None:
         original = self.fault.read_bytes()
         original_sha = __import__("hashlib").sha256(original).hexdigest()
-        result = self.run_harness(FAKE_MUTATE_FAULT_DRIVER="1")
+        probe_log = self.repo.parent / "fault-probes.jsonl"
+        result = self.run_harness(FAKE_MUTATE_FAULT_DRIVER_DURING_PROBES="1",
+                                  FAKE_FAULT_PROBE_LOG=str(probe_log))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotEqual(self.fault.read_bytes(), original)
+        probes = [json.loads(line) for line in probe_log.read_text().splitlines()]
+        self.assertEqual(probes[:2], [
+            {"scenario": "after_reservation",
+             "executed_path": str((self.output / "fault-driver-executed").resolve()),
+             "mutated_original": True},
+            {"scenario": "after_materialization",
+             "executed_path": str((self.output / "fault-driver-executed").resolve()),
+             "mutated_original": False},
+        ])
         environment = json.loads((self.output / "environment.json").read_text())
         driver = environment["fault_driver"]
         self.assertEqual(driver["executed_sha256"], original_sha)
