@@ -584,10 +584,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn append(&mut self, records: &[ObserverRecord]) -> Result<()> {
-        let result = match crate::db::acquire_workspace_lock_for_observer(
-            &self.workspace_db_dir,
-            &self.database_path,
-        ) {
+        let result = match self.acquire_observer_publication_lock() {
             Ok(_workspace_lock) => self.append_inner(records),
             Err(error) => Err(error),
         };
@@ -601,10 +598,7 @@ impl SegmentWriter {
     /// file-before-SQLite window to a command workspace lock holder.
     pub(crate) fn append_and_flush(&mut self, records: &[ObserverRecord]) -> Result<DurableCut> {
         let result = (|| {
-            let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
-                &self.workspace_db_dir,
-                &self.database_path,
-            )?;
+            let _workspace_lock = self.acquire_observer_publication_lock()?;
             self.append_inner(records)?;
             #[cfg(test)]
             run_append_flush_boundary_hook(&self.workspace_db_dir, &self.database_path);
@@ -625,10 +619,7 @@ impl SegmentWriter {
         records: &[ObserverRecord],
     ) -> Result<(DurableCut, DurableCut)> {
         let result = (|| {
-            let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
-                &self.workspace_db_dir,
-                &self.database_path,
-            )?;
+            let _workspace_lock = self.acquire_observer_publication_lock()?;
             self.append_inner(records)?;
             let sealed = self.flush_inner()?;
             self.rotate_inner()?;
@@ -750,10 +741,7 @@ impl SegmentWriter {
     }
 
     pub(crate) fn flush_durable(&mut self) -> Result<DurableCut> {
-        let result = match crate::db::acquire_workspace_lock_for_observer(
-            &self.workspace_db_dir,
-            &self.database_path,
-        ) {
+        let result = match self.acquire_observer_publication_lock() {
             Ok(_workspace_lock) => self.flush_inner(),
             Err(error) => Err(error),
         };
@@ -833,10 +821,7 @@ impl SegmentWriter {
     /// invalidation marker has been flushed.
     pub(crate) fn revoke(&mut self, reason: &str) -> Result<()> {
         self.ensure_authorized()?;
-        let _workspace_lock = crate::db::acquire_workspace_lock_for_observer(
-            &self.workspace_db_dir,
-            &self.database_path,
-        )?;
+        let _workspace_lock = self.acquire_observer_publication_lock()?;
         let transaction = self
             .control
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -911,10 +896,7 @@ impl SegmentWriter {
             last_hash: self.last_hash,
             provider_cursor: self.last_cursor.clone(),
         };
-        let result = match crate::db::acquire_workspace_lock_for_observer(
-            &self.workspace_db_dir,
-            &self.database_path,
-        ) {
+        let result = match self.acquire_observer_publication_lock() {
             Ok(_workspace_lock) => self.rotate_inner().map(|_| {
                 let anchor = DurableCut {
                     segment_id: self.segment_id.clone(),
@@ -1128,13 +1110,19 @@ impl SegmentWriter {
         validate_lease_on(&self.control, &self.identity)
     }
 
+    fn acquire_observer_publication_lock(&self) -> Result<crate::db::WorkspaceLock> {
+        let operation_id = self.identity.scope_id.to_text();
+        crate::db::acquire_workspace_lock_for_observer(
+            &self.workspace_db_dir,
+            &self.database_path,
+            &operation_id,
+        )
+    }
+
     fn retire(&mut self, reason: &str) {
         if self.authorized {
             self.authorized = false;
-            if let Ok(_workspace_lock) = crate::db::acquire_workspace_lock_for_observer(
-                &self.workspace_db_dir,
-                &self.database_path,
-            ) {
+            if let Ok(_workspace_lock) = self.acquire_observer_publication_lock() {
                 revoke_owner(
                     &self.control,
                     &self.identity.scope_id.to_text(),

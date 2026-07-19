@@ -1445,13 +1445,14 @@ mod schema_handoff_tests {
         let db_dir = root.path().join(".trail");
         let database = db_dir.join(DB_RELATIVE_PATH);
 
-        let first = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let first = acquire_workspace_lock_for_observer(&db_dir, &database, "observer-a").unwrap();
         let (acquired, received) = std::sync::mpsc::sync_channel(1);
         let other_db_dir = db_dir.clone();
         let other_database = database.clone();
         let waiter = std::thread::spawn(move || {
             let second =
-                acquire_workspace_lock_for_observer(&other_db_dir, &other_database).unwrap();
+                acquire_workspace_lock_for_observer(&other_db_dir, &other_database, "observer-b")
+                    .unwrap();
             acquired.send(()).unwrap();
             drop(second);
         });
@@ -1464,7 +1465,8 @@ mod schema_handoff_tests {
             .unwrap();
         waiter.join().unwrap();
 
-        let observer = acquire_workspace_lock_for_observer(&db_dir, &database).unwrap();
+        let observer =
+            acquire_workspace_lock_for_observer(&db_dir, &database, "observer-c").unwrap();
         let (mutated, mutation_received) = std::sync::mpsc::sync_channel(1);
         let workspace = root.path().to_path_buf();
         let mutation = std::thread::spawn(move || {
@@ -1484,7 +1486,7 @@ mod schema_handoff_tests {
 
         let external = acquire_workspace_lock(&db_dir).unwrap();
         assert!(matches!(
-            acquire_workspace_lock_for_observer(&db_dir, &database),
+            acquire_workspace_lock_for_observer(&db_dir, &database, "observer-d"),
             Err(Error::WorkspaceLocked(_))
         ));
         drop(external);

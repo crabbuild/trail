@@ -3169,6 +3169,7 @@ fn wait_for_observer_workspace_lock(db_dir: &Path) {
 pub(crate) fn acquire_workspace_lock_for_observer(
     db_dir: &Path,
     schema_path: &Path,
+    operation_id: &str,
 ) -> Result<WorkspaceLock> {
     let coordination = AUTHORIZED_OBSERVER_EXCLUSIONS.get_or_init(|| {
         (
@@ -3202,7 +3203,7 @@ pub(crate) fn acquire_workspace_lock_for_observer(
             schema_path,
             WorkspaceLockAdmission {
                 purpose: WorkspaceLockPurpose::ObserverPublication,
-                operation_id: None,
+                operation_id: Some(operation_id),
                 deadline: default_workspace_lock_admission_deadline()?,
                 retry_command: "retry observer publication",
             },
@@ -3398,6 +3399,15 @@ pub(crate) fn acquire_workspace_lock_with_admission(
                     WorkspaceLockInspection::Terminal(holder) => {
                         return Err(Error::WorkspaceLocked(holder.trim().to_string()));
                     }
+                    WorkspaceLockInspection::Turnover(holder) => {
+                        if !workspace_lock_admission_can_wait(&admission, &holder) {
+                            return Err(Error::WorkspaceLocked(holder.encode().trim().to_string()));
+                        }
+                        if Instant::now() >= wait_deadline {
+                            return Err(workspace_lock_timeout(&holder, &admission));
+                        }
+                        continue;
+                    }
                     WorkspaceLockInspection::Held(holder) => {
                         if !workspace_lock_admission_can_wait(&admission, &holder) {
                             return Err(Error::WorkspaceLocked(holder.encode().trim().to_string()));
@@ -3504,7 +3514,10 @@ fn workspace_lock_admission_can_wait(
             WorkspaceLockPurpose::ObserverStartup,
             WorkspaceLockPurpose::LaneAssociation | WorkspaceLockPurpose::ObserverPublication,
         ) => true,
-        (WorkspaceLockPurpose::ObserverStartup, WorkspaceLockPurpose::ObserverStartup) => true,
+        (WorkspaceLockPurpose::ObserverStartup, WorkspaceLockPurpose::ObserverStartup) => {
+            matches!((admission.operation_id, holder.operation_id.as_deref()),
+                (Some(requested), Some(held)) if requested != held)
+        }
         (
             WorkspaceLockPurpose::LaneAssociation,
             WorkspaceLockPurpose::CommandMutation | WorkspaceLockPurpose::ObserverPublication,
@@ -3517,6 +3530,10 @@ fn workspace_lock_admission_can_wait(
             WorkspaceLockPurpose::ObserverPublication,
             WorkspaceLockPurpose::LaneAssociation | WorkspaceLockPurpose::ObserverStartup,
         ) => true,
+        (WorkspaceLockPurpose::ObserverPublication, WorkspaceLockPurpose::ObserverPublication) => {
+            matches!((admission.operation_id, holder.operation_id.as_deref()),
+            (Some(requested), Some(held)) if requested != held)
+        }
         _ => false,
     }
 }
@@ -3619,7 +3636,36 @@ enum ParsedWorkspaceLockOwner {
 enum WorkspaceLockInspection {
     Reaped,
     Held(WorkspaceLockOwner),
+    Turnover(WorkspaceLockOwner),
     Terminal(String),
+}
+
+#[cfg(test)]
+type WorkspaceLockInspectionHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static WORKSPACE_LOCK_INSPECTION_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, WorkspaceLockInspectionHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn install_workspace_lock_inspection_hook(lock_path: &Path, hook: impl FnOnce() + Send + 'static) {
+    WORKSPACE_LOCK_INSPECTION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(lock_path.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_workspace_lock_inspection_hook(lock_path: &Path) {
+    let hook = WORKSPACE_LOCK_INSPECTION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(lock_path);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -3897,48 +3943,37 @@ fn current_executable_identity() -> std::io::Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-#[cfg(unix)]
-fn workspace_lock_has_authenticated_successor(lock_path: &Path, predecessor: &str) -> bool {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let Some(predecessor_nonce) =
-        parse_workspace_lock_owner(predecessor).map(|owner| match owner {
-            ParsedWorkspaceLockOwner::V1(owner) => owner.nonce,
-            ParsedWorkspaceLockOwner::V2(owner) => owner.nonce,
-        })
-    else {
-        return false;
-    };
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW);
-    let Ok(file) = options.open(lock_path) else {
-        return false;
-    };
-    let Ok(descriptor) = file.metadata() else {
-        return false;
-    };
-    let Ok(named) = fs::symlink_metadata(lock_path) else {
-        return false;
-    };
-    if !workspace_lock_metadata_is_private_regular(&descriptor)
-        || descriptor.dev() != named.dev()
-        || descriptor.ino() != named.ino()
-    {
-        return false;
+fn authenticated_live_workspace_lock_owner(
+    record: &str,
+) -> std::result::Result<Option<WorkspaceLockOwner>, String> {
+    match parse_workspace_lock_owner(record) {
+        Some(ParsedWorkspaceLockOwner::V1(owner)) => {
+            if self::util::process_matches_start_token(owner.pid, &owner.process_start_identity) {
+                Err(
+                    "live trail-workspace-lock-v1 owner is incompatible with role-aware admission"
+                        .into(),
+                )
+            } else {
+                Ok(None)
+            }
+        }
+        Some(ParsedWorkspaceLockOwner::V2(owner)) => {
+            if !self::util::process_matches_start_token(owner.pid, &owner.process_start_identity) {
+                return Ok(None);
+            }
+            match current_executable_identity() {
+                Ok(identity) if identity == owner.executable_identity => Ok(Some(owner)),
+                Ok(_) => Err(
+                    "workspace lock executable identity changed while its owner remained live"
+                        .into(),
+                ),
+                Err(error) => Err(format!(
+                    "workspace lock executable identity could not be authenticated: {error}"
+                )),
+            }
+        }
+        None => Err(record.trim().to_string()),
     }
-    let Ok(Some(record)) = read_workspace_lock_record(&file) else {
-        return false;
-    };
-    let Some(owner) = WorkspaceLockOwner::parse(&record) else {
-        return false;
-    };
-    owner.nonce != predecessor_nonce
-        && self::util::process_matches_start_token(owner.pid, &owner.process_start_identity)
-        && current_executable_identity().is_ok_and(|identity| identity == owner.executable_identity)
-        && workspace_lock_link_topology_is_valid(lock_path, &descriptor, &owner.nonce)
 }
 
 fn create_workspace_lock_candidate(
@@ -4244,6 +4279,9 @@ fn inspect_existing_workspace_lock(lock_path: &Path) -> std::io::Result<Workspac
             "workspace lock record is invalid or exceeds the safe size limit".into(),
         ));
     };
+    let authenticated_predecessor = authenticated_live_workspace_lock_owner(&holder);
+    #[cfg(test)]
+    run_workspace_lock_inspection_hook(lock_path);
 
     #[cfg(unix)]
     {
@@ -4251,27 +4289,22 @@ fn inspect_existing_workspace_lock(lock_path: &Path) -> std::io::Result<Workspac
         let named = match fs::symlink_metadata(lock_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(WorkspaceLockInspection::Reaped);
+                return Ok(match authenticated_predecessor {
+                    Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
+                    Ok(None) => WorkspaceLockInspection::Reaped,
+                    Err(reason) => WorkspaceLockInspection::Terminal(reason),
+                });
             }
             Err(error) => return Err(error),
         };
         if descriptor.dev() != named.dev() || descriptor.ino() != named.ino() {
-            if workspace_lock_has_authenticated_successor(lock_path, &holder) {
-                return Ok(WorkspaceLockInspection::Reaped);
-            }
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .is_ok()
-            {
-                // The authenticated predecessor released while a successor
-                // atomically published at the same pathname. Retry against
-                // that successor; replacement of an inode still held by its
-                // owner remains terminal below.
-                return Ok(WorkspaceLockInspection::Reaped);
-            }
-            return Ok(WorkspaceLockInspection::Terminal(
-                "workspace lock pathname changed during validation".into(),
-            ));
+            return Ok(match authenticated_predecessor {
+                Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
+                Ok(None) => WorkspaceLockInspection::Terminal(
+                    "workspace lock pathname changed during validation".into(),
+                ),
+                Err(reason) => WorkspaceLockInspection::Terminal(reason),
+            });
         }
         if !workspace_lock_metadata_is_private_regular(&descriptor) {
             return Ok(WorkspaceLockInspection::Terminal(
@@ -4316,14 +4349,19 @@ fn inspect_existing_workspace_lock(lock_path: &Path) -> std::io::Result<Workspac
             }
         }
         if !topology_valid {
-            if workspace_lock_has_authenticated_successor(lock_path, &holder) {
-                return Ok(WorkspaceLockInspection::Reaped);
-            }
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .is_ok()
-            {
-                return Ok(WorkspaceLockInspection::Reaped);
+            let named_changed = fs::symlink_metadata(lock_path).is_ok_and(|named| {
+                file.metadata().is_ok_and(|descriptor| {
+                    descriptor.dev() != named.dev() || descriptor.ino() != named.ino()
+                })
+            });
+            if named_changed {
+                return Ok(match authenticated_predecessor {
+                    Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
+                    Ok(None) => WorkspaceLockInspection::Terminal(
+                        "workspace lock pathname changed during validation".into(),
+                    ),
+                    Err(reason) => WorkspaceLockInspection::Terminal(reason),
+                });
             }
             return Ok(WorkspaceLockInspection::Terminal(
                 "workspace lock has an untrusted hard-link topology".into(),
@@ -4811,12 +4849,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_lock_observer_startup_same_scope_serializes_exclusively() {
+    fn workspace_lock_observer_startup_same_scope_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let db_dir = temp.path().to_path_buf();
-        let schema = db_dir.join("trail.sqlite");
+        let schema = temp.path().join("trail.sqlite");
         let held = acquire_workspace_lock_with_admission(
-            &db_dir,
+            temp.path(),
             &schema,
             WorkspaceLockAdmission {
                 purpose: WorkspaceLockPurpose::ObserverStartup,
@@ -4826,28 +4863,76 @@ mod tests {
             },
         )
         .unwrap();
-        let waiter_dir = db_dir.clone();
-        let waiter_schema = schema.clone();
-        let (acquired, received) = std::sync::mpsc::sync_channel(1);
-        let waiter = std::thread::spawn(move || {
-            let lock = acquire_workspace_lock_with_admission(
-                &waiter_dir,
-                &waiter_schema,
+        let result = acquire_workspace_lock_with_admission(
+            temp.path(),
+            &schema,
+            WorkspaceLockAdmission {
+                purpose: WorkspaceLockPurpose::ObserverStartup,
+                operation_id: Some("scope-same"),
+                deadline: Duration::from_secs(1),
+                retry_command: "retry observer startup",
+            },
+        );
+        assert!(matches!(result, Err(Error::WorkspaceLocked(_))));
+        drop(held);
+    }
+
+    #[test]
+    fn workspace_lock_generation_turnover_retries_only_for_compatible_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_dir = temp.path().to_path_buf();
+        let schema = db_dir.join("trail.sqlite");
+        let predecessor = acquire_workspace_lock_with_admission(
+            &db_dir,
+            &schema,
+            WorkspaceLockAdmission {
+                purpose: WorkspaceLockPurpose::LaneAssociation,
+                operation_id: Some("init-predecessor"),
+                deadline: Duration::ZERO,
+                retry_command: "predecessor",
+            },
+        )
+        .unwrap();
+        let predecessor = Arc::new(Mutex::new(Some(predecessor)));
+        let predecessor_for_hook = Arc::clone(&predecessor);
+        let successor_dir = db_dir.clone();
+        let successor_schema = schema.clone();
+        install_workspace_lock_inspection_hook(&db_dir.join("lock"), move || {
+            drop(
+                predecessor_for_hook
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take(),
+            );
+            let successor = acquire_workspace_lock_with_admission(
+                &successor_dir,
+                &successor_schema,
                 WorkspaceLockAdmission {
-                    purpose: WorkspaceLockPurpose::ObserverStartup,
-                    operation_id: Some("scope-same"),
-                    deadline: Duration::from_secs(1),
-                    retry_command: "retry observer startup",
+                    purpose: WorkspaceLockPurpose::ObserverPublication,
+                    operation_id: Some("publication-successor"),
+                    deadline: Duration::ZERO,
+                    retry_command: "successor",
                 },
             )
             .unwrap();
-            acquired.send(()).unwrap();
-            lock
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                drop(successor);
+            });
         });
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
-        drop(held);
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(waiter.join().unwrap());
+
+        let acquired = acquire_workspace_lock_with_admission(
+            &db_dir,
+            &schema,
+            WorkspaceLockAdmission {
+                purpose: WorkspaceLockPurpose::ObserverStartup,
+                operation_id: Some("scope-distinct"),
+                deadline: Duration::from_secs(1),
+                retry_command: "retry observer startup",
+            },
+        )
+        .unwrap();
+        drop(acquired);
         assert!(!db_dir.join("lock").exists());
     }
 
