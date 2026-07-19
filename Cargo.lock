@@ -3196,6 +3196,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3750,6 +3751,8 @@ dependencies = [
 name = "prolly-bindings"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures-util",
  "hex",
  "prolly-map",
  "prolly-store-sqlite",
@@ -3761,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "prolly-map"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "js-sys",
@@ -3778,12 +3781,15 @@ dependencies = [
 name = "prolly-node-native"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "napi",
  "napi-build",
  "napi-derive",
  "prolly-bindings",
+ "send_wrapper",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3897,11 +3903,11 @@ dependencies = [
 name = "prolly-store-sqlite"
 version = "0.1.0"
 dependencies = [
- "libc",
  "prolly-map",
  "prolly-store-test",
  "rusqlite",
- "tempfile",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4687,6 +4693,12 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
 
 [[package]]
 name = "serde"

@@ -191,6 +191,48 @@ fixture is initialized from the working tree and must return
 `GIT_MAPPING_REQUIRED` without changing Git HEAD, the Git index, or Trail's
 mapping table.
 
+## Reproducible Prolly Qualification
+
+Trail is qualified against the full prolly revision
+`b68fcf4c57ce477292440da00bfc8aeed816c63a`. The configured submodule remote is
+`https://github.com/crabbuild/prolly.git`; release qualification must prove the
+full object remains fetchable rather than relying on an abbreviated hash or a
+developer's existing submodule object database:
+
+```sh
+prolly_revision=b68fcf4c57ce477292440da00bfc8aeed816c63a
+test "$(git -C prolly rev-parse HEAD)" = "$prolly_revision"
+git -C prolly fetch --dry-run origin "$prolly_revision"
+git diff --submodule=log -- prolly Cargo.lock
+```
+
+Run the focused root-map/storage, diff/merge, GC/fsck/backup, and recovery
+compatibility gates against that checkout:
+
+```sh
+cargo test -p trail db::storage --lib -- --nocapture
+cargo test -p prolly-store-sqlite -- --nocapture
+cargo test -p prolly-store-slatedb -- --nocapture
+cargo test -p trail db::merge --lib -- --nocapture
+cargo test -p trail --test e2e init_record_why_and_fsck_work -- --exact --nocapture
+cargo test -p trail --test e2e gc_prunes_unreachable_known_objects_and_preserves_reachable_roots -- --exact --nocapture
+cargo test -p trail --test e2e backup_create_verify_and_restore_roundtrip -- --exact --nocapture
+cargo test -p trail db::change_ledger::recovery --lib -- --nocapture
+```
+
+The candidate package is named `prolly-map`, so regenerate and verify the lock
+without updating unrelated packages:
+
+```sh
+cargo update -p prolly-map
+cargo metadata --locked --format-version 1 > /tmp/trail-cargo-metadata.json
+```
+
+Finally, clone the committed candidate with `git clone --no-local`, initialize
+submodules recursively, and run `cargo build -p trail --locked` from that clone.
+This clean-clone gate is mandatory because an uncommitted submodule checkout can
+hide an unavailable gitlink or local dependency edits.
+
 ## Current Evidence
 
 The path-index structural matrix was freshly measured on July 13, 2026 with a
