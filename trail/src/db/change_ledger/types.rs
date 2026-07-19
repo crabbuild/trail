@@ -384,21 +384,24 @@ pub(crate) fn trail_case_probe_token(token: &EvidenceAcknowledgementToken) -> bo
 }
 
 pub(crate) fn trail_atomic_temp_target(token: &EvidenceAcknowledgementToken) -> Option<String> {
-    let required_flags =
+    let split_rename_flags =
         EvidenceFlags::CREATE.0 | EvidenceFlags::CONTENT.0 | EvidenceFlags::RENAME_FROM.0;
+    let coalesced_rename_flags = EvidenceFlags::RENAME_FROM.0 | EvidenceFlags::RENAME_TO.0;
+    let flags = token.flags.0;
+    let split_rename = flags & split_rename_flags == split_rename_flags;
+    let coalesced_rename = flags & coalesced_rename_flags == coalesced_rename_flags;
     if token.kind != EvidenceRowKind::Exact
         || token.source_mask != EvidenceSource::Observer.mask()
         || token.provider_sequence.is_none()
         || token.intent_id.is_some()
         || token.first_sequence > token.last_sequence
-        // Native rename streams attach RENAME_FROM to the temporary source
-        // and RENAME_TO to the intended destination; requiring both on the
-        // temporary row can never match a real atomic replacement. CREATE +
-        // CONTENT + RENAME_FROM, the exact numeric Trail temp name, a matching
-        // intended target, and the later pinned absence check together bind
-        // this row to the controlled projection without hiding persistent
-        // user files that merely resemble Trail's namespace.
-        || token.flags.0 & required_flags != required_flags
+        // Split native streams report CREATE + CONTENT + RENAME_FROM. macOS
+        // may instead coalesce the same short-lived replacement into both
+        // rename endpoints while omitting CREATE, CONTENT, and MODE entirely.
+        // Both endpoints, together with the exact numeric Trail temp name,
+        // matching intended target, controlled interval, baseline absence,
+        // and later pinned absence, reject a one-sided persistent rename.
+        || (!split_rename && !coalesced_rename)
     {
         return None;
     }
@@ -493,6 +496,54 @@ mod internal_control_tests {
         assert_eq!(
             trail_atomic_temp_target(&observer_token("src/.lib.rs.trail-tmp-456", rename_flags,)),
             Some("src/lib.rs".into())
+        );
+        let coalesced_rename_flags =
+            EvidenceFlags::CONTENT.0 | EvidenceFlags::RENAME_FROM.0 | EvidenceFlags::RENAME_TO.0;
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                coalesced_rename_flags,
+            )),
+            Some("src/lib.rs".into())
+        );
+        let coalesced_metadata_flags = EvidenceFlags::CREATE.0
+            | EvidenceFlags::MODE.0
+            | EvidenceFlags::RENAME_FROM.0
+            | EvidenceFlags::RENAME_TO.0;
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                coalesced_metadata_flags,
+            )),
+            Some("src/lib.rs".into())
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                EvidenceFlags::RENAME_FROM.0 | EvidenceFlags::RENAME_TO.0,
+            )),
+            Some("src/lib.rs".into())
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                EvidenceFlags::RENAME_FROM.0,
+            )),
+            None
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                EvidenceFlags::RENAME_TO.0,
+            )),
+            None
+        );
+        assert_eq!(
+            trail_atomic_temp_target(&observer_token(
+                "src/.lib.rs.trail-tmp-456",
+                EvidenceFlags::CONTENT.0 | EvidenceFlags::RENAME_FROM.0,
+            )),
+            None
         );
         assert_eq!(
             trail_atomic_temp_target(&observer_token("src/.lib.rs.trail-tmp-user", rename_flags,)),
