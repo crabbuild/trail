@@ -2952,6 +2952,16 @@ fn macos_filesystem_is_supported(filesystem: &str) -> bool {
 }
 
 #[cfg(debug_assertions)]
+fn cross_device_workspace_candidate_is_compatible(
+    is_directory: bool,
+    is_distinct_device: bool,
+    is_supported_filesystem: bool,
+    has_history_authority: bool,
+) -> bool {
+    is_directory && is_distinct_device && is_supported_filesystem && has_history_authority
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn run_unsupported_filesystem_rejection() -> std::result::Result<(), String> {
     if !macos_filesystem_is_supported("apfs") {
         return Err("APFS was rejected".into());
@@ -3640,10 +3650,23 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
         if let Ok(volumes) = std::fs::read_dir("/Volumes") {
             for volume in volumes.flatten() {
                 let path = volume.path();
-                if std::fs::metadata(&path)
-                    .ok()
-                    .is_none_or(|metadata| !metadata.is_dir() || metadata.dev() == policy_device)
-                {
+                let Some(metadata) = std::fs::metadata(&path).ok() else {
+                    continue;
+                };
+                let is_directory = metadata.is_dir();
+                let is_distinct_device = metadata.dev() != policy_device;
+                let is_supported_filesystem =
+                    is_directory && is_distinct_device && ensure_apfs(&path).is_ok();
+                let has_history_authority = is_supported_filesystem
+                    && path.canonicalize().ok().is_some_and(|canonical_path| {
+                        actual_history_authority(&canonical_path, metadata.dev()).is_ok()
+                    });
+                if !cross_device_workspace_candidate_is_compatible(
+                    is_directory,
+                    is_distinct_device,
+                    is_supported_filesystem,
+                    has_history_authority,
+                ) {
                     continue;
                 }
                 if let Ok(temp) = tempfile::Builder::new()
@@ -3744,8 +3767,12 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
         let provider = b"macos-fsevents-file-events-v1".to_vec();
         let (durability, _) = memory_durability(provider, Duration::ZERO);
         let system_dependency = PathBuf::from("/etc/gitconfig");
+        let system_workspace = tempfile::Builder::new()
+            .prefix("trail-system-policy-alias-")
+            .tempdir_in("/private/tmp")?;
+        std::fs::create_dir(system_workspace.path().join(".trail"))?;
         let system_observer = MacOsFseventsObserver::start(
-            external_root.path(),
+            system_workspace.path(),
             Box::new(durability),
             None,
             std::slice::from_ref(&system_dependency),
@@ -4900,6 +4927,30 @@ pub(crate) fn run_uuid_revalidation() -> std::result::Result<(), String> {
         Ok(())
     }
     run().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod cross_device_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn cross_device_workspace_selection_requires_apfs_history_authority() {
+        assert!(cross_device_workspace_candidate_is_compatible(
+            true, true, true, true
+        ));
+        assert!(!cross_device_workspace_candidate_is_compatible(
+            true, true, false, true
+        ));
+        assert!(!cross_device_workspace_candidate_is_compatible(
+            true, false, true, true
+        ));
+        assert!(!cross_device_workspace_candidate_is_compatible(
+            false, true, true, true
+        ));
+        assert!(!cross_device_workspace_candidate_is_compatible(
+            true, true, true, false
+        ));
+    }
 }
 
 #[cfg(test)]
