@@ -61,6 +61,9 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
     expected_paths = []
     lane_rows = []
     result_rows = []
+    executed_driver_bytes = b"fixture fault driver\n"
+    executed_driver_sha = hashlib.sha256(executed_driver_bytes).hexdigest()
+    (root / "fault-driver-executed").write_bytes(executed_driver_bytes)
 
     def command(command_id: str, phase: str, lane: str = "", seconds: float = wall) -> None:
         result_rows.append({
@@ -72,6 +75,12 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         (commands / f"{command_id}.stdout").write_text("{}\n", encoding="utf-8")
         (commands / f"{command_id}.stderr").write_text("\n", encoding="utf-8")
         (commands / f"{command_id}.rss").write_text("4096\n", encoding="utf-8")
+
+    command("baseline-status", "baseline")
+    (commands / "baseline-status.json").write_text(json.dumps({
+        "actual_exit_code": 0,
+        "payload": {"head": {"name": "refs/branches/main", "change_id": "trail-change", "root_id": "trail-root"}},
+    }) + "\n", encoding="utf-8")
 
     for index in range(lanes):
         lane = f"scale-{index:04d}"
@@ -152,10 +161,13 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         "source": {"repo": "/tmp/source", "commit": "2" * 40,
                    "tree_clean": True, "submodules_clean": True,
                    "status_porcelain": [], "submodule_status": []},
-        "fault_driver": {"path": "/tmp/fault-driver", "sha256": "3" * 64,
-                         "expected_sha256": "3" * 64, "exact_expected": True,
+        "fault_driver": {"path": "/tmp/fault-driver", "sha256": executed_driver_sha,
+                         "expected_sha256": executed_driver_sha, "exact_expected": True,
                          "is_candidate_harness": True, "qualification_kind": "candidate_harness",
-                         "attestation_path": "", "attestation_sha256": ""},
+                         "attestation_path": "", "attestation_sha256": "",
+                         "executed_evidence_path": "fault-driver-executed",
+                         "executed_sha256": executed_driver_sha,
+                         "executed_digest_verified_each_probe": True},
         "candidate_relationship": {"kind": "locally_bound_unproven_build",
                                    "expected_binary_sha256": "1" * 64,
                                    "expected_source_commit": "2" * 40},
@@ -263,7 +275,8 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         "schema_version": checker.SCHEMA_VERSION,
         "run": {"run_id": run_id, "lanes": lanes, "files_per_lane": files,
                 "concurrency": lanes, "fault_phase": "all", "latency_ceiling_seconds": 1.0},
-        "baseline": {"trail_commit": "trail-commit", "trail_ref": "trail-ref",
+        "baseline": {"trail_commit": "trail-change", "trail_source_commit": "2" * 40,
+                     "trail_ref": "refs/branches/main",
                      "trail_root": "trail-root", "git_head": "a" * 40,
                      "git_branch": "main", "git_index_tree": "b" * 40,
                      "filesystem": "testfs", "repo_path": "/tmp/repo"},
@@ -551,6 +564,44 @@ class CheckerContractTests(unittest.TestCase):
         (root / "environment.json").write_text(json.dumps(environment) + "\n")
         refresh_manifest(root)
         with self.assertRaisesRegex(checker.EvidenceError, "binary"):
+            checker.check(root)
+
+    def test_baseline_trail_identity_must_match_raw_status(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        metrics = json.loads((root / "metrics.json").read_text())
+        metrics["baseline"]["trail_commit"] = "candidate-source-confusion"
+        (root / "metrics.json").write_text(json.dumps(metrics, sort_keys=True) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "baseline Trail identity"):
+            checker.check(root)
+
+    def test_baseline_source_identity_must_match_environment(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        metrics = json.loads((root / "metrics.json").read_text())
+        metrics["baseline"]["trail_source_commit"] = "4" * 40
+        (root / "metrics.json").write_text(json.dumps(metrics, sort_keys=True) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "candidate source"):
+            checker.check(root)
+
+    def test_baseline_git_tree_must_match_exact_path_state(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        metrics = json.loads((root / "metrics.json").read_text())
+        metrics["baseline"]["git_index_tree"] = "9" * 40
+        (root / "metrics.json").write_text(json.dumps(metrics, sort_keys=True) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "baseline Git tree"):
+            checker.check(root)
+
+    def test_executed_fault_driver_bytes_must_match_claimed_digest(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        (root / "fault-driver-executed").write_bytes(b"mutated executed driver\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "executed fault driver"):
             checker.check(root)
 
     def test_native_cow_fallback_is_rejected(self) -> None:

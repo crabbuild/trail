@@ -141,8 +141,10 @@ elif command in (["doctor"],["fsck"]):
     if command == ["doctor"] and os.environ.get("FAKE_LEAK_SOCKET"):
         (trail/os.environ["FAKE_LEAK_SOCKET"]).write_bytes(b"leaked tombstone\n")
     if command == ["doctor"] and os.environ.get("FAKE_LEAK_JOURNAL"):
-        journal=trail/"index/materialization-operations"; journal.mkdir(parents=True,exist_ok=True)
+        journal=trail/"materialization-operations"; journal.mkdir(parents=True,exist_ok=True)
         (journal/os.environ["FAKE_LEAK_JOURNAL"]).write_text('{"state":"preparing"}\n')
+    if command == ["doctor"] and os.environ.get("FAKE_MUTATE_FAULT_DRIVER"):
+        pathlib.Path(os.environ["TRAIL_SCALE_FAULT_DRIVER"]).write_text("#!/bin/sh\nexit 97\n")
     emit({"status":"ok","checks":[]} if command == ["doctor"] else {"checked_refs":1,"checked_roots":1,"checked_texts":1,"errors":[]})
 else:
     print("unsupported fake command: "+repr(command),file=sys.stderr); raise SystemExit(64)
@@ -194,7 +196,7 @@ class HarnessContractTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "baseline"], check=True)
         (self.repo / ".trail/index").mkdir(parents=True)
-        (self.repo / ".trail/index/HEAD").write_text("main\n", encoding="utf-8")
+        (self.repo / ".trail/HEAD").write_text("main\n", encoding="utf-8")
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
             db.executescript("""
                 CREATE TABLE lanes(lane_id TEXT PRIMARY KEY, name TEXT UNIQUE);
@@ -273,6 +275,13 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual({row["status"] for row in final["merge_queue"]}, {"merged"})
         self.assertEqual({row["status"] for row in final["lane_branches"]}, {"removed"})
         self.assertTrue(all(row["name"].startswith("retired/") for row in final["lanes"]))
+        metrics = json.loads((self.output / "metrics.json").read_text())
+        environment = json.loads((self.output / "environment.json").read_text())
+        self.assertEqual(metrics["baseline"]["trail_commit"], "basechange")
+        self.assertEqual(metrics["baseline"]["trail_source_commit"], environment["source"]["commit"])
+        executed = self.output / environment["fault_driver"]["executed_evidence_path"]
+        self.assertEqual(__import__("hashlib").sha256(executed.read_bytes()).hexdigest(),
+                         environment["fault_driver"]["executed_sha256"])
 
     def test_candidate_filesystem_fault_probe_dispatches_native_exact_test(self) -> None:
         result = self.run_candidate_fault_probe("filesystem_replacement")
@@ -341,6 +350,14 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("mapped_delta baseline", result.stderr)
         self.assertFalse((self.repo / ".trail/status-was-called").exists())
         self.assertFalse(self.output.exists())
+
+    def test_real_trail_head_path_is_required(self) -> None:
+        (self.repo / ".trail/HEAD").unlink()
+        (self.repo / ".trail/index/HEAD").write_text("main\n", encoding="utf-8")
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("Trail HEAD file", result.stderr)
+        self.assertFalse((self.repo / ".trail/fake-state.json").exists())
 
     def test_preexisting_lane_collision_is_rejected_and_never_cleaned_up(self) -> None:
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
@@ -418,6 +435,19 @@ class HarnessContractTests(unittest.TestCase):
         self.assertTrue(all(row["source_commit"] == environment["source"]["commit"] for row in faults))
         self.assertTrue(all(row["binary_sha256"] == environment["binary"]["sha256"] for row in faults))
         self.assertTrue(all(row["test_count"] == "1" for row in faults if row["evidence_kind"] != "harness_control"))
+
+    def test_mutated_original_fault_driver_does_not_change_executed_verified_bytes(self) -> None:
+        original = self.fault.read_bytes()
+        original_sha = __import__("hashlib").sha256(original).hexdigest()
+        result = self.run_harness(FAKE_MUTATE_FAULT_DRIVER="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(self.fault.read_bytes(), original)
+        environment = json.loads((self.output / "environment.json").read_text())
+        driver = environment["fault_driver"]
+        self.assertEqual(driver["executed_sha256"], original_sha)
+        self.assertTrue(driver["executed_digest_verified_each_probe"])
+        executed = self.output / driver["executed_evidence_path"]
+        self.assertEqual(__import__("hashlib").sha256(executed.read_bytes()).hexdigest(), original_sha)
 
     def test_candidate_binary_path_with_spaces_supports_version_probe(self) -> None:
         spaced = self.repo.parent / "fake trail binary"

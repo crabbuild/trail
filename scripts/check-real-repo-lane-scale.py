@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
@@ -347,13 +347,31 @@ def check_environment(path: Path) -> dict[str, Any]:
     fault_driver = environment["fault_driver"]
     exact_keys(fault_driver, ["path", "sha256", "expected_sha256", "exact_expected",
                               "is_candidate_harness", "qualification_kind",
-                              "attestation_path", "attestation_sha256"], "environment.fault_driver")
+                              "attestation_path", "attestation_sha256",
+                              "executed_evidence_path", "executed_sha256",
+                              "executed_digest_verified_each_probe"], "environment.fault_driver")
     if not isinstance(fault_driver["path"], str) or not Path(fault_driver["path"]).is_absolute(): fail("environment.fault_driver.path must be absolute")
     if not isinstance(fault_driver["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", fault_driver["sha256"]): fail("environment.fault_driver.sha256 is invalid")
     if fault_driver["expected_sha256"] != fault_driver["sha256"]:
         fail("environment fault driver does not match the exact expected digest")
     if not boolean(fault_driver["exact_expected"], "environment.fault_driver.exact_expected"):
         fail("environment fault driver is not exact")
+    if fault_driver["executed_evidence_path"] != "fault-driver-executed":
+        fail("environment executed fault driver evidence path is not exact")
+    if fault_driver["executed_sha256"] != fault_driver["sha256"]:
+        fail("environment executed fault driver digest differs from qualified driver")
+    if not boolean(fault_driver["executed_digest_verified_each_probe"],
+                   "environment.fault_driver.executed_digest_verified_each_probe"):
+        fail("environment does not attest per-probe executed fault-driver verification")
+    executed_driver = path.parent / fault_driver["executed_evidence_path"]
+    try:
+        if not executed_driver.is_file() or executed_driver.is_symlink():
+            fail("executed fault driver evidence is missing or unsafe")
+        executed_digest = hashlib.sha256(executed_driver.read_bytes()).hexdigest()
+    except OSError as error:
+        fail(f"cannot read executed fault driver evidence: {error}")
+    if executed_digest != fault_driver["executed_sha256"]:
+        fail("executed fault driver evidence does not match claimed digest")
     candidate_driver = boolean(fault_driver["is_candidate_harness"], "environment.fault_driver.is_candidate_harness")
     if fault_driver["qualification_kind"] == "candidate_harness":
         if not candidate_driver or fault_driver["attestation_path"] or fault_driver["attestation_sha256"]:
@@ -495,9 +513,28 @@ def check(root: Path) -> dict[str, Any]:
 
     baseline = metrics["baseline"]
     if not isinstance(baseline, dict): fail("baseline must be an object")
-    exact_keys(baseline, ["trail_commit", "trail_ref", "trail_root", "git_head", "git_branch", "git_index_tree", "filesystem", "repo_path"], "baseline")
+    exact_keys(baseline, ["trail_commit", "trail_source_commit", "trail_ref", "trail_root",
+                          "git_head", "git_branch", "git_index_tree", "filesystem", "repo_path"],
+               "baseline")
     for key, value in baseline.items():
         if not isinstance(value, str) or not value: fail(f"baseline.{key} must be a non-empty string")
+    if not re.fullmatch(r"refs/branches/[A-Za-z0-9._/-]+", baseline["trail_ref"]):
+        fail("baseline.trail_ref is invalid")
+    if baseline["trail_source_commit"] != environment["source"]["commit"]:
+        fail("baseline candidate source does not match environment identity")
+    if baseline["filesystem"] != environment["filesystem"]["repo_filesystem"]:
+        fail("baseline filesystem does not match environment identity")
+    if not Path(baseline["repo_path"]).is_absolute():
+        fail("baseline.repo_path must be absolute")
+    baseline_status_wrapper = read_json(root / "commands/baseline-status.json")
+    baseline_status_payload = baseline_status_wrapper.get("payload")
+    baseline_status_head = (baseline_status_payload.get("head")
+                            if isinstance(baseline_status_payload, dict) else None)
+    if (baseline_status_wrapper.get("actual_exit_code") != 0
+            or not isinstance(baseline_status_head, dict)
+            or any(baseline_status_head.get(field) != baseline[key] for field, key in (
+                ("name", "trail_ref"), ("change_id", "trail_commit"), ("root_id", "trail_root")))):
+        fail("baseline Trail identity does not match raw baseline-status evidence")
 
     results = read_tsv(root / "results.tsv", RESULT_COLUMNS)
     command_ids: set[str] = set()
@@ -516,6 +553,10 @@ def check(root: Path) -> dict[str, Any]:
         for suffix in ("json", "stdout", "stderr", "rss"):
             relative = f"commands/{command_id}.{suffix}"
             if relative not in manifest_entries: fail(f"missing command evidence {relative}")
+    baseline_status_rows = [row for row in results
+                            if row["command_id"] == "baseline-status" and row["phase"] == "baseline"]
+    if len(baseline_status_rows) != 1:
+        fail("results must contain exactly one baseline-status command")
 
     lane_rows = read_tsv(root / "lanes.tsv", LANE_COLUMNS)
     if len(lane_rows) != lanes_expected: fail(f"expected {lanes_expected} lane rows, got {len(lane_rows)}")
@@ -648,6 +689,8 @@ def check(root: Path) -> dict[str, Any]:
     change_base, change_final, path_changes = read_path_changes(root / "path-changes.json")
     if (change_base, change_final) != (baseline_tree, final_tree):
         fail("path change evidence is not bound to the exact baseline/final trees")
+    if baseline["git_index_tree"] != baseline_tree:
+        fail("baseline Git tree does not match exact baseline path-state evidence")
     baseline_by_path = {row["path"]: row for row in baseline_entries}
     final_by_path = {row["path"]: row for row in final_entries}
     deleted_paths = sorted(baseline_by_path.keys() - final_by_path.keys())
@@ -721,6 +764,8 @@ def check(root: Path) -> dict[str, Any]:
     for key in ["commit", "parent", "dedicated_ref_target"]:
         if not isinstance(git_export[key], str) or not re.fullmatch(r"[0-9a-f]{40,64}", git_export[key]): fail(f"git_export.{key} is not an object id")
     if git_export["commit"] != git_export["dedicated_ref_target"]: fail("dedicated ref does not target export commit")
+    if git_export["parent"] != baseline["git_head"]:
+        fail("Git export parent does not match baseline Git HEAD")
     if not isinstance(git_export["dedicated_ref"], str) or not DEDICATED_REF.fullmatch(git_export["dedicated_ref"]): fail("Git export ref is not dedicated refs/heads/codex/... ref")
     for key in ["original_head_unchanged", "original_branch_unchanged", "original_index_unchanged"]:
         if not boolean(git_export[key], f"git_export.{key}"): fail(f"git_export.{key} must be true")

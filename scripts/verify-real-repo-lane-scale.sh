@@ -7,6 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+FAULT_PROJECT_ROOT=${TRAIL_FAULT_PROJECT_ROOT:-$PROJECT_ROOT}
 
 fault_probe() {
   local scenario=${1:-}
@@ -63,12 +64,12 @@ fault_probe() {
     *) echo "unsupported fault scenario: $scenario" >&2; return 64 ;;
   esac
   if [[ $test_target == lib ]]; then
-    test_output=$(cd "$PROJECT_ROOT" && cargo test -p trail "$test_name" --lib -- --exact --nocapture 2>&1) || {
+    test_output=$(cd "$FAULT_PROJECT_ROOT" && cargo test -p trail "$test_name" --lib -- --exact --nocapture 2>&1) || {
       printf '%s\n' "$test_output" >&2
       return 1
     }
   else
-    test_output=$(cd "$PROJECT_ROOT" && cargo test -p trail --test "$test_target" "$test_name" -- --exact --nocapture 2>&1) || {
+    test_output=$(cd "$FAULT_PROJECT_ROOT" && cargo test -p trail --test "$test_target" "$test_name" -- --exact --nocapture 2>&1) || {
       printf '%s\n' "$test_output" >&2
       return 1
     }
@@ -215,7 +216,7 @@ workdir_root=pathlib.Path(output)/"workdirs"
 if workdir_root.is_dir(): workdirs.extend(str(path.resolve()) for path in workdir_root.iterdir())
 resources["workdir_paths"]=sorted(set(workdirs))
 materialization_journals=[]
-journal_root=pathlib.Path(db_path).parent/"materialization-operations"
+journal_root=pathlib.Path(repo)/".trail/materialization-operations"
 if journal_root.exists():
     for path in sorted(journal_root.rglob("*")):
         relative=str(path.relative_to(journal_root))
@@ -422,7 +423,7 @@ output_device=$(device_id "$TRAIL_SCALE_OUTPUT")
 
 # Every rejection above and below this point uses only filesystem metadata, read-only Git,
 # and SQLite mode=ro. No daemon-backed Trail command is allowed before this block passes.
-head_file=$TRAIL_SCALE_REPO/.trail/index/HEAD
+head_file=$TRAIL_SCALE_REPO/.trail/HEAD
 [[ -f $head_file && ! -L $head_file ]] || die "Trail HEAD file is missing or unsafe"
 baseline_trail_branch=$(tr -d '\n' < "$head_file")
 [[ $baseline_trail_branch =~ ^[A-Za-z0-9._/-]+$ ]] || die "Trail HEAD branch is invalid"
@@ -452,6 +453,37 @@ PY
 ) || die "mapped_delta/lane/queue preflight failed"
 
 mkdir -p "$TRAIL_SCALE_OUTPUT/commands" "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs" "$TRAIL_SCALE_OUTPUT/manifests"
+fault_driver_executed_evidence_path=fault-driver-executed
+fault_driver_executable=$TRAIL_SCALE_OUTPUT/$fault_driver_executed_evidence_path
+python3 - "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_executable" "$fault_driver_sha256" <<'PY' || die "could not create exact immutable fault-driver evidence copy"
+import hashlib, os, stat, sys
+source, destination, expected=sys.argv[1:]
+flags=os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)
+descriptor=os.open(source,flags)
+try:
+    info=os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode): raise SystemExit("fault driver is not regular")
+    chunks=[]; digest=hashlib.sha256()
+    while True:
+        chunk=os.read(descriptor,1024*1024)
+        if not chunk: break
+        chunks.append(chunk); digest.update(chunk)
+finally:
+    os.close(descriptor)
+if digest.hexdigest()!=expected: raise SystemExit("fault driver changed before immutable copy")
+output=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o500)
+try:
+    for chunk in chunks:
+        view=memoryview(chunk)
+        while view:
+            written=os.write(output,view)
+            view=view[written:]
+    os.fsync(output)
+finally:
+    os.close(output)
+os.chmod(destination,0o500)
+PY
+[[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "immutable fault-driver evidence digest mismatch"
 if [[ $fault_qualification_kind == external_attestation ]]; then
   cp -p -- "$fault_attestation_path" "$TRAIL_SCALE_OUTPUT/fault-attestation.json"
 fi
@@ -814,7 +846,9 @@ open(sys.argv[1],"w").write(json.dumps(wrapper,sort_keys=True)+"\n")
 PY
     rm -f "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe.json" "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe-output.json"
   else
-    run_command "$command_id" fault "" false "" 0 "$TRAIL_SCALE_FAULT_DRIVER" --fault-probe "$scenario"
+    [[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "executed fault-driver digest changed before $scenario"
+    run_command "$command_id" fault "" false "" 0 env TRAIL_FAULT_PROJECT_ROOT="$PROJECT_ROOT" "$fault_driver_executable" --fault-probe "$scenario"
+    [[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "executed fault-driver digest changed after $scenario"
   fi
   python3 - "$TRAIL_SCALE_OUTPUT/commands/$command_id.json" "$command_id" "$TRAIL_SCALE_OUTPUT/rows/faultrow-$fault_index.tsv" "$trail_source_commit" "$candidate_binary_sha256" "$fault_qualification_kind" <<'PY'
 import json, sys
@@ -905,12 +939,13 @@ PY
 repo_filesystem=$(filesystem_type "$TRAIL_SCALE_REPO")
 output_filesystem=$(filesystem_type "$TRAIL_SCALE_OUTPUT")
 [[ $(sha256_file "$TRAIL_BIN") == "$candidate_binary_sha256" ]] || die "candidate binary changed during qualification"
+[[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "executed fault-driver evidence changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" rev-parse HEAD) == "$trail_source_commit" ]] || die "source commit changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=normal) == "$source_status_baseline" ]] || die "source tree state changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" submodule status --recursive) == "$source_submodules_baseline" ]] || die "source submodule state changed during qualification"
-python3 - "$TRAIL_SCALE_OUTPUT/environment.json" "$TRAIL_SCALE_REPO" "$TRAIL_BIN" "$repo_filesystem" "$output_filesystem" "$repo_device" "$output_device" "$trail_source_commit" "$candidate_binary_sha256" "$candidate_binary_size" "$candidate_binary_version" "$PROJECT_ROOT" "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_sha256" "$candidate_harness_path" "$fault_qualification_kind" "$fault_attestation_path" "$fault_attestation_sha256" <<'PY'
+python3 - "$TRAIL_SCALE_OUTPUT/environment.json" "$TRAIL_SCALE_REPO" "$TRAIL_BIN" "$repo_filesystem" "$output_filesystem" "$repo_device" "$output_device" "$trail_source_commit" "$candidate_binary_sha256" "$candidate_binary_size" "$candidate_binary_version" "$PROJECT_ROOT" "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_sha256" "$candidate_harness_path" "$fault_qualification_kind" "$fault_attestation_path" "$fault_attestation_sha256" "$fault_driver_executed_evidence_path" <<'PY'
 import json, platform, subprocess, sys
-(out,repo,binary,repo_fs,output_fs,repo_dev,output_dev,commit,binary_sha,size,version,source_repo,fault_driver,fault_sha,harness_path,qualification,attestation_path,attestation_sha)=sys.argv[1:]
+(out,repo,binary,repo_fs,output_fs,repo_dev,output_dev,commit,binary_sha,size,version,source_repo,fault_driver,fault_sha,harness_path,qualification,attestation_path,attestation_sha,executed_path)=sys.argv[1:]
 status=subprocess.check_output(["git","-C",source_repo,"status","--porcelain=v1","--untracked-files=normal"],text=True).splitlines()
 tracked_status=subprocess.check_output(["git","-C",source_repo,"status","--porcelain=v1","--untracked-files=no"],text=True).splitlines()
 submodules=subprocess.check_output(["git","-C",source_repo,"submodule","status","--recursive"],text=True).splitlines()
@@ -920,7 +955,7 @@ data={
  "filesystem":{"repo_device":int(repo_dev),"output_device":int(output_dev),"same_device":repo_dev==output_dev,"repo_filesystem":repo_fs,"output_filesystem":output_fs},
  "binary":{"path":binary,"sha256":binary_sha,"size_bytes":int(size),"version":version},
  "source":{"repo":source_repo,"commit":commit,"tree_clean":not tracked_status,"submodules_clean":not any(line[:1] in {"+","-","U"} for line in submodules),"status_porcelain":status,"submodule_status":submodules},
- "fault_driver":{"path":fault_driver,"sha256":fault_sha,"expected_sha256":fault_sha,"exact_expected":True,"is_candidate_harness":fault_driver==harness_path,"qualification_kind":qualification,"attestation_path":attestation_path,"attestation_sha256":attestation_sha},
+ "fault_driver":{"path":fault_driver,"sha256":fault_sha,"expected_sha256":fault_sha,"exact_expected":True,"is_candidate_harness":fault_driver==harness_path,"qualification_kind":qualification,"attestation_path":attestation_path,"attestation_sha256":attestation_sha,"executed_evidence_path":executed_path,"executed_sha256":fault_sha,"executed_digest_verified_each_probe":True},
  "candidate_relationship":{"kind":"locally_bound_unproven_build","expected_binary_sha256":binary_sha,"expected_source_commit":commit},
 }
 json.dump(data,open(out,"w"),sort_keys=True);open(out,"a").write("\n")
@@ -982,9 +1017,9 @@ integrity_commands={
  "git-fsck":git_fsck_wrapper["actual_exit_code"] == 0,
 }
 metrics={
- "schema_version":4,
+ "schema_version":5,
  "run":{"run_id":run_id,"lanes":lanes,"files_per_lane":files,"concurrency":int(concurrency),"fault_phase":fault_phase,"latency_ceiling_seconds":float(ceiling)},
- "baseline":{"trail_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
+ "baseline":{"trail_commit":trail_commit,"trail_source_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
  "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline)+len(added_changes^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
  "performance":{"spawn":perf("spawn"),"record":perf("record"),"queue_run":perf("queue_run"),"git_export":perf("git_export"),"latency_ceiling_enforced":lanes<=64},
  "storage":{"db_bytes_before":int(db_before),"db_bytes_after":int(db_after),"observer_log_bytes_before":int(log_before),"observer_log_bytes_after":int(log_after),"logical_lane_bytes":sum(int(r["logical_bytes"]) for r in lane_rows),"allocated_lane_bytes":sum(int(r["allocated_bytes"]) for r in lane_rows),"exclusive_lane_bytes":sum(int(r["exclusive_bytes"]) for r in lane_rows)},
