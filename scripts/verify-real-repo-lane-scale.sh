@@ -10,56 +10,93 @@ PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 fault_probe() {
   local scenario=${1:-}
-  local test_command durable_phase committed retry_result
+  local test_target test_name durable_phase committed retry_result test_output test_count
   case "$scenario" in
     after_reservation|after_materialization|after_association|after_reconciliation|after_marker|after_spawn_event)
-      test_command="cargo test -p trail --test lane_initialization_faults identical_spawn_resumes_at_every_durable_crash_cut -- --exact --nocapture"
+      test_target=lane_initialization_faults
+      test_name=identical_spawn_resumes_at_every_durable_crash_cut
       durable_phase=${scenario#after_}
       case "$scenario" in after_association|after_reconciliation|after_marker|after_spawn_event) committed=true ;; *) committed=false ;; esac
       retry_result=resumed_same_initialization
       ;;
     daemon_death)
-      test_command="cargo test -p trail --test changed_path_ledger_daemon killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change -- --exact --nocapture"
+      test_target=changed_path_ledger_daemon
+      test_name=killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change
       durable_phase=control committed=false retry_result=recovered_once ;;
     response_loss_after_association|response_loss_after_readiness)
-      test_command="cargo test -p trail --test changed_path_ledger_daemon external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback -- --exact --nocapture"
+      test_target=changed_path_ledger_daemon
+      test_name=external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback
       durable_phase=control committed=true retry_result=resumed_same_initialization ;;
     pid_reuse)
-      test_command="cargo test -p trail --test changed_path_ledger_daemon forged_dead_process_identity_cannot_replace_a_live_observer_owner -- --exact --nocapture"
+      test_target=changed_path_ledger_daemon
+      test_name=forged_dead_process_identity_cannot_replace_a_live_observer_owner
       durable_phase=control committed=false retry_result=refused_without_mutation ;;
     lock_holder_crash)
-      test_command="cargo test -p trail --test changed_path_ledger_daemon crash_after_persisting_ledger_owner_is_automatically_recovered -- --exact --nocapture"
+      test_target=changed_path_ledger_daemon
+      test_name=crash_after_persisting_ledger_owner_is_automatically_recovered
       durable_phase=control committed=false retry_result=recovered_once ;;
     policy_churn)
-      test_command="cargo test -p trail --test changed_path_ledger_daemon live_policy_invalidation_self_restarts_and_reconciles -- --exact --nocapture"
+      test_target=changed_path_ledger_daemon
+      test_name=live_policy_invalidation_self_restarts_and_reconciles
       durable_phase=control committed=false retry_result=recovered_once ;;
     filesystem_replacement)
-      test_command="cargo test -p trail --test changed_path_ledger_linux owner_death_and_root_replacement_cannot_prove_clean -- --exact --nocapture"
+      case "$(uname -s)" in
+        Darwin) test_target=changed_path_ledger_macos; test_name=every_root_revalidation_failure_revokes_globally ;;
+        Linux) test_target=changed_path_ledger_linux; test_name=owner_death_and_root_replacement_cannot_prove_clean ;;
+        *) echo "filesystem replacement fault probe is unsupported on $(uname -s)" >&2; return 64 ;;
+      esac
       durable_phase=control committed=false retry_result=refused_without_mutation ;;
     disk_full|permissions_failure|fsync_failure)
-      test_command="cargo test -p trail --test lane_initialization_faults io_failures_never_advance_past_or_delete_the_durable_artifact -- --exact --nocapture"
+      test_target=lane_initialization_faults
+      test_name=io_failures_never_advance_past_or_delete_the_durable_artifact
       durable_phase=reserved committed=false retry_result=refused_without_mutation ;;
     conflicting_lanes)
-      test_command="cargo test -p trail --test e2e lane_merge_queue_pauses_on_conflict -- --exact --nocapture"
+      test_target=e2e
+      test_name=lane_merge_queue_pauses_on_conflict
       durable_phase=control committed=false retry_result=refused_without_mutation ;;
     dirty_git_export_refusal)
       # The main harness performs the real dirty-worktree refusal. This focused mapped
       # export test additionally proves that the mapped-delta policy is the selected path.
-      test_command="cargo test -p trail db::merge::git_export::tests::mapped_git_export_requires_preexisting_clean_mapping --lib -- --exact --nocapture"
+      test_target=lib
+      test_name=db::merge::git_export::tests::mapped_git_export_requires_preexisting_clean_mapping
       durable_phase=control committed=false retry_result=refused_without_mutation ;;
     *) echo "unsupported fault scenario: $scenario" >&2; return 64 ;;
   esac
-  if ! (cd "$PROJECT_ROOT" && bash -c "$test_command") >&2; then
-    return 1
+  if [[ $test_target == lib ]]; then
+    test_output=$(cd "$PROJECT_ROOT" && cargo test -p trail "$test_name" --lib -- --exact --nocapture 2>&1) || {
+      printf '%s\n' "$test_output" >&2
+      return 1
+    }
+  else
+    test_output=$(cd "$PROJECT_ROOT" && cargo test -p trail --test "$test_target" "$test_name" -- --exact --nocapture 2>&1) || {
+      printf '%s\n' "$test_output" >&2
+      return 1
+    }
   fi
-  python3 - "$scenario" "$durable_phase" "$committed" "$retry_result" <<'PY'
+  printf '%s\n' "$test_output" >&2
+  test_count=$(TRAIL_FAULT_TEST_OUTPUT="$test_output" python3 - "$test_name" <<'PY'
+import os, re, sys
+name=sys.argv[1]
+text=os.environ["TRAIL_FAULT_TEST_OUTPUT"]
+summaries=re.findall(r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;", text)
+named=len(re.findall(r"^test " + re.escape(name) + r" \.\.\. ok$", text, re.M))
+if summaries != [("1","0","0")] or named != 1:
+    raise SystemExit(f"focused fault probe did not execute exactly one named test: name={name} summaries={summaries} named={named}")
+print(1)
+PY
+) || {
+    echo "focused fault probe did not execute exactly one test" >&2
+    return 1
+  }
+  python3 - "$scenario" "$durable_phase" "$committed" "$retry_result" "$test_target" "$test_name" "$test_count" <<'PY'
 import json, sys
-scenario, phase, committed, retry = sys.argv[1:]
+scenario, phase, committed, retry, target, name, count = sys.argv[1:]
 print(json.dumps({
     "scenario": scenario, "expected_code": "PASS", "actual_code": "PASS",
     "durable_phase": phase, "committed": committed == "true",
     "retry_result": retry, "integrity_result": "focused_test_exit_0", "leaked_resource_count": 0,
     "initialization_id": "", "retry_initialization_id": "",
+    "test_target": target, "test_name": name, "test_count": int(count),
 }, sort_keys=True))
 PY
 }
@@ -84,6 +121,9 @@ TRAIL_SCALE_OUTPUT=${TRAIL_SCALE_OUTPUT:-}
 TRAIL_SCALE_FAULT_DRIVER=${TRAIL_SCALE_FAULT_DRIVER:-$0}
 TRAIL_SCALE_EXPECTED_BINARY_SHA256=${TRAIL_SCALE_EXPECTED_BINARY_SHA256:-}
 TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=${TRAIL_SCALE_EXPECTED_SOURCE_COMMIT:-}
+TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=${TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256:-}
+TRAIL_SCALE_FAULT_ATTESTATION=${TRAIL_SCALE_FAULT_ATTESTATION:-}
+TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256=${TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256:-}
 
 die() { echo "verify-real-repo-lane-scale: $*" >&2; exit 64; }
 is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
@@ -108,11 +148,12 @@ PY
 capture_resource_inventory() {
   local output=$1
   python3 - "$db_path" "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT" "$output" <<'PY'
-import json, os, pathlib, socket, sqlite3, stat, subprocess, sys
+import hashlib, json, os, pathlib, sqlite3, stat, subprocess, sys
 db_path, repo, output, destination=sys.argv[1:]
 
 tables = {
     "lanes": ("lanes", ["lane_id", "name"]),
+    "lane_branches": ("lane_branches", ["lane_id", "ref_name", "status", "workdir", "base_change", "head_change"]),
     "lane_refs": ("refs", ["name", "change_id", "root_id", "operation_id", "generation"]),
     "merge_queue": ("lane_merge_queue", ["queue_id", "lane_id", "target_ref", "status"]),
     "initializations": ("lane_initializations", ["initialization_id", "lane_name", "lane_id", "request_fingerprint", "phase", "workdir", "materialization_json"]),
@@ -128,10 +169,10 @@ with sqlite3.connect(f"file:{pathlib.Path(db_path).resolve()}?mode=ro", uri=True
         if table not in existing:
             raise SystemExit(f"required Trail inventory table is missing: {table}")
         columns={row[1] for row in db.execute(f"PRAGMA table_info({table})")}
-        selected=[column for column in wanted if column in columns]
-        if not selected:
-            raise SystemExit(f"cannot inventory {table}: no expected columns")
-        rows=[dict(row) for row in db.execute(f"SELECT {','.join(selected)} FROM {table}")]
+        missing=set(wanted)-columns
+        if missing:
+            raise SystemExit(f"cannot inventory {table}: missing columns {sorted(missing)}")
+        rows=[dict(row) for row in db.execute(f"SELECT {','.join(wanted)} FROM {table}")]
         if key == "lane_refs": rows=[row for row in rows if str(row.get("name","")).startswith("refs/lanes/")]
         resources[key]=sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, separators=(",",":")))
 
@@ -173,6 +214,19 @@ for row in resources["workspace_views"]:
 workdir_root=pathlib.Path(output)/"workdirs"
 if workdir_root.is_dir(): workdirs.extend(str(path.resolve()) for path in workdir_root.iterdir())
 resources["workdir_paths"]=sorted(set(workdirs))
+materialization_journals=[]
+journal_root=pathlib.Path(db_path).parent/"materialization-operations"
+if journal_root.exists():
+    for path in sorted(journal_root.rglob("*")):
+        relative=str(path.relative_to(journal_root))
+        info=path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            kind="regular"; digest=hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISDIR(info.st_mode): kind="directory"; digest=None
+        elif stat.S_ISLNK(info.st_mode): kind="symlink"; digest=None
+        else: kind="other"; digest=None
+        materialization_journals.append({"path":relative,"kind":kind,"size_bytes":info.st_size,"sha256":digest})
+resources["materialization_journals"]=materialization_journals
 pathlib.Path(destination).write_text(json.dumps({"schema_version":1,"resources":resources},sort_keys=True)+"\n",encoding="utf-8")
 PY
 }
@@ -243,6 +297,41 @@ if baseline != final:
 PY
 }
 
+capture_git_path_state() {
+  local tree=$1 output=$2
+  python3 - "$TRAIL_SCALE_REPO" "$tree" "$output" <<'PY'
+import json, subprocess, sys
+repo, tree, output=sys.argv[1:]
+raw=subprocess.check_output(["git","-C",repo,"ls-tree","-rz","--full-tree",tree])
+entries=[]
+for record in raw.split(b"\0"):
+    if not record: continue
+    metadata, path=record.split(b"\t",1)
+    mode, kind, object_id=metadata.decode("ascii").split()
+    entries.append({"path":path.decode("utf-8","surrogateescape"),"mode":mode,"type":kind,"object":object_id})
+entries.sort(key=lambda row: row["path"].encode("utf-8","surrogateescape"))
+json.dump({"schema_version":1,"tree":subprocess.check_output(["git","-C",repo,"rev-parse",f"{tree}^{{tree}}"],text=True).strip(),"entries":entries},open(output,"w"),sort_keys=True)
+open(output,"a").write("\n")
+PY
+}
+
+capture_git_path_changes() {
+  local baseline=$1 final=$2 output=$3
+  python3 - "$TRAIL_SCALE_REPO" "$baseline" "$final" "$output" <<'PY'
+import json, subprocess, sys
+repo, baseline, final, output=sys.argv[1:]
+raw=subprocess.check_output(["git","-C",repo,"diff-tree","--no-commit-id","--name-status","-r","-z","--no-renames",baseline,final])
+parts=raw.split(b"\0"); changes=[]
+for index in range(0,len(parts)-1,2):
+    status=parts[index].decode("ascii"); path=parts[index+1].decode("utf-8","surrogateescape")
+    changes.append({"status":status,"path":path})
+changes.sort(key=lambda row:(row["path"].encode("utf-8","surrogateescape"),row["status"]))
+tree=lambda value: subprocess.check_output(["git","-C",repo,"rev-parse",f"{value}^{{tree}}"],text=True).strip()
+json.dump({"schema_version":1,"baseline_tree":tree(baseline),"final_tree":tree(final),"changes":changes},open(output,"w"),sort_keys=True)
+open(output,"a").write("\n")
+PY
+}
+
 [[ -n $TRAIL_SCALE_REPO ]] || die "TRAIL_SCALE_REPO is required"
 [[ $TRAIL_SCALE_REPO == /* ]] || die "TRAIL_SCALE_REPO must be absolute"
 [[ -d $TRAIL_SCALE_REPO && ! -L $TRAIL_SCALE_REPO ]] || die "TRAIL_SCALE_REPO must be a real directory"
@@ -270,6 +359,7 @@ case "$TRAIL_SCALE_FAULT_PHASE" in
 esac
 [[ -x $TRAIL_SCALE_FAULT_DRIVER ]] || die "TRAIL_SCALE_FAULT_DRIVER must be executable"
 TRAIL_SCALE_FAULT_DRIVER=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TRAIL_SCALE_FAULT_DRIVER")
+candidate_harness_path=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
 
 if [[ -z $TRAIL_SCALE_OUTPUT ]]; then
   TRAIL_SCALE_OUTPUT=$TRAIL_SCALE_REPO/.trail/benchmarks/real-repo-lane-scale-$TRAIL_SCALE_RUN_ID
@@ -282,42 +372,70 @@ git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree must be 
 git -C "$TRAIL_SCALE_REPO" diff --cached --quiet -- || die "Git index must be clean before qualification"
 baseline_git_head=$(git -C "$TRAIL_SCALE_REPO" rev-parse HEAD)
 baseline_git_branch=$(git -C "$TRAIL_SCALE_REPO" symbolic-ref --short -q HEAD) || die "detached Git HEAD is not supported"
-baseline_git_index=$(git -C "$TRAIL_SCALE_REPO" write-tree)
+baseline_git_index=$(git -C "$TRAIL_SCALE_REPO" rev-parse 'HEAD^{tree}')
 db_path=$TRAIL_SCALE_REPO/.trail/index/trail.sqlite
 [[ -f $db_path ]] || die "Trail database is missing at $db_path"
 
 [[ $TRAIL_SCALE_EXPECTED_BINARY_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "TRAIL_SCALE_EXPECTED_BINARY_SHA256 must be an exact lowercase SHA-256"
 [[ $TRAIL_SCALE_EXPECTED_SOURCE_COMMIT =~ ^[0-9a-f]{40,64}$ ]] || die "TRAIL_SCALE_EXPECTED_SOURCE_COMMIT must be an exact source commit"
+[[ $TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256 must be an exact lowercase SHA-256"
 candidate_binary_sha256=$(sha256_file "$TRAIL_BIN")
 [[ $candidate_binary_sha256 == "$TRAIL_SCALE_EXPECTED_BINARY_SHA256" ]] || die "candidate binary SHA-256 does not match TRAIL_SCALE_EXPECTED_BINARY_SHA256"
 candidate_binary_size=$(stat -f %z "$TRAIL_BIN" 2>/dev/null || stat -c %s "$TRAIL_BIN")
-candidate_binary_version=$($TRAIL_BIN --version 2>&1) || die "candidate binary --version failed"
+candidate_binary_version=$("$TRAIL_BIN" --version 2>&1) || die "candidate binary --version failed"
 [[ -n $candidate_binary_version && $candidate_binary_version != *$'\n'* ]] || die "candidate binary version must be one non-empty line"
 trail_source_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 [[ $trail_source_commit == "$TRAIL_SCALE_EXPECTED_SOURCE_COMMIT" ]] || die "source commit does not match TRAIL_SCALE_EXPECTED_SOURCE_COMMIT"
 source_status_baseline=$(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=normal)
+source_tracked_status_baseline=$(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=no)
 source_submodules_baseline=$(git -C "$PROJECT_ROOT" submodule status --recursive)
+fault_driver_sha256=$(sha256_file "$TRAIL_SCALE_FAULT_DRIVER")
+[[ $fault_driver_sha256 == "$TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256" ]] || die "fault driver SHA-256 does not match TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256"
+fault_attestation_path=
+fault_attestation_sha256=
+if [[ $TRAIL_SCALE_FAULT_DRIVER == "$candidate_harness_path" ]]; then
+  fault_qualification_kind=candidate_harness
+  [[ -z $source_tracked_status_baseline ]] || die "candidate Cargo fault probes require a clean tracked source tree"
+  if printf '%s\n' "$source_submodules_baseline" | grep -Eq '^[+-U]'; then die "candidate Cargo fault probes require clean submodules"; fi
+  [[ -z $TRAIL_SCALE_FAULT_ATTESTATION && -z $TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256 ]] || die "candidate harness must not use external fault attestation"
+else
+  fault_qualification_kind=external_attestation
+  [[ $TRAIL_SCALE_FAULT_ATTESTATION == /* && -f $TRAIL_SCALE_FAULT_ATTESTATION && ! -L $TRAIL_SCALE_FAULT_ATTESTATION ]] || die "external fault driver requires a regular absolute TRAIL_SCALE_FAULT_ATTESTATION"
+  [[ $TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "external fault driver requires an exact attestation SHA-256"
+  fault_attestation_path=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TRAIL_SCALE_FAULT_ATTESTATION")
+  fault_attestation_sha256=$(sha256_file "$fault_attestation_path")
+  [[ $fault_attestation_sha256 == "$TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256" ]] || die "fault attestation SHA-256 mismatch"
+  python3 - "$fault_attestation_path" "$fault_driver_sha256" "$trail_source_commit" "$candidate_binary_sha256" <<'PY' || die "external fault driver attestation is invalid"
+import json, sys
+path, driver, source, binary = sys.argv[1:]
+value=json.load(open(path, encoding="utf-8"))
+expected={"schema_version","kind","fault_driver_sha256","source_commit","binary_sha256","test_contract"}
+if set(value) != expected: raise SystemExit("attestation keys mismatch")
+if value != {"schema_version":1,"kind":"external_fault_driver","fault_driver_sha256":driver,
+             "source_commit":source,"binary_sha256":binary,"test_contract":"trail-task12-exact-one-v1"}:
+    raise SystemExit("attestation does not bind the exact candidate/driver contract")
+PY
+fi
 repo_device=$(device_id "$TRAIL_SCALE_REPO")
 output_device=$(device_id "$TRAIL_SCALE_OUTPUT")
 [[ $repo_device == "$output_device" ]] || die "TRAIL_SCALE_OUTPUT and repository must be on the same device for native-cow"
 
-# Status and SQLite checks are intentionally completed before evidence directories or lanes
-# are created. A qualifying run must be eligible for mapped_delta at its baseline.
-baseline_status_raw=$($TRAIL_BIN --workspace "$TRAIL_SCALE_REPO" --json status) || die "baseline Trail status preflight failed"
-read -r baseline_trail_ref baseline_trail_commit baseline_trail_root < <(python3 -c '
-import json,sys
-value=json.load(sys.stdin); head=value.get("head",{})
-items=[head.get("name"),head.get("change_id"),head.get("root_id")]
-if not all(isinstance(item,str) and item and not any(c.isspace() for c in item) for item in items):
-    raise SystemExit("baseline Trail status lacks safe head identity")
-print(*items)
-' <<<"$baseline_status_raw") || die "baseline Trail status preflight was malformed"
-
-python3 - "$db_path" "$baseline_trail_root" "$baseline_git_head" "$TRAIL_SCALE_LANES" <<'PY' || die "mapped_delta/lane/queue preflight failed"
+# Every rejection above and below this point uses only filesystem metadata, read-only Git,
+# and SQLite mode=ro. No daemon-backed Trail command is allowed before this block passes.
+head_file=$TRAIL_SCALE_REPO/.trail/index/HEAD
+[[ -f $head_file && ! -L $head_file ]] || die "Trail HEAD file is missing or unsafe"
+baseline_trail_branch=$(tr -d '\n' < "$head_file")
+[[ $baseline_trail_branch =~ ^[A-Za-z0-9._/-]+$ ]] || die "Trail HEAD branch is invalid"
+baseline_trail_ref=refs/branches/$baseline_trail_branch
+read -r baseline_trail_commit baseline_trail_root < <(python3 - "$db_path" "$baseline_trail_ref" "$baseline_git_head" "$TRAIL_SCALE_LANES" <<'PY'
 import sqlite3, sys
-db_path, root, head, count=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
+db_path, ref_name, head, count=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
 with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-    mapped=db.execute("SELECT 1 FROM git_mappings WHERE crab_root=? AND git_head=? AND git_dirty=0 LIMIT 1",(root,head)).fetchone()
+    current=db.execute("SELECT change_id,root_id FROM refs WHERE name=?",(ref_name,)).fetchone()
+    if not current or any(not isinstance(value,str) or not value or any(c.isspace() for c in value) for value in current):
+        raise SystemExit("Trail HEAD ref is missing or malformed")
+    root=current[1]
+    mapped=db.execute("SELECT 1 FROM git_mappings WHERE crab_change=? AND crab_root=? AND git_head=? AND git_dirty=0 LIMIT 1",(current[0],root,head)).fetchone()
     if not mapped: raise SystemExit("mapped_delta baseline is not mapped to current Git HEAD")
     planned=[f"scale-{index:04d}" for index in range(count)]
     placeholders=','.join('?'*len(planned))
@@ -329,13 +447,20 @@ with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
     if collisions: raise SystemExit(f"planned lane already exists: {collisions}")
     pending=[tuple(row) for row in db.execute("SELECT queue_id,status FROM lane_merge_queue WHERE status NOT IN ('merged','failed','cancelled') ORDER BY queue_id")]
     if pending: raise SystemExit(f"nonterminal merge queue work exists: {pending}")
+    print(*current)
 PY
+) || die "mapped_delta/lane/queue preflight failed"
 
 mkdir -p "$TRAIL_SCALE_OUTPUT/commands" "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs" "$TRAIL_SCALE_OUTPUT/manifests"
+if [[ $fault_qualification_kind == external_attestation ]]; then
+  cp -p -- "$fault_attestation_path" "$TRAIL_SCALE_OUTPUT/fault-attestation.json"
+fi
 snapshot_untracked "$TRAIL_SCALE_OUTPUT/baseline-untracked.json"
+capture_resource_inventory "$TRAIL_SCALE_OUTPUT/baseline-resources.json"
+capture_git_path_state "$baseline_git_head" "$TRAIL_SCALE_OUTPUT/baseline-path-state.json"
 RESULT_COLUMNS=$'command_id\tphase\tlane\twall_seconds\tpeak_rss_bytes\texit_code\tcommitted\tretry_of'
 LANE_COLUMNS=$'lane\tinitialization_id\tretry_initialization_id\trequest_fingerprint\tretry_request_fingerprint\tworkdir_mode\tworkdir\tedit_count\trecorded_path_count\tisolation_unexpected_count\tlogical_bytes\tallocated_bytes\texclusive_bytes'
-FAULT_COLUMNS=$'scenario\texpected_code\tactual_code\tdurable_phase\tcommitted\tretry_result\tintegrity_result\tleaked_resource_count\tinitialization_id\tretry_initialization_id\tevidence_command_id\tevidence_kind\tsource_commit\tbinary_sha256\tbinary_exercised'
+FAULT_COLUMNS=$'scenario\texpected_code\tactual_code\tdurable_phase\tcommitted\tretry_result\tintegrity_result\tleaked_resource_count\tinitialization_id\tretry_initialization_id\tevidence_command_id\tevidence_kind\tsource_commit\tbinary_sha256\tbinary_exercised\ttest_target\ttest_name\ttest_count'
 printf '%s\n' "$RESULT_COLUMNS" > "$TRAIL_SCALE_OUTPUT/results.tsv"
 printf '%s\n' "$LANE_COLUMNS" > "$TRAIL_SCALE_OUTPUT/lanes.tsv"
 printf '%s\n' "$FAULT_COLUMNS" > "$TRAIL_SCALE_OUTPUT/faults.tsv"
@@ -362,6 +487,21 @@ restore_dirty_probe() {
   dirty_probe_backup_dir=
   dirty_probe_marker=
 }
+verify_owned_lane_marker() {
+  local marker=$1
+  python3 - "$db_path" "$marker" <<'PY'
+import json, pathlib, sqlite3, sys
+db_path, marker=sys.argv[1:]
+expected=json.load(open(marker, encoding="utf-8"))
+keys={"lane","lane_id","initialization_id","request_fingerprint","workdir","ref_name"}
+if set(expected) != keys: raise SystemExit("owned lane marker schema mismatch")
+with sqlite3.connect(f"file:{pathlib.Path(db_path).resolve()}?mode=ro",uri=True) as db:
+    row=db.execute("SELECT l.name,l.lane_id,i.initialization_id,i.request_fingerprint,i.workdir,b.ref_name FROM lanes l JOIN lane_initializations i ON i.lane_id=l.lane_id JOIN lane_branches b ON b.lane_id=l.lane_id WHERE l.name=?",(expected["lane"],)).fetchone()
+actual=dict(zip(["lane","lane_id","initialization_id","request_fingerprint","workdir","ref_name"],row)) if row else None
+if actual != expected:
+    raise SystemExit(f"stable ownership changed for {expected['lane']}: expected={expected} actual={actual}")
+PY
+}
 cleanup_on_failure() {
   local status=$?
   if (( status != 0 )); then
@@ -369,7 +509,11 @@ cleanup_on_failure() {
     for marker in "$owned_lanes_dir"/*; do
       [[ -f $marker ]] || continue
       lane=${marker##*/}
-      "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json lane rm "$lane" >/dev/null 2>&1 || true
+      if verify_owned_lane_marker "$marker"; then
+        "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json lane rm "$lane" >/dev/null 2>&1 || true
+      else
+        echo "refusing failure cleanup for $lane because stable ownership changed" >&2
+      fi
     done
     echo "partial evidence retained at $TRAIL_SCALE_OUTPUT" >&2
   fi
@@ -480,7 +624,7 @@ run_command baseline-status baseline "" true "" 0 trail status
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.name) == "$baseline_trail_ref" ]] || die "Trail head changed after preflight"
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.change_id) == "$baseline_trail_commit" ]] || die "Trail commit changed after preflight"
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.root_id) == "$baseline_trail_root" ]] || die "Trail root changed after preflight"
-capture_resource_inventory "$TRAIL_SCALE_OUTPUT/baseline-resources.json"
+capture_resource_inventory "$TRAIL_SCALE_OUTPUT/runtime-resources.json"
 db_bytes_before=$(stat -f %z "$db_path" 2>/dev/null || stat -c %s "$db_path")
 observer_log_bytes_before=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -exec stat -f %z {} \; 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
 if [[ -z $observer_log_bytes_before ]]; then
@@ -507,7 +651,19 @@ spawn_one() {
   workdir=$TRAIL_SCALE_OUTPUT/workdirs/$lane
   run_command "spawn-$index" spawn "$lane" true "" 0 trail lane spawn "$lane" --from main --workdir-mode native-cow --workdir "$workdir"
   if [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/spawn-$index.json" resumed) == false ]]; then
-    : > "$owned_lanes_dir/$lane"
+    python3 - "$TRAIL_SCALE_OUTPUT/commands/spawn-$index.json" "$owned_lanes_dir/$lane" <<'PY'
+import json, sys
+payload=json.load(open(sys.argv[1],encoding="utf-8"))["payload"]
+keys={"lane":payload.get("lane",payload.get("name")),"lane_id":payload.get("lane_id"),
+      "initialization_id":payload.get("initialization_id"),"request_fingerprint":payload.get("request_fingerprint"),
+      "workdir":payload.get("workdir"),"ref_name":payload.get("ref_name")}
+if not keys["lane"]:
+    keys["lane"]=payload.get("ref_name","").removeprefix("refs/lanes/")
+if any(not isinstance(value,str) or not value for value in keys.values()):
+    raise SystemExit("spawn did not return complete stable ownership")
+open(sys.argv[2],"w",encoding="utf-8").write(json.dumps(keys,sort_keys=True)+"\n")
+PY
+    verify_owned_lane_marker "$owned_lanes_dir/$lane"
   else
     echo "$lane initial spawn did not prove this process created the lane" >&2
     return 1
@@ -599,6 +755,8 @@ export_parent=$(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/git-export.json
 run_command git-update-ref git_ref "" true "" 0 git -C "$TRAIL_SCALE_REPO" update-ref "$TRAIL_SCALE_GIT_REF" "$export_commit" ""
 git -C "$TRAIL_SCALE_REPO" diff-tree --no-commit-id --name-only -r "$export_commit" | LC_ALL=C sort > "$TRAIL_SCALE_OUTPUT/final-git-paths.txt"
 cmp -s "$expected_paths_file" "$TRAIL_SCALE_OUTPUT/final-git-paths.txt" || die "final Git manifest is not exact"
+capture_git_path_state "$export_commit" "$TRAIL_SCALE_OUTPUT/final-path-state.json"
+capture_git_path_changes "$baseline_git_head" "$export_commit" "$TRAIL_SCALE_OUTPUT/path-changes.json"
 
 run_command dirty-git-mark-reviewed dirty_refusal_setup scale-0000 true "" 0 trail agent mark-reviewed scale-0000 --note "scale dirty Git refusal reviewed"
 dirty_probe_relative=$(python3 - "$TRAIL_SCALE_REPO" <<'PY'
@@ -645,7 +803,7 @@ for scenario in "${fault_scenarios[@]}"; do
   if [[ $scenario == dirty_git_export_refusal ]]; then
     python3 - "$scenario" "$dirty_refusal_code" > "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe.json" <<'PY'
 import json, sys
-print(json.dumps({"scenario":sys.argv[1],"expected_code":sys.argv[2],"actual_code":sys.argv[2],"durable_phase":"control","committed":False,"retry_result":"refused_without_mutation","integrity_result":"harness_control_exit_0","leaked_resource_count":0,"initialization_id":"","retry_initialization_id":""}))
+print(json.dumps({"scenario":sys.argv[1],"expected_code":sys.argv[2],"actual_code":sys.argv[2],"durable_phase":"control","committed":False,"retry_result":"refused_without_mutation","integrity_result":"harness_control_exit_0","leaked_resource_count":0,"initialization_id":"","retry_initialization_id":"","test_target":"","test_name":"","test_count":0}))
 PY
     run_command "$command_id" fault "" false "dirty-git-refusal" 0 cp "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe.json" "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe-output.json"
     # Replace the cp payload (null) with the attested probe payload while retaining raw command evidence.
@@ -658,10 +816,10 @@ PY
   else
     run_command "$command_id" fault "" false "" 0 "$TRAIL_SCALE_FAULT_DRIVER" --fault-probe "$scenario"
   fi
-  python3 - "$TRAIL_SCALE_OUTPUT/commands/$command_id.json" "$command_id" "$TRAIL_SCALE_OUTPUT/rows/faultrow-$fault_index.tsv" "$trail_source_commit" "$candidate_binary_sha256" <<'PY'
+  python3 - "$TRAIL_SCALE_OUTPUT/commands/$command_id.json" "$command_id" "$TRAIL_SCALE_OUTPUT/rows/faultrow-$fault_index.tsv" "$trail_source_commit" "$candidate_binary_sha256" "$fault_qualification_kind" <<'PY'
 import json, sys
 payload=json.load(open(sys.argv[1]))["payload"]
-keys=["scenario","expected_code","actual_code","durable_phase","committed","retry_result","integrity_result","leaked_resource_count","initialization_id","retry_initialization_id"]
+keys=["scenario","expected_code","actual_code","durable_phase","committed","retry_result","integrity_result","leaked_resource_count","initialization_id","retry_initialization_id","test_target","test_name","test_count"]
 if not isinstance(payload,dict) or any(k not in payload for k in keys): raise SystemExit("fault driver returned incomplete evidence")
 scenario=payload["scenario"]
 if scenario == "dirty_git_export_refusal":
@@ -674,9 +832,14 @@ else:
     payload["initialization_id"]=""
     payload["retry_initialization_id"]=""
     payload["integrity_result"]="focused_test_exit_0"
-    evidence_kind="focused_test_aggregate"
+    if isinstance(payload["test_count"],bool) or payload["test_count"] != 1:
+        raise SystemExit("focused fault probe must execute exactly one test")
+    if not isinstance(payload["test_target"],str) or not payload["test_target"] or not isinstance(payload["test_name"],str) or not payload["test_name"]:
+        raise SystemExit("focused fault probe lacks exact test identity")
+    evidence_kind="focused_test_aggregate" if sys.argv[5] == "candidate_harness" else "externally_attested_focused_test"
     binary_exercised=False
-values=[payload[k] for k in keys]+[sys.argv[2],evidence_kind,sys.argv[4],sys.argv[5],binary_exercised]
+base_keys=keys[:10]
+values=[payload[k] for k in base_keys]+[sys.argv[2],evidence_kind,sys.argv[4],sys.argv[5],binary_exercised,payload["test_target"],payload["test_name"],payload["test_count"]]
 values=["true" if v is True else "false" if v is False else str(v) for v in values]
 open(sys.argv[3],"w").write("\t".join(values)+"\n")
 PY
@@ -687,7 +850,10 @@ for marker in "$owned_lanes_dir"/*; do
   [[ -f $marker ]] || continue
   lane=${marker##*/}
   index=$((10#${lane#scale-}))
+  verify_owned_lane_marker "$marker" || die "stable ownership changed before cleanup for $lane; refusing name-only lane removal"
+  expected_lane_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lane_id"])' "$marker")
   run_command "cleanup-$index" cleanup "$lane" true "" 0 trail lane rm "$lane"
+  [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/cleanup-$index.json" lane_id) == "$expected_lane_id" ]] || die "cleanup returned the wrong stable lane identity for $lane"
 done
 run_command trail-doctor integrity "" true "" 0 trail doctor
 run_command trail-fsck integrity "" true "" 0 trail fsck
@@ -707,7 +873,7 @@ if [[ -z $observer_log_bytes_after ]]; then
 fi
 final_git_head=$(git -C "$TRAIL_SCALE_REPO" rev-parse HEAD)
 final_git_branch=$(git -C "$TRAIL_SCALE_REPO" symbolic-ref --short -q HEAD)
-final_git_index=$(git -C "$TRAIL_SCALE_REPO" write-tree)
+final_git_index=$(git -C "$TRAIL_SCALE_REPO" rev-parse 'HEAD^{tree}')
 git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree changed during qualification"
 git -C "$TRAIL_SCALE_REPO" diff --cached --quiet -- || die "Git index changed during qualification"
 tracked_worktree_clean=true
@@ -728,34 +894,33 @@ import platform,re,subprocess,sys
 path=sys.argv[1]
 if platform.system() == "Darwin":
     try:
-        value=subprocess.check_output(["diskutil","info",path],text=True,errors="replace")
+        value=subprocess.check_output(["diskutil","info",path],text=True,errors="replace",stderr=subprocess.DEVNULL)
         match=re.search(r"^\s*File System Personality:\s*(.+?)\s*$",value,re.M)
         if match: print(match.group(1)); raise SystemExit
     except (OSError,subprocess.CalledProcessError): pass
-try: print(subprocess.check_output(["stat","-f","-c","%T",path],text=True).strip())
+try: print(subprocess.check_output(["stat","-f","-c","%T",path],text=True,stderr=subprocess.DEVNULL).strip())
 except (OSError,subprocess.CalledProcessError): print("unknown")
 PY
 }
 repo_filesystem=$(filesystem_type "$TRAIL_SCALE_REPO")
 output_filesystem=$(filesystem_type "$TRAIL_SCALE_OUTPUT")
-fault_driver_sha256=$(sha256_file "$TRAIL_SCALE_FAULT_DRIVER")
-candidate_harness_path=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
 [[ $(sha256_file "$TRAIL_BIN") == "$candidate_binary_sha256" ]] || die "candidate binary changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" rev-parse HEAD) == "$trail_source_commit" ]] || die "source commit changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=normal) == "$source_status_baseline" ]] || die "source tree state changed during qualification"
 [[ $(git -C "$PROJECT_ROOT" submodule status --recursive) == "$source_submodules_baseline" ]] || die "source submodule state changed during qualification"
-python3 - "$TRAIL_SCALE_OUTPUT/environment.json" "$TRAIL_SCALE_REPO" "$TRAIL_BIN" "$repo_filesystem" "$output_filesystem" "$repo_device" "$output_device" "$trail_source_commit" "$candidate_binary_sha256" "$candidate_binary_size" "$candidate_binary_version" "$PROJECT_ROOT" "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_sha256" "$candidate_harness_path" <<'PY'
+python3 - "$TRAIL_SCALE_OUTPUT/environment.json" "$TRAIL_SCALE_REPO" "$TRAIL_BIN" "$repo_filesystem" "$output_filesystem" "$repo_device" "$output_device" "$trail_source_commit" "$candidate_binary_sha256" "$candidate_binary_size" "$candidate_binary_version" "$PROJECT_ROOT" "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_sha256" "$candidate_harness_path" "$fault_qualification_kind" "$fault_attestation_path" "$fault_attestation_sha256" <<'PY'
 import json, platform, subprocess, sys
-(out,repo,binary,repo_fs,output_fs,repo_dev,output_dev,commit,binary_sha,size,version,source_repo,fault_driver,fault_sha,harness_path)=sys.argv[1:]
+(out,repo,binary,repo_fs,output_fs,repo_dev,output_dev,commit,binary_sha,size,version,source_repo,fault_driver,fault_sha,harness_path,qualification,attestation_path,attestation_sha)=sys.argv[1:]
 status=subprocess.check_output(["git","-C",source_repo,"status","--porcelain=v1","--untracked-files=normal"],text=True).splitlines()
+tracked_status=subprocess.check_output(["git","-C",source_repo,"status","--porcelain=v1","--untracked-files=no"],text=True).splitlines()
 submodules=subprocess.check_output(["git","-C",source_repo,"submodule","status","--recursive"],text=True).splitlines()
 data={
  "schema_version":2,
  "platform":{"description":platform.platform(),"machine":platform.machine(),"python":platform.python_version()},
  "filesystem":{"repo_device":int(repo_dev),"output_device":int(output_dev),"same_device":repo_dev==output_dev,"repo_filesystem":repo_fs,"output_filesystem":output_fs},
  "binary":{"path":binary,"sha256":binary_sha,"size_bytes":int(size),"version":version},
- "source":{"repo":source_repo,"commit":commit,"tree_clean":not status,"submodules_clean":not any(line[:1] in {"+","-","U"} for line in submodules),"status_porcelain":status,"submodule_status":submodules},
- "fault_driver":{"path":fault_driver,"sha256":fault_sha,"is_candidate_harness":fault_driver==harness_path},
+ "source":{"repo":source_repo,"commit":commit,"tree_clean":not tracked_status,"submodules_clean":not any(line[:1] in {"+","-","U"} for line in submodules),"status_porcelain":status,"submodule_status":submodules},
+ "fault_driver":{"path":fault_driver,"sha256":fault_sha,"expected_sha256":fault_sha,"exact_expected":True,"is_candidate_harness":fault_driver==harness_path,"qualification_kind":qualification,"attestation_path":attestation_path,"attestation_sha256":attestation_sha},
  "candidate_relationship":{"kind":"locally_bound_unproven_build","expected_binary_sha256":binary_sha,"expected_source_commit":commit},
 }
 json.dump(data,open(out,"w"),sort_keys=True);open(out,"a").write("\n")
@@ -775,29 +940,41 @@ def perf(phase):
     return {"count":len(rows),"p50_seconds":percentile(values,.5),"p95_seconds":percentile(values,.95),"p99_seconds":percentile(values,.99),"peak_rss_bytes":max(int(r["peak_rss_bytes"]) for r in rows)}
 export=json.load(open(root/"commands/git-export.json"))["payload"]
 baseline_resources=json.load(open(root/"baseline-resources.json"))["resources"]
+runtime_resources=json.load(open(root/"runtime-resources.json"))["resources"]
 active_resources=json.load(open(root/"active-resources.json"))["resources"]
 final_resources=json.load(open(root/"final-resources.json"))["resources"]
 planned={f"scale-{index:04d}" for index in range(lanes)}
 active_names={row["name"] for row in active_resources["lanes"]}
 active_lane_names_from_refs={row["name"].removeprefix("refs/lanes/") for row in active_resources["lane_refs"]}
 active_lane_names_from_initializations={row["lane_name"] for row in active_resources["initializations"]}
-baseline_names={row["name"] for row in baseline_resources["lanes"]}
-final_names={row["name"] for row in final_resources["lanes"]}
+active_lane_ids={row["name"]:row["lane_id"] for row in active_resources["lanes"] if row["name"] in planned}
+run_lane_ids=set(active_lane_ids.values())
 def added_count(key):
-    before={json.dumps(row,sort_keys=True) for row in baseline_resources[key]}
+    before={json.dumps(row,sort_keys=True) for row in runtime_resources[key]}
     after={json.dumps(row,sort_keys=True) for row in final_resources[key]}
     return len(after-before)
 cleanup={
  "stale_mounts":added_count("mount_paths"),"stale_sockets":added_count("socket_paths"),
  "stale_locks":added_count("lock_paths")+added_count("leases"),
- "stale_initializations":added_count("initializations"),
- "stale_materializations":added_count("workspace_views"),"leaked_workdirs":added_count("workdir_paths"),
- "stale_queue_rows":added_count("merge_queue"),"stale_lane_rows":added_count("lanes"),
- "stale_lane_refs":added_count("lane_refs"),
+ "stale_initializations":sum(row.get("lane_id") in run_lane_ids for row in final_resources["initializations"]),
+ "stale_materializations":sum(row.get("lane_id") in run_lane_ids for row in final_resources["workspace_views"])+added_count("materialization_journals"),
+ "leaked_workdirs":added_count("workdir_paths"),
+ "stale_queue_rows":sum(row.get("lane_id") in run_lane_ids and row.get("status") not in {"merged","failed","cancelled"} for row in final_resources["merge_queue"]),
+ "stale_lane_rows":sum(row.get("lane_id") in run_lane_ids and not str(row.get("name","")).startswith("retired/") for row in final_resources["lanes"]),
+ "stale_lane_refs":sum(row.get("name") in {f"refs/lanes/{name}" for name in planned} for row in final_resources["lane_refs"]),
 }
 expected_paths=(root/"expected-paths.txt").read_text().splitlines()
 trail_paths=(root/"final-trail-paths.txt").read_text().splitlines()
 git_paths=(root/"final-git-paths.txt").read_text().splitlines()
+baseline_path_state=json.load(open(root/"baseline-path-state.json"))
+final_path_state=json.load(open(root/"final-path-state.json"))
+path_changes=json.load(open(root/"path-changes.json"))["changes"]
+baseline_by_path={row["path"]:row for row in baseline_path_state["entries"]}
+final_by_path={row["path"]:row for row in final_path_state["entries"]}
+deleted_paths=set(baseline_by_path)-set(final_by_path)
+modified_baseline={path for path in set(baseline_by_path)&set(final_by_path) if baseline_by_path[path] != final_by_path[path]}
+unexpected_changes=[row for row in path_changes if row["status"] != "A" or row["path"] not in set(expected_paths)]
+added_changes={row["path"] for row in path_changes if row["status"] == "A"}
 doctor_wrapper=json.load(open(root/"commands/trail-doctor.json")); fsck_wrapper=json.load(open(root/"commands/trail-fsck.json")); git_fsck_wrapper=json.load(open(root/"commands/git-fsck.json"))
 integrity_commands={
  "trail-doctor":doctor_wrapper["actual_exit_code"] == 0 and isinstance(doctor_wrapper.get("payload"),dict) and doctor_wrapper["payload"].get("status")=="ok",
@@ -805,14 +982,15 @@ integrity_commands={
  "git-fsck":git_fsck_wrapper["actual_exit_code"] == 0,
 }
 metrics={
- "schema_version":3,
+ "schema_version":4,
  "run":{"run_id":run_id,"lanes":lanes,"files_per_lane":files,"concurrency":int(concurrency),"fault_phase":fault_phase,"latency_ceiling_seconds":float(ceiling)},
  "baseline":{"trail_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
- "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(baseline_names-final_names),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
+ "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline)+len(added_changes^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
  "performance":{"spawn":perf("spawn"),"record":perf("record"),"queue_run":perf("queue_run"),"git_export":perf("git_export"),"latency_ceiling_enforced":lanes<=64},
  "storage":{"db_bytes_before":int(db_before),"db_bytes_after":int(db_after),"observer_log_bytes_before":int(log_before),"observer_log_bytes_after":int(log_after),"logical_lane_bytes":sum(int(r["logical_bytes"]) for r in lane_rows),"allocated_lane_bytes":sum(int(r["allocated_bytes"]) for r in lane_rows),"exclusive_lane_bytes":sum(int(r["exclusive_bytes"]) for r in lane_rows)},
  "git_export":{"export_mode":export["performance"]["export_mode"],"changed_path_count":export["performance"]["changed_path_count"],"commit_count":int(commit_count),"commit":export_commit,"parent":export_parent,"dedicated_ref":dedicated_ref,"dedicated_ref_target":dedicated_target,"original_head_unchanged":True,"original_branch_unchanged":True,"original_index_unchanged":True,"dirty_refusal_code":dirty_code,"unexpected_path_count":len(set(git_paths)^set(expected_paths))},
  "cleanup":cleanup,
+ "audit_history":{"retired_lane_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["lanes"]),"removed_lane_branch_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["lane_branches"]),"terminal_queue_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["merge_queue"])},
  "integrity":{"trail_doctor":integrity_commands["trail-doctor"],"trail_fsck":integrity_commands["trail-fsck"],"git_fsck":integrity_commands["git-fsck"],"conflict_control":any(r["scenario"]=="conflicting_lanes" and r["expected_code"]==r["actual_code"] for r in fault_rows)},
  "git_state_preservation":{"tracked_worktree_clean":tracked_clean=="true","index_clean":index_clean=="true","preexisting_untracked_count":int(untracked_count),"final_untracked_count":int(untracked_count),"preserved_untracked_count":int(untracked_count),"added_untracked_count":0,"removed_untracked_count":0,"modified_untracked_count":0},
  "evidence":{"result_rows":len(results),"command_count":len(results),"fault_rows":len(fault_rows),"manifest_entries":0},

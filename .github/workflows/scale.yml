@@ -59,6 +59,7 @@ jobs:
         run: |
           echo "TRAIL_SCALE_EXPECTED_BINARY_SHA256=$(shasum -a 256 target/release/trail | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=$(shasum -a 256 scripts/verify-real-repo-lane-scale.sh | awk '{print $1}')" >> "$GITHUB_ENV"
       - name: Create clean Superset-class fixture
         shell: bash
         run: |
@@ -76,6 +77,7 @@ jobs:
           TRAIL_SCALE_FILES_PER_LANE: "50"
           TRAIL_SCALE_CONCURRENCY: ${{ github.event.inputs.real_repo_lanes || '64' }}
           TRAIL_SCALE_FAULT_PHASE: all
+          TRAIL_SCALE_FAULT_DRIVER: ${{ github.workspace }}/scripts/verify-real-repo-lane-scale.sh
       - name: Upload blocking gate evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -102,6 +104,7 @@ jobs:
         run: |
           echo "TRAIL_SCALE_EXPECTED_BINARY_SHA256=$(shasum -a 256 target/release/trail | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=$(shasum -a 256 scripts/verify-real-repo-lane-scale.sh | awk '{print $1}')" >> "$GITHUB_ENV"
       - name: Create clean Superset-class fixture
         shell: bash
         run: |
@@ -119,6 +122,7 @@ jobs:
           TRAIL_SCALE_FILES_PER_LANE: "50"
           TRAIL_SCALE_CONCURRENCY: ${{ github.event.inputs.real_repo_stress_lanes || '128' }}
           TRAIL_SCALE_FAULT_PHASE: all
+          TRAIL_SCALE_FAULT_DRIVER: ${{ github.workspace }}/scripts/verify-real-repo-lane-scale.sh
       - name: Upload stress evidence
         uses: actions/upload-artifact@v4
         if: always()

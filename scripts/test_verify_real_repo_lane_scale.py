@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import platform
 import sqlite3
 import stat
 import subprocess
@@ -50,6 +51,8 @@ def lane_paths(lane):
     return sorted(str(path.relative_to(workdir)) for path in root.rglob("*") if path.is_file()) if root.exists() else []
 
 if command == ["status"]:
+    if os.environ.get("FAKE_STATUS_MUTATES"):
+        (trail/os.environ["FAKE_STATUS_MUTATES"]).write_text("status mutation\n")
     state=locked(); emit({"branch":"main","head":{"name":"refs/branches/main","change_id":"basechange" if not state["main_paths"] else "finalchange","root_id":"baseroot" if not state["main_paths"] else "finalroot"},"worktree_state":"clean","changed_paths":[]})
 elif command[:2] == ["lane","spawn"]:
     lane=command[2]; workdir=command[command.index("--workdir")+1]
@@ -69,6 +72,7 @@ elif command[:2] == ["lane","spawn"]:
     if not preexisting:
         with sqlite3.connect(db_path) as db:
             db.execute("INSERT INTO lanes(lane_id,name) VALUES(?,?)", ("id-"+lane,lane))
+            db.execute("INSERT INTO lane_branches(lane_id,ref_name,status,workdir,base_change,head_change) VALUES(?,?,?,?,?,?)", ("id-"+lane,"refs/lanes/"+lane,"active",workdir,"basechange","basechange"))
             db.execute("INSERT INTO lane_initializations(initialization_id,lane_name,lane_id,request_fingerprint,phase,workdir,materialization_json) VALUES(?,?,?,?,?,?,?)", ("init-"+lane,lane,"id-"+lane,"fp-"+lane,"observer_ready",workdir,json.dumps({"workdir_mode":"native-cow"})))
             db.execute("INSERT INTO refs(name,change_id,root_id,operation_id,generation) VALUES(?,?,?,?,?)", ("refs/lanes/"+lane,"basechange","baseroot","spawn-"+lane,1))
     mode="portable-copy" if os.environ.get("FAKE_COW_FALLBACK") == lane else "native-cow"
@@ -93,7 +97,9 @@ elif command[:3] == ["lane","merge-queue","add"]:
 elif command[:3] == ["lane","merge-queue","run"]:
     def merge(state): state["main_paths"]=sorted({p for lane in state["lanes"].values() for p in lane["paths"]})
     locked(merge)
-    with sqlite3.connect(db_path) as db: db.execute("UPDATE lane_merge_queue SET status='merged'")
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE lane_merge_queue SET status='merged'")
+        db.execute("UPDATE lane_branches SET status='merged',head_change='finalchange'")
     emit({"completed":True})
 elif command[:1] == ["diff"]:
     emit({"from":"basechange","to":"finalchange","files":[{"path":p} for p in locked()["main_paths"]]})
@@ -123,26 +129,50 @@ elif command[:2] == ["lane","rm"]:
     if removed:
         shutil.rmtree(removed["workdir"],ignore_errors=True)
         with sqlite3.connect(db_path) as db:
-            db.execute("DELETE FROM lane_merge_queue WHERE lane_id=?", ("id-"+lane,))
             db.execute("DELETE FROM lane_initializations WHERE lane_name=?", (lane,))
             db.execute("DELETE FROM refs WHERE name=?", ("refs/lanes/"+lane,))
-            db.execute("DELETE FROM lanes WHERE name=?", (lane,))
-    emit({"removed":lane})
+            lane_id=db.execute("SELECT lane_id FROM lanes WHERE name=?", (lane,)).fetchone()[0]
+            db.execute("UPDATE lane_branches SET status='removed',ref_name=? WHERE lane_id=?", ("retired/"+lane_id+"/123",lane_id))
+            db.execute("UPDATE lanes SET name=? WHERE lane_id=?", ("retired/"+lane+"/"+lane_id,lane_id))
+    emit({"removed":lane,"lane_id":"id-"+lane})
 elif command in (["doctor"],["fsck"]):
     if command == ["doctor"] and os.environ.get("FAKE_CREATE_UNTRACKED"):
         (workspace/os.environ["FAKE_CREATE_UNTRACKED"]).write_bytes(b"unexpected\n")
     if command == ["doctor"] and os.environ.get("FAKE_LEAK_SOCKET"):
         (trail/os.environ["FAKE_LEAK_SOCKET"]).write_bytes(b"leaked tombstone\n")
+    if command == ["doctor"] and os.environ.get("FAKE_LEAK_JOURNAL"):
+        journal=trail/"index/materialization-operations"; journal.mkdir(parents=True,exist_ok=True)
+        (journal/os.environ["FAKE_LEAK_JOURNAL"]).write_text('{"state":"preparing"}\n')
     emit({"status":"ok","checks":[]} if command == ["doctor"] else {"checked_refs":1,"checked_roots":1,"checked_texts":1,"errors":[]})
 else:
     print("unsupported fake command: "+repr(command),file=sys.stderr); raise SystemExit(64)
 '''
 
 FAULT_DRIVER = r'''#!/usr/bin/env python3
-import hashlib,json,sys
+import json,os,pathlib,platform,sqlite3,sys
 scenario=sys.argv[-1]; phase=scenario.removeprefix("after_") if scenario.startswith("after_") else "control"
-identity=hashlib.sha256(scenario.encode()).hexdigest() if scenario.startswith("after_") else ""
-print(json.dumps({"scenario":scenario,"expected_code":"PASS","actual_code":"PASS","durable_phase":phase,"committed":scenario in {"after_association","after_reconciliation","after_marker","after_spawn_event"},"retry_result":"resumed_same_initialization" if scenario.startswith("after_") else ("refused_without_mutation" if scenario in {"conflicting_lanes","dirty_git_export_refusal"} else "recovered_once"),"integrity_result":"ok","leaked_resource_count":0,"initialization_id":identity,"retry_initialization_id":identity}))
+tests={
+ "daemon_death":("changed_path_ledger_daemon","killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change"),
+ "response_loss_after_association":("changed_path_ledger_daemon","external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback"),
+ "response_loss_after_readiness":("changed_path_ledger_daemon","external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback"),
+ "pid_reuse":("changed_path_ledger_daemon","forged_dead_process_identity_cannot_replace_a_live_observer_owner"),
+ "lock_holder_crash":("changed_path_ledger_daemon","crash_after_persisting_ledger_owner_is_automatically_recovered"),
+ "policy_churn":("changed_path_ledger_daemon","live_policy_invalidation_self_restarts_and_reconciles"),
+ "disk_full":("lane_initialization_faults","io_failures_never_advance_past_or_delete_the_durable_artifact"),
+ "permissions_failure":("lane_initialization_faults","io_failures_never_advance_past_or_delete_the_durable_artifact"),
+ "fsync_failure":("lane_initialization_faults","io_failures_never_advance_past_or_delete_the_durable_artifact"),
+ "conflicting_lanes":("e2e","lane_merge_queue_pauses_on_conflict"),
+}
+if scenario.startswith("after_"): target,name=("lane_initialization_faults","identical_spawn_resumes_at_every_durable_crash_cut")
+elif scenario=="filesystem_replacement":
+ target,name=(("changed_path_ledger_macos","every_root_revalidation_failure_revokes_globally") if platform.system()=="Darwin" else ("changed_path_ledger_linux","owner_death_and_root_replacement_cannot_prove_clean"))
+else: target,name=tests[scenario]
+if os.environ.get("FAKE_REPLACE_BEFORE_CLEANUP") and scenario=="after_reservation":
+ lane=os.environ["FAKE_REPLACE_BEFORE_CLEANUP"]; db_path=pathlib.Path(os.environ["TRAIL_SCALE_REPO"])/".trail/index/trail.sqlite"
+ with sqlite3.connect(db_path) as db:
+  old="id-"+lane; db.execute("UPDATE lanes SET lane_id='foreign-replacement' WHERE lane_id=?",(old,)); db.execute("UPDATE lane_branches SET lane_id='foreign-replacement' WHERE lane_id=?",(old,)); db.execute("UPDATE lane_initializations SET lane_id='foreign-replacement',initialization_id='foreign-init',request_fingerprint='foreign-fp' WHERE lane_id=?",(old,)); db.execute("UPDATE lane_merge_queue SET lane_id='foreign-replacement' WHERE lane_id=?",(old,))
+count=0 if os.environ.get("FAKE_ZERO_TEST_SCENARIO")==scenario else 1
+print(json.dumps({"scenario":scenario,"expected_code":"PASS","actual_code":"PASS","durable_phase":phase,"committed":scenario in {"after_association","after_reconciliation","after_marker","after_spawn_event"},"retry_result":"resumed_same_initialization" if scenario.startswith("after_") else ("refused_without_mutation" if scenario=="conflicting_lanes" else "recovered_once"),"integrity_result":"focused_test_exit_0","leaked_resource_count":0,"initialization_id":"","retry_initialization_id":"","test_target":target,"test_name":name,"test_count":count}))
 '''
 
 
@@ -164,9 +194,11 @@ class HarnessContractTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "baseline"], check=True)
         (self.repo / ".trail/index").mkdir(parents=True)
+        (self.repo / ".trail/index/HEAD").write_text("main\n", encoding="utf-8")
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
             db.executescript("""
                 CREATE TABLE lanes(lane_id TEXT PRIMARY KEY, name TEXT UNIQUE);
+                CREATE TABLE lane_branches(lane_id TEXT PRIMARY KEY, ref_name TEXT, status TEXT, workdir TEXT, base_change TEXT, head_change TEXT);
                 CREATE TABLE refs(name TEXT PRIMARY KEY, change_id TEXT, root_id TEXT, operation_id TEXT, generation INTEGER);
                 CREATE TABLE lane_merge_queue(queue_id TEXT PRIMARY KEY, lane_id TEXT, target_ref TEXT, status TEXT);
                 CREATE TABLE lane_initializations(initialization_id TEXT PRIMARY KEY, lane_name TEXT UNIQUE, lane_id TEXT, request_fingerprint TEXT, phase TEXT, workdir TEXT, materialization_json TEXT);
@@ -176,6 +208,7 @@ class HarnessContractTests(unittest.TestCase):
                 CREATE TABLE git_mappings(mapping_id TEXT PRIMARY KEY, direction TEXT, branch TEXT, git_head TEXT, git_dirty INTEGER, crab_change TEXT, crab_root TEXT, created_at INTEGER);
             """)
             head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+            db.execute("INSERT INTO refs VALUES(?,?,?,?,?)", ("refs/branches/main", "basechange", "baseroot", "init", 1))
             db.execute("INSERT INTO git_mappings VALUES(?,?,?,?,?,?,?,?)", ("baseline-map","import","refs/branches/main",head,0,"basechange","baseroot",1))
         for path, source in ((self.fake, FAKE_TRAIL), (self.fault, FAULT_DRIVER)):
             path.write_text(source, encoding="utf-8")
@@ -183,17 +216,46 @@ class HarnessContractTests(unittest.TestCase):
 
     def run_harness(self, **overrides: str) -> subprocess.CompletedProcess[str]:
         source_commit = subprocess.check_output(["git", "-C", str(SCRIPT_DIR.parent), "rev-parse", "HEAD"], text=True).strip()
-        binary_sha = __import__("hashlib").sha256(self.fake.read_bytes()).hexdigest()
-        env = dict(os.environ, TRAIL_BIN=str(self.fake), TRAIL_SCALE_REPO=str(self.repo),
+        binary_path = Path(overrides.get("TRAIL_BIN", self.fake))
+        binary_sha = __import__("hashlib").sha256(binary_path.read_bytes()).hexdigest()
+        fault_sha = __import__("hashlib").sha256(self.fault.read_bytes()).hexdigest()
+        attestation = self.repo.parent / "fault-attestation.json"
+        attestation.write_text(json.dumps({"schema_version": 1, "kind": "external_fault_driver",
+            "fault_driver_sha256": fault_sha, "source_commit": source_commit,
+            "binary_sha256": binary_sha, "test_contract": "trail-task12-exact-one-v1"}, sort_keys=True) + "\n")
+        attestation_sha = __import__("hashlib").sha256(attestation.read_bytes()).hexdigest()
+        env = dict(os.environ, TRAIL_BIN=str(binary_path), TRAIL_SCALE_REPO=str(self.repo),
                    TRAIL_SCALE_LANES="2", TRAIL_SCALE_FILES_PER_LANE="2",
                    TRAIL_SCALE_CONCURRENCY="2", TRAIL_SCALE_RUN_ID="contract",
                    TRAIL_SCALE_OUTPUT=str(self.output),
                    TRAIL_SCALE_GIT_REF="refs/heads/codex/trail-scale-contract",
                    TRAIL_SCALE_FAULT_DRIVER=str(self.fault),
                    TRAIL_SCALE_EXPECTED_BINARY_SHA256=binary_sha,
-                   TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=source_commit)
+                   TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=source_commit,
+                   TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=fault_sha,
+                   TRAIL_SCALE_FAULT_ATTESTATION=str(attestation),
+                   TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256=attestation_sha)
         env.update(overrides)
         return subprocess.run([str(HARNESS)], env=env, text=True, capture_output=True)
+
+    def run_candidate_fault_probe(self, scenario: str, test_count: int = 1) -> subprocess.CompletedProcess[str]:
+        fake_bin = self.repo.parent / "fake-bin"
+        fake_bin.mkdir(exist_ok=True)
+        cargo = fake_bin / "cargo"
+        cargo.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import os, sys
+            name = sys.argv[-4]
+            count = {test_count}
+            print(f"running {{count}} test" + ("" if count == 1 else "s"))
+            if count == 1:
+                print(f"test {{name}} ... ok")
+            print(f"test result: ok. {{count}} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")
+        """), encoding="utf-8")
+        cargo.chmod(cargo.stat().st_mode | stat.S_IXUSR)
+        env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ["PATH"])
+        return subprocess.run([str(HARNESS), "--fault-probe", scenario], env=env,
+                              text=True, capture_output=True)
 
     def test_fake_trail_contract_produces_checker_approved_evidence(self) -> None:
         result = self.run_harness()
@@ -207,6 +269,25 @@ class HarnessContractTests(unittest.TestCase):
         expected = (self.output / "expected-paths.txt").read_text().splitlines()
         self.assertEqual(len(expected), len(set(expected)))
         self.assertEqual(expected, (self.output / "final-git-paths.txt").read_text().splitlines())
+        final = json.loads((self.output / "final-resources.json").read_text())["resources"]
+        self.assertEqual({row["status"] for row in final["merge_queue"]}, {"merged"})
+        self.assertEqual({row["status"] for row in final["lane_branches"]}, {"removed"})
+        self.assertTrue(all(row["name"].startswith("retired/") for row in final["lanes"]))
+
+    def test_candidate_filesystem_fault_probe_dispatches_native_exact_test(self) -> None:
+        result = self.run_candidate_fault_probe("filesystem_replacement")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        expected = (("changed_path_ledger_macos", "every_root_revalidation_failure_revokes_globally")
+                    if platform.system() == "Darwin" else
+                    ("changed_path_ledger_linux", "owner_death_and_root_replacement_cannot_prove_clean"))
+        self.assertEqual((payload["test_target"], payload["test_name"], payload["test_count"]),
+                         (*expected, 1))
+
+    def test_candidate_fault_probe_rejects_zero_filtered_tests(self) -> None:
+        result = self.run_candidate_fault_probe("filesystem_replacement", test_count=0)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one test", result.stderr)
 
     def test_preexisting_untracked_files_are_preserved_and_attested(self) -> None:
         expected = {
@@ -252,6 +333,15 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("mapped_delta baseline", result.stderr)
         self.assertFalse((self.repo / ".trail/fake-state.json").exists())
 
+    def test_read_only_preflight_rejects_before_daemon_backed_status(self) -> None:
+        with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
+            db.execute("UPDATE git_mappings SET git_head=?", ("f" * 40,))
+        result = self.run_harness(FAKE_STATUS_MUTATES="status-was-called")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("mapped_delta baseline", result.stderr)
+        self.assertFalse((self.repo / ".trail/status-was-called").exists())
+        self.assertFalse(self.output.exists())
+
     def test_preexisting_lane_collision_is_rejected_and_never_cleaned_up(self) -> None:
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
             db.execute("INSERT INTO lanes VALUES(?,?)", ("foreign-id", "scale-0001"))
@@ -268,6 +358,14 @@ class HarnessContractTests(unittest.TestCase):
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
             self.assertEqual(db.execute("SELECT lane_id FROM lanes WHERE name='scale-0001'").fetchone(), ("foreign-late",))
             self.assertIsNone(db.execute("SELECT lane_id FROM lanes WHERE name='scale-0000'").fetchone())
+
+    def test_cleanup_refuses_lane_whose_stable_identity_changed(self) -> None:
+        result = self.run_harness(FAKE_REPLACE_BEFORE_CLEANUP="scale-0001")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stable ownership changed", result.stderr)
+        with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
+            self.assertEqual(db.execute("SELECT lane_id FROM lanes WHERE name='scale-0001'").fetchone(),
+                             ("foreign-replacement",))
 
     def test_reserved_initialization_name_collision_is_rejected(self) -> None:
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
@@ -293,6 +391,12 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("binary SHA-256", result.stderr)
         self.assertFalse((self.repo / ".trail/fake-state.json").exists())
 
+    def test_fault_driver_digest_mismatch_is_rejected_before_mutation(self) -> None:
+        result = self.run_harness(TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256="0" * 64)
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("fault driver SHA-256", result.stderr)
+        self.assertFalse((self.repo / ".trail/fake-state.json").exists())
+
     def test_cross_device_output_is_rejected_before_mutation(self) -> None:
         if os.stat(self.repo).st_dev == os.stat("/tmp").st_dev:
             self.skipTest("no second filesystem is available")
@@ -313,6 +417,19 @@ class HarnessContractTests(unittest.TestCase):
             faults = list(csv.DictReader(stream, delimiter="\t"))
         self.assertTrue(all(row["source_commit"] == environment["source"]["commit"] for row in faults))
         self.assertTrue(all(row["binary_sha256"] == environment["binary"]["sha256"] for row in faults))
+        self.assertTrue(all(row["test_count"] == "1" for row in faults if row["evidence_kind"] != "harness_control"))
+
+    def test_candidate_binary_path_with_spaces_supports_version_probe(self) -> None:
+        spaced = self.repo.parent / "fake trail binary"
+        spaced.write_bytes(self.fake.read_bytes())
+        spaced.chmod(spaced.stat().st_mode | stat.S_IXUSR)
+        result = self.run_harness(TRAIL_BIN=str(spaced))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_zero_test_fault_probe_is_rejected(self) -> None:
+        result = self.run_harness(FAKE_ZERO_TEST_SCENARIO="after_reservation")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one test", result.stderr)
 
     def test_concurrent_spawn_failure_propagates(self) -> None:
         result = self.run_harness(FAKE_FAIL_SPAWN="scale-0001")
@@ -332,7 +449,12 @@ class HarnessContractTests(unittest.TestCase):
     def test_measured_final_inventory_leak_is_rejected(self) -> None:
         result = self.run_harness(FAKE_LEAK_SOCKET="changed-path.sock.tombstone")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("final resource inventory differs from baseline", result.stderr)
+        self.assertIn("transient/leaked resource", result.stderr)
+
+    def test_materialization_operation_journal_leak_is_rejected(self) -> None:
+        result = self.run_harness(FAKE_LEAK_JOURNAL="leaked.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("materialization", result.stderr)
 
     def test_forbidden_bypass_flags_are_absent(self) -> None:
         source = HARNESS.read_text(encoding="utf-8")

@@ -84,9 +84,12 @@ dedicated Git ref are explicit inputs:
 ```sh
 candidate_sha=$(shasum -a 256 "$PWD/target/release/trail" | awk '{print $1}')
 candidate_commit=$(git rev-parse HEAD)
+fault_driver_sha=$(shasum -a 256 "$PWD/scripts/verify-real-repo-lane-scale.sh" | awk '{print $1}')
 TRAIL_BIN="$PWD/target/release/trail" \
 TRAIL_SCALE_EXPECTED_BINARY_SHA256="$candidate_sha" \
 TRAIL_SCALE_EXPECTED_SOURCE_COMMIT="$candidate_commit" \
+TRAIL_SCALE_FAULT_DRIVER="$PWD/scripts/verify-real-repo-lane-scale.sh" \
+TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256="$fault_driver_sha" \
 TRAIL_SCALE_REPO=/absolute/path/to/repository \
 TRAIL_SCALE_OUTPUT=/absolute/same-device/path/to/new-evidence-directory \
 TRAIL_SCALE_LANES=64 \
@@ -104,6 +107,15 @@ nonterminal row, the dedicated ref is absent, and the candidate binary/source
 identities match the explicit digests. A baseline that has already absorbed a
 previous scale run is not eligible for another `mapped_delta` export while Git
 HEAD is unchanged.
+
+All rejection checks before the first daemon-backed command read only filesystem
+metadata, Git state, the Trail `HEAD` file, and SQLite opened in read-only mode.
+Inventories immediately before and after the first `trail status` make runtime
+socket, observer, lock, or lease startup explicit. Candidate-harness Cargo
+probes require a clean tracked source tree and clean submodules. An alternate
+fault driver requires an explicitly digest-pinned JSON attestation binding the
+driver, source commit, candidate binary digest, and
+`trail-task12-exact-one-v1` test contract.
 
 Run 64 and 128 against independently initialized copies. The safe sequence is:
 
@@ -135,23 +147,31 @@ Artifacts form a closed, checksummed evidence set:
   exact edit/record counts, isolation, and logical/allocated/exclusive space;
 - `faults.tsv`: every durable initialization crash cut plus daemon death,
   response loss, PID reuse, lock crash, policy churn, filesystem replacement,
-  disk/permission/fsync failures, conflicts, and dirty Git refusal;
+  disk/permission/fsync failures, conflicts, and dirty Git refusal. Each Cargo
+  row records the exact target/test and proves exactly one matching test ran;
+  filesystem replacement dispatches to the native Linux or macOS target;
 - `expected-paths.txt`, `final-trail-paths.txt`, and `final-git-paths.txt`: exact
   sorted manifests that must be byte-identical;
+- `baseline-path-state.json`, `final-path-state.json`, and `path-changes.json`:
+  exact Git tree entries and change types used to derive false-deletion and
+  unintended-path counts independently of command summaries;
 - `metrics.json`, `environment.json`, and `evidence-manifest.sha256`: closed
   metrics/environment schemas and an exact digest inventory.
-- `baseline-resources.json`, `active-resources.json`, and
-  `final-resources.json`: raw SQLite/filesystem inventories of lane rows,
-  initialization rows, queue work, materializations, leases, observer owners,
-  locks, sockets/tombstones, mounts, and workdirs. The checker derives cleanup
-  deltas and run ownership from these files.
+- `baseline-resources.json`, `runtime-resources.json`, `active-resources.json`,
+  and `final-resources.json`: raw SQLite/filesystem inventories of lane rows,
+  lane branches, terminal queue/audit rows, initialization rows,
+  materializations, leases, observer owners, locks, sockets/tombstones, mounts,
+  workdirs, and materialization-operation journals. The checker enforces exact
+  row schemas, derives cleanup deltas and run ownership, and models real lane
+  retirement/terminal queue history separately from transient leaks.
 
-Focused fault rows are explicitly labeled `focused_test_aggregate`: they bind
+Candidate-harness fault rows are explicitly labeled `focused_test_aggregate`: they bind
 the exact source commit, candidate binary digest, and fault-driver digest, but
 state that those Cargo tests did not execute the release binary and do not
 claim synthetic per-scenario initialization IDs. The dirty-Git refusal row is
 separately labeled as a binary-backed harness control. `environment.json`
-discloses whether the source tree/submodules were clean and records the local
+requires the candidate harness/digest (or a pinned external attestation),
+discloses whether the source tree/submodules were clean, and records the local
 binary/source relationship as unproven unless a reproducible-build attestation
 is available.
 
@@ -168,6 +188,13 @@ initialization/materialization resources. At up to 64 lanes it also enforces the
 configured p99 latency ceiling. The scheduled 128-lane stress job records the
 same p50/p95/p99 and RSS evidence without applying the 64-lane ceiling; every
 correctness and cleanup invariant remains blocking inside the harness.
+
+Cleanup records each successfully created lane's stable lane ID,
+initialization ID, request fingerprint, workdir, and ref. It rechecks that tuple
+immediately before the name-only `lane rm`; a mismatch fails closed and leaves
+the lane for investigation. Trail does not currently expose an atomic
+remove-by-expected-ID CLI, so the remaining check-to-remove race requires an
+otherwise quiescent/exclusive qualification workspace.
 
 Pull-request CI runs the fake-Trail/temp-Git contracts and Linux/macOS native
 changed-path, schema-19, and fault suites. The scheduled/release workflow owns

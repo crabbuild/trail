@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
@@ -31,6 +31,7 @@ FAULT_COLUMNS = [
     "retry_result", "integrity_result", "leaked_resource_count",
     "initialization_id", "retry_initialization_id", "evidence_command_id",
     "evidence_kind", "source_commit", "binary_sha256", "binary_exercised",
+    "test_target", "test_name", "test_count",
 ]
 INITIALIZATION_PHASES = [
     "after_reservation", "after_materialization", "after_association",
@@ -46,15 +47,43 @@ FAULT_SCENARIOS = INITIALIZATION_PHASES + [
 LANE_PHASES = ("spawn", "spawn_retry", "status", "space", "record", "readiness", "handoff")
 ROOT_FILES = {
     "active-resources.json", "baseline-resources.json", "baseline-untracked.json",
-    "environment.json", "expected-paths.txt", "faults.tsv", "final-resources.json",
+    "baseline-path-state.json", "environment.json", "expected-paths.txt", "faults.tsv",
+    "final-path-state.json", "final-resources.json", "path-changes.json", "runtime-resources.json",
     "final-git-paths.txt", "final-trail-paths.txt", "final-untracked.json", "lanes.tsv",
     "metrics.json", "results.tsv", "evidence-manifest.sha256",
 }
 RESOURCE_KEYS = [
-    "lanes", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases",
+    "lanes", "lane_branches", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases",
     "observer_owners", "lock_paths", "socket_paths", "mount_paths", "workdir_paths",
+    "materialization_journals",
 ]
 DEDICATED_REF = re.compile(r"^refs/heads/codex/[A-Za-z0-9._/-]+$")
+FAULT_TESTS = {
+    **{scenario: ("lane_initialization_faults", "identical_spawn_resumes_at_every_durable_crash_cut")
+       for scenario in INITIALIZATION_PHASES},
+    "daemon_death": ("changed_path_ledger_daemon", "killed_daemon_is_replaced_and_full_reconciliation_captures_offline_change"),
+    "response_loss_after_association": ("changed_path_ledger_daemon", "external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback"),
+    "response_loss_after_readiness": ("changed_path_ledger_daemon", "external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback"),
+    "pid_reuse": ("changed_path_ledger_daemon", "forged_dead_process_identity_cannot_replace_a_live_observer_owner"),
+    "lock_holder_crash": ("changed_path_ledger_daemon", "crash_after_persisting_ledger_owner_is_automatically_recovered"),
+    "policy_churn": ("changed_path_ledger_daemon", "live_policy_invalidation_self_restarts_and_reconciles"),
+    "disk_full": ("lane_initialization_faults", "io_failures_never_advance_past_or_delete_the_durable_artifact"),
+    "permissions_failure": ("lane_initialization_faults", "io_failures_never_advance_past_or_delete_the_durable_artifact"),
+    "fsync_failure": ("lane_initialization_faults", "io_failures_never_advance_past_or_delete_the_durable_artifact"),
+    "conflicting_lanes": ("e2e", "lane_merge_queue_pauses_on_conflict"),
+}
+
+RESOURCE_ROW_KEYS = {
+    "lanes": {"lane_id", "name"},
+    "lane_branches": {"lane_id", "ref_name", "status", "workdir", "base_change", "head_change"},
+    "lane_refs": {"name", "change_id", "root_id", "operation_id", "generation"},
+    "merge_queue": {"queue_id", "lane_id", "target_ref", "status"},
+    "initializations": {"initialization_id", "lane_name", "lane_id", "request_fingerprint", "phase", "workdir", "materialization_json"},
+    "workspace_views": {"view_id", "lane_id", "backend", "mountpoint", "source_upper", "generated_upper", "scratch_upper", "meta_dir", "journal_path", "status", "owner_pid"},
+    "leases": {"lease_id", "lane_id", "ref_name", "path", "mode", "expires_at"},
+    "observer_owners": {"scope_id", "lease_state", "daemon_pid"},
+    "materialization_journals": {"path", "kind", "size_bytes", "sha256"},
+}
 
 
 class EvidenceError(ValueError):
@@ -197,13 +226,86 @@ def read_resource_inventory(path: Path) -> dict[str, list[Any]]:
         encoded = [json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows]
         if encoded != sorted(set(encoded)):
             fail(f"{path.name}.resources.{key} must be sorted and duplicate-free")
-    for key in ["lanes", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases", "observer_owners"]:
-        if any(not isinstance(row, dict) for row in resources[key]):
-            fail(f"{path.name}.resources.{key} rows must be objects")
+    for key, keys in RESOURCE_ROW_KEYS.items():
+        for index, row in enumerate(resources[key]):
+            label = f"{path.name}.resources.{key}[{index}]"
+            if not isinstance(row, dict):
+                fail(f"{label} must be an object")
+            exact_keys(row, keys, label)
+            for field, value in row.items():
+                if field in {"generation", "expires_at", "owner_pid", "daemon_pid", "size_bytes"}:
+                    if value is not None:
+                        integer(value, f"{label}.{field}")
+                elif value is not None and (not isinstance(value, str) or not value):
+                    fail(f"{label}.{field} must be a non-empty string or null")
+            if key == "materialization_journals":
+                if row["kind"] not in {"regular", "directory", "symlink", "other"}:
+                    fail(f"{label}.kind is unsupported")
+                if row["kind"] == "regular":
+                    if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+                        fail(f"{label}.sha256 is invalid")
+                elif row["sha256"] is not None:
+                    fail(f"{label}.sha256 must be null for non-regular paths")
     for key in ["lock_paths", "socket_paths", "mount_paths", "workdir_paths"]:
         if any(not isinstance(row, str) or not row for row in resources[key]):
             fail(f"{path.name}.resources.{key} rows must be non-empty paths")
     return resources
+
+
+def read_path_state(path: Path) -> tuple[str, list[dict[str, str]]]:
+    state = read_json(path)
+    exact_keys(state, ["schema_version", "tree", "entries"], path.name)
+    if state["schema_version"] != 1:
+        fail(f"{path.name} schema_version must be 1")
+    if not isinstance(state["tree"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", state["tree"]):
+        fail(f"{path.name}.tree is invalid")
+    entries = state["entries"]
+    if not isinstance(entries, list):
+        fail(f"{path.name}.entries must be an array")
+    paths: list[str] = []
+    for index, row in enumerate(entries):
+        label = f"{path.name}.entries[{index}]"
+        if not isinstance(row, dict):
+            fail(f"{label} must be an object")
+        exact_keys(row, ["path", "mode", "type", "object"], label)
+        if (not isinstance(row["path"], str) or not row["path"] or row["path"].startswith("/")
+                or "\0" in row["path"] or ".." in Path(row["path"]).parts):
+            fail(f"{label}.path is unsafe")
+        if not isinstance(row["mode"], str) or not re.fullmatch(r"[0-7]{6}", row["mode"]):
+            fail(f"{label}.mode is invalid")
+        if row["type"] not in {"blob", "tree", "commit"}:
+            fail(f"{label}.type is unsupported")
+        if not isinstance(row["object"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", row["object"]):
+            fail(f"{label}.object is invalid")
+        paths.append(row["path"])
+    if paths != sorted(set(paths)):
+        fail(f"{path.name} entries must be path-sorted and duplicate-free")
+    return state["tree"], entries
+
+
+def read_path_changes(path: Path) -> tuple[str, str, list[dict[str, str]]]:
+    value = read_json(path)
+    exact_keys(value, ["schema_version", "baseline_tree", "final_tree", "changes"], path.name)
+    if value["schema_version"] != 1:
+        fail(f"{path.name} schema_version must be 1")
+    for key in ["baseline_tree", "final_tree"]:
+        if not isinstance(value[key], str) or not re.fullmatch(r"[0-9a-f]{40,64}", value[key]):
+            fail(f"{path.name}.{key} is invalid")
+    changes = value["changes"]
+    if not isinstance(changes, list):
+        fail(f"{path.name}.changes must be an array")
+    for index, row in enumerate(changes):
+        label = f"{path.name}.changes[{index}]"
+        if not isinstance(row, dict):
+            fail(f"{label} must be an object")
+        exact_keys(row, ["status", "path"], label)
+        if row["status"] not in {"A", "M", "D", "T"}:
+            fail(f"{label}.status is unsupported")
+        if not isinstance(row["path"], str) or not row["path"]:
+            fail(f"{label}.path is invalid")
+    if changes != sorted(changes, key=lambda row: (row["path"], row["status"])):
+        fail(f"{path.name}.changes must be sorted")
+    return value["baseline_tree"], value["final_tree"], changes
 
 
 def resource_added_count(before: dict[str, list[Any]], after: dict[str, list[Any]], key: str) -> int:
@@ -238,11 +340,57 @@ def check_environment(path: Path) -> dict[str, Any]:
     if not isinstance(source["commit"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", source["commit"]): fail("environment.source.commit is invalid")
     boolean(source["tree_clean"], "environment.source.tree_clean"); boolean(source["submodules_clean"], "environment.source.submodules_clean")
     if not all(isinstance(source[key], list) and all(isinstance(row, str) for row in source[key]) for key in ["status_porcelain", "submodule_status"]): fail("environment source cleanliness disclosure is malformed")
+    derived_tree_clean = not any(not row.startswith("??") for row in source["status_porcelain"])
+    derived_submodules_clean = not any(row[:1] in {"+", "-", "U"} for row in source["submodule_status"])
+    if source["tree_clean"] != derived_tree_clean or source["submodules_clean"] != derived_submodules_clean:
+        fail("environment source cleanliness booleans disagree with raw disclosure")
     fault_driver = environment["fault_driver"]
-    exact_keys(fault_driver, ["path", "sha256", "is_candidate_harness"], "environment.fault_driver")
+    exact_keys(fault_driver, ["path", "sha256", "expected_sha256", "exact_expected",
+                              "is_candidate_harness", "qualification_kind",
+                              "attestation_path", "attestation_sha256"], "environment.fault_driver")
     if not isinstance(fault_driver["path"], str) or not Path(fault_driver["path"]).is_absolute(): fail("environment.fault_driver.path must be absolute")
     if not isinstance(fault_driver["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", fault_driver["sha256"]): fail("environment.fault_driver.sha256 is invalid")
-    boolean(fault_driver["is_candidate_harness"], "environment.fault_driver.is_candidate_harness")
+    if fault_driver["expected_sha256"] != fault_driver["sha256"]:
+        fail("environment fault driver does not match the exact expected digest")
+    if not boolean(fault_driver["exact_expected"], "environment.fault_driver.exact_expected"):
+        fail("environment fault driver is not exact")
+    candidate_driver = boolean(fault_driver["is_candidate_harness"], "environment.fault_driver.is_candidate_harness")
+    if fault_driver["qualification_kind"] == "candidate_harness":
+        if not candidate_driver or fault_driver["attestation_path"] or fault_driver["attestation_sha256"]:
+            fail("candidate harness fault driver linkage is malformed")
+        if not source["tree_clean"] or not source["submodules_clean"]:
+            fail("Cargo fault probes require a clean source tree and clean submodules")
+    elif fault_driver["qualification_kind"] == "external_attestation":
+        if candidate_driver:
+            fail("external fault attestation cannot claim the candidate harness")
+        if (not isinstance(fault_driver["attestation_path"], str)
+                or not Path(fault_driver["attestation_path"]).is_absolute()
+                or not isinstance(fault_driver["attestation_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", fault_driver["attestation_sha256"])):
+            fail("external fault driver attestation is malformed")
+        attestation_file = path.parent / "fault-attestation.json"
+        try:
+            attestation_digest = hashlib.sha256(attestation_file.read_bytes()).hexdigest()
+        except OSError as error:
+            fail(f"external fault attestation evidence is missing: {error}")
+        if attestation_digest != fault_driver["attestation_sha256"]:
+            fail("external fault attestation evidence digest mismatch")
+        attestation = read_json(attestation_file)
+        exact_keys(attestation, ["schema_version", "kind", "fault_driver_sha256",
+                                 "source_commit", "binary_sha256", "test_contract"],
+                   "fault-attestation")
+        expected_attestation = {
+            "schema_version": 1,
+            "kind": "external_fault_driver",
+            "fault_driver_sha256": fault_driver["sha256"],
+            "source_commit": source["commit"],
+            "binary_sha256": binary["sha256"],
+            "test_contract": "trail-task12-exact-one-v1",
+        }
+        if attestation != expected_attestation:
+            fail("external fault attestation does not bind the exact candidate/driver contract")
+    else:
+        fail("environment fault driver qualification is unsupported")
     relationship = environment["candidate_relationship"]
     exact_keys(relationship, ["kind", "expected_binary_sha256", "expected_source_commit"], "environment.candidate_relationship")
     if relationship["kind"] not in {"locally_bound_unproven_build", "verified_reproducible_build"}: fail("candidate binary/source relationship is unsupported")
@@ -298,15 +446,18 @@ def check(root: Path) -> dict[str, Any]:
     manifest_entries = check_manifest(root)
     environment = check_environment(root / "environment.json")
     baseline_resources = read_resource_inventory(root / "baseline-resources.json")
+    runtime_resources = read_resource_inventory(root / "runtime-resources.json")
     active_resources = read_resource_inventory(root / "active-resources.json")
     final_resources = read_resource_inventory(root / "final-resources.json")
-    if final_resources != baseline_resources:
-        differences = [key for key in RESOURCE_KEYS if final_resources[key] != baseline_resources[key]]
-        fail(f"final resource inventory differs from baseline: {differences}")
+    runtime_mutable = {"observer_owners", "socket_paths", "lock_paths", "leases"}
+    unexpected_runtime = [key for key in RESOURCE_KEYS
+                          if key not in runtime_mutable and runtime_resources[key] != baseline_resources[key]]
+    if unexpected_runtime:
+        fail(f"daemon-backed status changed unexpected runtime resources: {unexpected_runtime}")
     metrics = read_json(root / "metrics.json")
     exact_keys(metrics, [
         "schema_version", "run", "baseline", "correctness", "performance", "storage",
-        "git_export", "cleanup", "integrity", "git_state_preservation", "evidence",
+        "git_export", "cleanup", "audit_history", "integrity", "git_state_preservation", "evidence",
     ], "metrics")
     if metrics["schema_version"] != SCHEMA_VERSION:
         fail(f"metrics schema_version must be {SCHEMA_VERSION}")
@@ -399,6 +550,7 @@ def check(root: Path) -> dict[str, Any]:
     if set(lane_names) - set(active_lanes):
         fail(f"active inventory is missing run lanes: {sorted(set(lane_names)-set(active_lanes))}")
     active_initializations = {row.get("lane_name"): row for row in active_resources["initializations"]}
+    active_branches = {row.get("lane_id"): row for row in active_resources["lane_branches"]}
     active_lane_refs = {row.get("name") for row in active_resources["lane_refs"]}
     active_queue_by_lane = {}
     for queue_row in active_resources["merge_queue"]:
@@ -429,9 +581,55 @@ def check(root: Path) -> dict[str, Any]:
         if f"refs/lanes/{row['lane']}" not in active_lane_refs:
             fail(f"active inventory is missing lane ref for {row['lane']}")
         lane_id = active_lanes[row["lane"]].get("lane_id")
+        branch = active_branches.get(lane_id)
+        if (not branch or branch.get("ref_name") != f"refs/lanes/{row['lane']}"
+                or branch.get("workdir") != row["workdir"] or branch.get("status") == "removed"):
+            fail(f"active inventory lane branch does not match {row['lane']}")
         queue_rows = active_queue_by_lane.get(lane_id, [])
         if len(queue_rows) != 1 or queue_rows[0].get("status") != "queued":
             fail(f"active inventory does not contain exactly one queued run-owned row for {row['lane']}")
+
+    run_lane_ids = {active_lanes[name]["lane_id"] for name in lane_names}
+    final_lanes_by_id = {row.get("lane_id"): row for row in final_resources["lanes"]}
+    final_branches_by_id = {row.get("lane_id"): row for row in final_resources["lane_branches"]}
+    final_queue_by_lane: dict[Any, list[dict[str, Any]]] = {}
+    for queue_row in final_resources["merge_queue"]:
+        final_queue_by_lane.setdefault(queue_row.get("lane_id"), []).append(queue_row)
+    for row in lane_rows:
+        lane_id = active_lanes[row["lane"]]["lane_id"]
+        retired = final_lanes_by_id.get(lane_id)
+        if not retired or retired.get("name") != f"retired/{row['lane']}/{lane_id}":
+            fail(f"final inventory lacks the exact retired lane audit row for {row['lane']}")
+        branch = final_branches_by_id.get(lane_id)
+        if (not branch or branch.get("status") != "removed"
+                or not str(branch.get("ref_name", "")).startswith(f"retired/{lane_id}/")
+                or branch.get("workdir") != row["workdir"]):
+            fail(f"final inventory lacks the exact removed lane branch audit row for {row['lane']}")
+        queue_rows = final_queue_by_lane.get(lane_id, [])
+        if len(queue_rows) != 1 or queue_rows[0].get("status") != "merged":
+            fail(f"final inventory lacks exactly one terminal queue audit row for {row['lane']}")
+
+    def without_run(rows: list[dict[str, Any]], key: str = "lane_id") -> list[dict[str, Any]]:
+        return [row for row in rows if row.get(key) not in run_lane_ids]
+
+    for key in ["lanes", "lane_branches", "merge_queue"]:
+        if without_run(final_resources[key]) != runtime_resources[key]:
+            fail(f"final resource inventory changed pre-runtime {key} rows")
+    if [row for row in final_resources["initializations"] if row.get("lane_id") in run_lane_ids]:
+        fail("final resource inventory retains run-owned initializations")
+    if [row for row in final_resources["workspace_views"] if row.get("lane_id") in run_lane_ids]:
+        fail("final resource inventory retains run-owned materializations")
+    if [row for row in final_resources["leases"] if row.get("lane_id") in run_lane_ids]:
+        fail("final resource inventory retains run-owned leases")
+    if any(row.get("name") in {f"refs/lanes/{lane}" for lane in lane_names}
+           for row in final_resources["lane_refs"]):
+        fail("final resource inventory retains run-owned lane refs")
+    stable_keys = ["lane_refs", "initializations", "workspace_views", "leases",
+                   "observer_owners", "lock_paths", "socket_paths", "mount_paths",
+                   "workdir_paths", "materialization_journals"]
+    differences = [key for key in stable_keys if final_resources[key] != runtime_resources[key]]
+    if differences:
+        fail(f"final resource inventory contains transient/leaked resource differences: {differences}")
 
     expected_paths = read_paths(root / "expected-paths.txt")
     final_trail_paths = read_paths(root / "final-trail-paths.txt")
@@ -445,6 +643,23 @@ def check(root: Path) -> dict[str, Any]:
         lane_paths = [path for path in expected_paths if path.startswith(prefix)]
         if len(lane_paths) != files_per_lane: fail(f"{lane}: expected-path allocation is not exact/disjoint")
 
+    baseline_tree, baseline_entries = read_path_state(root / "baseline-path-state.json")
+    final_tree, final_entries = read_path_state(root / "final-path-state.json")
+    change_base, change_final, path_changes = read_path_changes(root / "path-changes.json")
+    if (change_base, change_final) != (baseline_tree, final_tree):
+        fail("path change evidence is not bound to the exact baseline/final trees")
+    baseline_by_path = {row["path"]: row for row in baseline_entries}
+    final_by_path = {row["path"]: row for row in final_entries}
+    deleted_paths = sorted(baseline_by_path.keys() - final_by_path.keys())
+    modified_baseline = sorted(path for path in baseline_by_path.keys() & final_by_path.keys()
+                               if baseline_by_path[path] != final_by_path[path])
+    change_deleted = sorted(row["path"] for row in path_changes if row["status"] == "D")
+    if deleted_paths != change_deleted:
+        fail("false deletion evidence disagrees with exact path state")
+    added_changes = sorted(row["path"] for row in path_changes if row["status"] == "A")
+    unexpected_change_rows = [row for row in path_changes
+                              if row["status"] != "A" or row["path"] not in set(expected_paths)]
+
     correctness = metrics["correctness"]
     if not isinstance(correctness, dict): fail("correctness must be an object")
     exact_keys(correctness, ["lane_count", "edit_count", "ambiguous_results", "false_deletions", "missing_lanes", "unintended_paths", "integrity_errors", "live_locks"], "correctness")
@@ -452,11 +667,14 @@ def check(root: Path) -> dict[str, Any]:
     if integer(correctness["edit_count"], "correctness.edit_count") != expected_count: fail("correctness edit count mismatch")
     derived_correctness = {
         "ambiguous_results": sum(row["initialization_id"] != row["retry_initialization_id"] for row in lane_rows),
-        "false_deletions": len({row.get("name") for row in baseline_resources["lanes"]} - {row.get("name") for row in final_resources["lanes"]}),
+        "false_deletions": len(deleted_paths),
         "missing_lanes": len(set(lane_names) - set(active_lanes)),
-        "unintended_paths": len(set(final_trail_paths) ^ set(expected_paths)) + len(set(final_git_paths) ^ set(expected_paths)),
+        "unintended_paths": (len(set(final_trail_paths) ^ set(expected_paths))
+                             + len(set(final_git_paths) ^ set(expected_paths))
+                             + len(unexpected_change_rows) + len(modified_baseline)
+                             + len(set(added_changes) ^ set(expected_paths))),
         "integrity_errors": 0,
-        "live_locks": resource_added_count(baseline_resources, final_resources, "lock_paths") + resource_added_count(baseline_resources, final_resources, "leases"),
+        "live_locks": resource_added_count(runtime_resources, final_resources, "lock_paths") + resource_added_count(runtime_resources, final_resources, "leases"),
     }
     for key, expected in derived_correctness.items():
         if integer(correctness[key], f"correctness.{key}") != expected: fail(f"correctness.{key} does not match raw evidence")
@@ -523,14 +741,57 @@ def check(root: Path) -> dict[str, Any]:
         if scenario == "dirty_git_export_refusal":
             if row["evidence_kind"] != "harness_control" or row["binary_exercised"] != "true" or row["integrity_result"] != "harness_control_exit_0":
                 fail(f"{scenario}: binary-backed harness control linkage is malformed")
+            if row["test_target"] or row["test_name"] or parse_int(row["test_count"], f"{scenario} test_count") != 0:
+                fail(f"{scenario}: harness control must not claim a Cargo test")
         else:
-            if row["evidence_kind"] != "focused_test_aggregate" or row["binary_exercised"] != "false" or row["integrity_result"] != "focused_test_exit_0":
+            expected_kind = ("focused_test_aggregate"
+                             if environment["fault_driver"]["qualification_kind"] == "candidate_harness"
+                             else "externally_attested_focused_test")
+            if row["evidence_kind"] != expected_kind or row["binary_exercised"] != "false" or row["integrity_result"] != "focused_test_exit_0":
                 fail(f"{scenario}: focused-test evidence linkage is malformed")
             if row["initialization_id"] or row["retry_initialization_id"]:
                 fail(f"{scenario}: focused test did not establish per-scenario initialization identity")
+            if scenario == "filesystem_replacement":
+                platform_description = environment["platform"]["description"]
+                if "Darwin" in platform_description or "macOS" in platform_description:
+                    expected_test = ("changed_path_ledger_macos", "every_root_revalidation_failure_revokes_globally")
+                elif "Linux" in platform_description:
+                    expected_test = ("changed_path_ledger_linux", "owner_death_and_root_replacement_cannot_prove_clean")
+                else:
+                    fail("filesystem replacement fault evidence has an unsupported platform")
+            else:
+                expected_test = FAULT_TESTS[scenario]
+            if (row["test_target"], row["test_name"]) != expected_test:
+                fail(f"{scenario}: fault evidence does not name the exact focused test")
+            if parse_int(row["test_count"], f"{scenario} test_count") != 1:
+                fail(f"{scenario}: focused fault probe must execute exactly one test")
+            if environment["fault_driver"]["qualification_kind"] == "candidate_harness":
+                try:
+                    cargo_output = (root / f"commands/{row['evidence_command_id']}.stderr").read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError as error:
+                    fail(f"{scenario}: cannot read raw Cargo output: {error}")
+                summaries = re.findall(
+                    r"test result: ok\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;",
+                    cargo_output,
+                )
+                named = len(re.findall(
+                    r"^test " + re.escape(row["test_name"]) + r" \.\.\. ok$",
+                    cargo_output,
+                    re.MULTILINE,
+                ))
+                if summaries != [("1", "0", "0")] or named != 1:
+                    fail(f"{scenario}: raw Cargo output does not prove exactly one named test")
         command_wrapper = read_json(root / f"commands/{row['evidence_command_id']}.json")
         if command_wrapper.get("actual_exit_code") != 0:
             fail(f"{scenario}: raw evidence command did not exit zero")
+        command_payload = command_wrapper.get("payload")
+        if (not isinstance(command_payload, dict)
+                or command_payload.get("scenario") != scenario
+                or command_payload.get("test_target", "") != row["test_target"]
+                or command_payload.get("test_name", "") != row["test_name"]
+                or command_payload.get("test_count", 0) != int(row["test_count"])):
+            fail(f"{scenario}: raw fault evidence does not match the exact test identity/count")
         if scenario in INITIALIZATION_PHASES:
             if row["durable_phase"] != scenario.removeprefix("after_"): fail(f"{scenario}: durable phase is wrong")
             if row["retry_result"] not in {"resumed_same_initialization", "repaired_once"}: fail(f"{scenario}: retry result is not a committed repair/resume")
@@ -541,19 +802,35 @@ def check(root: Path) -> dict[str, Any]:
     if not isinstance(cleanup, dict): fail("cleanup must be an object")
     exact_keys(cleanup, ["stale_mounts", "stale_sockets", "stale_locks", "stale_initializations", "stale_materializations", "leaked_workdirs", "stale_queue_rows", "stale_lane_rows", "stale_lane_refs"], "cleanup")
     derived_cleanup = {
-        "stale_mounts": resource_added_count(baseline_resources, final_resources, "mount_paths"),
-        "stale_sockets": resource_added_count(baseline_resources, final_resources, "socket_paths"),
-        "stale_locks": resource_added_count(baseline_resources, final_resources, "lock_paths") + resource_added_count(baseline_resources, final_resources, "leases"),
-        "stale_initializations": resource_added_count(baseline_resources, final_resources, "initializations"),
-        "stale_materializations": resource_added_count(baseline_resources, final_resources, "workspace_views"),
-        "leaked_workdirs": resource_added_count(baseline_resources, final_resources, "workdir_paths"),
-        "stale_queue_rows": resource_added_count(baseline_resources, final_resources, "merge_queue"),
-        "stale_lane_rows": resource_added_count(baseline_resources, final_resources, "lanes"),
-        "stale_lane_refs": resource_added_count(baseline_resources, final_resources, "lane_refs"),
+        "stale_mounts": resource_added_count(runtime_resources, final_resources, "mount_paths"),
+        "stale_sockets": resource_added_count(runtime_resources, final_resources, "socket_paths"),
+        "stale_locks": resource_added_count(runtime_resources, final_resources, "lock_paths") + resource_added_count(runtime_resources, final_resources, "leases"),
+        "stale_initializations": len([row for row in final_resources["initializations"] if row.get("lane_id") in run_lane_ids]),
+        "stale_materializations": (len([row for row in final_resources["workspace_views"] if row.get("lane_id") in run_lane_ids])
+                                   + resource_added_count(runtime_resources, final_resources, "materialization_journals")),
+        "leaked_workdirs": resource_added_count(runtime_resources, final_resources, "workdir_paths"),
+        "stale_queue_rows": len([row for row in final_resources["merge_queue"]
+                                  if row.get("lane_id") in run_lane_ids and row.get("status") not in {"merged", "failed", "cancelled"}]),
+        "stale_lane_rows": len([row for row in final_resources["lanes"]
+                                 if row.get("lane_id") in run_lane_ids and not str(row.get("name", "")).startswith("retired/")]),
+        "stale_lane_refs": len([row for row in final_resources["lane_refs"]
+                                 if row.get("name") in {f"refs/lanes/{lane}" for lane in lane_names}]),
     }
     for key, expected in derived_cleanup.items():
         if integer(cleanup[key], f"cleanup.{key}") != expected: fail(f"cleanup.{key} does not match resource inventory")
         if expected != 0: fail("cleanup evidence reports leaked resources")
+    audit_history = metrics["audit_history"]
+    if not isinstance(audit_history, dict):
+        fail("audit_history must be an object")
+    exact_keys(audit_history, ["retired_lane_rows", "removed_lane_branch_rows", "terminal_queue_rows"], "audit_history")
+    derived_audit = {
+        "retired_lane_rows": len([row for row in final_resources["lanes"] if row.get("lane_id") in run_lane_ids]),
+        "removed_lane_branch_rows": len([row for row in final_resources["lane_branches"] if row.get("lane_id") in run_lane_ids]),
+        "terminal_queue_rows": len([row for row in final_resources["merge_queue"] if row.get("lane_id") in run_lane_ids]),
+    }
+    for key, expected in derived_audit.items():
+        if integer(audit_history[key], f"audit_history.{key}") != expected or expected != lanes_expected:
+            fail(f"audit_history.{key} does not match retained run audit history")
     integrity = metrics["integrity"]
     if not isinstance(integrity, dict): fail("integrity must be an object")
     exact_keys(integrity, ["trail_doctor", "trail_fsck", "git_fsck", "conflict_control"], "integrity")
