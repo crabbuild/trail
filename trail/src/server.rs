@@ -99,6 +99,14 @@ fn verify_persisted_workspace_owner(
     let Some(owner) = owner else {
         return Ok(None);
     };
+    if !workspace_daemon_process_start_identity_is_canonical(
+        owner.stale_pid,
+        &owner.process_start_identity,
+    ) {
+        return Err(crate::Error::DaemonUnavailable(
+            "persisted workspace daemon owner process start identity is malformed".into(),
+        ));
+    }
     if workspace_daemon_process_is_alive(owner.stale_pid) {
         match workspace_daemon_process_start_identity(owner.stale_pid) {
             Some(actual) if actual == owner.process_start_identity => {
@@ -134,7 +142,7 @@ fn verify_stale_workspace_owner_publication(
     let process_start_identity = stale.process_start_identity;
     if stale_pid == 0
         || stale_pid > i32::MAX as u32
-        || process_start_identity.is_empty()
+        || !workspace_daemon_process_start_identity_is_canonical(stale_pid, &process_start_identity)
         || stale.daemon_launch_nonce.len() != 64
     {
         return Err(crate::Error::DaemonUnavailable(
@@ -164,6 +172,45 @@ fn verify_stale_workspace_owner_publication(
         &process_start_identity,
         &stale.daemon_launch_nonce,
     )
+}
+
+fn workspace_daemon_process_start_identity_is_canonical(pid: u32, identity: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(start_ticks) = identity.strip_prefix("linux:") else {
+            return false;
+        };
+        canonical_decimal_u64(start_ticks)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut fields = identity.split(':');
+        if fields.next() != Some("macos") || fields.next() != Some(pid.to_string().as_str()) {
+            return false;
+        }
+        let (Some(start_seconds), Some(start_microseconds), None) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        canonical_decimal_u64(start_seconds)
+            && canonical_decimal_u64(start_microseconds)
+            && start_microseconds
+                .parse::<u32>()
+                .is_ok_and(|microseconds| microseconds < 1_000_000)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, identity);
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn canonical_decimal_u64(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
 }
 
 fn workspace_daemon_process_is_alive(pid: u32) -> bool {

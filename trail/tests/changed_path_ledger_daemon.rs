@@ -198,6 +198,28 @@ fn authenticated_post(endpoint: &Endpoint, path: &str, body: serde_json::Value) 
     response
 }
 
+fn authenticated_post_allow_disconnect(
+    endpoint: Endpoint,
+    path: &'static str,
+    body: serde_json::Value,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let body = serde_json::to_vec(&body).unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            endpoint.auth_token,
+            body.len()
+        );
+        let mut stream = UnixStream::connect(&endpoint.socket_path).unwrap();
+        use std::io::{Read as _, Write as _};
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+    })
+}
+
 fn spawn_status_waiting_after_daemon_authority_load(
     fixture: &Fixture,
     barrier: &Path,
@@ -1886,6 +1908,196 @@ fn live_durable_daemon_owner_without_publication_is_not_replaced() {
         )
         .unwrap();
     assert_eq!(after, before);
+}
+
+#[test]
+fn malformed_durable_daemon_process_identity_without_publication_is_rejected() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    fs::remove_file(fixture.endpoint_path()).unwrap();
+    fs::remove_file(fixture.socket_path()).unwrap();
+
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET daemon_process_start_identity='not-a-process-start-identity'",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    let before: (i64, String, String) = conn
+        .query_row(
+            "SELECT epoch,owner_token,daemon_process_start_identity
+             FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    drop(conn);
+
+    assert_status_failed_for(&fixture.status(), "malformed durable process identity");
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let after: (i64, String, String) = conn
+        .query_row(
+            "SELECT epoch,owner_token,daemon_process_start_identity
+             FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn durable_macos_process_identity_with_different_embedded_pid_is_rejected() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    fs::remove_file(fixture.endpoint_path()).unwrap();
+    fs::remove_file(fixture.socket_path()).unwrap();
+
+    let mut fields = first.process_start_identity.split(':');
+    assert_eq!(fields.next(), Some("macos"));
+    let _recorded_pid = fields.next().unwrap();
+    let seconds = fields.next().unwrap();
+    let micros = fields.next().unwrap();
+    assert!(fields.next().is_none());
+    let different_pid = if first.pid == i32::MAX as u32 {
+        first.pid - 1
+    } else {
+        first.pid + 1
+    };
+    let mismatched_identity = format!("macos:{different_pid}:{seconds}:{micros}");
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_observer_owners SET daemon_process_start_identity=?1",
+            [&mismatched_identity],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+
+    assert_status_failed_for(&fixture.status(), "mismatched durable macOS PID binding");
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let after: (i64, String) = conn
+        .query_row(
+            "SELECT epoch,daemon_process_start_identity FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after.0, first.epoch as i64);
+    assert_eq!(after.1, mismatched_identity);
+}
+
+#[test]
+fn associated_materialized_spawn_retry_responds_once_before_daemon_retires() {
+    let fixture = Fixture::new();
+    let handshake = fixture.root().join("associated-spawn.handshake");
+    let handshake_text = handshake.to_str().unwrap();
+    let started = fixture.status_with_env(&[
+        (
+            "TRAIL_TEST_LANE_INITIALIZATION_CRASH_AFTER",
+            "after_association",
+        ),
+        ("TRAIL_TEST_LANE_INITIALIZATION_HANDSHAKE", handshake_text),
+    ]);
+    assert!(
+        started.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let first = fixture.endpoint();
+    let interrupted = authenticated_post_allow_disconnect(
+        first.clone(),
+        "/v1/lanes",
+        serde_json::json!({
+            "name": "associated-retry",
+            "from": "main",
+            "materialize": true
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !handshake.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not reach associated crash cut"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let phase: String = conn
+        .query_row(
+            "SELECT phase FROM lane_initializations WHERE lane_name='associated-retry'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "associated");
+    drop(conn);
+    kill_and_wait(first.pid);
+    interrupted.join().unwrap();
+
+    let delay_env = [
+        ("TRAIL_TEST_DAEMON_RESPONSE_DELAY_PATH", "/v1/lanes"),
+        ("TRAIL_TEST_DAEMON_RESPONSE_DELAY_MS", "31000"),
+    ];
+    let restarted = fixture.status_with_env(&delay_env);
+    assert!(
+        restarted.status.success(),
+        "replacement daemon start failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let replacement = fixture.endpoint();
+    assert_ne!(replacement.pid, first.pid);
+
+    let request_started = Instant::now();
+    let retried = fixture.run(&[
+        "lane",
+        "spawn",
+        "associated-retry",
+        "--from",
+        "main",
+        "--materialize",
+    ]);
+    assert!(
+        retried.status.success(),
+        "associated retry failed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(request_started.elapsed() < Duration::from_secs(30));
+    let report: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert_eq!(report["phase"], "observer_ready");
+    assert_eq!(report["resumed"], true);
+    assert_ne!(unsafe { libc::kill(replacement.pid as i32, 0) }, 0);
+
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let counts: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM lanes WHERE name='associated-retry'),
+                (SELECT COUNT(*) FROM lane_initializations WHERE lane_name='associated-retry'),
+                (SELECT COUNT(*) FROM lane_events event
+                 JOIN lanes lane USING(lane_id)
+                 WHERE lane.name='associated-retry' AND event.event_type='lane_spawned')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1, 1));
 }
 
 #[test]

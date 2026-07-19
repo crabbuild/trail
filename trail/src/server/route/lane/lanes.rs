@@ -51,15 +51,16 @@ pub(super) fn handle_lane_resources(
             body.include_neighbors,
         )?;
         let resumed = report.resumed;
-        let external_materialization =
-            report.workdir.is_some() && !report.workdir_mode.is_transparent_cow();
         let deferred = report.phase == LaneInitializationPhase::Associated;
-        let retire_after_response = external_materialization && (!resumed || deferred);
         let mut report = if deferred {
             db.resume_deferred_initial_lane_ledger(&body.name)?
         } else {
             report
         };
+        let external_materialization =
+            report.workdir.is_some() && !report.workdir_mode.is_transparent_cow();
+        let retire_after_response =
+            external_materialization && (!resumed || report.completed_deferred_initialization);
         report.resumed = resumed;
         let (status, reason) = if report.resumed {
             (200, "OK")

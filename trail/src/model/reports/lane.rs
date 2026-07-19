@@ -140,6 +140,8 @@ pub struct LaneSpawnReport {
     pub committed: bool,
     #[serde(default)]
     pub resumed: bool,
+    #[serde(skip)]
+    pub completed_deferred_initialization: bool,
     pub lane_id: String,
     pub ref_name: String,
     pub base_change: ChangeId,
