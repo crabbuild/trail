@@ -130,6 +130,16 @@ impl MaterializationReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneSpawnReport {
+    #[serde(default)]
+    pub initialization_id: String,
+    #[serde(default)]
+    pub request_fingerprint: String,
+    #[serde(default = "default_completed_lane_initialization_phase")]
+    pub phase: LaneInitializationPhase,
+    #[serde(default = "default_true")]
+    pub committed: bool,
+    #[serde(default)]
+    pub resumed: bool,
     pub lane_id: String,
     pub ref_name: String,
     pub base_change: ChangeId,
@@ -151,6 +161,14 @@ pub enum LaneInitializationPhase {
     Associated,
     ObserverReady,
     RepairRequired,
+}
+
+fn default_completed_lane_initialization_phase() -> LaneInitializationPhase {
+    LaneInitializationPhase::ObserverReady
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

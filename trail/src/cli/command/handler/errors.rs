@@ -78,7 +78,7 @@ fn render_cli_parse_error(err: &clap::Error, exit_code: i32) {
 
 pub(super) fn render_error(err: &Error, json: bool) {
     if json {
-        let value = StructuredErrorEnvelope::from_error(err);
+        let value = structured_error_value(err);
         let rendered = serde_json::to_string(&value)
             .unwrap_or_else(|_| structured_error_fallback(err).to_string());
         let _ = render_structured_error(&rendered);
@@ -86,6 +86,25 @@ pub(super) fn render_error(err: &Error, json: bool) {
     }
     let document = TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic_for_error(err)));
     let _ = render_error_document(&document, &default_error_options());
+}
+
+fn structured_error_value(err: &Error) -> serde_json::Value {
+    let mut value = serde_json::to_value(StructuredErrorEnvelope::from_error(err))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Error::LaneInitializationConflict {
+        lane,
+        existing_fingerprint,
+        requested_fingerprint,
+    } = err
+    {
+        value["error"]["status"] = serde_json::json!(409);
+        value["error"]["details"] = serde_json::json!({
+            "lane": lane,
+            "existing_fingerprint": existing_fingerprint,
+            "requested_fingerprint": requested_fingerprint,
+        });
+    }
+    value
 }
 
 fn structured_error_fallback(_err: &Error) -> &'static str {
@@ -221,6 +240,21 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
                 command: "trail status".to_string(),
                 reason: "Reopen authoritative state and idempotently repair ref, marker, and runtime mirrors."
                     .to_string(),
+            });
+            diagnostic
+        }
+        Error::LaneInitializationConflict { lane, .. } => {
+            let mut diagnostic = UiDiagnostic::new(
+                err.code(),
+                "Lane initialization request conflicts with an existing reservation",
+            );
+            diagnostic.consequence = Some(
+                "Trail preserved the existing lane initialization without writing new state."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: format!("trail lane status {lane}"),
+                reason: "Inspect the existing lane before choosing another lane name.".to_string(),
             });
             diagnostic
         }
@@ -387,6 +421,29 @@ mod tests {
         assert_eq!(value["error"]["status"], 500);
         assert_eq!(value["error"]["exit"], 1);
         assert!(!rendered.contains("quote:"));
+    }
+
+    #[test]
+    fn lane_initialization_conflict_json_contains_identity_details() {
+        let error = Error::LaneInitializationConflict {
+            lane: "agent-1".into(),
+            existing_fingerprint: "sha256:existing".into(),
+            requested_fingerprint: "sha256:requested".into(),
+        };
+        let value = structured_error_value(&error);
+
+        assert_eq!(value["error"]["code"], "LANE_INITIALIZATION_CONFLICT");
+        assert_eq!(value["error"]["status"], 409);
+        assert_eq!(value["error"]["exit"], 2);
+        assert_eq!(value["error"]["details"]["lane"], "agent-1");
+        assert_eq!(
+            value["error"]["details"]["existing_fingerprint"],
+            "sha256:existing"
+        );
+        assert_eq!(
+            value["error"]["details"]["requested_fingerprint"],
+            "sha256:requested"
+        );
     }
 
     #[test]

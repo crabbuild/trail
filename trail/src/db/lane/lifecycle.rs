@@ -1,3 +1,6 @@
+use super::initialization::{
+    LaneInitializationRecord, LaneInitializationReservation, ResolvedLaneSpawnRequest,
+};
 use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
 
@@ -58,6 +61,42 @@ pub(crate) fn committed_lane_step<T>(
 const LARGE_LANE_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
 
 impl Trail {
+    fn lane_spawn_report_for_initialization(
+        &self,
+        initialization: &LaneInitializationRecord,
+        resumed: bool,
+    ) -> Result<LaneSpawnReport> {
+        let details = self.lane_details(&initialization.lane_id)?;
+        let requested_workdir_mode =
+            self.lane_requested_workdir_mode_for(&details.record, &details.branch)?;
+        let workdir_mode = self.lane_workdir_mode_for(&details.record, &details.branch)?;
+        let workdir_backend = self.lane_workdir_backend_for(&details.record)?;
+        let materialization = self.lane_materialization_report_for(&details.record)?;
+        let sparse_paths = self.lane_report_sparse_paths(&details.branch)?;
+        Ok(LaneSpawnReport {
+            initialization_id: initialization.initialization_id.clone(),
+            request_fingerprint: initialization.request_fingerprint.clone(),
+            phase: initialization.phase,
+            committed: matches!(
+                initialization.phase,
+                LaneInitializationPhase::Associated
+                    | LaneInitializationPhase::ObserverReady
+                    | LaneInitializationPhase::RepairRequired
+            ),
+            resumed,
+            lane_id: details.branch.lane_id,
+            ref_name: details.branch.ref_name,
+            base_change: details.branch.base_change,
+            workdir: details.branch.workdir,
+            requested_workdir_mode,
+            workdir_mode: workdir_mode.clone(),
+            workdir_backend,
+            materialization,
+            sparse_paths,
+            transparent_cow_available: workdir_mode.is_transparent_cow(),
+        })
+    }
+
     pub fn default_lane_materialize(&self) -> bool {
         self.config.lane.default_materialize
     }
@@ -268,29 +307,59 @@ impl Trail {
         validate_lane_workdir_mode_request(&workdir_mode, workdir.is_some(), sparse_paths)?;
         let sparse_paths = normalize_record_paths(sparse_paths)?;
         let source = match from {
+            Some(refish) if refish.starts_with("refs/heads/") => self.resolve_branch_ref(
+                refish
+                    .strip_prefix("refs/heads/")
+                    .expect("prefix was checked"),
+            )?,
             Some(refish) => self.resolve_refish(refish)?,
             None => self.resolve_branch_ref(&self.current_branch()?)?,
         };
         let lane_id = format!("lane_{}", crate::ids::short_hash(name.as_bytes(), 8));
         let ref_name = lane_ref(name);
-        if self.try_get_ref(&ref_name)?.is_some() {
-            return Err(Error::InvalidInput(format!("lane `{name}` already exists")));
-        }
         let workdir_path = if workdir_mode.materializes() {
             Some(self.resolve_lane_workdir_path(name, workdir.as_deref())?)
         } else {
             None
         };
-        let transparent_cow_available = workdir_mode.is_transparent_cow();
+        let source_ref = if from.is_some_and(crate::ids::is_change_id) {
+            format!("detached:{}", source.change_id.0)
+        } else {
+            source.name.clone()
+        };
+        let request = ResolvedLaneSpawnRequest::new(
+            &self.config.workspace.id.0,
+            name,
+            lane_id.clone(),
+            source_ref,
+            source.change_id.clone(),
+            source.root_id.clone(),
+            source.operation_id.clone(),
+            workdir_mode.clone(),
+            workdir_path.clone(),
+            sparse_paths.clone(),
+            include_neighbors,
+            provider.clone(),
+            model.clone(),
+        )?;
+        let (initialization, resumed) = match self.reserve_lane_initialization(&request)? {
+            LaneInitializationReservation::Start(record) => (record, false),
+            LaneInitializationReservation::Resume(record) => (record, true),
+            LaneInitializationReservation::Ready(record) => {
+                return self.lane_spawn_report_for_initialization(&record, true);
+            }
+        };
+        let transparent_cow_available = request.requested_workdir_mode.is_transparent_cow();
         let mut sparse_policy_paths = None;
-        let mut resolved_workdir_mode = workdir_mode.clone();
-        let mut workdir_backend = workdir_mode
+        let mut resolved_workdir_mode = request.requested_workdir_mode.clone();
+        let mut workdir_backend = request
+            .requested_workdir_mode
             .default_backend()
             .unwrap_or(WorkdirBackend::Clone);
         let mut materialization_report = None;
         let mut materialization_operation_id = None;
-        let materialized_workdir = if let Some(dir) = &workdir_path {
-            match &workdir_mode {
+        let materialized_workdir = if let Some(dir) = &request.workdir {
+            match &request.requested_workdir_mode {
                 LaneWorkdirMode::FuseCow => {
                     self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
@@ -308,32 +377,32 @@ impl Trail {
                 LaneWorkdirMode::Sparse => {
                     let (report, operation_id) = self
                         .materialize_lane_workdir_at_paths_with_neighbors(
-                            &source.root_id,
+                            &request.source_root,
                             dir,
                             workdir.is_some(),
-                            &sparse_paths,
-                            include_neighbors,
+                            &request.sparse_paths,
+                            request.include_neighbors,
                         )?;
                     materialization_operation_id = operation_id;
                     if let Some(report) = report {
                         workdir_backend = report.backend();
                         materialization_report = Some(report);
                     }
-                    if !sparse_paths.is_empty() {
+                    if !request.sparse_paths.is_empty() {
                         sparse_policy_paths = self.sparse_workdir_paths(dir)?;
                     }
                 }
                 LaneWorkdirMode::NativeCow
                 | LaneWorkdirMode::PortableCopy
                 | LaneWorkdirMode::Auto => {
-                    let policy = match workdir_mode {
+                    let policy = match request.requested_workdir_mode {
                         LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
                         LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
                         LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
                         _ => unreachable!(),
                     };
                     let outcome = self.materialize_lane_root_staged(
-                        &source.root_id,
+                        &request.source_root,
                         dir,
                         workdir.is_some(),
                         policy,
@@ -350,15 +419,25 @@ impl Trail {
         } else {
             None
         };
+        let initialization_operation = materialization_operation_id
+            .as_ref()
+            .map(|operation_id| ObjectId(operation_id.clone()))
+            .unwrap_or_else(|| request.source_operation.clone());
+        self.mark_lane_initialization_materialized(
+            &request,
+            &initialization_operation,
+            materialization_report.as_ref(),
+        )?;
         let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
-        let requested_workdir_mode = workdir_mode.clone();
+        let requested_workdir_mode = request.requested_workdir_mode.clone();
         let metadata_json = serde_json::to_string(&serde_json::json!({
+            "source_ref": request.source_ref,
             "requested_workdir_mode": requested_workdir_mode.as_str(),
             "workdir_mode": resolved_workdir_mode.as_str(),
             "workdir_backend": workdir_backend.as_str(),
             "materialization": materialization_report,
             "sparse_paths": sparse_paths_for_report,
-            "include_neighbors": include_neighbors,
+            "include_neighbors": request.include_neighbors,
             "transparent_cow_available": transparent_cow_available
         }))?;
         let now = now_ts();
@@ -366,15 +445,23 @@ impl Trail {
         let association = (|| -> Result<()> {
             self.insert_new_ref_database_only(
                 &ref_name,
-                &source.change_id,
-                &source.root_id,
-                &source.operation_id,
+                &request.source_change,
+                &request.source_root,
+                &request.source_operation,
             )?;
             fail_lane_association_if_requested("spawn_after_ref")?;
             self.conn.execute(
                 "INSERT INTO lanes (lane_id, name, kind, provider, model, created_at, metadata_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![lane_id, name, "coding-lane", provider, model, now, metadata_json],
+                params![
+                    lane_id,
+                    name,
+                    "coding-lane",
+                    request.provider,
+                    request.model,
+                    now,
+                    metadata_json
+                ],
             )?;
             fail_lane_association_if_requested("spawn_after_lane")?;
             self.conn.execute(
@@ -384,16 +471,28 @@ impl Trail {
                 params![
                     lane_id,
                     ref_name,
-                    source.change_id.0,
-                    source.change_id.0,
-                    source.root_id.0,
-                    source.root_id.0,
+                    request.source_change.0,
+                    request.source_change.0,
+                    request.source_root.0,
+                    request.source_root.0,
                     Option::<String>::None,
                     materialized_workdir,
                     now
                 ],
             )?;
             fail_lane_association_if_requested("spawn_after_branch")?;
+            let changed = self.conn.execute(
+                "UPDATE lane_initializations SET phase='associated',updated_at=?1
+                 WHERE initialization_id=?2 AND request_fingerprint=?3
+                   AND phase='materialized'",
+                params![now, request.initialization_id, request.request_fingerprint,],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{}` could not transition materialized -> associated",
+                    request.initialization_id
+                )));
+            }
             Ok(())
         })();
         match association {
@@ -408,7 +507,7 @@ impl Trail {
         }
         let committed_operation = materialization_operation_id
             .clone()
-            .unwrap_or_else(|| source.operation_id.0.clone());
+            .unwrap_or_else(|| request.source_operation.0.clone());
         committed_lane_step(
             &committed_operation,
             "new lane ref mirror",
@@ -416,9 +515,9 @@ impl Trail {
                 fail_lane_association_if_requested("spawn_ref_repair")?;
                 self.repair_new_ref_mirror(
                     &ref_name,
-                    &source.change_id,
-                    &source.root_id,
-                    &source.operation_id,
+                    &request.source_change,
+                    &request.source_root,
+                    &request.source_operation,
                 )
             })(),
         )?;
@@ -440,12 +539,17 @@ impl Trail {
         if defer_initial_ledger
             && ledger_authority
             && materialized_workdir.is_some()
-            && !workdir_mode.is_transparent_cow()
+            && !request.requested_workdir_mode.is_transparent_cow()
         {
             return Ok(LaneSpawnReport {
+                initialization_id: initialization.initialization_id,
+                request_fingerprint: initialization.request_fingerprint,
+                phase: LaneInitializationPhase::Associated,
+                committed: true,
+                resumed,
                 lane_id,
                 ref_name,
-                base_change: source.change_id,
+                base_change: request.source_change,
                 workdir: materialized_workdir,
                 requested_workdir_mode,
                 workdir_mode: resolved_workdir_mode,
@@ -455,7 +559,9 @@ impl Trail {
                 transparent_cow_available,
             });
         }
-        if ledger_authority && materialized_workdir.is_some() && !workdir_mode.is_transparent_cow()
+        if ledger_authority
+            && materialized_workdir.is_some()
+            && !request.requested_workdir_mode.is_transparent_cow()
         {
             let expected =
                 crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
@@ -464,7 +570,7 @@ impl Trail {
                 .map_err(|error| Error::CommittedRepairRequired {
                     operation: materialization_operation_id
                         .clone()
-                        .unwrap_or_else(|| source.operation_id.0.clone()),
+                        .unwrap_or_else(|| request.source_operation.0.clone()),
                     repair: "initial materialized lane ledger reconciliation".into(),
                     reason: error.to_string(),
                 })?;
@@ -489,7 +595,7 @@ impl Trail {
                             let comparison = db.compare_controlled_projection_target(
                                 policy,
                                 candidates,
-                                &source.root_id,
+                                &request.source_root,
                                 crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
                             )?;
                             if comparison.summaries.is_empty() {
@@ -513,7 +619,7 @@ impl Trail {
             .map_err(|error| Error::CommittedRepairRequired {
                 operation: materialization_operation_id
                     .clone()
-                    .unwrap_or_else(|| source.operation_id.0.clone()),
+                    .unwrap_or_else(|| request.source_operation.0.clone()),
                 repair: "initial materialized lane ledger alignment".into(),
                 reason: error.to_string(),
             })?;
@@ -527,7 +633,7 @@ impl Trail {
                 })(),
             )?;
         }
-        if workdir_mode.is_transparent_cow() {
+        if request.requested_workdir_mode.is_transparent_cow() {
             committed_lane_step(
                 &committed_operation,
                 "initial lane workspace view publication",
@@ -538,9 +644,9 @@ impl Trail {
                     })?;
                     self.create_workspace_view(
                         &lane_id,
-                        &source.change_id,
-                        &source.root_id,
-                        platform_workspace_backend(&workdir_mode),
+                        &request.source_change,
+                        &request.source_root,
+                        platform_workspace_backend(&request.requested_workdir_mode),
                         Path::new(mountpoint),
                     )
                 })(),
@@ -554,27 +660,33 @@ impl Trail {
                 self.insert_lane_event(
                     &lane_id,
                     "lane_spawned",
-                    Some(&source.change_id),
+                    Some(&request.source_change),
                     None,
                     &serde_json::json!({
                         "ref_name": ref_name.clone(),
-                        "base_root": source.root_id.0.clone(),
+                        "base_root": request.source_root.0.clone(),
                         "workdir": materialized_workdir.clone(),
                         "requested_workdir_mode": requested_workdir_mode.as_str(),
                         "workdir_mode": resolved_workdir_mode.as_str(),
                         "workdir_backend": workdir_backend.as_str(),
                         "materialization": materialization_report,
                         "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
-                        "include_neighbors": include_neighbors,
+                        "include_neighbors": request.include_neighbors,
                         "transparent_cow_available": transparent_cow_available
                     }),
                 )
             })(),
         )?;
+        self.mark_lane_initialization_observer_ready(&request)?;
         Ok(LaneSpawnReport {
+            initialization_id: request.initialization_id,
+            request_fingerprint: request.request_fingerprint,
+            phase: LaneInitializationPhase::ObserverReady,
+            committed: true,
+            resumed,
             lane_id,
             ref_name,
-            base_change: source.change_id,
+            base_change: request.source_change,
             workdir: materialized_workdir,
             requested_workdir_mode,
             workdir_mode: resolved_workdir_mode,
@@ -712,7 +824,13 @@ impl Trail {
             )?;
         }
 
+        let initialization = self.complete_deferred_lane_initialization(&details.branch.lane_id)?;
         Ok(LaneSpawnReport {
+            initialization_id: initialization.initialization_id,
+            request_fingerprint: initialization.request_fingerprint,
+            phase: LaneInitializationPhase::ObserverReady,
+            committed: true,
+            resumed: true,
             lane_id: details.branch.lane_id,
             ref_name: details.branch.ref_name,
             base_change: details.branch.base_change,

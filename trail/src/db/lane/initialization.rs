@@ -234,6 +234,116 @@ pub(crate) struct LaneInitializationRecord {
     pub updated_at: i64,
 }
 
+#[derive(serde::Serialize)]
+struct CanonicalLaneSpawnRequestV1<'a> {
+    version: u8,
+    workspace_id: &'a str,
+    lane_name: &'a str,
+    source_ref: &'a str,
+    source_change: &'a str,
+    source_root: &'a str,
+    requested_workdir_mode: &'a LaneWorkdirMode,
+    workdir: Option<&'a str>,
+    sparse_paths: &'a [String],
+    include_neighbors: bool,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+}
+
+impl CanonicalLaneSpawnRequestV1<'_> {
+    fn fingerprint(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(self)?;
+        Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedLaneSpawnRequest {
+    pub lane_name: String,
+    pub lane_id: String,
+    pub source_ref: String,
+    pub source_change: ChangeId,
+    pub source_root: ObjectId,
+    pub source_operation: ObjectId,
+    pub requested_workdir_mode: LaneWorkdirMode,
+    pub workdir: Option<PathBuf>,
+    pub sparse_paths: Vec<String>,
+    pub include_neighbors: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_fingerprint: String,
+    pub initialization_id: String,
+}
+
+impl ResolvedLaneSpawnRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        workspace_id: &str,
+        lane_name: &str,
+        lane_id: String,
+        source_ref: String,
+        source_change: ChangeId,
+        source_root: ObjectId,
+        source_operation: ObjectId,
+        requested_workdir_mode: LaneWorkdirMode,
+        workdir: Option<PathBuf>,
+        sparse_paths: Vec<String>,
+        include_neighbors: bool,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Result<Self> {
+        let workdir_text = workdir
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let canonical = CanonicalLaneSpawnRequestV1 {
+            version: 1,
+            workspace_id,
+            lane_name,
+            source_ref: &source_ref,
+            source_change: &source_change.0,
+            source_root: &source_root.0,
+            requested_workdir_mode: &requested_workdir_mode,
+            workdir: workdir_text.as_deref(),
+            sparse_paths: &sparse_paths,
+            include_neighbors,
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+        };
+        let request_fingerprint = canonical.fingerprint()?;
+        let mut digest = Sha256::new();
+        digest.update(b"trail-lane-initialization-v1\0");
+        digest.update(workspace_id.as_bytes());
+        digest.update([0]);
+        digest.update(lane_name.as_bytes());
+        digest.update([0]);
+        digest.update(request_fingerprint.as_bytes());
+        let initialization_id = format!("init_{}", hex::encode(digest.finalize()));
+        Ok(Self {
+            lane_name: lane_name.to_string(),
+            lane_id,
+            source_ref,
+            source_change,
+            source_root,
+            source_operation,
+            requested_workdir_mode,
+            workdir,
+            sparse_paths,
+            include_neighbors,
+            provider,
+            model,
+            request_fingerprint,
+            initialization_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LaneInitializationReservation {
+    Start(LaneInitializationRecord),
+    Resume(LaneInitializationRecord),
+    Ready(LaneInitializationRecord),
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 struct CanonicalLegacyLaneMetadata {
     requested_workdir_mode: String,
@@ -342,73 +452,220 @@ impl LaneInitializationRecord {
     }
 }
 
+fn lane_initialization_record(
+    conn: &Connection,
+    lane: &str,
+) -> Result<Option<LaneInitializationRecord>> {
+    conn.query_row(
+        "SELECT initialization_id,lane_name,lane_id,request_fingerprint,
+                operation_id,phase,workdir,materialization_json,last_error_code,
+                last_error_message,repair_command,created_at,updated_at
+         FROM lane_initializations
+         WHERE lane_name=?1 OR lane_id=?1
+         ORDER BY CASE WHEN lane_name=?1 THEN 0 ELSE 1 END
+         LIMIT 1",
+        params![lane],
+        |row| {
+            let phase = row.get::<_, String>(5)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                phase,
+                row.get::<_, Option<String>>(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(
+        |(
+            initialization_id,
+            lane_name,
+            lane_id,
+            request_fingerprint,
+            operation_id,
+            phase,
+            workdir,
+            materialization_json,
+            last_error_code,
+            last_error_message,
+            repair_command,
+            created_at,
+            updated_at,
+        )| {
+            Ok(LaneInitializationRecord {
+                initialization_id,
+                lane_name,
+                lane_id,
+                request_fingerprint,
+                operation_id,
+                phase: LaneInitializationPhase::from_database(&phase)?,
+                workdir: workdir.map(PathBuf::from),
+                materialization_json,
+                last_error_code,
+                last_error_message,
+                repair_command,
+                created_at,
+                updated_at,
+            })
+        },
+    )
+    .transpose()
+}
+
 impl Trail {
     pub fn lane_initialization(&self, lane: &str) -> Result<Option<LaneInitializationReport>> {
-        self.conn
-            .query_row(
-                "SELECT initialization_id,lane_name,lane_id,request_fingerprint,
-                        operation_id,phase,workdir,materialization_json,last_error_code,
-                        last_error_message,repair_command,created_at,updated_at
-                 FROM lane_initializations
-                 WHERE lane_name=?1 OR lane_id=?1
-                 ORDER BY CASE WHEN lane_name=?1 THEN 0 ELSE 1 END
-                 LIMIT 1",
-                params![lane],
-                |row| {
-                    let phase = row.get::<_, String>(5)?;
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        phase,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                    ))
-                },
-            )
-            .optional()?
-            .map(
-                |(
-                    initialization_id,
-                    lane_name,
-                    lane_id,
-                    request_fingerprint,
-                    operation_id,
-                    phase,
-                    workdir,
-                    materialization_json,
-                    last_error_code,
-                    last_error_message,
-                    repair_command,
-                    created_at,
-                    updated_at,
-                )| {
-                    Ok(LaneInitializationRecord {
-                        initialization_id,
-                        lane_name,
-                        lane_id,
-                        request_fingerprint,
-                        operation_id,
-                        phase: LaneInitializationPhase::from_database(&phase)?,
-                        workdir: workdir.map(PathBuf::from),
-                        materialization_json,
-                        last_error_code,
-                        last_error_message,
-                        repair_command,
-                        created_at,
-                        updated_at,
-                    }
-                    .report())
-                },
-            )
-            .transpose()
+        Ok(lane_initialization_record(&self.conn, lane)?.map(LaneInitializationRecord::report))
+    }
+
+    pub(crate) fn reserve_lane_initialization(
+        &mut self,
+        request: &ResolvedLaneSpawnRequest,
+    ) -> Result<LaneInitializationReservation> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(existing) = lane_initialization_record(&tx, &request.lane_name)? {
+            if existing.request_fingerprint != request.request_fingerprint {
+                return Err(Error::LaneInitializationConflict {
+                    lane: request.lane_name.clone(),
+                    existing_fingerprint: existing.request_fingerprint,
+                    requested_fingerprint: request.request_fingerprint.clone(),
+                });
+            }
+            let ready = existing.phase == LaneInitializationPhase::ObserverReady;
+            tx.commit()?;
+            return Ok(if ready {
+                LaneInitializationReservation::Ready(existing)
+            } else {
+                LaneInitializationReservation::Resume(existing)
+            });
+        }
+
+        let lane_ref_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM refs WHERE name=?1)",
+            [lane_ref(&request.lane_name)],
+            |row| row.get(0),
+        )?;
+        if lane_ref_exists {
+            return Err(Error::InvalidInput(format!(
+                "lane `{}` already exists without initialization identity",
+                request.lane_name
+            )));
+        }
+
+        let now = now_ts();
+        tx.execute(
+            "INSERT INTO lane_initializations(
+                 initialization_id,lane_name,lane_id,request_fingerprint,operation_id,
+                 phase,workdir,materialization_json,last_error_code,last_error_message,
+                 repair_command,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,'reserved',?6,NULL,NULL,NULL,NULL,?7,?7)",
+            params![
+                request.initialization_id,
+                request.lane_name,
+                request.lane_id,
+                request.request_fingerprint,
+                request.source_operation.0,
+                request
+                    .workdir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                now,
+            ],
+        )?;
+        let record = lane_initialization_record(&tx, &request.lane_name)?
+            .ok_or_else(|| Error::Corrupt("lane initialization reservation disappeared".into()))?;
+        tx.commit()?;
+        Ok(LaneInitializationReservation::Start(record))
+    }
+
+    pub(crate) fn mark_lane_initialization_materialized(
+        &mut self,
+        request: &ResolvedLaneSpawnRequest,
+        operation_id: &ObjectId,
+        materialization: Option<&MaterializationReport>,
+    ) -> Result<()> {
+        let materialization_json = materialization.map(serde_json::to_string).transpose()?;
+        let changed = self.conn.execute(
+            "UPDATE lane_initializations
+             SET phase='materialized',operation_id=?1,materialization_json=?2,updated_at=?3
+             WHERE initialization_id=?4 AND request_fingerprint=?5 AND phase='reserved'",
+            params![
+                operation_id.0,
+                materialization_json,
+                now_ts(),
+                request.initialization_id,
+                request.request_fingerprint,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` could not transition reserved -> materialized",
+                request.initialization_id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_lane_initialization_observer_ready(
+        &mut self,
+        request: &ResolvedLaneSpawnRequest,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE lane_initializations SET phase='observer_ready',updated_at=?1
+             WHERE initialization_id=?2 AND request_fingerprint=?3 AND phase='associated'",
+            params![
+                now_ts(),
+                request.initialization_id,
+                request.request_fingerprint,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` could not transition associated -> observer_ready",
+                request.initialization_id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_deferred_lane_initialization(
+        &mut self,
+        lane: &str,
+    ) -> Result<LaneInitializationRecord> {
+        let record = lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
+        if record.phase == LaneInitializationPhase::ObserverReady {
+            return Ok(record);
+        }
+        if record.phase != LaneInitializationPhase::Associated {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` is {:?}, expected associated",
+                record.initialization_id, record.phase
+            )));
+        }
+        let changed = self.conn.execute(
+            "UPDATE lane_initializations SET phase='observer_ready',updated_at=?1
+             WHERE initialization_id=?2 AND phase='associated'",
+            params![now_ts(), record.initialization_id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` could not complete deferred observer readiness",
+                record.initialization_id
+            )));
+        }
+        lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` initialization disappeared")))
     }
 }
 

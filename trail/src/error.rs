@@ -29,6 +29,14 @@ pub enum Error {
         repair: String,
         reason: String,
     },
+    #[error(
+        "lane `{lane}` is already reserved by request {existing_fingerprint}; requested {requested_fingerprint}"
+    )]
+    LaneInitializationConflict {
+        lane: String,
+        existing_fingerprint: String,
+        requested_fingerprint: String,
+    },
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -106,6 +114,7 @@ impl Error {
             Error::SchemaReinitializeRequired { .. } => "SCHEMA_REINITIALIZE_REQUIRED",
             Error::ChangeLedgerReconcileRequired { .. } => "CHANGE_LEDGER_RECONCILE_REQUIRED",
             Error::CommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
+            Error::LaneInitializationConflict { .. } => "LANE_INITIALIZATION_CONFLICT",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -160,6 +169,7 @@ impl Error {
             Error::SchemaReinitializeRequired { .. } => 15,
             Error::ChangeLedgerReconcileRequired { .. } => 16,
             Error::CommittedRepairRequired { .. } => 16,
+            Error::LaneInitializationConflict { .. } => 2,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
             | Error::CloneUnsupported
@@ -255,5 +265,21 @@ mod tests {
         assert_eq!(committed.code(), "COMMITTED_REPAIR_REQUIRED");
         assert_eq!(committed.exit_code(), 16);
         assert!(committed.to_string().contains("operation op-1 committed"));
+    }
+
+    #[test]
+    fn lane_initialization_conflict_has_stable_code_exit_and_fields() {
+        let error = Error::LaneInitializationConflict {
+            lane: "agent-1".into(),
+            existing_fingerprint: "sha256:existing".into(),
+            requested_fingerprint: "sha256:requested".into(),
+        };
+
+        assert_eq!(error.code(), "LANE_INITIALIZATION_CONFLICT");
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "lane `agent-1` is already reserved by request sha256:existing; requested sha256:requested"
+        );
     }
 }
