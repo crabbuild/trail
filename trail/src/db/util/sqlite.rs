@@ -97,8 +97,27 @@ fn persist_wal_across_process_lifetimes(conn: &Connection) -> Result<()> {
     if result == SQLITE_OK {
         Ok(())
     } else {
-        Err(Error::DaemonUnavailable(format!(
+        Err(persistent_wal_capability_error(result))
+    }
+}
+
+fn persistent_wal_capability_error(result: c_int) -> Error {
+    Error::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(result),
+        Some(format!(
             "SQLite persistent-WAL configuration failed with result code {result}"
-        )))
+        )),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_wal_capability_failure_is_a_sqlite_error() {
+        let error = persistent_wal_capability_error(rusqlite::ffi::SQLITE_NOTFOUND);
+        assert_eq!(error.code(), "SQLITE_ERROR");
+        assert!(matches!(error, Error::Sqlite(_)));
     }
 }

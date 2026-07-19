@@ -850,6 +850,38 @@ fn successful_removal_deletes_initialization_and_allows_name_reuse() {
     )
     .unwrap();
     assert_ne!(second.request_fingerprint, first.request_fingerprint);
+    assert_eq!(
+        fixture
+            .db_mut()
+            .lane_details("reusable-lane")
+            .unwrap()
+            .record
+            .lane_id,
+        second.lane_id
+    );
+    assert_eq!(
+        fixture
+            .db_mut()
+            .lane_details(&first.lane_id)
+            .unwrap()
+            .branch
+            .status,
+        "removed"
+    );
+    fixture.db_mut().remove_lane("reusable-lane", true).unwrap();
+    let ambiguous = fixture.db_mut().lane_details("reusable-lane").unwrap_err();
+    assert!(
+        matches!(ambiguous, Error::InvalidInput(message) if message.contains("ambiguous") && message.contains("lane ID"))
+    );
+    assert_eq!(
+        fixture
+            .db_mut()
+            .lane_details(&second.lane_id)
+            .unwrap()
+            .branch
+            .status,
+        "removed"
+    );
 }
 
 #[test]

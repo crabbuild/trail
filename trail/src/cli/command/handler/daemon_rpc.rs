@@ -541,7 +541,7 @@ fn handle_timeline_command(
     args: &TimelineArgs,
 ) -> Result<bool> {
     let mut params = vec![format!("limit={}", args.limit)];
-    if let Some(branch) = &args.branch {
+    if let Some(branch) = args.branch.as_ref().or(ctx.branch.as_ref()) {
         params.push(format!("branch={branch}"));
     }
     if let Some(session) = &args.session {

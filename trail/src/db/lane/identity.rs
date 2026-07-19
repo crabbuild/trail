@@ -93,9 +93,39 @@ impl Trail {
     }
 
     pub fn lane_details(&self, lane: &str) -> Result<LaneDetails> {
-        let branch = self.lane_branch(lane)?;
-        let record = self.lane_record(&branch.lane_id)?;
-        Ok(LaneDetails { record, branch })
+        match self.lane_branch(lane) {
+            Ok(branch) => {
+                let record = self.lane_record(&branch.lane_id)?;
+                Ok(LaneDetails { record, branch })
+            }
+            Err(Error::RefNotFound(_)) => self.unique_retired_lane_details(lane),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unique_retired_lane_details(&self, former_name: &str) -> Result<LaneDetails> {
+        if validate_ref_segment(former_name).is_err() {
+            return Err(Error::RefNotFound(former_name.to_string()));
+        }
+        let retired_name_prefix = format!("retired/{former_name}/");
+        let mut stmt = self.conn.prepare(
+            "SELECT a.lane_id,a.name,a.kind,a.provider,a.model,a.created_at,a.metadata_json, \
+                    b.ref_name,b.base_change,b.head_change,b.base_root,b.head_root,b.session_id, \
+                    b.workdir,b.status,b.created_at,b.updated_at \
+             FROM lanes a JOIN lane_branches b ON b.lane_id=a.lane_id \
+             WHERE substr(a.name,1,length(?1))=?1 \
+             ORDER BY a.lane_id LIMIT 2",
+        )?;
+        let retired = stmt
+            .query_map([retired_name_prefix], lane_details_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        match retired.as_slice() {
+            [] => Err(Error::RefNotFound(lane_ref(former_name))),
+            [details] => Ok(details.clone()),
+            _ => Err(Error::InvalidInput(format!(
+                "retired lane name `{former_name}` is ambiguous; select a specific lane ID"
+            ))),
+        }
     }
 
     pub fn resolve_lane_handle(&self, handle: &str) -> Result<String> {

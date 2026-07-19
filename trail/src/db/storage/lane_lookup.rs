@@ -2,41 +2,11 @@ use super::*;
 
 impl Trail {
     pub(crate) fn lane_branch(&self, lane: &str) -> Result<LaneBranch> {
-        let active_or_id = self
-            .conn
+        self.conn
             .query_row(
                 "SELECT lane_id, ref_name, base_change, head_change, base_root, head_root, session_id, workdir, status, created_at, updated_at \
                  FROM lane_branches WHERE lane_id = ?1 OR ref_name = ?2 OR lane_id IN (SELECT lane_id FROM lanes WHERE name = ?1)",
                 params![lane, lane_ref(lane)],
-                |row| {
-                    Ok(LaneBranch {
-                        lane_id: row.get(0)?,
-                        ref_name: row.get(1)?,
-                        base_change: ChangeId(row.get(2)?),
-                        head_change: ChangeId(row.get(3)?),
-                        base_root: ObjectId(row.get(4)?),
-                        head_root: ObjectId(row.get(5)?),
-                        session_id: row.get(6)?,
-                        workdir: row.get(7)?,
-                        status: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(branch) = active_or_id {
-            return Ok(branch);
-        }
-
-        let retired_name_prefix = format!("retired/{lane}/");
-        self.conn
-            .query_row(
-                "SELECT b.lane_id, b.ref_name, b.base_change, b.head_change, b.base_root, b.head_root, b.session_id, b.workdir, b.status, b.created_at, b.updated_at \
-                 FROM lane_branches b JOIN lanes a ON a.lane_id = b.lane_id \
-                 WHERE substr(a.name, 1, length(?1)) = ?1 \
-                 ORDER BY b.updated_at DESC, b.lane_id DESC LIMIT 1",
-                [&retired_name_prefix],
                 |row| {
                     Ok(LaneBranch {
                         lane_id: row.get(0)?,

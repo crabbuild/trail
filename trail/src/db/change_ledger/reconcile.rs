@@ -4794,11 +4794,11 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_attempt_ids_include_process_identity() {
+    fn reconciliation_attempt_ids_are_unique_and_include_process_identity() {
         let fixture = Fixture::new();
         let observer = FakeQualifiedObserver::new();
         let ledger = ChangedPathLedger::new(&fixture.db.conn);
-        let attempt = begin_reconciliation(
+        let first = begin_reconciliation(
             &fixture.db,
             &ledger,
             &observer,
@@ -4808,13 +4808,30 @@ mod tests {
             "process_identity",
         )
         .unwrap();
-
+        let first_id = first.attempt_id.clone();
+        drop(first);
+        let second_observer = FakeQualifiedObserver::new();
+        let second = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &second_observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::Full,
+            "process_identity_second",
+        )
+        .unwrap();
+        assert_ne!(first_id, second.attempt_id);
         assert!(
-            attempt
-                .attempt_id
-                .contains(&format!("-{}-", std::process::id())),
+            first_id.contains(&format!("-{}-", std::process::id())),
             "attempt id does not carry a cross-process discriminator: {}",
-            attempt.attempt_id
+            first_id
+        );
+        assert_eq!(
+            second.attempt_id.rsplit('-').next().unwrap().len(),
+            32,
+            "attempt id does not end in a 128-bit nonce: {}",
+            second.attempt_id
         );
     }
 

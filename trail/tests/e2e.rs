@@ -2057,6 +2057,23 @@ fn cli_env_defaults_select_workspace_db_branch_and_format() {
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
     db.create_branch("scratch", Some("main")).unwrap();
+    fs::write(temp.path().join("SCRATCH.md"), "scratch timeline\n").unwrap();
+    db.record(
+        Some("scratch"),
+        Some("scratch timeline sentinel".to_string()),
+        Actor::human(),
+        false,
+    )
+    .unwrap();
+    fs::remove_file(temp.path().join("SCRATCH.md")).unwrap();
+    fs::write(temp.path().join("MAIN.md"), "main timeline\n").unwrap();
+    db.record(
+        Some("main"),
+        Some("main timeline sentinel".to_string()),
+        Actor::human(),
+        false,
+    )
+    .unwrap();
     drop(db);
 
     let workspace_output = Command::new(trail_bin())
@@ -2079,6 +2096,47 @@ fn cli_env_defaults_select_workspace_db_branch_and_format() {
 
     let local_branch_status = run_trail_json(temp.path(), &["status", "--branch", "scratch"]);
     assert_eq!(local_branch_status["branch"], "scratch");
+    let auto_daemon_status = run_trail_json(temp.path(), &["status"]);
+    assert_eq!(auto_daemon_status["branch"], "main");
+
+    let env_timeline_output = Command::new(trail_bin())
+        .env("TRAIL_WORKSPACE", temp.path())
+        .env_remove("TRAIL_DIR")
+        .env("TRAIL_FORMAT", "json")
+        .env("TRAIL_BRANCH", "scratch")
+        .arg("timeline")
+        .output()
+        .unwrap();
+    assert!(
+        env_timeline_output.status.success(),
+        "timeline with env branch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&env_timeline_output.stdout),
+        String::from_utf8_lossy(&env_timeline_output.stderr)
+    );
+    let env_timeline: serde_json::Value =
+        serde_json::from_slice(&env_timeline_output.stdout).unwrap();
+    assert!(env_timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| { entry["message"] == "scratch timeline sentinel" }));
+    assert!(!env_timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["message"] == "main timeline sentinel"));
+
+    let global_branch_timeline = run_trail_json(temp.path(), &["--branch", "scratch", "timeline"]);
+    assert!(global_branch_timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["message"] == "scratch timeline sentinel"));
+    assert!(!global_branch_timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["message"] == "main timeline sentinel"));
 
     let db_dir_output = Command::new(trail_bin())
         .env_remove("TRAIL_WORKSPACE")
@@ -22377,7 +22435,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         assert!(Path::new(&view.meta_dir).is_dir());
     }
 
-    let mut db = Trail::open(temp.path()).unwrap();
+    let db = Trail::open(temp.path()).unwrap();
     assert_eq!(
         db.lane_status("cli-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
@@ -22423,9 +22481,39 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
     assert!(!sparse_workdir.join("src/claimed.rs").exists());
+    trail::test_support::set_changed_path_authority_override(true);
     let sparse_clean = db.lane_status("sparse-bot").unwrap();
     assert_eq!(sparse_clean.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_clean.workdir_changed_paths.is_empty());
+    let authoritative_marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(sparse_workdir.join(".trail/workdir-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(authoritative_marker["version"], 2);
+    assert_eq!(
+        authoritative_marker["root_id"],
+        db.lane_details("sparse-bot").unwrap().branch.head_root.0
+    );
+    assert!(authoritative_marker.get("files").is_none());
+    for field in [
+        "scope_id",
+        "filesystem_identity",
+        "ref_name",
+        "ref_generation",
+        "policy_fingerprint",
+        "epoch",
+        "provider_cut",
+        "provider_segment_id",
+        "sparse_selection_fingerprint",
+    ] {
+        assert!(
+            !authoritative_marker[field].is_null(),
+            "v2 marker is missing `{field}`"
+        );
+    }
+    trail::test_support::set_changed_path_authority_override(false);
+    drop(db);
+    let mut db = Trail::open(temp.path()).unwrap();
     let claimed_hydration = run_trail_json(
         temp.path(),
         &[
