@@ -8,6 +8,65 @@ on:
     - cron: "17 9 * * 1"
 
 jobs:
+  trail-lib-serial:
+    name: Trail library tests (serial)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Trail library tests serially
+        run: cargo test -p trail --lib
+        env:
+          RUST_TEST_THREADS: "1"
+
+  trail-lib-parallel:
+    name: Trail library tests (parallel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Trail library tests with the default scheduler
+        run: cargo test -p trail --lib
+
+  trail-native-hardening:
+    name: Trail native ledger/schema/fault (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run schema-19 contracts
+        run: cargo test -p trail --test schema_v19_lane_initializations -- --nocapture
+      - name: Run lane initialization fault contracts
+        run: cargo test -p trail --test lane_initialization_faults -- --nocapture
+      - name: Run Linux native changed-path contracts
+        if: runner.os == 'Linux'
+        run: cargo test -p trail --test changed_path_ledger_linux -- --nocapture
+      - name: Run macOS native changed-path contracts
+        if: runner.os == 'macOS'
+        run: cargo test -p trail --test changed_path_ledger_macos -- --nocapture
+      - name: Run real-repository harness/checker contracts
+        run: |
+          python3 -m unittest scripts/test_verify_real_repo_lane_scale.py -v
+          python3 -m unittest scripts/test_check_real_repo_lane_scale.py -v
+      - name: Check real-repository harness syntax
+        run: bash -n scripts/verify-real-repo-lane-scale.sh
+
   acp-v1-reference-interop:
     name: ACP v1 official-type interoperability
     runs-on: ubuntu-latest

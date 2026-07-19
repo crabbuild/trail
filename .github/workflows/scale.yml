@@ -3,6 +3,8 @@ name: CLI Scale Benchmark
 on:
   schedule:
     - cron: "17 9 * * *"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       scale_files:
@@ -29,8 +31,91 @@ on:
         description: "Changed-path ledger scale (1000, 100000, or 1000000)"
         required: true
         default: "1000"
+      real_repo_lanes:
+        description: "Blocking real-repository native-COW lane count"
+        required: true
+        default: "64"
+      real_repo_stress_lanes:
+        description: "Artifact-only real-repository stress lane count"
+        required: true
+        default: "128"
 
 jobs:
+  real-repo-64:
+    name: Blocking real-repository 64-lane gate
+    if: github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build exact release binary
+        run: cargo build -p trail --release --locked
+      - name: Create clean Superset-class fixture
+        shell: bash
+        run: |
+          git clone --filter=blob:none https://github.com/apache/superset.git "${{ runner.temp }}/superset"
+          printf '.trail/\n' >> "${{ runner.temp }}/superset/.git/info/exclude"
+          target/release/trail --workspace "${{ runner.temp }}/superset" --json init --from-git
+      - name: Run blocking native-COW lane gate
+        run: scripts/verify-real-repo-lane-scale.sh
+        env:
+          TRAIL_BIN: ${{ github.workspace }}/target/release/trail
+          TRAIL_SCALE_REPO: ${{ runner.temp }}/superset
+          TRAIL_SCALE_OUTPUT: ${{ runner.temp }}/trail-real-repo-64
+          TRAIL_SCALE_RUN_ID: ci-${{ github.run_id }}-64
+          TRAIL_SCALE_LANES: ${{ github.event.inputs.real_repo_lanes || '64' }}
+          TRAIL_SCALE_FILES_PER_LANE: "50"
+          TRAIL_SCALE_CONCURRENCY: ${{ github.event.inputs.real_repo_lanes || '64' }}
+          TRAIL_SCALE_FAULT_PHASE: all
+      - name: Upload blocking gate evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trail-real-repo-64-${{ runner.os }}
+          path: ${{ runner.temp }}/trail-real-repo-64
+
+  real-repo-128-stress:
+    name: Artifact-only real-repository 128-lane stress
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build exact release binary
+        run: cargo build -p trail --release --locked
+      - name: Create clean Superset-class fixture
+        shell: bash
+        run: |
+          git clone --filter=blob:none https://github.com/apache/superset.git "${{ runner.temp }}/superset"
+          printf '.trail/\n' >> "${{ runner.temp }}/superset/.git/info/exclude"
+          target/release/trail --workspace "${{ runner.temp }}/superset" --json init --from-git
+      - name: Run non-blocking stress qualification
+        run: scripts/verify-real-repo-lane-scale.sh
+        env:
+          TRAIL_BIN: ${{ github.workspace }}/target/release/trail
+          TRAIL_SCALE_REPO: ${{ runner.temp }}/superset
+          TRAIL_SCALE_OUTPUT: ${{ runner.temp }}/trail-real-repo-128
+          TRAIL_SCALE_RUN_ID: ci-${{ github.run_id }}-128
+          TRAIL_SCALE_LANES: ${{ github.event.inputs.real_repo_stress_lanes || '128' }}
+          TRAIL_SCALE_FILES_PER_LANE: "50"
+          TRAIL_SCALE_CONCURRENCY: ${{ github.event.inputs.real_repo_stress_lanes || '128' }}
+          TRAIL_SCALE_FAULT_PHASE: all
+      - name: Upload stress evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trail-real-repo-128-${{ runner.os }}
+          path: ${{ runner.temp }}/trail-real-repo-128
+
   scale:
     runs-on: ubuntu-latest
     timeout-minutes: 360

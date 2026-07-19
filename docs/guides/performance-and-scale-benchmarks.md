@@ -74,6 +74,66 @@ TRAIL_SCALE_LABEL=manual-scale \
 scripts/cli-scale-bench.sh
 ```
 
+## Real-Repository Concurrent Lane Gate
+
+Use the blocking real-repository harness for release qualification of native-COW
+lane concurrency. The repository must be an absolute, clean Git working tree
+that was initialized with `trail init --from-git`; the exact Trail binary and
+dedicated Git ref are explicit inputs:
+
+```sh
+TRAIL_BIN="$PWD/target/release/trail" \
+TRAIL_SCALE_REPO=/absolute/path/to/repository \
+TRAIL_SCALE_LANES=64 \
+TRAIL_SCALE_FILES_PER_LANE=50 \
+TRAIL_SCALE_CONCURRENCY=64 \
+TRAIL_SCALE_GIT_REF=refs/heads/codex/trail-scale-release-candidate \
+scripts/verify-real-repo-lane-scale.sh
+```
+
+The gate creates unique `scale-NNNN` lanes with strict `native-cow`, repeats
+each identical spawn to prove stable initialization identity, makes and records
+disjoint edits concurrently, verifies pre-record isolation, and collects status,
+space, readiness, and handoff evidence. It serializes every merge through the
+lane merge queue into Trail `main`, requires the exact expected path manifest,
+exports one `mapped_delta` Git commit, and updates only the dedicated
+`refs/heads/codex/...` ref. The checked-out Git branch, HEAD, and index must stay
+unchanged and clean.
+
+Artifacts form a closed, checksummed evidence set:
+
+- `results.tsv` and `commands/*`: wall time, peak RSS, exit status, raw output,
+  and normalized JSON for every command;
+- `lanes.tsv`: initialization identity/fingerprint replay, native-COW mode,
+  exact edit/record counts, isolation, and logical/allocated/exclusive space;
+- `faults.tsv`: every durable initialization crash cut plus daemon death,
+  response loss, PID reuse, lock crash, policy churn, filesystem replacement,
+  disk/permission/fsync failures, conflicts, and dirty Git refusal;
+- `expected-paths.txt`, `final-trail-paths.txt`, and `final-git-paths.txt`: exact
+  sorted manifests that must be byte-identical;
+- `metrics.json`, `environment.json`, and `evidence-manifest.sha256`: closed
+  metrics/environment schemas and an exact digest inventory.
+
+Run the structural checker independently when copying or inspecting evidence:
+
+```sh
+python3 scripts/check-real-repo-lane-scale.py /path/to/artifact-directory
+```
+
+The checker blocks on missing or unknown evidence, ambiguous retries, fallback
+materialization, wrong counts or paths, failed commands, incomplete fault rows,
+integrity errors, dirty original Git state, live locks, and leaked mount/socket/
+initialization/materialization resources. At up to 64 lanes it also enforces the
+configured p99 latency ceiling. The scheduled 128-lane stress job records the
+same p50/p95/p99 and RSS evidence without applying the 64-lane ceiling; every
+correctness and cleanup invariant remains blocking inside the harness.
+
+Pull-request CI runs the fake-Trail/temp-Git contracts and Linux/macOS native
+changed-path, schema-19, and fault suites. The scheduled/release workflow owns
+the blocking 64-lane Superset-class run and always uploads raw evidence; its
+128-lane job is artifact-producing stress qualification and is non-blocking at
+the workflow level.
+
 Optional toggles:
 
 - `TRAIL_SCALE_MATERIALIZED=0|1`
