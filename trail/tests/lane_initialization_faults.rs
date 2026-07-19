@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -231,6 +232,85 @@ fn post_association_failure_is_durable_committed_repair_and_repairs_once() {
             "repair-lane"
         ),
         1
+    );
+}
+
+#[test]
+fn sixty_four_observers_serialize_publication_without_ambiguous_failures() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    const OBSERVERS: usize = 64;
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    trail::test_support::set_changed_path_authority_override(true);
+    let _authority = AuthorityOverride;
+    let workspace = Arc::new(temp.path().to_path_buf());
+    let start = Arc::new(Barrier::new(OBSERVERS + 1));
+    let handles = (0..OBSERVERS)
+        .map(|index| {
+            let workspace = Arc::clone(&workspace);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let lane = format!("observer-{index:02}");
+                let mut db = Trail::open(&*workspace).unwrap();
+                start.wait();
+                let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    &lane,
+                    Some("main"),
+                    LaneWorkdirMode::PortableCopy,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                );
+                (lane, result)
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+
+    for handle in handles {
+        let (lane, result) = handle.join().unwrap();
+        match result {
+            Ok(report) => assert_eq!(
+                report.phase,
+                LaneInitializationPhase::ObserverReady,
+                "{lane} did not reach observer_ready"
+            ),
+            Err(error) => {
+                assert_ne!(error.code(), "DAEMON_UNAVAILABLE", "{lane}: {error}");
+                panic!("{lane} startup failed ambiguously: {error:?}");
+            }
+        }
+    }
+
+    let db_dir = temp.path().join(".trail");
+    let sqlite = db_dir.join("index/trail.sqlite");
+    let ready: i64 = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM lane_initializations WHERE phase='observer_ready'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ready, OBSERVERS as i64);
+    assert!(!db_dir.join("lock").exists(), "live workspace lock leaked");
+    assert!(
+        fs::read_dir(&db_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".workspace-lock-candidate-")
+        }),
+        "workspace lock candidate leaked"
     );
 }
 

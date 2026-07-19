@@ -156,9 +156,16 @@ impl SegmentWriter {
                 "native observer provider identity does not match the acquired writer".into(),
             ));
         }
-        let _workspace_lock = crate::db::acquire_workspace_lock_for_database(
+        let scope_text = self.identity.scope_id.to_text();
+        let _workspace_lock = crate::db::acquire_workspace_lock_with_admission(
             &self.workspace_db_dir,
             &self.database_path,
+            crate::db::WorkspaceLockAdmission {
+                purpose: crate::db::WorkspaceLockPurpose::ObserverPublication,
+                operation_id: Some(&scope_text),
+                deadline: crate::db::default_workspace_lock_admission_deadline()?,
+                retry_command: "retry observer startup",
+            },
         )?;
         self.ensure_authorized()?;
         let transaction = self
@@ -312,8 +319,6 @@ impl SegmentWriter {
             ));
         }
         let workspace_db_dir = workspace_db_dir_for_database(database_path)?;
-        let _workspace_lock =
-            crate::db::acquire_workspace_lock_for_database(&workspace_db_dir, database_path)?;
         let mut control = Connection::open(database_path).map_err(|error| {
             Error::DaemonUnavailable(format!(
                 "observer segment writer could not open its control connection: {error}"
@@ -331,9 +336,34 @@ impl SegmentWriter {
                     "observer segment writer could not configure its busy timeout: {error}"
                 ))
             })?;
+        let scope_text = scope_id.to_text();
+        let retry_command = control
+            .query_row(
+                "SELECT initialization.lane_name
+                 FROM changed_path_scopes scope
+                 JOIN lane_initializations initialization
+                   ON initialization.lane_id=scope.owner_id
+                 WHERE scope.scope_id=?1 AND scope.scope_kind='materialized_lane'",
+                [&scope_text],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .map(|lane| format!("trail lane repair-initialization {lane}"))
+            .unwrap_or_else(|| "retry observer startup".to_string());
+        let _workspace_lock = crate::db::acquire_workspace_lock_with_admission(
+            &workspace_db_dir,
+            database_path,
+            crate::db::WorkspaceLockAdmission {
+                purpose: crate::db::WorkspaceLockPurpose::ObserverStartup,
+                operation_id: Some(&scope_text),
+                deadline: crate::db::default_workspace_lock_admission_deadline()?,
+                retry_command: &retry_command,
+            },
+        )?;
         let now = now_ts();
         let expires_at = lease_expiry(now, lease_duration)?;
-        let scope_text = scope_id.to_text();
         let epoch_sql = sql_i64(epoch, "observer epoch")?;
         let owner_text = hex::encode(owner_token);
         let transaction = control.transaction_with_behavior(TransactionBehavior::Immediate)?;

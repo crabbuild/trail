@@ -162,6 +162,19 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             );
             diagnostic
         }
+        Error::WorkspaceLockTimeout { retry_command, .. } => {
+            let mut diagnostic =
+                UiDiagnostic::new(err.code(), "Timed out waiting for the workspace writer");
+            diagnostic.consequence = Some(
+                "Trail left the authenticated live owner in place and stopped this operation."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: retry_command.clone(),
+                reason: "Retry after the current workspace operation finishes.".to_string(),
+            });
+            diagnostic
+        }
         Error::IgnoredPath(path) => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Path is protected by Trail ignore rules");

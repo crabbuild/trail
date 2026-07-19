@@ -445,7 +445,20 @@ impl Trail {
             )
         );
         request.lane_id.clone_from(&lane_id);
-        let (initialization, resumed) = match self.reserve_lane_initialization(&request)? {
+        let repair_command = format!("trail lane repair-initialization {name}");
+        let reservation_lock = if ledger_authority {
+            Some(crate::db::acquire_workspace_lock_for_lane_association(
+                &self.db_dir,
+                &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                &request.initialization_id,
+                &repair_command,
+            )?)
+        } else {
+            None
+        };
+        let reservation = self.reserve_lane_initialization(&request)?;
+        drop(reservation_lock);
+        let (initialization, resumed) = match reservation {
             LaneInitializationReservation::Start(record) => (record, false),
             LaneInitializationReservation::Resume(record) => (record, true),
             LaneInitializationReservation::Ready(record) => {
@@ -564,11 +577,22 @@ impl Trail {
             }
         }
         if initialization.phase == LaneInitializationPhase::Reserved {
+            let materialization_lock = if ledger_authority {
+                Some(crate::db::acquire_workspace_lock_for_lane_association(
+                    &self.db_dir,
+                    &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                    &request.initialization_id,
+                    &repair_command,
+                )?)
+            } else {
+                None
+            };
             self.mark_lane_initialization_materialized(
                 &request,
                 &initialization_operation,
                 materialization_report.as_ref(),
             )?;
+            drop(materialization_lock);
         }
         lane_initialization_crash_cut("after_materialization")?;
         let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
@@ -584,6 +608,16 @@ impl Trail {
             "transparent_cow_available": transparent_cow_available
         }))?;
         let now = now_ts();
+        let association_lock = if ledger_authority {
+            Some(crate::db::acquire_workspace_lock_for_lane_association(
+                &self.db_dir,
+                &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                &request.initialization_id,
+                &repair_command,
+            )?)
+        } else {
+            None
+        };
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let association = (|| -> Result<()> {
             self.insert_new_ref_database_only(
@@ -655,6 +689,7 @@ impl Trail {
                 return Err(error);
             }
         }
+        drop(association_lock);
         lane_initialization_crash_cut("after_association")?;
         let committed_operation = materialization_operation_id
             .clone()

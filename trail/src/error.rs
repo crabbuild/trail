@@ -64,6 +64,16 @@ pub enum Error {
     DirtyWorktreeWithMessage(String),
     #[error("workspace is locked by another writer: {0}")]
     WorkspaceLocked(String),
+    #[error(
+        "workspace lock wait timed out behind {holder_purpose} owner after {holder_age_ms}ms{}; retry with `{retry_command}`",
+        operation_id.as_ref().map(|id| format!(" for operation {id}")).unwrap_or_default()
+    )]
+    WorkspaceLockTimeout {
+        holder_purpose: String,
+        holder_age_ms: u64,
+        operation_id: Option<String>,
+        retry_command: String,
+    },
     #[error("merge conflict: {0}")]
     Conflict(String),
     #[error("patch rejected: {0}")]
@@ -134,6 +144,7 @@ impl Error {
             Error::ObjectNotFound { .. } => "OBJECT_NOT_FOUND",
             Error::DirtyWorktree | Error::DirtyWorktreeWithMessage(_) => "DIRTY_WORKTREE",
             Error::WorkspaceLocked(_) => "WORKSPACE_LOCKED",
+            Error::WorkspaceLockTimeout { .. } => "WORKSPACE_LOCK_TIMEOUT",
             Error::Conflict(_) => "MERGE_CONFLICT",
             Error::PatchRejected(_) => "PATCH_REJECTED",
             Error::StaleBranch(_) => "STALE_BRANCH",
@@ -168,7 +179,9 @@ impl Error {
             Error::DirtyWorktree | Error::DirtyWorktreeWithMessage(_) => 5,
             Error::Conflict(_) => 6,
             Error::PatchRejected(_) => 7,
-            Error::StaleBranch(_) | Error::WorkspaceLocked(_) => 8,
+            Error::StaleBranch(_)
+            | Error::WorkspaceLocked(_)
+            | Error::WorkspaceLockTimeout { .. } => 8,
             Error::InvalidPath { .. } | Error::PathIndexRequired(_) => 9,
             Error::Git(_)
             | Error::GitMappingRequired(_)

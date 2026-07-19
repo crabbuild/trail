@@ -142,6 +142,7 @@ impl StructuredErrorEnvelope {
             | crate::Error::PatchRejected(_)
             | crate::Error::StaleBranch(_)
             | crate::Error::WorkspaceLocked(_)
+            | crate::Error::WorkspaceLockTimeout { .. }
             | crate::Error::SchemaReinitializeRequired { .. }
             | crate::Error::ChangeLedgerReconcileRequired { .. }
             | crate::Error::CommittedRepairRequired { .. }
@@ -206,6 +207,17 @@ impl StructuredErrorEnvelope {
                 "committed": committed,
                 "repair": repair,
                 "reason": reason,
+            })),
+            crate::Error::WorkspaceLockTimeout {
+                holder_purpose,
+                holder_age_ms,
+                operation_id,
+                retry_command,
+            } => Some(serde_json::json!({
+                "holder_purpose": holder_purpose,
+                "holder_age_ms": holder_age_ms,
+                "operation_id": operation_id,
+                "retry_command": retry_command,
             })),
             _ => None,
         };

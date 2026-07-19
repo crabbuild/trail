@@ -593,7 +593,16 @@ fn preflight_existing_schema_with_migration(
 }
 
 fn migrate_existing_schema_v18(db_dir: &Path, db_path: &Path, prolly_backend: &str) -> Result<()> {
-    let _lock = acquire_workspace_lock_for_database(db_dir, db_path)?;
+    let _lock = acquire_workspace_lock_with_admission(
+        db_dir,
+        db_path,
+        WorkspaceLockAdmission {
+            purpose: WorkspaceLockPurpose::SchemaTransition,
+            operation_id: Some("schema-v18-to-v19"),
+            deadline: Duration::ZERO,
+            retry_command: "trail init --force",
+        },
+    )?;
     let mut conn = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,

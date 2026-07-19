@@ -46,7 +46,16 @@ fn acquire_projection_publication_lock(db: &crate::Trail) -> Result<crate::db::W
     // writer that acquired the lock just before exclusion gets a short,
     // bounded interval to finish and release it. External or stuck ownership
     // still fails closed at the deadline.
-    crate::Trail::with_write_lock_wait(Duration::from_secs(2), || db.acquire_write_lock())
+    crate::db::acquire_workspace_lock_with_admission(
+        &db.db_dir,
+        &db.db_dir.join(crate::db::DB_RELATIVE_PATH),
+        crate::db::WorkspaceLockAdmission {
+            purpose: crate::db::WorkspaceLockPurpose::ObserverPublication,
+            operation_id: None,
+            deadline: Duration::from_secs(2),
+            retry_command: "retry the command",
+        },
+    )
 }
 
 pub(crate) enum ProjectionAlignmentMode {
