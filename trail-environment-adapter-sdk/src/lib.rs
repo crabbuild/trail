@@ -1132,7 +1132,7 @@ fn validate_adapter_runtime_resources(
             .sort_by(|left, right| left.name.cmp(&right.name));
     }
     for (index, resource) in resources.iter().enumerate() {
-        let valid_volume = resource.volume_target.as_deref().map_or(true, |target| {
+        let valid_volume = resource.volume_target.as_deref().is_none_or(|target| {
             target.starts_with('/')
                 && target.len() <= 4096
                 && !target.contains('\\')
@@ -1207,7 +1207,7 @@ fn valid_adapter_secret_references(secrets: &[AdapterSecretReference]) -> bool {
                 .skip(1)
                 .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
             && targets.insert(secret.target.clone())
-            && secret.environment.as_deref().map_or(true, |name| {
+            && secret.environment.as_deref().is_none_or(|name| {
                 !name.is_empty()
                     && name.len() <= 128
                     && !name.as_bytes()[0].is_ascii_digit()
@@ -1215,7 +1215,7 @@ fn valid_adapter_secret_references(secrets: &[AdapterSecretReference]) -> bool {
                         byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
                     })
             })
-            && secret.version.as_deref().map_or(true, |version| {
+            && secret.version.as_deref().is_none_or(|version| {
                 !version.is_empty()
                     && version.len() <= 256
                     && !version.chars().any(char::is_control)
