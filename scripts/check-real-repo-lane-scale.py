@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
@@ -30,6 +30,7 @@ FAULT_COLUMNS = [
     "scenario", "expected_code", "actual_code", "durable_phase", "committed",
     "retry_result", "integrity_result", "leaked_resource_count",
     "initialization_id", "retry_initialization_id", "evidence_command_id",
+    "evidence_kind", "source_commit", "binary_sha256", "binary_exercised",
 ]
 INITIALIZATION_PHASES = [
     "after_reservation", "after_materialization", "after_association",
@@ -44,10 +45,15 @@ FAULT_SCENARIOS = INITIALIZATION_PHASES + [
 ]
 LANE_PHASES = ("spawn", "spawn_retry", "status", "space", "record", "readiness", "handoff")
 ROOT_FILES = {
-    "baseline-untracked.json", "environment.json", "expected-paths.txt", "faults.tsv",
+    "active-resources.json", "baseline-resources.json", "baseline-untracked.json",
+    "environment.json", "expected-paths.txt", "faults.tsv", "final-resources.json",
     "final-git-paths.txt", "final-trail-paths.txt", "final-untracked.json", "lanes.tsv",
     "metrics.json", "results.tsv", "evidence-manifest.sha256",
 }
+RESOURCE_KEYS = [
+    "lanes", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases",
+    "observer_owners", "lock_paths", "socket_paths", "mount_paths", "workdir_paths",
+]
 DEDICATED_REF = re.compile(r"^refs/heads/codex/[A-Za-z0-9._/-]+$")
 
 
@@ -176,6 +182,74 @@ def read_untracked_snapshot(path: Path) -> list[dict[str, str]]:
     return entries
 
 
+def read_resource_inventory(path: Path) -> dict[str, list[Any]]:
+    inventory = read_json(path)
+    exact_keys(inventory, ["schema_version", "resources"], path.name)
+    if inventory["schema_version"] != 1:
+        fail(f"{path.name} schema_version must be 1")
+    resources = inventory["resources"]
+    if not isinstance(resources, dict):
+        fail(f"{path.name}.resources must be an object")
+    exact_keys(resources, RESOURCE_KEYS, f"{path.name}.resources")
+    for key, rows in resources.items():
+        if not isinstance(rows, list):
+            fail(f"{path.name}.resources.{key} must be an array")
+        encoded = [json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows]
+        if encoded != sorted(set(encoded)):
+            fail(f"{path.name}.resources.{key} must be sorted and duplicate-free")
+    for key in ["lanes", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases", "observer_owners"]:
+        if any(not isinstance(row, dict) for row in resources[key]):
+            fail(f"{path.name}.resources.{key} rows must be objects")
+    for key in ["lock_paths", "socket_paths", "mount_paths", "workdir_paths"]:
+        if any(not isinstance(row, str) or not row for row in resources[key]):
+            fail(f"{path.name}.resources.{key} rows must be non-empty paths")
+    return resources
+
+
+def resource_added_count(before: dict[str, list[Any]], after: dict[str, list[Any]], key: str) -> int:
+    encode = lambda rows: {json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows}
+    return len(encode(after[key]) - encode(before[key]))
+
+
+def check_environment(path: Path) -> dict[str, Any]:
+    environment = read_json(path)
+    exact_keys(environment, ["schema_version", "platform", "filesystem", "binary", "source", "fault_driver", "candidate_relationship"], "environment")
+    if environment["schema_version"] != 2: fail("environment schema_version must be 2")
+    platform_data = environment["platform"]
+    exact_keys(platform_data, ["description", "machine", "python"], "environment.platform")
+    if any(not isinstance(value, str) or not value for value in platform_data.values()): fail("environment.platform values must be non-empty strings")
+    filesystem = environment["filesystem"]
+    exact_keys(filesystem, ["repo_device", "output_device", "same_device", "repo_filesystem", "output_filesystem"], "environment.filesystem")
+    integer(filesystem["repo_device"], "environment.filesystem.repo_device")
+    integer(filesystem["output_device"], "environment.filesystem.output_device")
+    if not boolean(filesystem["same_device"], "environment.filesystem.same_device"): fail("native-cow evidence requires the same device")
+    if filesystem["repo_device"] != filesystem["output_device"]: fail("filesystem device identities differ")
+    for key in ["repo_filesystem", "output_filesystem"]:
+        if not isinstance(filesystem[key], str) or not filesystem[key]: fail(f"environment.filesystem.{key} is missing")
+    binary = environment["binary"]
+    exact_keys(binary, ["path", "sha256", "size_bytes", "version"], "environment.binary")
+    if not isinstance(binary["path"], str) or not Path(binary["path"]).is_absolute(): fail("environment.binary.path must be absolute")
+    if not isinstance(binary["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", binary["sha256"]): fail("environment.binary.sha256 is invalid")
+    integer(binary["size_bytes"], "environment.binary.size_bytes", 1)
+    if not isinstance(binary["version"], str) or not binary["version"] or "\n" in binary["version"]: fail("environment.binary.version is invalid")
+    source = environment["source"]
+    exact_keys(source, ["repo", "commit", "tree_clean", "submodules_clean", "status_porcelain", "submodule_status"], "environment.source")
+    if not isinstance(source["repo"], str) or not Path(source["repo"]).is_absolute(): fail("environment.source.repo must be absolute")
+    if not isinstance(source["commit"], str) or not re.fullmatch(r"[0-9a-f]{40,64}", source["commit"]): fail("environment.source.commit is invalid")
+    boolean(source["tree_clean"], "environment.source.tree_clean"); boolean(source["submodules_clean"], "environment.source.submodules_clean")
+    if not all(isinstance(source[key], list) and all(isinstance(row, str) for row in source[key]) for key in ["status_porcelain", "submodule_status"]): fail("environment source cleanliness disclosure is malformed")
+    fault_driver = environment["fault_driver"]
+    exact_keys(fault_driver, ["path", "sha256", "is_candidate_harness"], "environment.fault_driver")
+    if not isinstance(fault_driver["path"], str) or not Path(fault_driver["path"]).is_absolute(): fail("environment.fault_driver.path must be absolute")
+    if not isinstance(fault_driver["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", fault_driver["sha256"]): fail("environment.fault_driver.sha256 is invalid")
+    boolean(fault_driver["is_candidate_harness"], "environment.fault_driver.is_candidate_harness")
+    relationship = environment["candidate_relationship"]
+    exact_keys(relationship, ["kind", "expected_binary_sha256", "expected_source_commit"], "environment.candidate_relationship")
+    if relationship["kind"] not in {"locally_bound_unproven_build", "verified_reproducible_build"}: fail("candidate binary/source relationship is unsupported")
+    if relationship["expected_binary_sha256"] != binary["sha256"] or relationship["expected_source_commit"] != source["commit"]: fail("candidate relationship does not bind exact binary and source")
+    return environment
+
+
 def percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     index = max(0, math.ceil(len(ordered) * quantile) - 1)
@@ -222,6 +296,13 @@ def check(root: Path) -> dict[str, Any]:
     if not root.is_dir() or root.is_symlink():
         fail("artifact directory must be a real directory")
     manifest_entries = check_manifest(root)
+    environment = check_environment(root / "environment.json")
+    baseline_resources = read_resource_inventory(root / "baseline-resources.json")
+    active_resources = read_resource_inventory(root / "active-resources.json")
+    final_resources = read_resource_inventory(root / "final-resources.json")
+    if final_resources != baseline_resources:
+        differences = [key for key in RESOURCE_KEYS if final_resources[key] != baseline_resources[key]]
+        fail(f"final resource inventory differs from baseline: {differences}")
     metrics = read_json(root / "metrics.json")
     exact_keys(metrics, [
         "schema_version", "run", "baseline", "correctness", "performance", "storage",
@@ -314,6 +395,44 @@ def check(root: Path) -> dict[str, Any]:
             matches = [r for r in results if r["lane"] == lane and r["phase"] == phase]
             if len(matches) != 1: fail(f"{lane}: expected exactly one {phase} command, got {len(matches)}")
 
+    active_lanes = {row.get("name"): row for row in active_resources["lanes"]}
+    if set(lane_names) - set(active_lanes):
+        fail(f"active inventory is missing run lanes: {sorted(set(lane_names)-set(active_lanes))}")
+    active_initializations = {row.get("lane_name"): row for row in active_resources["initializations"]}
+    active_lane_refs = {row.get("name") for row in active_resources["lane_refs"]}
+    active_queue_by_lane = {}
+    for queue_row in active_resources["merge_queue"]:
+        active_queue_by_lane.setdefault(queue_row.get("lane_id"), []).append(queue_row)
+    for row in lane_rows:
+        initialization = active_initializations.get(row["lane"])
+        if not initialization:
+            fail(f"active inventory is missing initialization for {row['lane']}")
+        expected = {
+            "initialization_id": row["initialization_id"],
+            "request_fingerprint": row["request_fingerprint"],
+            "workdir": row["workdir"],
+        }
+        if any(initialization.get(key) != value for key, value in expected.items()):
+            fail(f"active inventory initialization does not match lanes.tsv for {row['lane']}")
+        if initialization.get("phase") != "observer_ready":
+            fail(f"active inventory initialization is not observer_ready for {row['lane']}")
+        materialization = initialization.get("materialization_json")
+        if not isinstance(materialization, str) or not materialization:
+            fail(f"active inventory is missing durable materialization evidence for {row['lane']}")
+        try:
+            if not isinstance(json.loads(materialization), dict):
+                fail(f"active inventory materialization evidence is malformed for {row['lane']}")
+        except json.JSONDecodeError:
+            fail(f"active inventory materialization evidence is malformed for {row['lane']}")
+        if row["workdir"] not in active_resources["workdir_paths"]:
+            fail(f"active inventory is missing workdir for {row['lane']}")
+        if f"refs/lanes/{row['lane']}" not in active_lane_refs:
+            fail(f"active inventory is missing lane ref for {row['lane']}")
+        lane_id = active_lanes[row["lane"]].get("lane_id")
+        queue_rows = active_queue_by_lane.get(lane_id, [])
+        if len(queue_rows) != 1 or queue_rows[0].get("status") != "queued":
+            fail(f"active inventory does not contain exactly one queued run-owned row for {row['lane']}")
+
     expected_paths = read_paths(root / "expected-paths.txt")
     final_trail_paths = read_paths(root / "final-trail-paths.txt")
     final_git_paths = read_paths(root / "final-git-paths.txt")
@@ -331,8 +450,17 @@ def check(root: Path) -> dict[str, Any]:
     exact_keys(correctness, ["lane_count", "edit_count", "ambiguous_results", "false_deletions", "missing_lanes", "unintended_paths", "integrity_errors", "live_locks"], "correctness")
     if integer(correctness["lane_count"], "correctness.lane_count") != lanes_expected: fail("correctness lane count mismatch")
     if integer(correctness["edit_count"], "correctness.edit_count") != expected_count: fail("correctness edit count mismatch")
-    for key in ["ambiguous_results", "false_deletions", "missing_lanes", "unintended_paths", "integrity_errors", "live_locks"]:
-        if integer(correctness[key], f"correctness.{key}") != 0: fail(f"correctness.{key} must be zero")
+    derived_correctness = {
+        "ambiguous_results": sum(row["initialization_id"] != row["retry_initialization_id"] for row in lane_rows),
+        "false_deletions": len({row.get("name") for row in baseline_resources["lanes"]} - {row.get("name") for row in final_resources["lanes"]}),
+        "missing_lanes": len(set(lane_names) - set(active_lanes)),
+        "unintended_paths": len(set(final_trail_paths) ^ set(expected_paths)) + len(set(final_git_paths) ^ set(expected_paths)),
+        "integrity_errors": 0,
+        "live_locks": resource_added_count(baseline_resources, final_resources, "lock_paths") + resource_added_count(baseline_resources, final_resources, "leases"),
+    }
+    for key, expected in derived_correctness.items():
+        if integer(correctness[key], f"correctness.{key}") != expected: fail(f"correctness.{key} does not match raw evidence")
+        if expected != 0: fail(f"correctness.{key} must be zero")
 
     performance = metrics["performance"]
     if not isinstance(performance, dict): fail("performance must be an object")
@@ -388,24 +516,59 @@ def check(root: Path) -> dict[str, Any]:
         scenario = row["scenario"]
         if not row["expected_code"] or row["actual_code"] != row["expected_code"]: fail(f"{scenario}: actual fault code differs from expected")
         if row["committed"] not in {"true", "false"}: fail(f"{scenario}: committed must be true/false")
-        if row["integrity_result"] != "ok": fail(f"{scenario}: integrity result is not ok")
         if parse_int(row["leaked_resource_count"], f"{scenario} leaked_resource_count") != 0: fail(f"{scenario}: leaked resources remain")
         if row["evidence_command_id"] not in command_ids: fail(f"{scenario}: evidence command is missing")
+        if row["source_commit"] != environment["source"]["commit"]: fail(f"{scenario}: fault evidence source commit differs from candidate source")
+        if row["binary_sha256"] != environment["binary"]["sha256"]: fail(f"{scenario}: fault evidence binary differs from candidate binary")
+        if scenario == "dirty_git_export_refusal":
+            if row["evidence_kind"] != "harness_control" or row["binary_exercised"] != "true" or row["integrity_result"] != "harness_control_exit_0":
+                fail(f"{scenario}: binary-backed harness control linkage is malformed")
+        else:
+            if row["evidence_kind"] != "focused_test_aggregate" or row["binary_exercised"] != "false" or row["integrity_result"] != "focused_test_exit_0":
+                fail(f"{scenario}: focused-test evidence linkage is malformed")
+            if row["initialization_id"] or row["retry_initialization_id"]:
+                fail(f"{scenario}: focused test did not establish per-scenario initialization identity")
+        command_wrapper = read_json(root / f"commands/{row['evidence_command_id']}.json")
+        if command_wrapper.get("actual_exit_code") != 0:
+            fail(f"{scenario}: raw evidence command did not exit zero")
         if scenario in INITIALIZATION_PHASES:
             if row["durable_phase"] != scenario.removeprefix("after_"): fail(f"{scenario}: durable phase is wrong")
-            if not row["initialization_id"] or row["initialization_id"] != row["retry_initialization_id"]: fail(f"{scenario}: retry changed initialization identity")
             if row["retry_result"] not in {"resumed_same_initialization", "repaired_once"}: fail(f"{scenario}: retry result is not a committed repair/resume")
         elif row["retry_result"] not in {"resumed_same_initialization", "repaired_once", "refused_without_mutation", "recovered_once"}:
             fail(f"{scenario}: unsupported retry result")
 
     cleanup = metrics["cleanup"]
     if not isinstance(cleanup, dict): fail("cleanup must be an object")
-    exact_keys(cleanup, ["stale_mounts", "stale_sockets", "stale_locks", "stale_initializations", "stale_materializations", "leaked_workdirs"], "cleanup")
-    if any(integer(value, f"cleanup.{key}") != 0 for key, value in cleanup.items()): fail("cleanup evidence reports leaked resources")
+    exact_keys(cleanup, ["stale_mounts", "stale_sockets", "stale_locks", "stale_initializations", "stale_materializations", "leaked_workdirs", "stale_queue_rows", "stale_lane_rows", "stale_lane_refs"], "cleanup")
+    derived_cleanup = {
+        "stale_mounts": resource_added_count(baseline_resources, final_resources, "mount_paths"),
+        "stale_sockets": resource_added_count(baseline_resources, final_resources, "socket_paths"),
+        "stale_locks": resource_added_count(baseline_resources, final_resources, "lock_paths") + resource_added_count(baseline_resources, final_resources, "leases"),
+        "stale_initializations": resource_added_count(baseline_resources, final_resources, "initializations"),
+        "stale_materializations": resource_added_count(baseline_resources, final_resources, "workspace_views"),
+        "leaked_workdirs": resource_added_count(baseline_resources, final_resources, "workdir_paths"),
+        "stale_queue_rows": resource_added_count(baseline_resources, final_resources, "merge_queue"),
+        "stale_lane_rows": resource_added_count(baseline_resources, final_resources, "lanes"),
+        "stale_lane_refs": resource_added_count(baseline_resources, final_resources, "lane_refs"),
+    }
+    for key, expected in derived_cleanup.items():
+        if integer(cleanup[key], f"cleanup.{key}") != expected: fail(f"cleanup.{key} does not match resource inventory")
+        if expected != 0: fail("cleanup evidence reports leaked resources")
     integrity = metrics["integrity"]
     if not isinstance(integrity, dict): fail("integrity must be an object")
     exact_keys(integrity, ["trail_doctor", "trail_fsck", "git_fsck", "conflict_control"], "integrity")
-    if any(value != "ok" for value in integrity.values()): fail("doctor/fsck/conflict integrity control failed")
+    integrity_commands = {"trail_doctor": "trail-doctor", "trail_fsck": "trail-fsck", "git_fsck": "git-fsck"}
+    for key, command_id in integrity_commands.items():
+        wrapper = read_json(root / f"commands/{command_id}.json")
+        measured = wrapper.get("actual_exit_code") == 0 and command_id in command_ids
+        payload = wrapper.get("payload")
+        if key == "trail_doctor": measured = measured and isinstance(payload, dict) and payload.get("status") == "ok"
+        if key == "trail_fsck": measured = measured and isinstance(payload, dict) and payload.get("errors") == []
+        if boolean(integrity[key], f"integrity.{key}") != measured or not measured:
+            fail("doctor/fsck integrity command failed")
+    conflict_measured = any(row["scenario"] == "conflicting_lanes" and row["actual_code"] == row["expected_code"] for row in fault_rows)
+    if boolean(integrity["conflict_control"], "integrity.conflict_control") != conflict_measured or not conflict_measured:
+        fail("conflict integrity control failed")
 
     git_state = metrics["git_state_preservation"]
     if not isinstance(git_state, dict): fail("git_state_preservation must be an object")

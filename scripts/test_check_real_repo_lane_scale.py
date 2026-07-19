@@ -52,7 +52,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
             "wall_seconds": f"{seconds:.6f}", "peak_rss_bytes": "4096",
             "exit_code": "0", "committed": "true", "retry_of": "",
         })
-        (commands / f"{command_id}.json").write_text("{}\n", encoding="utf-8")
+        (commands / f"{command_id}.json").write_text(json.dumps({"actual_exit_code": 0}) + "\n", encoding="utf-8")
         (commands / f"{command_id}.stdout").write_text("{}\n", encoding="utf-8")
         (commands / f"{command_id}.stderr").write_text("\n", encoding="utf-8")
         (commands / f"{command_id}.rss").write_text("4096\n", encoding="utf-8")
@@ -75,13 +75,17 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
             command(f"{phase}-{index:04d}", phase, lane)
     command("queue-run", "queue_run")
     command("git-export", "git_export")
+    command("trail-doctor", "integrity")
+    command("trail-fsck", "integrity")
+    command("git-fsck", "integrity")
+    (commands / "trail-doctor.json").write_text(json.dumps({"actual_exit_code": 0, "payload": {"status": "ok", "checks": []}}) + "\n")
+    (commands / "trail-fsck.json").write_text(json.dumps({"actual_exit_code": 0, "payload": {"errors": []}}) + "\n")
 
     fault_rows = []
     for index, scenario in enumerate(checker.FAULT_SCENARIOS):
         command_id = f"fault-{index:02d}"
         command(command_id, "fault")
         is_phase = scenario in checker.INITIALIZATION_PHASES
-        identity = f"fault-init-{index:02d}" if is_phase else ""
         fault_rows.append({
             "scenario": scenario, "expected_code": "137" if is_phase else "0",
             "actual_code": "137" if is_phase else "0",
@@ -90,9 +94,12 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
             "retry_result": "resumed_same_initialization" if is_phase else (
                 "refused_without_mutation" if scenario in {"conflicting_lanes", "dirty_git_export_refusal"} else "recovered_once"
             ),
-            "integrity_result": "ok", "leaked_resource_count": "0",
-            "initialization_id": identity, "retry_initialization_id": identity,
+            "integrity_result": "harness_control_exit_0" if scenario == "dirty_git_export_refusal" else "focused_test_exit_0",
+            "leaked_resource_count": "0", "initialization_id": "", "retry_initialization_id": "",
             "evidence_command_id": command_id,
+            "evidence_kind": "harness_control" if scenario == "dirty_git_export_refusal" else "focused_test_aggregate",
+            "source_commit": "2" * 40, "binary_sha256": "1" * 64,
+            "binary_exercised": "true" if scenario == "dirty_git_export_refusal" else "false",
         })
 
     expected_paths.sort()
@@ -101,7 +108,60 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
     write_tsv(root / "results.tsv", checker.RESULT_COLUMNS, result_rows)
     write_tsv(root / "lanes.tsv", checker.LANE_COLUMNS, lane_rows)
     write_tsv(root / "faults.tsv", checker.FAULT_COLUMNS, fault_rows)
-    (root / "environment.json").write_text('{"platform":"contract"}\n', encoding="utf-8")
+    environment = {
+        "schema_version": 2,
+        "platform": {"description": "contract", "machine": "test", "python": "3"},
+        "filesystem": {"repo_device": 1, "output_device": 1, "same_device": True,
+                       "repo_filesystem": "testfs", "output_filesystem": "testfs"},
+        "binary": {"path": "/tmp/trail", "sha256": "1" * 64,
+                   "size_bytes": 123, "version": "trail 1.0.0"},
+        "source": {"repo": "/tmp/source", "commit": "2" * 40,
+                   "tree_clean": True, "submodules_clean": True,
+                   "status_porcelain": [], "submodule_status": []},
+        "fault_driver": {"path": "/tmp/fault-driver", "sha256": "3" * 64,
+                         "is_candidate_harness": False},
+        "candidate_relationship": {"kind": "locally_bound_unproven_build",
+                                   "expected_binary_sha256": "1" * 64,
+                                   "expected_source_commit": "2" * 40},
+    }
+    (root / "environment.json").write_text(json.dumps(environment, sort_keys=True) + "\n", encoding="utf-8")
+    empty_resources = {
+        "schema_version": 1,
+        "resources": {key: [] for key in (
+            "lanes", "lane_refs", "merge_queue", "initializations", "workspace_views",
+            "leases", "observer_owners", "lock_paths", "socket_paths",
+            "mount_paths", "workdir_paths",
+        )},
+    }
+    active_resources = json.loads(json.dumps(empty_resources))
+    active_resources["resources"]["lanes"] = [
+        {"lane_id": f"id-scale-{index:04d}", "name": f"scale-{index:04d}"}
+        for index in range(lanes)
+    ]
+    active_resources["resources"]["initializations"] = [
+        {"initialization_id": f"init-{index:04d}", "lane_id": f"id-scale-{index:04d}",
+         "lane_name": f"scale-{index:04d}", "phase": "observer_ready",
+         "request_fingerprint": f"fingerprint-{index:04d}", "workdir": f"/tmp/scale-{index:04d}",
+         "materialization_json": json.dumps({"workdir_mode": "native-cow"}, sort_keys=True)}
+        for index in range(lanes)
+    ]
+    active_resources["resources"]["lane_refs"] = [
+        {"name": f"refs/lanes/scale-{index:04d}", "change_id": f"change-{index}",
+         "root_id": f"root-{index}", "operation_id": f"operation-{index}", "generation": 1}
+        for index in range(lanes)
+    ]
+    active_resources["resources"]["lane_refs"].sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+    active_resources["resources"]["merge_queue"] = [
+        {"queue_id": f"queue-{index}", "lane_id": f"id-scale-{index:04d}",
+         "target_ref": "refs/branches/main", "status": "queued"}
+        for index in range(lanes)
+    ]
+    active_resources["resources"]["merge_queue"].sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")))
+    active_resources["resources"]["workdir_paths"] = [f"/tmp/scale-{index:04d}" for index in range(lanes)]
+    for name, payload in (("baseline-resources.json", empty_resources),
+                          ("active-resources.json", active_resources),
+                          ("final-resources.json", empty_resources)):
+        (root / name).write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     untracked = {
         "schema_version": checker.UNTRACKED_SCHEMA_VERSION,
         "algorithm": "sha256",
@@ -143,9 +203,10 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
                        "dirty_refusal_code": "GIT_MAPPING_REQUIRED", "unexpected_path_count": 0},
         "cleanup": {"stale_mounts": 0, "stale_sockets": 0, "stale_locks": 0,
                     "stale_initializations": 0, "stale_materializations": 0,
-                    "leaked_workdirs": 0},
-        "integrity": {"trail_doctor": "ok", "trail_fsck": "ok",
-                      "git_fsck": "ok", "conflict_control": "ok"},
+                    "leaked_workdirs": 0, "stale_queue_rows": 0, "stale_lane_rows": 0,
+                    "stale_lane_refs": 0},
+        "integrity": {"trail_doctor": True, "trail_fsck": True,
+                      "git_fsck": True, "conflict_control": True},
         "git_state_preservation": {"tracked_worktree_clean": True, "index_clean": True,
                                    "preexisting_untracked_count": 1,
                                    "final_untracked_count": 1,
@@ -219,7 +280,47 @@ class CheckerContractTests(unittest.TestCase):
         metrics["cleanup"]["stale_locks"] = 1
         (root / "metrics.json").write_text(json.dumps(metrics) + "\n")
         refresh_manifest(root)
-        with self.assertRaisesRegex(checker.EvidenceError, "leaked resources"):
+        with self.assertRaisesRegex(checker.EvidenceError, "resource inventory"):
+            checker.check(root)
+
+    def test_raw_final_inventory_difference_is_rejected_even_when_metrics_claim_zero(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        final = json.loads((root / "final-resources.json").read_text())
+        final["resources"]["socket_paths"] = ["/tmp/leaked.sock"]
+        (root / "final-resources.json").write_text(json.dumps(final) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "resource inventory"):
+            checker.check(root)
+
+    def test_active_inventory_missing_run_lane_is_rejected(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        active = json.loads((root / "active-resources.json").read_text())
+        active["resources"]["lanes"].pop()
+        (root / "active-resources.json").write_text(json.dumps(active) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "active inventory"):
+            checker.check(root)
+
+    def test_fault_binary_linkage_mismatch_is_rejected(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        rows = checker.read_tsv(root / "faults.tsv", checker.FAULT_COLUMNS)
+        rows[0]["binary_sha256"] = "f" * 64
+        write_tsv(root / "faults.tsv", checker.FAULT_COLUMNS, rows)
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "binary"):
+            checker.check(root)
+
+    def test_binary_metadata_is_required(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        environment = json.loads((root / "environment.json").read_text())
+        del environment["binary"]["size_bytes"]
+        (root / "environment.json").write_text(json.dumps(environment) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "binary"):
             checker.check(root)
 
     def test_native_cow_fallback_is_rejected(self) -> None:

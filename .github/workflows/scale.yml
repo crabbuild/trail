@@ -54,6 +54,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build exact release binary
         run: cargo build -p trail --release --locked
+      - name: Bind exact release candidate identity
+        shell: bash
+        run: |
+          echo "TRAIL_SCALE_EXPECTED_BINARY_SHA256=$(shasum -a 256 target/release/trail | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Create clean Superset-class fixture
         shell: bash
         run: |
@@ -92,6 +97,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build exact release binary
         run: cargo build -p trail --release --locked
+      - name: Bind exact release candidate identity
+        shell: bash
+        run: |
+          echo "TRAIL_SCALE_EXPECTED_BINARY_SHA256=$(shasum -a 256 target/release/trail | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Create clean Superset-class fixture
         shell: bash
         run: |

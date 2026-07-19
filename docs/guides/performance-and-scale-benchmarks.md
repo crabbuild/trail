@@ -82,14 +82,41 @@ that was initialized with `trail init --from-git`; the exact Trail binary and
 dedicated Git ref are explicit inputs:
 
 ```sh
+candidate_sha=$(shasum -a 256 "$PWD/target/release/trail" | awk '{print $1}')
+candidate_commit=$(git rev-parse HEAD)
 TRAIL_BIN="$PWD/target/release/trail" \
+TRAIL_SCALE_EXPECTED_BINARY_SHA256="$candidate_sha" \
+TRAIL_SCALE_EXPECTED_SOURCE_COMMIT="$candidate_commit" \
 TRAIL_SCALE_REPO=/absolute/path/to/repository \
+TRAIL_SCALE_OUTPUT=/absolute/same-device/path/to/new-evidence-directory \
 TRAIL_SCALE_LANES=64 \
 TRAIL_SCALE_FILES_PER_LANE=50 \
 TRAIL_SCALE_CONCURRENCY=64 \
 TRAIL_SCALE_GIT_REF=refs/heads/codex/trail-scale-release-candidate \
 scripts/verify-real-repo-lane-scale.sh
 ```
+
+The output path must not exist and its nearest existing parent must be on the
+same device as the repository. Before creating the output or a lane, the gate
+also proves that the current Trail root has a clean Git mapping to the current
+Git HEAD, every deterministic lane name is absent, the merge queue has no
+nonterminal row, the dedicated ref is absent, and the candidate binary/source
+identities match the explicit digests. A baseline that has already absorbed a
+previous scale run is not eligible for another `mapped_delta` export while Git
+HEAD is unchanged.
+
+Run 64 and 128 against independently initialized copies. The safe sequence is:
+
+1. Create a fresh Git copy for 64 lanes, exclude `.trail/`, and initialize it
+   with the exact candidate via `trail init --from-git`.
+2. Run the command above with a new same-device output, unique run ID/ref,
+   `TRAIL_SCALE_LANES=64`, `TRAIL_SCALE_FILES_PER_LANE=50`, and concurrency 64.
+3. Create and initialize a second fresh Git copy for 128 lanes, then use another
+   new output, run ID/ref, `TRAIL_SCALE_LANES=128`, and concurrency 128.
+
+Reusing one copy requires an explicitly authorized `trail git import-update`
+normalization that maps the new Trail baseline to the current Git HEAD before
+the next run. The harness never performs that baseline mutation itself.
 
 The gate creates unique `scale-NNNN` lanes with strict `native-cow`, repeats
 each identical spawn to prove stable initialization identity, makes and records
@@ -113,6 +140,20 @@ Artifacts form a closed, checksummed evidence set:
   sorted manifests that must be byte-identical;
 - `metrics.json`, `environment.json`, and `evidence-manifest.sha256`: closed
   metrics/environment schemas and an exact digest inventory.
+- `baseline-resources.json`, `active-resources.json`, and
+  `final-resources.json`: raw SQLite/filesystem inventories of lane rows,
+  initialization rows, queue work, materializations, leases, observer owners,
+  locks, sockets/tombstones, mounts, and workdirs. The checker derives cleanup
+  deltas and run ownership from these files.
+
+Focused fault rows are explicitly labeled `focused_test_aggregate`: they bind
+the exact source commit, candidate binary digest, and fault-driver digest, but
+state that those Cargo tests did not execute the release binary and do not
+claim synthetic per-scenario initialization IDs. The dirty-Git refusal row is
+separately labeled as a binary-backed harness control. `environment.json`
+discloses whether the source tree/submodules were clean and records the local
+binary/source relationship as unproven unless a reproducible-build attestation
+is available.
 
 Run the structural checker independently when copying or inspecting evidence:
 
