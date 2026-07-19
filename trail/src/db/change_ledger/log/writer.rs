@@ -156,17 +156,7 @@ impl SegmentWriter {
                 "native observer provider identity does not match the acquired writer".into(),
             ));
         }
-        let scope_text = self.identity.scope_id.to_text();
-        let _workspace_lock = crate::db::acquire_workspace_lock_with_admission(
-            &self.workspace_db_dir,
-            &self.database_path,
-            crate::db::WorkspaceLockAdmission {
-                purpose: crate::db::WorkspaceLockPurpose::ObserverPublication,
-                operation_id: Some(&scope_text),
-                deadline: crate::db::default_workspace_lock_admission_deadline()?,
-                retry_command: "retry observer startup",
-            },
-        )?;
+        let _workspace_lock = self.acquire_observer_publication_lock()?;
         self.ensure_authorized()?;
         let transaction = self
             .control
@@ -1112,16 +1102,42 @@ impl SegmentWriter {
 
     fn acquire_observer_publication_lock(&self) -> Result<crate::db::WorkspaceLock> {
         let operation_id = self.identity.scope_id.to_text();
-        crate::db::acquire_workspace_lock_for_observer(
+        let workspace_lock = crate::db::acquire_workspace_lock_for_observer(
             &self.workspace_db_dir,
             &self.database_path,
             &operation_id,
-        )
+        )?;
+        // A same-process command convoy can intentionally hold observer
+        // publication behind authorized write exclusion for longer than one
+        // lease interval. The retained SegmentWriter still owns the locked
+        // sidecar and exact active owner token. Refresh that same capability
+        // after admission, before publishing any new segment boundary; an
+        // epoch/token/state change remains a terminal CAS failure.
+        let now = now_ts();
+        let expiry = lease_expiry(now, self.lease_duration)?;
+        let changed = self.control.execute(
+            "UPDATE changed_path_observer_owners
+             SET heartbeat_at=?1, expires_at=?2, updated_at=?1
+             WHERE scope_id=?3 AND epoch=?4 AND owner_token=?5
+               AND lease_state='active'",
+            params![
+                now,
+                expiry,
+                self.identity.scope_id.to_text(),
+                sql_i64(self.identity.epoch, "observer epoch")?,
+                hex::encode(self.identity.owner_token)
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::WorkspaceLocked(
+                "observer owner changed while publication was waiting".into(),
+            ));
+        }
+        Ok(workspace_lock)
     }
 
     fn retire(&mut self, reason: &str) {
         if self.authorized {
-            self.authorized = false;
             if let Ok(_workspace_lock) = self.acquire_observer_publication_lock() {
                 revoke_owner(
                     &self.control,
@@ -1131,6 +1147,7 @@ impl SegmentWriter {
                     reason,
                 );
             }
+            self.authorized = false;
         }
     }
 

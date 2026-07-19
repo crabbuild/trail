@@ -247,7 +247,6 @@ fn sixty_four_observers_serialize_publication_without_ambiguous_failures() {
     const OBSERVERS: usize = 64;
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
-    trail::test_support::set_changed_path_authority_override(true);
     let _authority = AuthorityOverride;
     let workspace = Arc::new(temp.path().to_path_buf());
     let start = Arc::new(Barrier::new(OBSERVERS + 1));
@@ -256,6 +255,14 @@ fn sixty_four_observers_serialize_publication_without_ambiguous_failures() {
             let workspace = Arc::clone(&workspace);
             let start = Arc::clone(&start);
             thread::spawn(move || {
+                struct WorkerAuthorityOverride;
+                impl Drop for WorkerAuthorityOverride {
+                    fn drop(&mut self) {
+                        trail::test_support::set_changed_path_authority_override(false);
+                    }
+                }
+                trail::test_support::set_changed_path_authority_override(true);
+                let _authority = WorkerAuthorityOverride;
                 let lane = format!("observer-{index:02}");
                 let mut db = Trail::open(&*workspace).unwrap();
                 start.wait();

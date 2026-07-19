@@ -1584,7 +1584,7 @@ mod schema_handoff_tests {
                 [],
             )
             .unwrap();
-        fail_next_schema_validation(&db_path);
+        let _failure = fail_next_schema_validation(&db_path);
         let advancing_path = db_path.clone();
         let advancing = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
@@ -1903,8 +1903,11 @@ mod schema_handoff_tests {
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
         let db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
-        fail_next_schema_validation(&db_path);
-        delay_next_schema_validation_server_shutdown_for_test(&db_path, Duration::from_millis(300));
+        let _failure = fail_next_schema_validation(&db_path);
+        let _shutdown_delay = delay_next_schema_validation_server_shutdown_for_test(
+            &db_path,
+            Duration::from_millis(300),
+        );
         let barrier = Arc::new(Barrier::new(16));
         let started = Instant::now();
         let handles = (0..16)
@@ -1945,7 +1948,10 @@ mod schema_handoff_tests {
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
         let db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
-        delay_next_schema_validation_server_start_for_test(&db_path, Duration::from_millis(300));
+        let _start_delay = delay_next_schema_validation_server_start_for_test(
+            &db_path,
+            Duration::from_millis(300),
+        );
 
         let started = Instant::now();
         Trail::open(root.path()).unwrap();
@@ -1963,7 +1969,7 @@ mod schema_handoff_tests {
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
         let canonical_db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
-        delay_next_schema_validation_server_shutdown_for_test(
+        let _shutdown_delay = delay_next_schema_validation_server_shutdown_for_test(
             &canonical_db_path,
             Duration::from_millis(300),
         );

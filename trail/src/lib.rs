@@ -23,6 +23,11 @@ pub use model::*;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod test_support {
+    #[allow(dead_code)]
+    pub(crate) mod scoped_state {
+        include!("test_support/scoped_state.rs");
+    }
+
     pub fn create_schema_v18_fixture(workspace: &std::path::Path) -> Result<(), String> {
         crate::db::create_schema_v18_fixture_for_test(workspace).map_err(|error| error.to_string())
     }

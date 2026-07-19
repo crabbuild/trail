@@ -104,7 +104,7 @@ static SCHEMA_VALIDATION_SERVERS: OnceLock<Mutex<HashMap<PathBuf, ActiveSchemaVa
 static NEXT_SCHEMA_VALIDATION_SERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 #[cfg(test)]
 type SchemaSnapshotGenerationHook = Box<dyn FnOnce(&Path) + Send>;
 #[cfg(test)]
@@ -176,12 +176,11 @@ fn clear_schema_wal_digest_attempt_hook(path: &Path) {
 }
 
 #[cfg(test)]
-fn fail_next_schema_validation(db_path: &Path) {
-    SCHEMA_VALIDATION_FAILURES
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(db_path.to_path_buf());
+fn fail_next_schema_validation(
+    db_path: &Path,
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, ()> {
+    let failures = SCHEMA_VALIDATION_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    crate::test_support::scoped_state::ScopedTestState::install(failures, db_path.to_path_buf(), ())
 }
 
 #[cfg(test)]
@@ -209,25 +208,29 @@ fn run_schema_snapshot_generation_hook(db_path: &Path) {
 }
 
 #[cfg(test)]
-fn delay_next_schema_validation_server_start_for_test(db_path: &Path, delay: Duration) {
-    NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(db_path.to_path_buf())
-        .or_default()
-        .0 = delay.as_millis() as u64;
+fn delay_next_schema_validation_server_start_for_test(
+    db_path: &Path,
+    delay: Duration,
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, (u64, u64)> {
+    let delays = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS.get_or_init(|| Mutex::new(HashMap::new()));
+    crate::test_support::scoped_state::ScopedTestState::install(
+        delays,
+        db_path.to_path_buf(),
+        (delay.as_millis() as u64, 0),
+    )
 }
 
 #[cfg(test)]
-fn delay_next_schema_validation_server_shutdown_for_test(db_path: &Path, delay: Duration) {
-    NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(db_path.to_path_buf())
-        .or_default()
-        .1 = delay.as_millis() as u64;
+fn delay_next_schema_validation_server_shutdown_for_test(
+    db_path: &Path,
+    delay: Duration,
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, (u64, u64)> {
+    let delays = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS.get_or_init(|| Mutex::new(HashMap::new()));
+    crate::test_support::scoped_state::ScopedTestState::install(
+        delays,
+        db_path.to_path_buf(),
+        (0, delay.as_millis() as u64),
+    )
 }
 
 #[cfg(test)]
@@ -1643,10 +1646,11 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     schema_validation_process_test_probe()?;
     #[cfg(test)]
     if SCHEMA_VALIDATION_FAILURES
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(db_path)
+        .is_some()
     {
         std::thread::sleep(Duration::from_millis(100));
         return Err(schema_reinitialize_error(
@@ -3533,8 +3537,10 @@ fn workspace_lock_admission_can_wait(
             WorkspaceLockPurpose::LaneAssociation | WorkspaceLockPurpose::ObserverStartup,
         ) => true,
         (WorkspaceLockPurpose::ObserverPublication, WorkspaceLockPurpose::ObserverPublication) => {
-            matches!((admission.operation_id, holder.operation_id.as_deref()),
-            (Some(requested), Some(held)) if requested != held)
+            true
+        }
+        (WorkspaceLockPurpose::CommandMutation, WorkspaceLockPurpose::CommandMutation) => {
+            !admission.deadline.is_zero()
         }
         _ => false,
     }
@@ -3999,7 +4005,6 @@ fn create_workspace_lock_candidate(
         // safe (no owner survives, and a reappearing record is reaped). Avoiding
         // directory barriers also keeps every workspace command off that hot
         // durability path.
-        file.sync_all()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
             .map_err(std::io::Error::from)?;

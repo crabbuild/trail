@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -24,6 +26,45 @@ const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 static SPILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static CAPTURE_WORKER_PAUSES: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pause_capture_worker_for_test(
+    workspace_root: &Path,
+) -> (
+    crate::test_support::scoped_state::ScopedTestState<PathBuf, Arc<AtomicBool>>,
+    Arc<AtomicBool>,
+) {
+    let key = fs::canonicalize(workspace_root).unwrap();
+    let paused = Arc::new(AtomicBool::new(true));
+    let pauses = CAPTURE_WORKER_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = crate::test_support::scoped_state::ScopedTestState::install(
+        pauses,
+        key,
+        Arc::clone(&paused),
+    );
+    (guard, paused)
+}
+
+#[cfg(test)]
+fn wait_for_capture_worker_test_pause(workspace_root: &Path) {
+    let key = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    loop {
+        let paused = CAPTURE_WORKER_PAUSES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .is_some_and(|paused| paused.load(Ordering::Acquire));
+        if !paused {
+            return;
+        }
+        thread::yield_now();
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CapturedFrame {
@@ -113,6 +154,8 @@ impl CaptureIngress {
         let worker = thread::Builder::new()
             .name("trail-acp-capture".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                wait_for_capture_worker_test_pause(&_workspace_root);
                 let panic_health = Arc::clone(&worker_health);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     capture_worker(
@@ -1157,11 +1200,8 @@ mod tests {
             upstream_env: BTreeMap::new(),
         };
         let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
-        fs::write(
-            temp.path().join(".trail/lock"),
-            format!("pid={} created_at=0\n", std::process::id()),
-        )
-        .unwrap();
+        let (_pause_guard, paused) = pause_capture_worker_for_test(temp.path());
+        let lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
@@ -1184,6 +1224,7 @@ mod tests {
                 ))
                 .unwrap();
         }
+        paused.store(false, Ordering::Release);
         let shutdown_started = Instant::now();
         let report = ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
         assert!(shutdown_started.elapsed() < CAPTURE_SHUTDOWN_TIMEOUT + Duration::from_millis(250));
@@ -1191,7 +1232,7 @@ mod tests {
             report.spilled >= 1,
             "the bounded queue never entered spill mode"
         );
-        fs::remove_file(temp.path().join(".trail/lock")).unwrap();
+        drop(lock);
 
         let preserved = fs::read_dir(temp.path().join(".trail/acp-ingress"))
             .unwrap()

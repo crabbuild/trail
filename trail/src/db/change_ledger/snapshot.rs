@@ -15,10 +15,12 @@ use crate::model::{Operation, RefRecord};
 use crate::{ObjectId, Result};
 use rusqlite::params;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-static COMMAND_AUTHORITY_OVERRIDE: AtomicBool = AtomicBool::new(false);
+#[cfg(debug_assertions)]
+thread_local! {
+    static COMMAND_AUTHORITY_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const LEDGER_AUTHORITY_ENABLED: bool = true;
@@ -46,7 +48,7 @@ fn checked_activation_enabled() -> bool {
 /// production authority through process-global state.
 pub(crate) fn command_authority_enabled() -> bool {
     if cfg!(debug_assertions) {
-        checked_activation_enabled() && COMMAND_AUTHORITY_OVERRIDE.load(Ordering::Acquire)
+        checked_activation_enabled() && COMMAND_AUTHORITY_OVERRIDE.with(std::cell::Cell::get)
     } else {
         checked_activation_enabled()
     }
@@ -54,7 +56,7 @@ pub(crate) fn command_authority_enabled() -> bool {
 
 #[cfg(debug_assertions)]
 pub(crate) fn set_command_authority_override(enabled: bool) {
-    COMMAND_AUTHORITY_OVERRIDE.store(enabled, Ordering::Release);
+    COMMAND_AUTHORITY_OVERRIDE.with(|override_enabled| override_enabled.set(enabled));
 }
 
 #[derive(Clone, Debug)]
