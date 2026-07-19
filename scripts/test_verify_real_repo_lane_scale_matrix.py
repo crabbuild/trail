@@ -56,7 +56,7 @@ raise SystemExit(64)
 
 
 FAKE_INNER = r'''#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import hashlib, json, os, pathlib, subprocess, sys, time
 
 repo = pathlib.Path(os.environ["TRAIL_SCALE_REPO"]).resolve()
 output = pathlib.Path(os.environ["TRAIL_SCALE_OUTPUT"])
@@ -101,6 +101,10 @@ if os.environ.get("FAKE_INNER_FAIL_LANES") == str(lanes):
 if os.environ.get("FAKE_INNER_MUTATE_SOURCE_TRAIL_LANES") == str(lanes):
     canonical = pathlib.Path(os.environ["FAKE_CANONICAL_REPO"])
     (canonical / ".trail/misrouted-inner-state").write_text("mutated\n", encoding="utf-8")
+if os.environ.get("FAKE_INNER_TOUCH_SOURCE_TRAIL_LANES") == str(lanes):
+    target = pathlib.Path(os.environ["FAKE_CANONICAL_REPO"]) / ".trail/stale-source-state"
+    metadata = target.stat()
+    os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000))
 if os.environ.get("FAKE_INNER_BLOCK_LANES") == str(lanes):
     pathlib.Path(os.environ["FAKE_INNER_PID_FILE"]).write_text(
         json.dumps({"pid": os.getpid(), "pgid": os.getpgrp()}) + "\n", encoding="utf-8"
@@ -113,10 +117,30 @@ def git(*args: str) -> str:
 
 parent = git("rev-parse", "HEAD")
 tree = git("rev-parse", "HEAD^{tree}")
-commit = subprocess.check_output(
-    ["git", "-C", str(repo), "commit-tree", tree, "-p", parent, "-m", f"fake scale {lanes}"],
-    text=True,
-).strip()
+topology = os.environ.get("FAKE_INNER_TOPOLOGY") if os.environ.get("FAKE_INNER_TOPOLOGY_LANES") == str(lanes) else "single"
+if topology == "merge":
+    side = subprocess.check_output(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", parent, "-m", "fake side"],
+        text=True,
+    ).strip()
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", parent, "-p", side,
+         "-m", f"fake merge scale {lanes}"], text=True,
+    ).strip()
+elif topology == "multi":
+    first = subprocess.check_output(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", parent, "-m", "fake first"],
+        text=True,
+    ).strip()
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", first,
+         "-m", f"fake second scale {lanes}"], text=True,
+    ).strip()
+else:
+    commit = subprocess.check_output(
+        ["git", "-C", str(repo), "commit-tree", tree, "-p", parent,
+         "-m", f"fake scale {lanes}"], text=True,
+    ).strip()
 subprocess.run(["git", "-C", str(repo), "update-ref", ref, commit, ""], check=True)
 (output / "checker.out").write_text(
     json.dumps({"status": "PASS", "lanes": lanes, "commands": 1, "faults": 0}, sort_keys=True) + "\n",
@@ -136,6 +160,32 @@ if os.environ.get("FAKE_INNER_TAMPER_PRIOR_LANES") == str(lanes):
         proof = json.loads(proof_path.read_text(encoding="utf-8"))
         proof["lanes"] = 999
         proof_path.write_text(json.dumps(proof, sort_keys=True) + "\n", encoding="utf-8")
+    elif kind == "topology-multi":
+        proof_path = prior_run / "proof.json"
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        prior_repo = pathlib.Path(proof["copy"])
+        prior_tree = subprocess.check_output(
+            ["git", "-C", str(prior_repo), "rev-parse", proof["baseline"] + "^{tree}"],
+            text=True,
+        ).strip()
+        first = subprocess.check_output(
+            ["git", "-C", str(prior_repo), "commit-tree", prior_tree, "-p", proof["baseline"],
+             "-m", "coherent first"], text=True,
+        ).strip()
+        second = subprocess.check_output(
+            ["git", "-C", str(prior_repo), "commit-tree", prior_tree, "-p", first,
+             "-m", "coherent second"], text=True,
+        ).strip()
+        subprocess.run(["git", "-C", str(prior_repo), "update-ref", proof["ref"], second], check=True)
+        bundle = pathlib.Path(proof["bundle"])
+        bundle.unlink()
+        subprocess.run(["git", "-C", str(prior_repo), "bundle", "create", str(bundle), proof["ref"]],
+                       check=True, stdout=subprocess.DEVNULL)
+        proof["commit"] = second
+        proof["tree"] = prior_tree
+        proof["bundle_sha256"] = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        proof_path.write_text(json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+                              encoding="utf-8")
     else:
         raise SystemExit("unsupported tamper kind")
 print("fake inner PASS")
@@ -164,6 +214,31 @@ if "show-ref" in args:
     print("injected show-ref operational failure", file=sys.stderr)
     raise SystemExit(2)
 real = os.environ["FAKE_REAL_GIT"]
+os.execv(real, [real, *args])
+'''
+
+
+GIT_PUBLICATION_TOCTOU_WRAPPER = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+real = os.environ["FAKE_REAL_GIT"]
+state = pathlib.Path(os.environ["FAKE_TOCTOU_STATE"])
+proof = pathlib.Path(os.environ["FAKE_TOCTOU_PROOF"])
+bundle = pathlib.Path(os.environ["FAKE_TOCTOU_BUNDLE"])
+proof_marker = pathlib.Path(os.environ["FAKE_TOCTOU_PROOF_MARKER"])
+bundle_marker = pathlib.Path(os.environ["FAKE_TOCTOU_BUNDLE_MARKER"])
+if "bundle" in args and "list-heads" in args:
+    count = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    state.write_text(str(count + 1), encoding="utf-8")
+if "for-each-ref" in args and state.exists() and state.read_text(encoding="utf-8") == "2" and not proof_marker.exists():
+    value = json.loads(proof.read_text(encoding="utf-8"))
+    value["commit"] = value["baseline"]
+    proof.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    proof_marker.write_text("tampered\n", encoding="utf-8")
+if "fetch" in args and not bundle_marker.exists():
+    with bundle.open("ab") as stream:
+        stream.write(b"concurrent tamper")
+    bundle_marker.write_text("tampered\n", encoding="utf-8")
 os.execv(real, [real, *args])
 '''
 
@@ -409,6 +484,34 @@ class DisposableScaleMatrixTests(unittest.TestCase):
         self.assertEqual(final["index_digest"], baseline["index_digest"])
         self.assertEqual(final["worktree"], baseline["worktree"])
 
+    def test_publication_uses_captured_proof_and_staged_bundle_after_concurrent_tamper(self) -> None:
+        wrapper_dir = self.root / "publication-toctou-bin"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text(GIT_PUBLICATION_TOCTOU_WRAPPER, encoding="utf-8")
+        wrapper.chmod(0o755)
+        real_git = shutil.which("git")
+        assert real_git is not None
+        baseline = self.git("rev-parse", "HEAD")
+        proof_marker = self.root / "proof-tampered"
+        bundle_marker = self.root / "bundle-tampered"
+        result = self.run_matrix(publish="1", extra_env={
+            "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+            "FAKE_REAL_GIT": real_git,
+            "FAKE_TOCTOU_STATE": str(self.root / "list-heads-count"),
+            "FAKE_TOCTOU_PROOF": str(self.output / "runs/64/proof.json"),
+            "FAKE_TOCTOU_BUNDLE": str(self.output / "runs/64/final.bundle"),
+            "FAKE_TOCTOU_PROOF_MARKER": str(proof_marker),
+            "FAKE_TOCTOU_BUNDLE_MARKER": str(bundle_marker),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(proof_marker.is_file())
+        self.assertTrue(bundle_marker.is_file())
+        commit64 = self.git("rev-parse", "refs/heads/codex/trail-scale-contract-64")
+        commit128 = self.git("rev-parse", "refs/heads/codex/trail-scale-contract-128")
+        self.assertNotEqual(commit64, baseline)
+        self.assertNotEqual(commit128, baseline)
+
     def test_clonefile_failure_aborts_without_byte_copy_fallback(self) -> None:
         interposer = self.build_clonefile_failure_interposer()
         destination = self.root / "failed-clone"
@@ -506,6 +609,22 @@ class DisposableScaleMatrixTests(unittest.TestCase):
         self.assertIn("raced", value["failure"]["message"])
         self.assertFalse(value["byte_copy_fallback"])
 
+    def test_clone_helper_rejects_manifest_inside_either_tree(self) -> None:
+        for location in ("source", "destination"):
+            with self.subTest(location=location):
+                source = self.root / f"manifest-{location}-source"
+                destination = self.root / f"manifest-{location}-destination"
+                source.mkdir(); destination.mkdir()
+                (source / "data.txt").write_text("data\n", encoding="utf-8")
+                parent = source if location == "source" else destination
+                manifest = parent / "clone-manifest.json"
+                result = subprocess.run(
+                    ["python3", str(CLONE_HELPER), str(source), str(destination), str(manifest)],
+                    text=True, capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("manifest", result.stderr)
+
     def test_source_root_trail_mutation_is_detected(self) -> None:
         result = self.run_matrix(
             extra_env={"FAKE_INNER_MUTATE_SOURCE_TRAIL_LANES": "64"},
@@ -514,6 +633,35 @@ class DisposableScaleMatrixTests(unittest.TestCase):
         self.assertIn("source repository drifted", result.stderr)
         self.assertEqual([call["lanes"] for call in self.calls()], [64])
         self.assertFalse((self.output / "runs/128").exists())
+
+    def test_source_root_trail_metadata_only_drift_is_detected(self) -> None:
+        result = self.run_matrix(extra_env={"FAKE_INNER_TOUCH_SOURCE_TRAIL_LANES": "64"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source repository drifted", result.stderr)
+        self.assertEqual([call["lanes"] for call in self.calls()], [64])
+        self.assertFalse((self.output / "runs/128").exists())
+
+    def test_merge_commit_is_rejected_during_proof_creation(self) -> None:
+        result = self.run_matrix(extra_env={
+            "FAKE_INNER_TOPOLOGY_LANES": "64",
+            "FAKE_INNER_TOPOLOGY": "merge",
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one commit", result.stderr)
+        self.assertEqual([call["lanes"] for call in self.calls()], [64])
+        self.assertFalse((self.output / "runs/64/proof.json").exists())
+        self.assertFalse((self.output / "runs/128").exists())
+
+    def test_multicommit_chain_is_rejected_during_prepublication_revalidation(self) -> None:
+        result = self.run_matrix(
+            publish="1",
+            extra_env={"FAKE_INNER_TAMPER_PRIOR_LANES": "128",
+                       "FAKE_INNER_TAMPER_PRIOR_KIND": "topology-multi"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("proof revalidation", result.stderr)
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-64"))
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-128"))
 
     def test_publication_revalidates_stored_checker_hash(self) -> None:
         result = self.run_matrix(

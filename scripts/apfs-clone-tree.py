@@ -284,6 +284,8 @@ def validate(source_value: str, destination_value: str, manifest_value: str) -> 
     if os.path.lexists(manifest):
         raise FileExistsError(errno.EEXIST, "manifest already exists", str(manifest))
     canonical_existing_directory(str(manifest.parent))
+    if source in manifest.parents or destination in manifest.parents:
+        raise ValueError("manifest must be outside source and destination trees")
     with os.scandir(destination) as stream:
         if next(stream, None) is not None:
             raise ValueError("destination must be empty")

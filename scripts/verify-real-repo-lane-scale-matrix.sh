@@ -242,7 +242,7 @@ def visit(directory):
         if mode == "checkout" and first == ".git": continue
         metadata=os.lstat(path)
         permission=stat.S_IMODE(metadata.st_mode)
-        row={"path":relative,"mode":permission}
+        row={"path":relative,"mode":permission,"mtime_ns":metadata.st_mtime_ns}
         if stat.S_ISLNK(metadata.st_mode):
             target=os.readlink(path)
             row.update(type="symlink",size=len(os.fsencode(target)),
@@ -547,58 +547,121 @@ revalidate_run_proof() {
   local git_ref=$5
   local baseline=$6
   local run_dir=$7
+  local staged_bundle=$8
   local proof=$run_dir/proof.json
-  python3 - "$proof" "$count" "$run_id" "$copy" "$evidence" "$git_ref" "$baseline" \
-    "$run_dir/final.bundle" "$pinned_trail_sha" <<'PY'
-import hashlib, json, os, stat, sys
-proof_path,count,run_id,copy,evidence,ref,baseline,bundle,binary_sha=sys.argv[1:]
+  local captured
+  captured=$(python3 - "$proof" "$count" "$run_id" "$copy" "$evidence" "$git_ref" "$baseline" \
+    "$run_dir/final.bundle" "$pinned_trail_sha" "$staged_bundle" <<'PY'
+import errno, hashlib, json, os, stat, sys
+proof_path,count,run_id,copy,evidence,ref,baseline,bundle,binary_sha,staged=sys.argv[1:]
 expected_keys={"schema_version","lanes","run_id","copy","evidence","ref","baseline",
                "commit","tree","bundle","bundle_sha256","checker_sha256","binary_sha256"}
-metadata=os.lstat(proof_path)
-if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-    raise SystemExit("proof is not a regular non-symlink file")
-value=json.load(open(proof_path,encoding="utf-8"))
+def read_once(path):
+    descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode): raise SystemExit(f"artifact is not regular: {path}")
+        chunks=[]
+        while True:
+            chunk=os.read(descriptor,1024*1024)
+            if not chunk: break
+            chunks.append(chunk)
+        after=os.fstat(descriptor)
+        fingerprint=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_size,
+                                 item.st_mtime_ns,item.st_ctime_ns)
+        if fingerprint(before) != fingerprint(after): raise SystemExit(f"artifact raced: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+value=json.loads(read_once(proof_path).decode("utf-8"))
 if set(value) != expected_keys: raise SystemExit("proof schema is not exact")
 expected={"schema_version":1,"lanes":int(count),"run_id":run_id,"copy":copy,
           "evidence":evidence,"ref":ref,"baseline":baseline,"bundle":bundle,
           "binary_sha256":binary_sha}
 for key,item in expected.items():
     if value.get(key) != item: raise SystemExit(f"proof binding mismatch: {key}")
-def digest(path):
-    metadata=os.lstat(path)
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise SystemExit(f"proof artifact is unsafe: {path}")
-    result=hashlib.sha256()
-    with open(path,"rb") as stream:
-        while True:
-            chunk=stream.read(1024*1024)
-            if not chunk: break
-            result.update(chunk)
-    return result.hexdigest()
-if digest(bundle) != value["bundle_sha256"]: raise SystemExit("bundle hash mismatch")
 checker=os.path.join(evidence,"checker.out")
-if digest(checker) != value["checker_sha256"]: raise SystemExit("checker hash mismatch")
+if hashlib.sha256(read_once(checker)).hexdigest() != value["checker_sha256"]:
+    raise SystemExit("checker hash mismatch")
+source_fd=os.open(bundle,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+    before=os.fstat(source_fd)
+    if not stat.S_ISREG(before.st_mode): raise SystemExit("bundle is not regular")
+    destination_fd=os.open(staged,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o444)
+    digest=hashlib.sha256()
+    try:
+        while True:
+            chunk=os.read(source_fd,1024*1024)
+            if not chunk: break
+            digest.update(chunk)
+            view=memoryview(chunk)
+            while view:
+                written=os.write(destination_fd,view)
+                if written <= 0: raise OSError(errno.EIO,"short staged bundle write")
+                view=view[written:]
+        os.fchmod(destination_fd,0o444)
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    after=os.fstat(source_fd)
+    fingerprint=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_size,
+                             item.st_mtime_ns,item.st_ctime_ns)
+    if fingerprint(before) != fingerprint(after): raise SystemExit("bundle raced during staging")
+finally:
+    os.close(source_fd)
+bundle_sha=digest.hexdigest()
+if bundle_sha != value["bundle_sha256"]: raise SystemExit("bundle hash mismatch")
+parent_fd=os.open(os.path.dirname(staged),os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try: os.fsync(parent_fd)
+finally: os.close(parent_fd)
+print(value["commit"]); print(value["tree"]); print(value["ref"]); print(staged); print(bundle_sha)
 PY
-  [[ $? -eq 0 ]] || return 1
-  local identities
-  identities=$(python3 - "$proof" <<'PY'
-import json,sys
-value=json.load(open(sys.argv[1],encoding="utf-8")); print(value["commit"]); print(value["tree"])
-PY
-) || return 1
+  ) || return 1
   local commit
   local tree
-  commit=$(printf '%s\n' "$identities" | sed -n '1p')
-  tree=$(printf '%s\n' "$identities" | sed -n '2p')
+  local captured_ref
+  local bundle_sha
+  commit=$(printf '%s\n' "$captured" | sed -n '1p')
+  tree=$(printf '%s\n' "$captured" | sed -n '2p')
+  captured_ref=$(printf '%s\n' "$captured" | sed -n '3p')
+  staged_bundle=$(printf '%s\n' "$captured" | sed -n '4p')
+  bundle_sha=$(printf '%s\n' "$captured" | sed -n '5p')
+  [[ $(printf '%s\n' "$captured" | wc -l | tr -d '[:space:]') == 5 ]] || return 1
+  [[ $captured_ref == "$git_ref" ]] || return 1
   [[ $(git -C "$copy" rev-parse "$git_ref^{commit}") == "$commit" ]] || return 1
   [[ $(git -C "$copy" rev-parse "$commit^{tree}") == "$tree" ]] || return 1
-  git -C "$copy" merge-base --is-ancestor "$baseline" "$commit" || return 1
+  validate_exact_export_topology "$copy" "$baseline" "$commit" || return 1
   validate_checker_pass "$evidence/checker.out" "$count" || return 1
-  git -C "$copy" bundle verify "$run_dir/final.bundle" >/dev/null 2>&1 || return 1
+  git -C "$copy" bundle verify "$staged_bundle" >/dev/null 2>&1 || return 1
   local heads
-  heads=$(git -C "$copy" bundle list-heads "$run_dir/final.bundle") || return 1
+  heads=$(git -C "$copy" bundle list-heads "$staged_bundle") || return 1
   [[ $heads == "$commit $git_ref" ]] || return 1
   assert_pinned_binary
+  printf '%s\n%s\n%s\n%s\n%s\n' "$commit" "$tree" "$captured_ref" "$staged_bundle" "$bundle_sha"
+}
+
+assert_staged_bundle() {
+  local bundle=$1
+  local expected_sha=$2
+  python3 - "$bundle" <<'PY'
+import os,stat,sys
+metadata=os.lstat(sys.argv[1])
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit("staged bundle is unsafe")
+PY
+  [[ $(sha256_file "$bundle") == "$expected_sha" ]]
+}
+
+validate_exact_export_topology() {
+  local copy=$1
+  local baseline=$2
+  local commit=$3
+  local parents
+  local count
+  parents=$(git -C "$copy" show -s --format='%P' "$commit") || return 1
+  [[ $parents == "$baseline" ]] || return 1
+  count=$(git -C "$copy" rev-list --count "$baseline..$commit") || return 1
+  [[ $count == 1 ]]
 }
 
 create_run_proof() {
@@ -613,7 +676,8 @@ create_run_proof() {
   local tree
   local bundle=$run_dir/final.bundle
   commit=$(git -C "$copy" rev-parse "$git_ref^{commit}") || die "missing dedicated ref after $count-lane PASS"
-  git -C "$copy" merge-base --is-ancestor "$baseline" "$commit" || die "$count-lane commit is not based on copied HEAD"
+  validate_exact_export_topology "$copy" "$baseline" "$commit" ||
+    die "$count-lane exported commit must be exactly one commit whose sole parent is copied HEAD"
   tree=$(git -C "$copy" rev-parse "$commit^{tree}")
   git -C "$copy" bundle create "$bundle" "$git_ref" >/dev/null
   git -C "$copy" bundle verify "$bundle" >"$run_dir/bundle.verify" 2>&1 || die "$count-lane bundle verification failed"
@@ -631,28 +695,22 @@ with open(path,"w",encoding="utf-8") as stream:
 PY
 }
 
-proof_field() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-print(json.load(open(sys.argv[1],encoding="utf-8"))[sys.argv[2]])
-PY
-}
-
 verify_postpublication_source() {
-  local proof64=$1
-  local proof128=$2
+  local ref64=$1
+  local commit64=$2
+  local ref128=$3
+  local commit128=$4
   local worktree_inventory=$TRAIL_SCALE_MATRIX_OUTPUT/source-postpublish-checkout.json
   local source_snapshot=$TRAIL_SCALE_MATRIX_OUTPUT/source-postpublish.json
   capture_inventory "$TRAIL_SCALE_REPO" checkout "$worktree_inventory"
   capture_source_snapshot "$TRAIL_SCALE_REPO" checkout "$source_snapshot" "$worktree_inventory"
   python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/source-checkout-baseline.json" "$source_snapshot" \
-    "$proof64" "$proof128" <<'PY'
+    "$ref64" "$commit64" "$ref128" "$commit128" <<'PY'
 import json, sys
 before=json.load(open(sys.argv[1],encoding="utf-8")); after=json.load(open(sys.argv[2],encoding="utf-8"))
-proofs=[json.load(open(path,encoding="utf-8")) for path in sys.argv[3:]]
 for key in ["head","symbolic_head","status_sha256","status_hex","index","inventory"]:
     if before[key] != after[key]: raise SystemExit(f"source checkout drifted after publication: {key}")
-expected={proof["ref"]+"\0"+proof["commit"] for proof in proofs}
+expected={sys.argv[3]+"\0"+sys.argv[4],sys.argv[5]+"\0"+sys.argv[6]}
 before_refs=set(before["refs"]); after_refs=set(after["refs"])
 if not before_refs.issubset(after_refs): raise SystemExit("an original source ref changed or disappeared")
 if after_refs-before_refs != expected: raise SystemExit("publication changed refs outside the exact run refs")
@@ -779,29 +837,43 @@ proof128=$TRAIL_SCALE_MATRIX_OUTPUT/runs/128/proof.json
 assert_source_unchanged "pre-publication"
 
 if [[ $TRAIL_SCALE_MATRIX_PUBLISH == 1 ]]; then
-  revalidate_run_proof 64 "$copy64" "$evidence64" "$run_id64" "$ref64" "$baseline64" \
-    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/64" || die "proof revalidation failed for 64 lanes"
-  revalidate_run_proof 128 "$copy128" "$evidence128" "$run_id128" "$ref128" "$baseline128" \
-    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/128" || die "proof revalidation failed for 128 lanes"
+  publication_stage=$TRAIL_SCALE_MATRIX_OUTPUT/publication-stage
+  mkdir -- "$publication_stage"
+  publication64=$(revalidate_run_proof 64 "$copy64" "$evidence64" "$run_id64" "$ref64" "$baseline64" \
+    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/64" "$publication_stage/64.bundle") ||
+    die "proof revalidation failed for 64 lanes"
+  publication128=$(revalidate_run_proof 128 "$copy128" "$evidence128" "$run_id128" "$ref128" "$baseline128" \
+    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/128" "$publication_stage/128.bundle") ||
+    die "proof revalidation failed for 128 lanes"
+  chmod 0555 "$publication_stage"
+  commit64=$(printf '%s\n' "$publication64" | sed -n '1p')
+  tree64=$(printf '%s\n' "$publication64" | sed -n '2p')
+  publish_ref64=$(printf '%s\n' "$publication64" | sed -n '3p')
+  bundle64=$(printf '%s\n' "$publication64" | sed -n '4p')
+  bundle_sha64=$(printf '%s\n' "$publication64" | sed -n '5p')
+  commit128=$(printf '%s\n' "$publication128" | sed -n '1p')
+  tree128=$(printf '%s\n' "$publication128" | sed -n '2p')
+  publish_ref128=$(printf '%s\n' "$publication128" | sed -n '3p')
+  bundle128=$(printf '%s\n' "$publication128" | sed -n '4p')
+  bundle_sha128=$(printf '%s\n' "$publication128" | sed -n '5p')
   assert_source_unchanged "proof revalidation"
-  require_ref_absent "$ref64"
-  require_ref_absent "$ref128"
-  commit64=$(proof_field "$proof64" commit)
-  commit128=$(proof_field "$proof128" commit)
-  bundle64=$(proof_field "$proof64" bundle)
-  bundle128=$(proof_field "$proof128" bundle)
-  git -C "$TRAIL_SCALE_REPO" fetch --no-tags --no-write-fetch-head "$bundle64" "$ref64" >/dev/null
-  git -C "$TRAIL_SCALE_REPO" fetch --no-tags --no-write-fetch-head "$bundle128" "$ref128" >/dev/null
-  [[ $(git -C "$TRAIL_SCALE_REPO" rev-parse "$commit64^{tree}") == "$(proof_field "$proof64" tree)" ]] || die "imported 64-lane tree mismatch"
-  [[ $(git -C "$TRAIL_SCALE_REPO" rev-parse "$commit128^{tree}") == "$(proof_field "$proof128" tree)" ]] || die "imported 128-lane tree mismatch"
+  require_ref_absent "$publish_ref64"
+  require_ref_absent "$publish_ref128"
+  assert_staged_bundle "$bundle64" "$bundle_sha64" || die "staged 64-lane bundle changed before fetch"
+  git -C "$TRAIL_SCALE_REPO" fetch --no-tags --no-write-fetch-head "$bundle64" "$publish_ref64" >/dev/null
+  assert_staged_bundle "$bundle128" "$bundle_sha128" || die "staged 128-lane bundle changed before fetch"
+  git -C "$TRAIL_SCALE_REPO" fetch --no-tags --no-write-fetch-head "$bundle128" "$publish_ref128" >/dev/null
+  [[ $(git -C "$TRAIL_SCALE_REPO" rev-parse "$commit64^{tree}") == "$tree64" ]] || die "imported 64-lane tree mismatch"
+  [[ $(git -C "$TRAIL_SCALE_REPO" rev-parse "$commit128^{tree}") == "$tree128" ]] || die "imported 128-lane tree mismatch"
   {
     echo start
-    echo "create $ref64 $commit64"
-    echo "create $ref128 $commit128"
+    echo "create $publish_ref64 $commit64"
+    echo "create $publish_ref128 $commit128"
     echo prepare
     echo commit
   } | git -C "$TRAIL_SCALE_REPO" update-ref --stdin >/dev/null || die "atomic absent-only publication CAS failed"
-  verify_postpublication_source "$proof64" "$proof128" || die "source drifted outside exact published refs"
+  verify_postpublication_source "$publish_ref64" "$commit64" "$publish_ref128" "$commit128" ||
+    die "source drifted outside exact published refs"
 fi
 
 python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/matrix-summary.json" "$TRAIL_SCALE_MATRIX_RUN_ID" \

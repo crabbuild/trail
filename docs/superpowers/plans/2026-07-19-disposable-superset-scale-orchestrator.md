@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Work only in the isolated clone; never invoke the real Superset matrix.
-- Do not modify `scripts/verify-real-repo-lane-scale.sh` or `scripts/test_verify_real_repo_lane_scale.py`.
+- The coordinated release also modifies `scripts/verify-real-repo-lane-scale.sh` and its test to enforce the disposable owner contract; those companion edits are developed outside this isolated orchestrator branch.
 - The source, output parent, pinned binary, and both copies must be same-device APFS paths.
 - Recursive deletion is allowed only for the exact validated copied `.trail` directory.
 - Failed and successful copies/evidence are retained.
@@ -93,11 +93,11 @@ Implement `die`, `sha256_file`, `canonical_dir`, `device_id`, `filesystem_type`,
 
 - [ ] **Step 2: Add deterministic inventories**
 
-Embed Python that uses `os.scandir(..., follow_symlinks=False)` and `os.lstat` to record every entry's relative path, type, mode, size, and SHA-256 of regular bytes or symlink target. Produce both a full-copy inventory and a source invariant inventory excluding root `.trail`; separately record HEAD, symbolic HEAD, complete sorted refs, porcelain status with ignored entries, and Git index type/mode/digest.
+Embed Python that uses `os.scandir(..., follow_symlinks=False)` and `os.lstat` to record every entry's relative path, type, mode, nanosecond mtime, size, and SHA-256 of regular bytes or symlink target. Produce both a full-copy inventory and a full source invariant inventory including root `.trail`; separately record HEAD, symbolic HEAD, complete sorted refs, porcelain status with ignored entries, and Git index type/mode/digest.
 
 - [ ] **Step 3: Pin and validate Trail**
 
-Use same-device APFS COW copy to create `pinned/trail`, set mode `0555`, require matching SHA-256, run `--version`, run `init --help`, and require the help text to contain exact `--from-git` support.
+Use the secure no-follow, exclusive byte-copy path to create `pinned/trail`, fsync it, set mode `0555` and its directory non-writable, require matching SHA-256, run `--version`, run `init --help`, and require the help text to contain exact `--from-git` support.
 
 - [ ] **Step 4: Create and initialize each copy**
 
@@ -108,7 +108,7 @@ copy=$(mktemp -d "$run_root/copy-$count.XXXXXX")
 python3 scripts/apfs-clone-tree.py "$source" "$copy" "$run_dir/clone-manifest.json"
 ```
 
-Validate exact prefix/parent/realpath/device/APFS. Require a clonefile-only PASS manifest with complete syscall, hardlink, device, size, and digest accounting; compare full inventories; validate and remove only `$copy/.trail`; invoke the pinned binary with `--workspace "$copy" --json init --from-git`; and create the exact owner JSON beneath the new `$copy/.trail`. Never byte-copy-fallback a disposable tree.
+Validate exact prefix/parent/realpath/device/APFS and require the manifest path to be outside source and destination. Require a clonefile-only PASS manifest with complete syscall, hardlink, device, size, and digest accounting; compare full inventories; validate and remove only `$copy/.trail`; invoke the pinned binary with `--workspace "$copy" --json init --from-git`; and create the exact owner JSON beneath the new `$copy/.trail`. Never byte-copy-fallback a disposable tree.
 
 - [ ] **Step 5: Invoke the inner harness once**
 
@@ -139,7 +139,7 @@ Run the focused unittest command. Expected: independent/preservation and failure
 
 - [ ] **Step 1: Produce proof after each PASS**
 
-Resolve the copy baseline, dedicated commit, and tree; require commit ancestry from baseline. Create `final.bundle`, run `git bundle verify`, and write `proof.json` containing schema version, lanes, run ID, copy, evidence, ref, baseline, commit, tree, bundle, and SHA-256 values.
+Resolve the copy baseline, dedicated commit, and tree; require exactly one parent equal to baseline and `rev-list --count baseline..commit == 1`. Create `final.bundle`, run `git bundle verify`, and write `proof.json` containing schema version, lanes, run ID, copy, evidence, ref, baseline, commit, tree, bundle, and SHA-256 values.
 
 - [ ] **Step 2: Add publication preflight**
 
@@ -147,7 +147,7 @@ Before any run, derive both final source refs and require both absent in every p
 
 - [ ] **Step 3: Revalidate, import, and atomically create refs**
 
-Revalidate the exact proof schema/bindings, all stored hashes, checker PASS, bundle verification and exact heads, and copy commit/tree/ancestry. Fetch each exact proof commit using `git fetch --no-tags --no-write-fetch-head BUNDLE COMMIT`, verify imported commit/tree identities, then use one `git update-ref --stdin` transaction with two `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation.
+Parse each proof once and capture its validated commit/tree/ref/digest. Revalidate the exact schema/bindings, all stored hashes, checker PASS, bundle verification and exact heads, and the exact one-commit parent topology while securely staging the already-open bundle. Rehash each read-only staged bundle immediately before fetching its captured ref with `git fetch --no-tags --no-write-fetch-head STAGED_BUNDLE REF`, verify imported commit/tree identities from captured values, then use one `git update-ref --stdin` transaction with two captured `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation or proof/bundle TOCTOU substitution.
 
 - [ ] **Step 4: Recheck final source state**
 
