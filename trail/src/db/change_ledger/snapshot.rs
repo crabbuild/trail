@@ -47,11 +47,13 @@ fn checked_activation_enabled() -> bool {
 /// remain explicitly opt-in so parallel tests cannot accidentally share
 /// production authority through process-global state.
 pub(crate) fn command_authority_enabled() -> bool {
-    if cfg!(debug_assertions) {
-        checked_activation_enabled() && COMMAND_AUTHORITY_OVERRIDE.with(std::cell::Cell::get)
-    } else {
-        checked_activation_enabled()
+    #[cfg(debug_assertions)]
+    {
+        return checked_activation_enabled()
+            && COMMAND_AUTHORITY_OVERRIDE.with(std::cell::Cell::get);
     }
+    #[cfg(not(debug_assertions))]
+    checked_activation_enabled()
 }
 
 #[cfg(debug_assertions)]
