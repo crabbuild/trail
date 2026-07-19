@@ -674,6 +674,11 @@ impl ViewMutationJournal {
         self.generation
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_paths(&self) -> (&Path, &Path) {
+        (&self.path, &self.whiteout_path)
+    }
+
     pub(crate) fn rotate_after_checkpoint(
         upperdir: &Path,
         sequence: u64,

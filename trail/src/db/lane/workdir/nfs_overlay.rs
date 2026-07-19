@@ -1177,9 +1177,10 @@ mod macos {
                 .lane_workspace_view("authority-nfs-corrupt")
                 .unwrap()
                 .unwrap();
-            let layout = ViewUpperLayout::from_source_upper(PathBuf::from(view.source_upper));
-            fs::remove_file(layout.journal_path()).unwrap();
-            fs::remove_file(layout.whiteout_journal_path()).unwrap();
+            let journal = ViewMutationJournal::open(Path::new(&view.source_upper)).unwrap();
+            let (mutation_path, whiteout_path) = journal.active_paths();
+            fs::remove_file(mutation_path).unwrap();
+            fs::remove_file(whiteout_path).unwrap();
 
             crate::db::change_ledger::set_command_authority_override(true);
             let _reset = AuthorityReset;
