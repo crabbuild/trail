@@ -137,6 +137,7 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
         );
         let environment = BTreeMap::from([
             ("GOWORK".to_string(), "off".to_string()),
+            ("GOTOOLCHAIN".to_string(), "local".to_string()),
             (
                 "GOMODCACHE".to_string(),
                 module_cache.storage_path.to_string_lossy().into_owned(),
