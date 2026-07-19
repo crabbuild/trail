@@ -110,7 +110,7 @@ impl<O: FrameObserver> StdioRelay<O> {
         let first = done_rx.recv().map_err(|err| {
             Error::InvalidInput(format!("ACP relay pump failed before startup: {err}"))
         })?;
-        let reason = finish_reason(&first);
+        let initial_reason = finish_reason(&first);
         if matches!(first, PumpDone::Agent(_)) {
             stop_editor.store(true, Ordering::Release);
         }
@@ -128,6 +128,10 @@ impl<O: FrameObserver> StdioRelay<O> {
         })?;
 
         let (editor_result, agent_result) = pump_results(first, second)?;
+        let child_failure = (!exit.timed_out && !exit.status.success())
+            .then(|| format!("upstream ACP agent exited with status {}", exit.status));
+        let reason =
+            final_finish_reason(initial_reason, &editor_result, &agent_result, child_failure);
         self.observer.finish(reason);
         if !self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT) {
             return Err(Error::InvalidInput(
@@ -155,6 +159,23 @@ fn finish_reason(done: &PumpDone) -> RelayFinishReason {
         PumpDone::Editor(Err(err)) => RelayFinishReason::EditorError(err.to_string()),
         PumpDone::Agent(Ok(())) => RelayFinishReason::AgentEof,
         PumpDone::Agent(Err(err)) => RelayFinishReason::AgentError(err.to_string()),
+    }
+}
+
+fn final_finish_reason(
+    initial_reason: RelayFinishReason,
+    editor_result: &io::Result<()>,
+    agent_result: &io::Result<()>,
+    child_failure: Option<String>,
+) -> RelayFinishReason {
+    if let Err(error) = agent_result {
+        RelayFinishReason::AgentError(error.to_string())
+    } else if let Some(error) = child_failure {
+        RelayFinishReason::AgentError(error)
+    } else if let Err(error) = editor_result {
+        RelayFinishReason::EditorError(error.to_string())
+    } else {
+        initial_reason
     }
 }
 
@@ -406,6 +427,44 @@ mod tests {
         }
 
         fn finish(&self, _reason: RelayFinishReason) {}
+    }
+
+    #[test]
+    fn final_finish_reason_reports_upstream_failure_regardless_of_clean_pump_order() {
+        let editor_result = Ok(());
+        let agent_result = Ok(());
+        let failure = "upstream ACP agent exited with status 7";
+
+        for initial_reason in [RelayFinishReason::EditorEof, RelayFinishReason::AgentEof] {
+            assert_eq!(
+                final_finish_reason(
+                    initial_reason,
+                    &editor_result,
+                    &agent_result,
+                    Some(failure.to_string()),
+                ),
+                RelayFinishReason::AgentError(failure.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn final_finish_reason_reports_agent_parse_error_after_editor_eof() {
+        let editor_result = Ok(());
+        let agent_result = Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed upstream JSON",
+        ));
+
+        assert_eq!(
+            final_finish_reason(
+                RelayFinishReason::EditorEof,
+                &editor_result,
+                &agent_result,
+                None,
+            ),
+            RelayFinishReason::AgentError("malformed upstream JSON".to_string())
+        );
     }
 
     #[test]
