@@ -3520,7 +3520,9 @@ fn workspace_lock_admission_can_wait(
         }
         (
             WorkspaceLockPurpose::LaneAssociation,
-            WorkspaceLockPurpose::CommandMutation | WorkspaceLockPurpose::ObserverPublication,
+            WorkspaceLockPurpose::CommandMutation
+            | WorkspaceLockPurpose::ObserverStartup
+            | WorkspaceLockPurpose::ObserverPublication,
         ) => true,
         (WorkspaceLockPurpose::LaneAssociation, WorkspaceLockPurpose::LaneAssociation) => {
             matches!((admission.operation_id, holder.operation_id.as_deref()),
@@ -4349,19 +4351,29 @@ fn inspect_existing_workspace_lock(lock_path: &Path) -> std::io::Result<Workspac
             }
         }
         if !topology_valid {
-            let named_changed = fs::symlink_metadata(lock_path).is_ok_and(|named| {
-                file.metadata().is_ok_and(|descriptor| {
-                    descriptor.dev() != named.dev() || descriptor.ino() != named.ino()
-                })
-            });
-            if named_changed {
-                return Ok(match authenticated_predecessor {
-                    Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
-                    Ok(None) => WorkspaceLockInspection::Terminal(
-                        "workspace lock pathname changed during validation".into(),
-                    ),
-                    Err(reason) => WorkspaceLockInspection::Terminal(reason),
-                });
+            match fs::symlink_metadata(lock_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(match authenticated_predecessor {
+                        Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
+                        Ok(None) => WorkspaceLockInspection::Reaped,
+                        Err(reason) => WorkspaceLockInspection::Terminal(reason),
+                    });
+                }
+                Ok(named)
+                    if file.metadata().is_ok_and(|descriptor| {
+                        descriptor.dev() != named.dev() || descriptor.ino() != named.ino()
+                    }) =>
+                {
+                    return Ok(match authenticated_predecessor {
+                        Ok(Some(owner)) => WorkspaceLockInspection::Turnover(owner),
+                        Ok(None) => WorkspaceLockInspection::Terminal(
+                            "workspace lock pathname changed during validation".into(),
+                        ),
+                        Err(reason) => WorkspaceLockInspection::Terminal(reason),
+                    });
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
             }
             return Ok(WorkspaceLockInspection::Terminal(
                 "workspace lock has an untrusted hard-link topology".into(),
