@@ -49,8 +49,7 @@ fn checked_activation_enabled() -> bool {
 pub(crate) fn command_authority_enabled() -> bool {
     #[cfg(debug_assertions)]
     {
-        return checked_activation_enabled()
-            && COMMAND_AUTHORITY_OVERRIDE.with(std::cell::Cell::get);
+        checked_activation_enabled() && COMMAND_AUTHORITY_OVERRIDE.with(std::cell::Cell::get)
     }
     #[cfg(not(debug_assertions))]
     checked_activation_enabled()
