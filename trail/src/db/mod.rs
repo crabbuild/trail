@@ -20,7 +20,7 @@ use prolly::{
 use prolly_store_slatedb::SlateDbStore;
 #[cfg(unix)]
 use prolly_store_sqlite::sqlite_main_file_identity;
-use prolly_store_sqlite::{SqliteMainFileIdentity, SqliteStore};
+use prolly_store_sqlite::{SqliteMainFileIdentity, SqliteStore, SqliteStoreConfig};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -2531,21 +2531,31 @@ fn open_prolly_store(
 ) -> Result<TrailProllyStore> {
     let backend = match config.storage.prolly_backend.as_str() {
         "sqlite" => {
+            let sqlite_config = SqliteStoreConfig {
+                persist_wal: true,
+                ..SqliteStoreConfig::default()
+            };
             let store = match schema_mode {
-                SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
+                SchemaOpenMode::FreshCreate => {
+                    SqliteStore::open_with_config(sqlite_path, sqlite_config)?
+                }
                 SchemaOpenMode::Existing => {
                     if let Some(validated) = validated_schema {
-                        SqliteStore::open_existing_verified(sqlite_path, |identity| {
-                            validated.verify_main_identity(identity).map_err(|error| {
-                                prolly_store_sqlite::SqliteStoreError::new(error.to_string())
-                            })
-                        })
+                        SqliteStore::open_existing_verified_with_config(
+                            sqlite_path,
+                            sqlite_config,
+                            |identity| {
+                                validated.verify_main_identity(identity).map_err(|error| {
+                                    prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                                })
+                            },
+                        )
                         .map_err(schema_reinitialize_error)?
                     } else {
                         // The only unverified existing-open path is an internal clone made
                         // while the caller already owns the workspace writer exclusion and
                         // a fully validated Trail handle.
-                        SqliteStore::open_existing(sqlite_path)?
+                        SqliteStore::open_existing_with_config(sqlite_path, sqlite_config)?
                     }
                 }
             };

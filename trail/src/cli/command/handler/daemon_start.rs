@@ -1694,6 +1694,12 @@ fn ready_timeout() -> Duration {
 pub(super) fn workspace_from_context(ctx: &RuntimeContext) -> Result<PathBuf> {
     ctx.workspace
         .clone()
+        .or_else(|| {
+            ctx.db_dir
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| Error::InvalidInput("workspace path is unavailable".into()))
 }

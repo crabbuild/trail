@@ -550,10 +550,18 @@ pub(crate) fn begin_reconciliation(
     let start_fence = observer.begin_observation(expected)?;
     let root = trail.open_pinned_worktree_root(policy)?;
     let root_handle_identity = trail.pinned_worktree_root_identity(&root);
+    let mut attempt_nonce = [0_u8; 16];
+    getrandom::getrandom(&mut attempt_nonce).map_err(|error| {
+        Error::InvalidInput(format!(
+            "failed to generate changed-path reconciliation attempt identity: {error}"
+        ))
+    })?;
     let attempt_id = format!(
-        "reconcile-{}-{}",
+        "reconcile-{}-{}-{}-{}",
         now_ts(),
-        NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)
+        std::process::id(),
+        NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed),
+        hex::encode(attempt_nonce)
     );
     let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
     exact_scope_guard(&tx, expected)?;
@@ -4783,6 +4791,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "abandoned");
+    }
+
+    #[test]
+    fn reconciliation_attempt_ids_include_process_identity() {
+        let fixture = Fixture::new();
+        let observer = FakeQualifiedObserver::new();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::Full,
+            "process_identity",
+        )
+        .unwrap();
+
+        assert!(
+            attempt
+                .attempt_id
+                .contains(&format!("-{}-", std::process::id())),
+            "attempt id does not carry a cross-process discriminator: {}",
+            attempt.attempt_id
+        );
     }
 
     #[test]

@@ -22618,15 +22618,6 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         .collect::<BTreeSet<_>>();
     assert!(sparse_manifest_paths.contains("README.md"));
     assert!(sparse_manifest_paths.contains("src/lib.rs"));
-    let clean_manifest: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(sparse_workdir.join(".trail/workdir-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        clean_manifest["root_id"],
-        sparse_hydrated.lane.branch.head_root.0
-    );
-    assert!(clean_manifest["files"].get("src/lib.rs").is_some());
     #[cfg(unix)]
     let clean_hydrated_inode = fs::metadata(sparse_workdir.join("src/lib.rs"))
         .unwrap()

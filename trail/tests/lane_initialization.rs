@@ -1,5 +1,8 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use rusqlite::{types::Value as SqlValue, Connection};
 use trail::{Actor, Error, InitImportMode, LaneWorkdirMode, Trail};
@@ -301,6 +304,69 @@ fn equivalent_spawn_requests_share_one_canonical_initialization_identity() {
     assert!(first.request_fingerprint.starts_with("sha256:"));
     assert!(replay.resumed);
     assert!(replay.committed);
+}
+
+#[test]
+fn long_lived_handle_reads_sparse_lanes_created_by_cli_processes() {
+    let mut fixture = LaneInitializationFixture::new();
+    #[cfg(unix)]
+    let mut wal_generation = None;
+
+    for index in 0..4 {
+        let name = format!("external-sparse-{index}");
+        let output = Command::new(env!("CARGO_BIN_EXE_trail"))
+            .arg("--workspace")
+            .arg(fixture.workspace())
+            .arg("--json")
+            .args([
+                "lane",
+                "spawn",
+                name.as_str(),
+                "--from",
+                "main",
+                "--paths",
+                "a",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "spawn failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[cfg(unix)]
+        {
+            let wal = PathBuf::from(format!("{}-wal", fixture.sqlite_path().display()));
+            let shm = PathBuf::from(format!("{}-shm", fixture.sqlite_path().display()));
+            let generation = (
+                fs::metadata(wal).unwrap().ino(),
+                fs::metadata(shm).unwrap().ino(),
+            );
+            if let Some(expected) = wal_generation {
+                assert_eq!(
+                    generation, expected,
+                    "WAL generation changed after spawn {index}"
+                );
+            } else {
+                wal_generation = Some(generation);
+            }
+        }
+        let integrity: String = Connection::open(fixture.sqlite_path())
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "integrity failed after spawn {index}");
+
+        let details = fixture
+            .db_mut()
+            .lane_details(&name)
+            .unwrap_or_else(|error| panic!("lane lookup failed after spawn {index}: {error:?}"));
+        assert_eq!(details.record.name, name);
+        let status = fixture.db_mut().lane_status(&name).unwrap_or_else(|error| {
+            panic!("long-lived status failed after spawn {index}: {error:?}")
+        });
+        assert_eq!(status.lane.record.name, name);
+    }
 }
 
 #[test]
@@ -760,6 +826,15 @@ fn successful_removal_deletes_initialization_and_allows_name_reuse() {
     )
     .unwrap();
     fixture.db_mut().remove_lane("reusable-lane", true).unwrap();
+    assert_eq!(
+        fixture
+            .db_mut()
+            .lane_details("reusable-lane")
+            .unwrap()
+            .branch
+            .status,
+        "removed"
+    );
     assert!(fixture
         .db_mut()
         .lane_initialization("reusable-lane")

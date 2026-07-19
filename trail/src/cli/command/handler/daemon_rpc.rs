@@ -22,6 +22,12 @@ pub(super) fn try_handle_auto_daemon_command(
     daemon_token: Option<String>,
     command: &Command,
 ) -> Result<bool> {
+    if ctx.db_dir.is_some() {
+        return Ok(false);
+    }
+    if matches!(command, Command::Status(args) if args.branch.is_some() || ctx.branch.is_some()) {
+        return Ok(false);
+    }
     if !daemon_supports_command(command) {
         return Ok(false);
     }
@@ -124,7 +130,7 @@ pub(super) fn try_handle_daemon_command(
     let client = DaemonClient::new(&daemon_url, token)?;
     match command {
         Command::Status(args) => {
-            if args.branch.is_some() {
+            if args.branch.is_some() || ctx.branch.is_some() {
                 return Ok(false);
             }
             let report: StatusReport = client.get_json("/v1/status")?;
@@ -1443,6 +1449,11 @@ fn error_from_daemon_response(status: u16, body: &[u8]) -> Error {
             return Error::DaemonUnavailable(error.error.message);
         }
         if error.error.code.as_ref().and_then(DaemonErrorCode::as_text)
+            == Some("PATH_INDEX_REQUIRED")
+        {
+            return Error::PathIndexRequired(error.error.message);
+        }
+        if error.error.code.as_ref().and_then(DaemonErrorCode::as_text)
             == Some("CHANGE_LEDGER_RECONCILE_REQUIRED")
         {
             return Error::ChangeLedgerReconcileRequired {
@@ -1654,6 +1665,20 @@ mod tests {
         match error {
             Error::ChangeLedgerReconcileRequired { command, .. } => {
                 assert_eq!(command, "trail index reconcile --lane reconcile-bot");
+            }
+            error => panic!("unexpected daemon error: {error}"),
+        }
+    }
+
+    #[test]
+    fn daemon_error_parser_preserves_path_index_required_type() {
+        let error = error_from_daemon_response(
+            409,
+            br#"{"error":{"code":"PATH_INDEX_REQUIRED","status":409,"exit":9,"message":"path invariant index is required; run `trail index rebuild`"}}"#,
+        );
+        match error {
+            Error::PathIndexRequired(message) => {
+                assert!(message.contains("trail index rebuild"));
             }
             error => panic!("unexpected daemon error: {error}"),
         }

@@ -1,7 +1,10 @@
 use super::*;
+use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
 
-use rusqlite::ffi::{sqlite3_auto_extension, SQLITE_OK};
+use rusqlite::ffi::{
+    sqlite3_auto_extension, sqlite3_file_control, SQLITE_FCNTL_PERSIST_WAL, SQLITE_OK,
+};
 use sqlite_vec::sqlite3_vec_init;
 
 static SQLITE_VEC_REGISTRATION: OnceLock<i32> = OnceLock::new();
@@ -61,6 +64,7 @@ pub(crate) fn apply_sqlite_pragmas(conn: &Connection) -> Result<()> {
 /// database-wide journal mode. Runtime observer connections open only after
 /// Trail's hard-cutover initializer has established WAL mode.
 pub(crate) fn apply_sqlite_runtime_pragmas(conn: &Connection) -> Result<()> {
+    persist_wal_across_process_lifetimes(conn)?;
     // Do not lower `synchronous` on a live database. New SQLite connections
     // default to FULL, which is stronger than Trail's initialized NORMAL mode;
     // attempting to change it while the primary daemon transaction is live can
@@ -76,4 +80,25 @@ pub(crate) fn apply_sqlite_runtime_pragmas(conn: &Connection) -> Result<()> {
             ))
         })?;
     Ok(())
+}
+
+fn persist_wal_across_process_lifetimes(conn: &Connection) -> Result<()> {
+    let mut enabled: c_int = 1;
+    // SAFETY: `conn` remains alive for the call, `main` is NUL terminated,
+    // and SQLite reads/writes one `int` for SQLITE_FCNTL_PERSIST_WAL.
+    let result = unsafe {
+        sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            SQLITE_FCNTL_PERSIST_WAL,
+            (&mut enabled as *mut c_int).cast::<c_void>(),
+        )
+    };
+    if result == SQLITE_OK {
+        Ok(())
+    } else {
+        Err(Error::DaemonUnavailable(format!(
+            "SQLite persistent-WAL configuration failed with result code {result}"
+        )))
+    }
 }
