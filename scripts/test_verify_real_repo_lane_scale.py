@@ -7,6 +7,7 @@ import csv
 import json
 import os
 import platform
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -526,6 +527,26 @@ class HarnessContractTests(unittest.TestCase):
         result = self.run_harness(TRAIL_SCALE_EXPECTED_BINARY_SHA256="0" * 64)
         self.assertEqual(result.returncode, 64)
         self.assertIn("binary SHA-256", result.stderr)
+        self.assertFalse((self.repo / ".trail/fake-state.json").exists())
+
+    def test_git_show_ref_operational_error_is_not_treated_as_ref_absence(self) -> None:
+        wrapper_dir = self.repo.parent / "git-wrapper"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "git"
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        wrapper.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            for argument in "$@"; do
+              if [ "$argument" = show-ref ]; then exit 2; fi
+            done
+            exec {real_git!r} "$@"
+        """), encoding="utf-8")
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+        result = self.run_harness(PATH=str(wrapper_dir) + os.pathsep + os.environ["PATH"])
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("could not inspect dedicated Git ref", result.stderr)
+        self.assertFalse(self.output.exists())
         self.assertFalse((self.repo / ".trail/fake-state.json").exists())
 
     def test_fault_driver_digest_mismatch_is_rejected_before_mutation(self) -> None:

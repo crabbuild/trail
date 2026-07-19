@@ -454,7 +454,15 @@ while True:
     if ancestor.exists() or ancestor.parent==ancestor: break
     ancestor=ancestor.parent
 PY
-git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$TRAIL_SCALE_GIT_REF" && die "dedicated Git ref already exists"
+set +e
+git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$TRAIL_SCALE_GIT_REF"
+show_ref_code=$?
+set -e
+case "$show_ref_code" in
+  0) die "dedicated Git ref already exists" ;;
+  1) ;;
+  *) die "could not inspect dedicated Git ref (git show-ref exit $show_ref_code)" ;;
+esac
 
 git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree must be clean before qualification"
 git -C "$TRAIL_SCALE_REPO" diff --cached --quiet -- || die "Git index must be clean before qualification"
