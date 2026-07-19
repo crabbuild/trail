@@ -2097,6 +2097,10 @@ mod schema_handoff_tests {
             )
             .unwrap();
         let _failure = fail_next_schema_validation_with_hook(&db_path, move |path| {
+            // The one-shot hook runs outside the failure registry lock, so a
+            // callback may safely install and drop scoped state reentrantly.
+            let reentrant = fail_next_schema_validation(path);
+            drop(reentrant);
             let connection = Connection::open(path).unwrap();
             connection
                 .execute(
