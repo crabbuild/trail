@@ -135,7 +135,7 @@ where
     } else {
         publish_alignment_in_transaction(db, expected, &intent)?;
     }
-    repair_marker_after_commit(db).map_err(|error| Error::CommittedRepairRequired {
+    repair_marker_after_commit(db).map_err(|error| Error::OperationCommittedRepairRequired {
         operation: intent.0.clone(),
         repair: "projection marker".into(),
         reason: error.to_string(),
@@ -301,7 +301,7 @@ where
             &operation.after_root,
             &operation_id,
         )
-        .map_err(|error| Error::CommittedRepairRequired {
+        .map_err(|error| Error::OperationCommittedRepairRequired {
             operation: operation_id.0.clone(),
             repair: "ref mirror".into(),
             reason: error.to_string(),
@@ -317,7 +317,7 @@ where
             },
         };
         repair_marker_after_commit(db, &publication).map_err(|error| {
-            Error::CommittedRepairRequired {
+            Error::OperationCommittedRepairRequired {
                 operation: publication.operation_id.0.clone(),
                 repair: "projection marker/runtime".into(),
                 reason: error.to_string(),
@@ -355,7 +355,7 @@ where
             },
         };
         repair_marker_after_commit(db, &publication).map_err(|error| {
-            Error::CommittedRepairRequired {
+            Error::OperationCommittedRepairRequired {
                 operation: publication.operation_id.0.clone(),
                 repair: "projection marker/runtime".into(),
                 reason: error.to_string(),
@@ -407,13 +407,13 @@ where
         &operation.after_root,
         &operation_id,
     )
-    .map_err(|error| Error::CommittedRepairRequired {
+    .map_err(|error| Error::OperationCommittedRepairRequired {
         operation: publication.operation_id.0.clone(),
         repair: "ref mirror".into(),
         reason: error.to_string(),
     })?;
     repair_marker_after_commit(db, &publication).map_err(|error| {
-        Error::CommittedRepairRequired {
+        Error::OperationCommittedRepairRequired {
             operation: publication.operation_id.0.clone(),
             repair: "projection marker/runtime".into(),
             reason: error.to_string(),
@@ -490,7 +490,7 @@ pub(crate) fn commit_lane_operation_atomic(
         &operation.after_root,
         &operation_id,
     )
-    .map_err(|error| Error::CommittedRepairRequired {
+    .map_err(|error| Error::OperationCommittedRepairRequired {
         operation: operation_id.0.clone(),
         repair: "lane operation ref mirror".into(),
         reason: error.to_string(),

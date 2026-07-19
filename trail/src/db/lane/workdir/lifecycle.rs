@@ -56,34 +56,39 @@ impl Trail {
             owners.push(view.view_id.as_str());
         }
         let roots = branch.workdir.as_deref().into_iter().collect::<Vec<_>>();
-        let retired_segments = retire_deletion_scopes(
-            &self.conn,
-            &self.sqlite_path,
-            &owners,
-            &roots,
-            &[branch.ref_name.as_str()],
-        )?;
-        remove_retired_segments(&self.conn, &retired_segments)?;
-        remove_ref_file(&self.db_dir, &branch.ref_name)?;
-        self.conn
-            .execute("DELETE FROM refs WHERE name = ?1", params![branch.ref_name])?;
-        if let Some(workdir) = &branch.workdir {
-            let path = PathBuf::from(workdir);
-            if path.exists() {
-                fs::remove_dir_all(&path)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let removal = (|| -> Result<()> {
+            let retired_segments = retire_deletion_scopes(
+                &self.conn,
+                &self.sqlite_path,
+                &owners,
+                &roots,
+                &[branch.ref_name.as_str()],
+            )?;
+            remove_retired_segments(&self.conn, &retired_segments)?;
+            remove_ref_file(&self.db_dir, &branch.ref_name)?;
+            self.conn
+                .execute("DELETE FROM refs WHERE name = ?1", params![branch.ref_name])?;
+            if let Some(workdir) = &branch.workdir {
+                let path = PathBuf::from(workdir);
+                if path.exists() {
+                    fs::remove_dir_all(&path)?;
+                }
             }
-        }
-        for backend in ["fuse-cow", "nfs-cow", "dokan-cow"] {
-            let state = self.db_dir.join(backend).join(lane);
-            if state.exists() {
-                fs::remove_dir_all(state)?;
+            for backend in ["fuse-cow", "nfs-cow", "dokan-cow"] {
+                let state = self.db_dir.join(backend).join(lane);
+                if state.exists() {
+                    fs::remove_dir_all(state)?;
+                }
             }
-        }
-        self.conn.execute(
-            "UPDATE lane_branches SET status = 'removed', updated_at = ?1 WHERE lane_id = ?2",
-            params![now_ts(), branch.lane_id],
-        )?;
-        self.insert_lane_event(
+            let removed_at = now_ts();
+            let retired_ref = format!("retired/{}/{}", branch.lane_id, removed_at);
+            self.conn.execute(
+                "UPDATE lane_branches
+             SET status='removed',ref_name=?1,updated_at=?2 WHERE lane_id=?3",
+                params![retired_ref, removed_at, branch.lane_id],
+            )?;
+            self.insert_lane_event(
             &branch.lane_id,
             "lane_removed",
             Some(&branch.head_change),
@@ -96,6 +101,26 @@ impl Trail {
                 "preserved_generated_bytes": preserved_space.as_ref().map(|space| space.generated_upper_bytes),
             }),
         )?;
+            self.conn.execute(
+                "DELETE FROM lane_initializations WHERE lane_id=?1",
+                params![branch.lane_id],
+            )?;
+            self.conn.execute(
+                "UPDATE lanes SET name=?1 WHERE lane_id=?2",
+                params![
+                    format!("retired/{}/{}", lane, branch.lane_id),
+                    branch.lane_id
+                ],
+            )?;
+            Ok(())
+        })();
+        match removal {
+            Ok(()) => self.conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
         Ok(LaneRemoveReport {
             lane_id: branch.lane_id,
             ref_name: branch.ref_name,

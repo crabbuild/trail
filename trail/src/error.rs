@@ -24,8 +24,19 @@ pub enum Error {
         command: String,
     },
     #[error("operation {operation} committed but {repair} repair is required: {reason}")]
-    CommittedRepairRequired {
+    OperationCommittedRepairRequired {
         operation: String,
+        repair: String,
+        reason: String,
+    },
+    #[error("lane `{lane}` initialization {initialization_id} committed in phase {phase:?}; run `{repair}`: {reason}")]
+    CommittedRepairRequired {
+        lane: String,
+        initialization_id: String,
+        request_fingerprint: String,
+        operation_id: String,
+        phase: crate::model::LaneInitializationPhase,
+        committed: bool,
         repair: String,
         reason: String,
     },
@@ -113,7 +124,8 @@ impl Error {
             Error::PathIndexRequired(_) => "PATH_INDEX_REQUIRED",
             Error::SchemaReinitializeRequired { .. } => "SCHEMA_REINITIALIZE_REQUIRED",
             Error::ChangeLedgerReconcileRequired { .. } => "CHANGE_LEDGER_RECONCILE_REQUIRED",
-            Error::CommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
+            Error::CommittedRepairRequired { .. }
+            | Error::OperationCommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
             Error::LaneInitializationConflict { .. } => "LANE_INITIALIZATION_CONFLICT",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
@@ -168,7 +180,8 @@ impl Error {
             Error::IgnoredPath(_) => 14,
             Error::SchemaReinitializeRequired { .. } => 15,
             Error::ChangeLedgerReconcileRequired { .. } => 16,
-            Error::CommittedRepairRequired { .. } => 16,
+            Error::CommittedRepairRequired { .. }
+            | Error::OperationCommittedRepairRequired { .. } => 16,
             Error::LaneInitializationConflict { .. } => 2,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
@@ -257,7 +270,7 @@ mod tests {
             "changed-path ledger reconciliation required for workspace:main: observer startup failed; run `trail status`"
         );
 
-        let committed = Error::CommittedRepairRequired {
+        let committed = Error::OperationCommittedRepairRequired {
             operation: "op-1".into(),
             repair: "ref mirror".into(),
             reason: "injected failure".into(),

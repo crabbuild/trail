@@ -1,0 +1,292 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use rusqlite::Connection;
+use trail::{Actor, InitImportMode, LaneInitializationPhase, LaneWorkdirMode, Trail};
+
+const CHILD_WORKSPACE: &str = "TRAIL_TEST_INITIALIZATION_CHILD_WORKSPACE";
+const CRASH_AFTER: &str = "TRAIL_TEST_LANE_INITIALIZATION_CRASH_AFTER";
+const HANDSHAKE: &str = "TRAIL_TEST_LANE_INITIALIZATION_HANDSHAKE";
+
+fn initialize_workspace(path: &Path) {
+    Trail::init(path, "main", InitImportMode::Empty, false).unwrap();
+    fs::write(path.join("file.txt"), "durable initialization\n").unwrap();
+    let mut db = Trail::open(path).unwrap();
+    db.record(
+        Some("main"),
+        Some("initialize crash fixture".into()),
+        Actor::human(),
+        false,
+    )
+    .unwrap();
+}
+
+fn count(sqlite: &Path, sql: &str, parameter: &str) -> i64 {
+    Connection::open(sqlite)
+        .unwrap()
+        .query_row(sql, [parameter], |row| row.get(0))
+        .unwrap()
+}
+
+fn rows_for_lane(sqlite: &Path, lane: &str) -> i64 {
+    count(
+        sqlite,
+        "SELECT COUNT(*) FROM lane_initializations WHERE lane_name=?1",
+        lane,
+    )
+}
+
+fn refs_for_lane(sqlite: &Path, lane: &str) -> i64 {
+    count(
+        sqlite,
+        "SELECT COUNT(*) FROM refs WHERE name=?1",
+        &format!("refs/lanes/{lane}"),
+    )
+}
+
+fn spawn_events_for_lane(sqlite: &Path, lane: &str) -> i64 {
+    count(
+        sqlite,
+        "SELECT COUNT(*) FROM lane_events event JOIN lanes lane ON lane.lane_id=event.lane_id WHERE lane.name=?1 AND event.event_type='lane_spawned'",
+        lane,
+    )
+}
+
+#[test]
+fn lane_initialization_crash_child() {
+    let Ok(workspace) = std::env::var(CHILD_WORKSPACE) else {
+        return;
+    };
+    let mut db = Trail::open(workspace).unwrap();
+    let _ = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "crash-lane",
+        Some("main"),
+        LaneWorkdirMode::PortableCopy,
+        Some("codex".into()),
+        Some("gpt-5".into()),
+        None,
+        &[],
+        false,
+    );
+}
+
+fn crash_and_resume(boundary: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let handshake = temp.path().join(format!("{boundary}.handshake"));
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("lane_initialization_crash_child")
+        .arg("--nocapture")
+        .env(CHILD_WORKSPACE, temp.path())
+        .env(CRASH_AFTER, boundary)
+        .env(HANDSHAKE, &handshake)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !handshake.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        handshake.exists(),
+        "child did not publish {boundary} handshake"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let result = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "crash-lane",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            Some("codex".into()),
+            Some("gpt-5".into()),
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    assert_eq!(rows_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(refs_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(result.phase, LaneInitializationPhase::ObserverReady);
+    assert!(result.resumed);
+}
+
+#[test]
+fn identical_spawn_resumes_at_every_durable_crash_cut() {
+    for boundary in [
+        "after_reservation",
+        "after_materialization",
+        "after_association",
+        "after_reconciliation",
+        "after_marker",
+        "after_spawn_event",
+    ] {
+        crash_and_resume(boundary);
+    }
+}
+
+#[test]
+fn io_failures_never_advance_past_or_delete_the_durable_artifact() {
+    for (boundary, disk_full) in [
+        ("workdir_write", true),
+        ("file_sync", true),
+        ("directory_sync", false),
+        ("association_sqlite_commit", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_workspace(temp.path());
+        trail::test_support::set_lane_initialization_io_failure_for_current_thread(
+            Some(boundary),
+            disk_full,
+        );
+        let mut db = Trail::open(temp.path()).unwrap();
+        let error = db
+            .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "io-lane",
+                Some("main"),
+                LaneWorkdirMode::PortableCopy,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap_err();
+        trail::test_support::set_lane_initialization_io_failure_for_current_thread(None, false);
+        assert_eq!(error.code(), "IO_ERROR", "boundary {boundary}: {error}");
+        let sqlite = temp.path().join(".trail/index/trail.sqlite");
+        assert_eq!(refs_for_lane(&sqlite, "io-lane"), 0, "{boundary}");
+        assert_eq!(spawn_events_for_lane(&sqlite, "io-lane"), 0, "{boundary}");
+        let initialization = db.lane_initialization("io-lane").unwrap();
+        assert!(
+            initialization
+                .as_ref()
+                .is_none_or(|record| record.phase == LaneInitializationPhase::Reserved),
+            "boundary {boundary}: {initialization:?}"
+        );
+        assert!(!temp.path().join(".trail/worktrees/io-lane").exists());
+    }
+}
+
+#[test]
+fn post_association_failure_is_durable_committed_repair_and_repairs_once() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some(
+        "spawn_after_commit",
+    ));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "repair-lane",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    match error {
+        trail::Error::CommittedRepairRequired {
+            lane,
+            phase,
+            committed,
+            repair,
+            ..
+        } => {
+            assert_eq!(lane, "repair-lane");
+            assert_eq!(phase, LaneInitializationPhase::RepairRequired);
+            assert!(committed);
+            assert_eq!(repair, "trail lane repair-initialization repair-lane");
+        }
+        other => panic!("expected committed repair, got {other:?}"),
+    }
+    let stored = db.lane_initialization("repair-lane").unwrap().unwrap();
+    assert_eq!(stored.phase, LaneInitializationPhase::RepairRequired);
+    assert_eq!(
+        stored.repair_command.as_deref(),
+        Some("trail lane repair-initialization repair-lane")
+    );
+    let repaired = db.repair_lane_initialization("repair-lane").unwrap();
+    assert_eq!(repaired.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(
+        spawn_events_for_lane(
+            &temp.path().join(".trail/index/trail.sqlite"),
+            "repair-lane"
+        ),
+        1
+    );
+}
+
+#[test]
+fn http_committed_repair_is_409_with_explicit_committed_body() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some(
+        "spawn_after_commit",
+    ));
+    let body = br#"{"name":"http-repair","from":"main","workdir_mode":"virtual"}"#;
+    let request = format!(
+        "POST /v1/lanes HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes()
+    .into_iter()
+    .chain(body.iter().copied())
+    .collect::<Vec<_>>();
+    let response = trail::server::handle_http_request(&mut db, &request);
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert_eq!(response.status, 409);
+    let value: serde_json::Value = response.body_json().unwrap();
+    assert_eq!(value["error"]["code"], "COMMITTED_REPAIR_REQUIRED");
+    assert_eq!(value["error"]["status"], 409);
+    assert_eq!(value["error"]["details"]["lane"], "http-repair");
+    assert_eq!(value["error"]["details"]["phase"], "repair_required");
+    assert_eq!(value["error"]["details"]["committed"], true);
+    assert_eq!(
+        value["error"]["details"]["repair"],
+        "trail lane repair-initialization http-repair"
+    );
+}
+
+#[allow(dead_code)]
+fn fsynced_handshake(path: &PathBuf) {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.write_all(b"durable\n").unwrap();
+    file.sync_all().unwrap();
+    FileSync::sync_parent(path);
+}
+
+struct FileSync;
+
+impl FileSync {
+    fn sync_parent(path: &Path) {
+        OpenOptions::new()
+            .read(true)
+            .open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+}

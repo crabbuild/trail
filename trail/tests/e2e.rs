@@ -1584,6 +1584,24 @@ fn run_trail_json(workspace: &Path, args: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[test]
+fn repair_initialization_cli_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let spawned = run_trail_json(
+        temp.path(),
+        &["lane", "spawn", "repair-cli", "--workdir-mode", "virtual"],
+    );
+    assert_eq!(spawned["phase"], "observer_ready");
+    let repaired = run_trail_json(
+        temp.path(),
+        &["lane", "repair-initialization", "repair-cli"],
+    );
+    assert_eq!(repaired["initialization_id"], spawned["initialization_id"]);
+    assert_eq!(repaired["phase"], "observer_ready");
+    assert_eq!(repaired["resumed"], true);
+}
+
 fn make_current_branch_root_legacy(workspace: &Path) -> ObjectId {
     let sqlite_path = workspace.join(".trail/index/trail.sqlite");
     let conn = Connection::open(sqlite_path).unwrap();

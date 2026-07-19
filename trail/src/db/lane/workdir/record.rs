@@ -55,8 +55,10 @@ fn lane_record_committed_repair_error(
     error: Error,
 ) -> Error {
     match error {
-        Error::CommittedRepairRequired { .. } => error,
-        error => Error::CommittedRepairRequired {
+        Error::CommittedRepairRequired { .. } | Error::OperationCommittedRepairRequired { .. } => {
+            error
+        }
+        error => Error::OperationCommittedRepairRequired {
             operation: operation.0.clone(),
             repair: repair.into(),
             reason: error.to_string(),

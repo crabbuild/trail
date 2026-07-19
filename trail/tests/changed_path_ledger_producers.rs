@@ -1672,7 +1672,7 @@ fn init_lane_fixture(lane: &str, sparse: bool) -> (tempfile::TempDir, Trail, Pat
     };
     let lane_root = match spawn_result {
         Ok(spawned) => PathBuf::from(spawned.workdir.unwrap()),
-        Err(Error::CommittedRepairRequired {
+        Err(Error::OperationCommittedRepairRequired {
             operation,
             repair,
             reason,
@@ -2091,7 +2091,7 @@ fn observed_lane_record_postcommit_failures_require_committed_repair() {
         trail::test_support::set_lane_record_postcommit_failure_for_current_thread(None);
 
         assert_eq!(error.code(), "COMMITTED_REPAIR_REQUIRED");
-        let Error::CommittedRepairRequired {
+        let Error::OperationCommittedRepairRequired {
             operation,
             repair,
             reason,

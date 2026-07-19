@@ -35,8 +35,10 @@ fn layered_update_committed_repair(
     error: Error,
 ) -> Error {
     match error {
-        Error::CommittedRepairRequired { .. } => error,
-        error => Error::CommittedRepairRequired {
+        Error::CommittedRepairRequired { .. } | Error::OperationCommittedRepairRequired { .. } => {
+            error
+        }
+        error => Error::OperationCommittedRepairRequired {
             operation: operation.0.clone(),
             repair: repair.into(),
             reason: error.to_string(),
@@ -740,7 +742,7 @@ mod tests {
             let view = db.lane_workspace_view(&lane).unwrap().unwrap();
             assert_eq!(view.base_change, after.change_id, "boundary {boundary}");
             match error {
-                Error::CommittedRepairRequired {
+                Error::OperationCommittedRepairRequired {
                     operation,
                     repair,
                     reason,

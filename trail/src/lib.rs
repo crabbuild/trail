@@ -87,6 +87,17 @@ pub mod test_support {
         crate::db::set_sparse_selection_write_failure_for_current_thread(enabled);
     }
 
+    pub fn set_lane_initialization_io_failure_for_current_thread(
+        boundary: Option<&'static str>,
+        disk_full: bool,
+    ) {
+        crate::db::set_lane_initialization_io_failure_for_current_thread(boundary, disk_full);
+    }
+
+    pub fn set_lane_association_failure_for_current_thread(boundary: Option<&'static str>) {
+        crate::db::set_lane_association_failure_for_current_thread(boundary);
+    }
+
     pub fn install_lane_record_after_c2_write_for_current_thread(
         path: std::path::PathBuf,
         bytes: Vec<u8>,

@@ -28,8 +28,10 @@ fn fail_patch_post_commit_if_requested() -> Result<()> {
 
 fn lane_patch_committed_repair(operation: &ObjectId, error: Error) -> Error {
     match error {
-        Error::CommittedRepairRequired { .. } => error,
-        error => Error::CommittedRepairRequired {
+        Error::CommittedRepairRequired { .. } | Error::OperationCommittedRepairRequired { .. } => {
+            error
+        }
+        error => Error::OperationCommittedRepairRequired {
             operation: operation.0.clone(),
             repair: "lane patch post-commit metadata and marker".into(),
             reason: error.to_string(),
@@ -656,7 +658,7 @@ mod tests {
         assert_ne!(after.change_id, before.change_id);
         assert_ne!(after.root_id, before.root_id);
         match error {
-            Error::CommittedRepairRequired {
+            Error::OperationCommittedRepairRequired {
                 operation,
                 repair,
                 reason,

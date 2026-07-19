@@ -36,7 +36,11 @@ mod workspace_runtime;
 mod workspace_view;
 
 #[cfg(debug_assertions)]
-pub(crate) use lifecycle::set_sparse_selection_write_failure_for_current_thread;
+pub(crate) use lifecycle::{
+    set_lane_association_failure_for_current_thread,
+    set_lane_initialization_io_failure_for_current_thread,
+    set_sparse_selection_write_failure_for_current_thread,
+};
 pub(crate) use workdir::ViewMutationBarrier;
 #[cfg(debug_assertions)]
 pub(crate) use workdir::{

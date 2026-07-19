@@ -144,6 +144,7 @@ impl StructuredErrorEnvelope {
             | crate::Error::WorkspaceLocked(_)
             | crate::Error::SchemaReinitializeRequired { .. }
             | crate::Error::ChangeLedgerReconcileRequired { .. }
+            | crate::Error::CommittedRepairRequired { .. }
             | crate::Error::LaneInitializationConflict { .. } => 409,
             crate::Error::InvalidInput(_)
             | crate::Error::InvalidPath { .. }
@@ -169,6 +170,12 @@ impl StructuredErrorEnvelope {
                 Some(format!("{found}; {guidance}")),
                 Some("trail init --force".to_string()),
             ),
+            crate::Error::CommittedRepairRequired { reason, repair, .. } => (
+                None,
+                Some("repair_required".to_string()),
+                Some(reason.clone()),
+                Some(repair.clone()),
+            ),
             _ => (None, None, None, None),
         };
         let details = match error {
@@ -180,6 +187,25 @@ impl StructuredErrorEnvelope {
                 "lane": lane,
                 "existing_fingerprint": existing_fingerprint,
                 "requested_fingerprint": requested_fingerprint,
+            })),
+            crate::Error::CommittedRepairRequired {
+                lane,
+                initialization_id,
+                request_fingerprint,
+                operation_id,
+                phase,
+                committed,
+                repair,
+                reason,
+            } => Some(serde_json::json!({
+                "lane": lane,
+                "initialization_id": initialization_id,
+                "request_fingerprint": request_fingerprint,
+                "operation_id": operation_id,
+                "phase": phase,
+                "committed": committed,
+                "repair": repair,
+                "reason": reason,
             })),
             _ => None,
         };

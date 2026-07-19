@@ -211,7 +211,8 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::Lease(_)
         | Command::Doctor => true,
         Command::Lane(lane) => match &lane.command {
-            LaneSubcommand::List
+            LaneSubcommand::Spawn(_)
+            | LaneSubcommand::List
             | LaneSubcommand::Show(_)
             | LaneSubcommand::Status(_)
             | LaneSubcommand::Review(_)
@@ -232,6 +233,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | LaneSubcommand::ApplyPatch(_)
             | LaneSubcommand::Diff(_)
             | LaneSubcommand::Timeline(_) => true,
+            LaneSubcommand::RepairInitialization(_) => true,
             LaneSubcommand::Turn(_) => true,
             LaneSubcommand::Trace(_) => true,
             _ => false,
@@ -289,6 +291,12 @@ fn handle_lane_command(
                 body.insert("model".to_string(), Value::String(model.clone()));
             }
             let report: LaneSpawnReport = client.post_json("/v1/lanes", &Value::Object(body))?;
+            render_lane_spawn(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        LaneSubcommand::RepairInitialization(args) => {
+            let report: LaneSpawnReport = client
+                .post_empty_json(&format!("/v1/lanes/{}/repair-initialization", args.name))?;
             render_lane_spawn(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
@@ -1061,6 +1069,10 @@ impl DaemonClient {
 
     fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
         self.request_json("POST", path, Some(body))
+    }
+
+    fn post_empty_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.request_json("POST", path, None)
     }
 
     fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {

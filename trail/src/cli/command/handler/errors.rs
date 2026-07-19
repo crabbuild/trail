@@ -208,7 +208,20 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
-        Error::CommittedRepairRequired { .. } => {
+        Error::CommittedRepairRequired { repair, .. } => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Lane committed; repair required");
+            diagnostic.consequence = Some(
+                "The lane association committed and remains available; initialization is not yet observer-ready."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: repair.clone(),
+                reason: "Validate the committed identity and idempotently finish initialization."
+                    .to_string(),
+            });
+            diagnostic
+        }
+        Error::OperationCommittedRepairRequired { .. } => {
             let mut diagnostic = UiDiagnostic::new(
                 err.code(),
                 "Operation committed; a derived mirror still needs repair",

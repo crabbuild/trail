@@ -12,7 +12,7 @@ pub(super) fn lane_paths() -> Value {
         },
         "/v1/lanes": {
             "get": openapi_operation("laneList", "List lanes", "List lane branches with metadata and branch state.", vec![], None, true),
-            "post": openapi_operation("laneSpawn", "Spawn lane", "Create or reuse a lane branch.", vec![], Some("SpawnLaneRequest"), true)
+            "post": lane_spawn_operation()
         },
         "/v1/lanes/{lane_or_id}": {
             "get": openapi_operation("laneShow", "Show lane", "Show lane metadata and branch state.", vec![
@@ -27,6 +27,11 @@ pub(super) fn lane_paths() -> Value {
             "get": openapi_operation("laneStatus", "Lane status", "Show a lane branch status.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/repair-initialization": {
+            "post": openapi_operation_with_response_schema("laneRepairInitialization", "Repair lane initialization", "Validate and idempotently finish a committed lane initialization.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, "LaneSpawnReport", true)
         },
         "/v1/lanes/{lane_or_id}/review": {
             "get": openapi_operation_with_response_schema("laneReview", "Lane review packet", "Produce a compact review packet for one lane branch with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.", vec![
@@ -228,4 +233,21 @@ pub(super) fn lane_paths() -> Value {
             ], Some("PatchRequest"), "LanePatchReport", true)
         }
     })
+}
+
+fn lane_spawn_operation() -> Value {
+    let mut operation = openapi_operation_with_response_schema(
+        "laneSpawn",
+        "Spawn lane",
+        "Create or resume a lane branch. First completion returns 201, replay returns 200, and committed repair remains a structured 409.",
+        vec![],
+        Some("SpawnLaneRequest"),
+        "LaneSpawnReport",
+        true,
+    );
+    operation["responses"]["201"] = operation["responses"]["200"].clone();
+    operation["responses"]["201"]["description"] =
+        Value::String("Lane initialization completed for the first time".into());
+    operation["responses"]["409"] = json!({ "$ref": "#/components/responses/Error" });
+    operation
 }

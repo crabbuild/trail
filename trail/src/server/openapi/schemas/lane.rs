@@ -2,6 +2,27 @@ use serde_json::{json, Value};
 
 pub(super) fn lane_schemas() -> Value {
     json!({
+        "LaneSpawnReport": {
+            "type": "object",
+            "required": ["initialization_id", "request_fingerprint", "phase", "committed", "resumed", "lane_id", "ref_name", "base_change", "requested_workdir_mode", "workdir_mode", "sparse_paths", "transparent_cow_available"],
+            "properties": {
+                "initialization_id": { "type": "string" },
+                "request_fingerprint": { "type": "string" },
+                "phase": { "type": "string", "enum": ["reserved", "materialized", "associated", "observer_ready", "repair_required"] },
+                "committed": { "type": "boolean" },
+                "resumed": { "type": "boolean" },
+                "lane_id": { "type": "string" },
+                "ref_name": { "type": "string" },
+                "base_change": { "type": "string" },
+                "workdir": { "type": ["string", "null"] },
+                "requested_workdir_mode": { "type": "string" },
+                "workdir_mode": { "type": "string" },
+                "workdir_backend": { "type": ["string", "null"] },
+                "materialization": { "$ref": "#/components/schemas/JsonValue" },
+                "sparse_paths": { "type": "array", "items": { "type": "string" } },
+                "transparent_cow_available": { "type": "boolean" }
+            }
+        },
         "LaneReviewEvidenceSummary": {
             "type": "object",
             "required": [

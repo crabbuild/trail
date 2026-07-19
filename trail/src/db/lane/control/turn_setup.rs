@@ -151,7 +151,7 @@ impl Trail {
                 crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
                     self, &lane_id,
                 )
-                .map_err(|error| Error::CommittedRepairRequired {
+                .map_err(|error| Error::OperationCommittedRepairRequired {
                     operation: materialization
                         .as_ref()
                         .map(|outcome| outcome.materialization_operation_id.clone())
@@ -200,7 +200,7 @@ impl Trail {
                 },
                 |db| db.publish_lane_marker_if_materialized(&lane_id),
             )
-            .map_err(|error| Error::CommittedRepairRequired {
+            .map_err(|error| Error::OperationCommittedRepairRequired {
                 operation: materialization
                     .as_ref()
                     .map(|outcome| outcome.materialization_operation_id.clone())

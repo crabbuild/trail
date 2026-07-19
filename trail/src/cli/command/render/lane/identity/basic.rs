@@ -46,9 +46,13 @@ pub(crate) fn render_lane_spawn(
             metadata.push(("Fallback".to_string(), reason.as_str().to_string()));
         }
     }
+    let title = if report.phase == LaneInitializationPhase::RepairRequired {
+        "Lane committed; repair required".to_string()
+    } else {
+        format!("Lane initialized: {}", report.lane_id)
+    };
     let mut document =
-        TerminalDocument::new(format!("Created lane {}", report.lane_id), UiTone::Success)
-            .block(UiBlock::Metadata(metadata));
+        TerminalDocument::new(title, UiTone::Success).block(UiBlock::Metadata(metadata));
     if let Some(workdir) = &report.workdir {
         document = document.block(UiBlock::Notice(format!("Workdir: {workdir}")));
     }

@@ -50,7 +50,24 @@ pub(super) fn handle_lane_resources(
             &body.paths,
             body.include_neighbors,
         )?;
-        return Ok(Some(json_response(201, "Created", &report)?));
+        let (status, reason) = if report.resumed {
+            (200, "OK")
+        } else {
+            (201, "Created")
+        };
+        return Ok(Some(json_response(status, reason, &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "repair-initialization"
+        && request.method == "POST"
+    {
+        reject_unexpected_body(request, "POST /v1/lanes/{lane_or_id}/repair-initialization")?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = db.repair_lane_initialization(&lane)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
     }
 
     if parts.len() == 3 && parts[0] == "v1" && parts[1] == "lanes" {

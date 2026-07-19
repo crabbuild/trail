@@ -707,3 +707,111 @@ fn neighbor_provider_and_model_conflicts_are_distinct_and_stable() {
         assert_initialization_conflict(error, name, &first.request_fingerprint);
     }
 }
+
+#[test]
+fn repair_initialization_is_idempotent_and_http_replay_is_200() {
+    let mut fixture = LaneInitializationFixture::new();
+    let first = spawn_virtual(
+        &mut fixture,
+        "repair-contract",
+        Some("main"),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let repaired = fixture
+        .db_mut()
+        .repair_lane_initialization("repair-contract")
+        .unwrap();
+    assert_eq!(repaired.initialization_id, first.initialization_id);
+    assert_eq!(
+        repaired.phase,
+        trail::LaneInitializationPhase::ObserverReady
+    );
+    assert!(repaired.resumed);
+
+    let replay = trail::server::handle_http_request(
+        fixture.db_mut(),
+        &api_request(
+            "POST",
+            "/v1/lanes",
+            serde_json::json!({"name":"repair-contract","from":"main","workdir_mode":"virtual"}),
+        ),
+    );
+    assert_eq!(replay.status, 200);
+    let repaired_http = trail::server::handle_http_request(
+        fixture.db_mut(),
+        b"POST /v1/lanes/repair-contract/repair-initialization HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(repaired_http.status, 200);
+}
+
+#[test]
+fn successful_removal_deletes_initialization_and_allows_name_reuse() {
+    let mut fixture = LaneInitializationFixture::new();
+    let first = spawn_virtual(
+        &mut fixture,
+        "reusable-lane",
+        Some("main"),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    fixture.db_mut().remove_lane("reusable-lane", true).unwrap();
+    assert!(fixture
+        .db_mut()
+        .lane_initialization("reusable-lane")
+        .unwrap()
+        .is_none());
+    let second = spawn_virtual(
+        &mut fixture,
+        "reusable-lane",
+        Some("main"),
+        Some("codex"),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_ne!(second.request_fingerprint, first.request_fingerprint);
+}
+
+#[test]
+fn failed_removal_preserves_initialization_identity() {
+    let mut fixture = LaneInitializationFixture::new();
+    spawn_virtual(
+        &mut fixture,
+        "failed-removal",
+        Some("main"),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let before = fixture
+        .db_mut()
+        .lane_initialization("failed-removal")
+        .unwrap()
+        .unwrap();
+    Connection::open(fixture.sqlite_path())
+        .unwrap()
+        .execute(
+            "UPDATE lane_branches SET head_change='change_unmerged' WHERE lane_id=?1",
+            [&before.lane_id],
+        )
+        .unwrap();
+    fixture.db = Trail::open(fixture.workspace()).unwrap();
+    fixture
+        .db_mut()
+        .remove_lane("failed-removal", false)
+        .unwrap_err();
+    let after = fixture
+        .db_mut()
+        .lane_initialization("failed-removal")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.initialization_id, before.initialization_id);
+    assert_eq!(after.request_fingerprint, before.request_fingerprint);
+    assert_eq!(after.phase, before.phase);
+}

@@ -40,6 +40,11 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             };
             render_lane_spawn(&report, ctx.json, &ctx.render)
         }
+        LaneSubcommand::RepairInitialization(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.repair_lane_initialization(&args.name)?;
+            render_lane_spawn(&report, ctx.json, &ctx.render)
+        }
         LaneSubcommand::List => {
             let db = open_db(ctx)?;
             let lanes = db.list_lanes()?;

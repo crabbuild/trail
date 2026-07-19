@@ -28,8 +28,10 @@ fn fail_rewind_post_commit_if_requested() -> Result<()> {
 
 fn lane_rewind_committed_repair(operation: &str, error: Error) -> Error {
     match error {
-        Error::CommittedRepairRequired { .. } => error,
-        error => Error::CommittedRepairRequired {
+        Error::CommittedRepairRequired { .. } | Error::OperationCommittedRepairRequired { .. } => {
+            error
+        }
+        error => Error::OperationCommittedRepairRequired {
             operation: operation.to_string(),
             repair: "lane rewind post-commit metadata and workdir".into(),
             reason: error.to_string(),
@@ -405,7 +407,7 @@ mod tests {
         assert_ne!(after.change_id, before.change_id);
         assert_eq!(after.root_id, base_root);
         match error {
-            Error::CommittedRepairRequired {
+            Error::OperationCommittedRepairRequired {
                 operation,
                 repair,
                 reason,

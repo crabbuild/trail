@@ -591,6 +591,9 @@ impl Trail {
             }
             let associated = self.materialization_record_has_lane_association(&record)?;
             if !associated {
+                if self.materialization_record_has_pending_initialization(&record)? {
+                    continue;
+                }
                 remove_owned_materialization_tree(&record, true)?;
             }
             journal.remove_leaf(entry)?;
@@ -676,6 +679,44 @@ impl Trail {
             }
         }
         Ok(false)
+    }
+
+    fn materialization_record_has_pending_initialization(
+        &self,
+        record: &MaterializationOperationRecord,
+    ) -> Result<bool> {
+        let expected_destination = Path::new(&record.parent).join(&record.destination_leaf);
+        let durable_initialization: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM lane_initializations
+                 WHERE operation_id=?1 AND workdir=?2
+                   AND phase='materialized')",
+            params![
+                record.operation_id,
+                expected_destination.to_string_lossy().as_ref()
+            ],
+            |row| row.get(0),
+        )?;
+        if !durable_initialization {
+            return Ok(false);
+        }
+        {
+            let parent = SecureDirectory::open_absolute(Path::new(&record.parent))?;
+            parent.verify_identity((record.parent_device, record.parent_inode))?;
+            let Some(leaf) = expected_destination
+                .file_name()
+                .and_then(|leaf| leaf.to_str())
+            else {
+                return Ok(false);
+            };
+            return match parent.open_dir(leaf) {
+                Ok(directory) => {
+                    Ok(directory.identity()? == (record.owned_device, record.owned_inode))
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
     }
 }
 

@@ -29,6 +29,8 @@ pub(super) struct LaneMergeArgs {
 pub(super) enum LaneSubcommand {
     /// Create a new lane branch and optional materialized workdir.
     Spawn(LaneSpawnArgs),
+    /// Validate and finish a committed lane initialization.
+    RepairInitialization(LaneRepairInitializationArgs),
     /// List all lane branches and metadata.
     List,
     /// Show one lane record and branch state.
@@ -141,6 +143,11 @@ pub(super) struct LaneSpawnArgs {
     pub(super) provider: Option<String>,
     #[arg(long)]
     pub(super) model: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct LaneRepairInitializationArgs {
+    pub(super) name: String,
 }
 
 #[derive(Args)]

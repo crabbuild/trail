@@ -452,7 +452,7 @@ impl LaneInitializationRecord {
     }
 }
 
-fn lane_initialization_record(
+pub(crate) fn lane_initialization_record(
     conn: &Connection,
     lane: &str,
 ) -> Result<Option<LaneInitializationRecord>> {
@@ -461,7 +461,7 @@ fn lane_initialization_record(
                 operation_id,phase,workdir,materialization_json,last_error_code,
                 last_error_message,repair_command,created_at,updated_at
          FROM lane_initializations
-         WHERE lane_name=?1 OR lane_id=?1
+         WHERE lane_name=?1 OR lane_id=?1 OR initialization_id=?1
          ORDER BY CASE WHEN lane_name=?1 THEN 0 ELSE 1 END
          LIMIT 1",
         params![lane],
@@ -519,6 +519,89 @@ fn lane_initialization_record(
         },
     )
     .transpose()
+}
+
+pub(crate) struct LaneInitializationUpdate<'a> {
+    pub(crate) operation_id: Option<&'a str>,
+    pub(crate) workdir: Option<&'a Path>,
+    pub(crate) materialization_json: Option<&'a str>,
+    pub(crate) last_error: Option<&'a Error>,
+}
+
+impl LaneInitializationUpdate<'_> {
+    pub(crate) fn none() -> Self {
+        Self {
+            operation_id: None,
+            workdir: None,
+            materialization_json: None,
+            last_error: None,
+        }
+    }
+}
+
+fn phase_database_name(phase: LaneInitializationPhase) -> &'static str {
+    match phase {
+        LaneInitializationPhase::Reserved => "reserved",
+        LaneInitializationPhase::Materialized => "materialized",
+        LaneInitializationPhase::Associated => "associated",
+        LaneInitializationPhase::ObserverReady => "observer_ready",
+        LaneInitializationPhase::RepairRequired => "repair_required",
+    }
+}
+
+pub(crate) fn transition_lane_initialization(
+    tx: &rusqlite::Transaction<'_>,
+    initialization_id: &str,
+    expected: LaneInitializationPhase,
+    next: LaneInitializationPhase,
+    update: LaneInitializationUpdate<'_>,
+) -> Result<()> {
+    let error_code = update.last_error.map(Error::code);
+    let error_message = update.last_error.map(|error| {
+        let mut message = error.to_string();
+        message.truncate(message.floor_char_boundary(4096));
+        message
+    });
+    let changed = tx.execute(
+        "UPDATE lane_initializations
+         SET phase=?1,
+             operation_id=COALESCE(?2,operation_id),
+             workdir=COALESCE(?3,workdir),
+             materialization_json=COALESCE(?4,materialization_json),
+             last_error_code=?5,last_error_message=?6,
+             repair_command=CASE WHEN ?1='repair_required'
+               THEN 'trail lane repair-initialization ' || lane_name ELSE NULL END,
+             updated_at=?7
+         WHERE initialization_id=?8 AND phase=?9",
+        params![
+            phase_database_name(next),
+            update.operation_id,
+            update
+                .workdir
+                .map(|path| path.to_string_lossy().into_owned()),
+            update.materialization_json,
+            error_code,
+            error_message,
+            now_ts(),
+            initialization_id,
+            phase_database_name(expected),
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(());
+    }
+    let current = lane_initialization_record(tx, initialization_id)?.ok_or_else(|| {
+        Error::Corrupt(format!(
+            "lane initialization `{initialization_id}` disappeared during transition"
+        ))
+    })?;
+    if current.phase == next {
+        return Ok(());
+    }
+    Err(Error::Corrupt(format!(
+        "lane initialization `{initialization_id}` is {:?}, expected {:?} for transition to {:?}",
+        current.phase, expected, next
+    )))
 }
 
 impl Trail {
@@ -595,24 +678,20 @@ impl Trail {
         materialization: Option<&MaterializationReport>,
     ) -> Result<()> {
         let materialization_json = materialization.map(serde_json::to_string).transpose()?;
-        let changed = self.conn.execute(
-            "UPDATE lane_initializations
-             SET phase='materialized',operation_id=?1,materialization_json=?2,updated_at=?3
-             WHERE initialization_id=?4 AND request_fingerprint=?5 AND phase='reserved'",
-            params![
-                operation_id.0,
-                materialization_json,
-                now_ts(),
-                request.initialization_id,
-                request.request_fingerprint,
-            ],
+        let tx = self.conn.transaction()?;
+        transition_lane_initialization(
+            &tx,
+            &request.initialization_id,
+            LaneInitializationPhase::Reserved,
+            LaneInitializationPhase::Materialized,
+            LaneInitializationUpdate {
+                operation_id: Some(&operation_id.0),
+                workdir: request.workdir.as_deref(),
+                materialization_json: materialization_json.as_deref(),
+                last_error: None,
+            },
         )?;
-        if changed != 1 {
-            return Err(Error::Corrupt(format!(
-                "lane initialization `{}` could not transition reserved -> materialized",
-                request.initialization_id
-            )));
-        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -622,7 +701,8 @@ impl Trail {
     ) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE lane_initializations SET phase='observer_ready',updated_at=?1
-             WHERE initialization_id=?2 AND request_fingerprint=?3 AND phase='associated'",
+             WHERE initialization_id=?2 AND request_fingerprint=?3
+               AND phase IN ('associated','repair_required')",
             params![
                 now_ts(),
                 request.initialization_id,
@@ -638,6 +718,47 @@ impl Trail {
         Ok(())
     }
 
+    pub(crate) fn mark_lane_initialization_repair_required(
+        &mut self,
+        initialization_id: &str,
+        error: &Error,
+    ) -> Result<LaneInitializationRecord> {
+        let current =
+            lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` disappeared"
+                ))
+            })?;
+        if current.phase == LaneInitializationPhase::ObserverReady {
+            return Ok(current);
+        }
+        if !matches!(
+            current.phase,
+            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+        ) {
+            return Err(Error::Corrupt(format!(
+                "cannot require repair for unassociated lane initialization `{initialization_id}`"
+            )));
+        }
+        let tx = self.conn.transaction()?;
+        transition_lane_initialization(
+            &tx,
+            initialization_id,
+            current.phase,
+            LaneInitializationPhase::RepairRequired,
+            LaneInitializationUpdate {
+                last_error: Some(error),
+                ..LaneInitializationUpdate::none()
+            },
+        )?;
+        tx.commit()?;
+        lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "lane initialization `{initialization_id}` disappeared"
+            ))
+        })
+    }
+
     pub(crate) fn complete_deferred_lane_initialization(
         &mut self,
         lane: &str,
@@ -647,15 +768,20 @@ impl Trail {
         if record.phase == LaneInitializationPhase::ObserverReady {
             return Ok(record);
         }
-        if record.phase != LaneInitializationPhase::Associated {
+        if !matches!(
+            record.phase,
+            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+        ) {
             return Err(Error::Corrupt(format!(
                 "lane initialization `{}` is {:?}, expected associated",
                 record.initialization_id, record.phase
             )));
         }
         let changed = self.conn.execute(
-            "UPDATE lane_initializations SET phase='observer_ready',updated_at=?1
-             WHERE initialization_id=?2 AND phase='associated'",
+            "UPDATE lane_initializations
+             SET phase='observer_ready',last_error_code=NULL,last_error_message=NULL,
+                 repair_command=NULL,updated_at=?1
+             WHERE initialization_id=?2 AND phase IN ('associated','repair_required')",
             params![now_ts(), record.initialization_id],
         )?;
         if changed != 1 {

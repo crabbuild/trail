@@ -1596,7 +1596,7 @@ impl crate::Trail {
             &operation.after_root,
             &operation_id,
         )
-        .map_err(|error| crate::Error::CommittedRepairRequired {
+        .map_err(|error| crate::Error::OperationCommittedRepairRequired {
             operation: operation_id.0.clone(),
             repair: "ref mirror".into(),
             reason: error.to_string(),
@@ -1621,7 +1621,7 @@ impl crate::Trail {
             {
                 runtime
                     .accept_observed_baseline(&observed.expected, &target)
-                    .map_err(|error| crate::Error::CommittedRepairRequired {
+                    .map_err(|error| crate::Error::OperationCommittedRepairRequired {
                         operation: operation_id.0.clone(),
                         repair: "workspace observer runtime".into(),
                         reason: error.to_string(),
