@@ -1,7 +1,71 @@
 use super::*;
 use crate::db::change_ledger::{remove_retired_segments, retire_deletion_scopes};
+use crate::db::lane::initialization::lane_initialization_record;
+
+pub(crate) struct NativeCowSpaceContext {
+    pub(crate) initialization_id: String,
+    pub(crate) workdir: PathBuf,
+    pub(crate) backend: String,
+    pub(crate) clone_count: u64,
+}
 
 impl Trail {
+    pub(crate) fn native_cow_space_context(&self, lane: &str) -> Result<NativeCowSpaceContext> {
+        let branch = self.lane_branch(lane)?;
+        let record = self.lane_record(&branch.lane_id)?;
+        let mode = self.lane_workdir_mode_for(&record, &branch)?;
+        if mode != LaneWorkdirMode::NativeCow {
+            return Err(Error::InvalidInput(format!(
+                "lane `{lane}` does not have a layered or native-COW workspace"
+            )));
+        }
+        let backend = self.lane_workdir_backend_for(&record)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "native-COW lane `{lane}` has no durable workdir backend"
+            ))
+        })?;
+        if backend != WorkdirBackend::Clone {
+            return Err(Error::Corrupt(format!(
+                "native-COW lane `{lane}` has incompatible durable backend `{}`",
+                backend.as_str()
+            )));
+        }
+        let initialization = lane_initialization_record(&self.conn, lane)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "native-COW lane `{lane}` has no durable initialization"
+            ))
+        })?;
+        let encoded = initialization
+            .materialization_json
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "native-COW lane `{lane}` has no durable materialization report"
+                ))
+            })?;
+        let materialization: MaterializationReport = serde_json::from_str(encoded)?;
+        if materialization.copied_files != 0 {
+            return Err(Error::Corrupt(format!(
+                "native-COW lane `{lane}` durable materialization contains copied files"
+            )));
+        }
+        let workdir = branch
+            .workdir
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::Corrupt(format!("native-COW lane `{lane}` has no workdir")))?;
+        if initialization.workdir.as_ref() != Some(&workdir) {
+            return Err(Error::Corrupt(format!(
+                "native-COW lane `{lane}` workdir does not match its durable initialization"
+            )));
+        }
+        Ok(NativeCowSpaceContext {
+            initialization_id: initialization.initialization_id,
+            workdir,
+            backend: mode.as_str().to_string(),
+            clone_count: materialization.cloned_files,
+        })
+    }
+
     pub fn lane_timeline(&self, lane: &str, limit: usize) -> Result<Vec<TimelineEntry>> {
         let branch = self.lane_branch(lane)?;
         let mut stmt = self.conn.prepare(

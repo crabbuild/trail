@@ -676,6 +676,20 @@ pub struct WorkspaceCheckpointReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalSharing {
+    Verified,
+    NotShared,
+    Unknown,
+}
+
+impl Default for PhysicalSharing {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSpaceReport {
     pub view_id: String,
     pub logical_visible_bytes: u64,
@@ -687,6 +701,20 @@ pub struct WorkspaceSpaceReport {
     pub generated_upper_bytes: u64,
     pub scratch_upper_bytes: u64,
     pub physical_accounting: String,
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub logical_file_count: u64,
+    #[serde(default)]
+    pub filesystem_allocated_bytes: u64,
+    #[serde(default)]
+    pub changed_since_baseline_bytes: Option<u64>,
+    #[serde(default)]
+    pub clone_count: u64,
+    #[serde(default)]
+    pub physical_sharing: PhysicalSharing,
+    #[serde(default)]
+    pub physical_sharing_evidence: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1137,5 +1165,30 @@ mod workdir_mode_tests {
         }))
         .unwrap();
         assert_eq!(record.path_index, PathIndexMetricsReport::default());
+    }
+
+    #[test]
+    fn legacy_workspace_space_reports_default_extended_accounting() {
+        let report: WorkspaceSpaceReport = serde_json::from_value(serde_json::json!({
+            "view_id": "view-1",
+            "logical_visible_bytes": 10,
+            "shared_physical_bytes": 2,
+            "lane_exclusive_physical_bytes": 3,
+            "shared_extent_bytes": null,
+            "reclaimable_cache_bytes": 0,
+            "uncheckpointed_source_bytes": 1,
+            "generated_upper_bytes": 0,
+            "scratch_upper_bytes": 0,
+            "physical_accounting": "allocated-blocks"
+        }))
+        .unwrap();
+
+        assert_eq!(report.backend, "");
+        assert_eq!(report.logical_file_count, 0);
+        assert_eq!(report.filesystem_allocated_bytes, 0);
+        assert_eq!(report.changed_since_baseline_bytes, None);
+        assert_eq!(report.clone_count, 0);
+        assert_eq!(report.physical_sharing, PhysicalSharing::Unknown);
+        assert_eq!(report.physical_sharing_evidence, "");
     }
 }

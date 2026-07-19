@@ -100,6 +100,36 @@ pub(crate) fn render_workspace_space(
                 "Lane-exclusive".to_string(),
                 byte_count(report.lane_exclusive_physical_bytes),
             ),
+            ("Backend".to_string(), report.backend.clone()),
+            (
+                "Logical files".to_string(),
+                report.logical_file_count.to_string(),
+            ),
+            (
+                "Filesystem allocated".to_string(),
+                byte_count(report.filesystem_allocated_bytes),
+            ),
+            (
+                "Changed since baseline".to_string(),
+                report
+                    .changed_since_baseline_bytes
+                    .map(byte_count)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+            ("Cloned files".to_string(), report.clone_count.to_string()),
+            (
+                "Physical sharing".to_string(),
+                match report.physical_sharing {
+                    PhysicalSharing::Verified => "verified",
+                    PhysicalSharing::NotShared => "not_shared",
+                    PhysicalSharing::Unknown => "unknown",
+                }
+                .to_string(),
+            ),
+            (
+                "Sharing evidence".to_string(),
+                report.physical_sharing_evidence.clone(),
+            ),
             (
                 "Uncheckpointed".to_string(),
                 byte_count(report.uncheckpointed_source_bytes),

@@ -22899,6 +22899,96 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         .contains("custom lane workdir requires materialization"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn native_cow_lane_space_reports_allocated_and_changed_bytes_honestly() {
+    let temp = tempfile::tempdir().unwrap();
+    let edit_before = b"edit before\n";
+    let edit_after = b"edited content after spawn\n";
+    let deleted = b"delete after spawn\n";
+    let kept = b"unchanged\n";
+    let added = b"new lane file\n";
+    fs::write(temp.path().join("edit.txt"), edit_before).unwrap();
+    fs::write(temp.path().join("delete.txt"), deleted).unwrap();
+    fs::write(temp.path().join("keep.txt"), kept).unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let workdirs = tempfile::tempdir().unwrap();
+    let workdir = workdirs.path().join("space-lane");
+    let spawned = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "space-lane",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "native-cow",
+            "--workdir",
+            workdir.to_str().unwrap(),
+        ],
+    );
+    fs::write(workdir.join("edit.txt"), edit_after).unwrap();
+    fs::write(workdir.join("added.txt"), added).unwrap();
+    fs::remove_file(workdir.join("delete.txt")).unwrap();
+
+    let report = run_trail_json(temp.path(), &["lane", "space", "space-lane"]);
+    assert_eq!(report["view_id"], spawned["initialization_id"]);
+    assert_eq!(report["backend"], "native-cow");
+    assert_eq!(report["logical_file_count"], 3);
+    assert_eq!(
+        report["logical_visible_bytes"],
+        u64::try_from(edit_after.len() + kept.len() + added.len()).unwrap()
+    );
+    assert!(report["filesystem_allocated_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        report["changed_since_baseline_bytes"],
+        u64::try_from(edit_after.len() + added.len()).unwrap()
+    );
+    assert_eq!(
+        report["clone_count"],
+        spawned["materialization"]["cloned_files"]
+    );
+    assert_eq!(report["shared_physical_bytes"], 0);
+    assert_eq!(report["lane_exclusive_physical_bytes"], 0);
+    assert!(report["shared_extent_bytes"].is_null());
+    assert_eq!(report["physical_sharing"], "unknown");
+    assert_eq!(
+        report["physical_sharing_evidence"],
+        "allocated_blocks_do_not_prove_apfs_extent_sharing"
+    );
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["lane", "space", "space-lane"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "human lane space failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "Backend",
+        "native-cow",
+        "Logical files",
+        "Filesystem allocated",
+        "Changed since baseline",
+        "Cloned files",
+        "Physical sharing",
+        "unknown",
+        "allocated_blocks_do_not_prove_apfs_extent_sharing",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing `{expected}` in:\n{stdout}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn sparse_lane_path_sync_rolls_back_hydrated_files_when_manifest_update_fails() {

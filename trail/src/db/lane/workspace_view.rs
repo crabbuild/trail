@@ -1102,17 +1102,26 @@ impl Trail {
     }
 
     pub fn lane_workspace_space(&self, lane: &str) -> Result<WorkspaceSpaceReport> {
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "lane `{lane}` does not have a layered workspace view"
-            ))
-        })?;
+        if let Some(view) = self.lane_workspace_view(lane)? {
+            return self.layered_workspace_space(view);
+        }
+        self.native_cow_workspace_space(lane)
+    }
+
+    fn layered_workspace_space(
+        &self,
+        view: LaneWorkspaceViewReport,
+    ) -> Result<WorkspaceSpaceReport> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &view.base_root)?;
         let source = directory_usage(Path::new(&view.source_upper))?;
         let generated = directory_usage(Path::new(&view.generated_upper))?;
         let scratch = directory_usage(Path::new(&view.scratch_upper))?;
         let blobs = directory_usage(&self.db_dir.join("cache/blobs"))?;
         let layers = directory_usage(&self.db_dir.join("cache/layers"))?;
+        let lane_exclusive_physical_bytes = source
+            .physical_bytes
+            .saturating_add(generated.physical_bytes)
+            .saturating_add(scratch.physical_bytes);
         Ok(WorkspaceSpaceReport {
             view_id: view.view_id,
             logical_visible_bytes: root
@@ -1121,10 +1130,7 @@ impl Trail {
                 .saturating_add(generated.logical_bytes)
                 .saturating_add(scratch.logical_bytes),
             shared_physical_bytes: blobs.physical_bytes.saturating_add(layers.physical_bytes),
-            lane_exclusive_physical_bytes: source
-                .physical_bytes
-                .saturating_add(generated.physical_bytes)
-                .saturating_add(scratch.physical_bytes),
+            lane_exclusive_physical_bytes,
             shared_extent_bytes: None,
             reclaimable_cache_bytes: self.workspace_reclaimable_cache_bytes()?,
             uncheckpointed_source_bytes: source.logical_bytes,
@@ -1135,7 +1141,94 @@ impl Trail {
             } else {
                 "file-size-estimate".to_string()
             },
+            backend: view.backend,
+            logical_file_count: root
+                .file_count
+                .saturating_add(source.file_count)
+                .saturating_add(generated.file_count)
+                .saturating_add(scratch.file_count),
+            filesystem_allocated_bytes: lane_exclusive_physical_bytes,
+            changed_since_baseline_bytes: None,
+            clone_count: 0,
+            physical_sharing: PhysicalSharing::Unknown,
+            physical_sharing_evidence:
+                "layered_workspace_uses_separate_shared_and_exclusive_accounting".to_string(),
         })
+    }
+
+    fn native_cow_workspace_space(&self, lane: &str) -> Result<WorkspaceSpaceReport> {
+        let context = self.native_cow_space_context(lane)?;
+        let branch = self.lane_branch(lane)?;
+        let usage = materialized_workdir_usage(&context.workdir)?;
+        let changed_since_baseline_bytes =
+            self.native_cow_changed_since_baseline_bytes(&branch, &context.workdir)?;
+        Ok(WorkspaceSpaceReport {
+            view_id: context.initialization_id,
+            logical_visible_bytes: usage.logical_bytes,
+            shared_physical_bytes: 0,
+            // Filesystem allocation does not establish whether APFS/reflink
+            // extents are shared or exclusive, so it is deliberately absent
+            // from both ownership projections.
+            lane_exclusive_physical_bytes: 0,
+            shared_extent_bytes: None,
+            reclaimable_cache_bytes: self.workspace_reclaimable_cache_bytes()?,
+            uncheckpointed_source_bytes: changed_since_baseline_bytes,
+            generated_upper_bytes: 0,
+            scratch_upper_bytes: 0,
+            physical_accounting: if cfg!(unix) {
+                "allocated-blocks-unattributed".to_string()
+            } else {
+                "file-size-estimate-unattributed".to_string()
+            },
+            backend: context.backend,
+            logical_file_count: usage.file_count,
+            filesystem_allocated_bytes: usage.physical_bytes,
+            changed_since_baseline_bytes: Some(changed_since_baseline_bytes),
+            clone_count: context.clone_count,
+            physical_sharing: PhysicalSharing::Unknown,
+            physical_sharing_evidence: "allocated_blocks_do_not_prove_apfs_extent_sharing"
+                .to_string(),
+        })
+    }
+
+    fn native_cow_changed_since_baseline_bytes(
+        &self,
+        branch: &LaneBranch,
+        workdir: &Path,
+    ) -> Result<u64> {
+        let head = self.get_ref(&branch.ref_name)?;
+        let mut candidate_paths = self
+            .diff_root_file_summaries(&branch.base_root, &branch.head_root)?
+            .into_iter()
+            .flat_map(|summary| [Some(summary.path), summary.old_path])
+            .flatten()
+            .collect::<Vec<_>>();
+        candidate_paths.extend(
+            self.lane_workdir_record_changed_paths(branch, &head, workdir)?
+                .into_iter()
+                .flat_map(|summary| [Some(summary.path), summary.old_path])
+                .flatten(),
+        );
+        candidate_paths.sort();
+        candidate_paths.dedup();
+        if candidate_paths.is_empty() {
+            return Ok(0);
+        }
+        let baseline = self.load_root_files_for_paths(&branch.base_root, &candidate_paths)?;
+        let disk_files = self.scan_files_under_for_paths(workdir, &candidate_paths)?;
+        let disk_manifest = self.disk_manifest(&disk_files);
+        let changed_paths = self
+            .diff_file_maps_to_manifest_for_paths(&baseline, &disk_manifest, &candidate_paths)?
+            .into_iter()
+            .map(|summary| summary.path)
+            .collect::<BTreeSet<_>>();
+        Ok(disk_files.into_iter().fold(0_u64, |total, file| {
+            if changed_paths.contains(&file.path) {
+                total.saturating_add(file.bytes.len().try_into().unwrap_or(u64::MAX))
+            } else {
+                total
+            }
+        }))
     }
 
     pub fn workspace_quota_status(&self, lane: &str) -> Result<WorkspaceQuotaReport> {
@@ -1481,6 +1574,46 @@ fn directory_usage(path: &Path) -> Result<DirectoryUsage> {
             continue;
         }
         let metadata = entry.metadata().map_err(|err| Error::Io(err.into()))?;
+        usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
+        usage.file_count = usage.file_count.saturating_add(1);
+        usage.largest_file_bytes = usage.largest_file_bytes.max(metadata.len());
+        usage.physical_bytes = usage
+            .physical_bytes
+            .saturating_add(file_physical_bytes(&metadata));
+    }
+    Ok(usage)
+}
+
+fn materialized_workdir_usage(path: &Path) -> Result<DirectoryUsage> {
+    if !path.is_dir() {
+        return Err(Error::Corrupt(format!(
+            "materialized workdir `{}` is not a directory",
+            path.display()
+        )));
+    }
+    let mut usage = DirectoryUsage::default();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let relative = entry.path().strip_prefix(path).map_err(|_| {
+            Error::Corrupt(format!(
+                "materialized workdir entry `{}` escaped `{}`",
+                entry.path().display(),
+                path.display()
+            ))
+        })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if is_internal_path(&relative) || !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
         usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
         usage.file_count = usage.file_count.saturating_add(1);
         usage.largest_file_bytes = usage.largest_file_bytes.max(metadata.len());
@@ -1837,6 +1970,14 @@ mod tests {
         assert!(Path::new(&view.scratch_upper).is_dir());
         let space = db.lane_workspace_space("layered").unwrap();
         assert!(space.lane_exclusive_physical_bytes < 64 * 1024);
+        assert_eq!(space.backend, view.backend);
+        assert_eq!(space.logical_file_count, 1);
+        assert_eq!(
+            space.filesystem_allocated_bytes,
+            space.lane_exclusive_physical_bytes
+        );
+        assert_eq!(space.changed_since_baseline_bytes, None);
+        assert_eq!(space.physical_sharing, PhysicalSharing::Unknown);
 
         drop(db);
         let reopened = Trail::open(temp.path()).unwrap();
@@ -1848,6 +1989,28 @@ mod tests {
                 .view_id,
             view.view_id
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_workdir_usage_never_follows_symlinks_or_counts_internal_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(root.path().join("visible.txt"), b"four").unwrap();
+        fs::create_dir(root.path().join(".trail")).unwrap();
+        fs::write(
+            root.path().join(".trail/workdir-manifest.json"),
+            vec![0_u8; 128],
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("outside-link")).unwrap();
+
+        let usage = materialized_workdir_usage(root.path()).unwrap();
+        assert_eq!(usage.logical_bytes, 4);
+        assert_eq!(usage.file_count, 1);
+        assert!(usage.physical_bytes > 0);
     }
 
     #[test]
