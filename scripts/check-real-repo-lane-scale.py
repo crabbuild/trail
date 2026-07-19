@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
     "exit_code", "committed", "retry_of",
@@ -43,9 +44,9 @@ FAULT_SCENARIOS = INITIALIZATION_PHASES + [
 ]
 LANE_PHASES = ("spawn", "spawn_retry", "status", "space", "record", "readiness", "handoff")
 ROOT_FILES = {
-    "environment.json", "expected-paths.txt", "faults.tsv", "final-git-paths.txt",
-    "final-trail-paths.txt", "lanes.tsv", "metrics.json", "results.tsv",
-    "evidence-manifest.sha256",
+    "baseline-untracked.json", "environment.json", "expected-paths.txt", "faults.tsv",
+    "final-git-paths.txt", "final-trail-paths.txt", "final-untracked.json", "lanes.tsv",
+    "metrics.json", "results.tsv", "evidence-manifest.sha256",
 }
 DEDICATED_REF = re.compile(r"^refs/heads/codex/[A-Za-z0-9._/-]+$")
 
@@ -142,6 +143,39 @@ def read_paths(path: Path) -> list[str]:
     return lines
 
 
+def read_untracked_snapshot(path: Path) -> list[dict[str, str]]:
+    snapshot = read_json(path)
+    exact_keys(snapshot, ["schema_version", "algorithm", "entries"], path.name)
+    if snapshot["schema_version"] != UNTRACKED_SCHEMA_VERSION:
+        fail(f"{path.name} schema_version must be {UNTRACKED_SCHEMA_VERSION}")
+    if snapshot["algorithm"] != "sha256":
+        fail(f"{path.name} algorithm must be sha256")
+    entries = snapshot["entries"]
+    if not isinstance(entries, list):
+        fail(f"{path.name} entries must be an array")
+    paths: list[str] = []
+    allowed_types = {"regular", "symlink", "fifo", "socket", "block_device", "char_device", "other"}
+    for index, entry in enumerate(entries):
+        label = f"{path.name}.entries[{index}]"
+        if not isinstance(entry, dict):
+            fail(f"{label} must be an object")
+        exact_keys(entry, ["path", "type", "digest"], label)
+        relative = entry["path"]
+        if (not isinstance(relative, str) or not relative or relative.startswith("/")
+                or "\0" in relative or relative == ".trail" or relative.startswith(".trail/")):
+            fail(f"{label}.path is invalid or Trail-internal")
+        if Path(relative).is_absolute() or ".." in Path(relative).parts:
+            fail(f"{label}.path is unsafe")
+        if entry["type"] not in allowed_types:
+            fail(f"{label}.type is unsupported")
+        if not isinstance(entry["digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["digest"]):
+            fail(f"{label}.digest is not sha256")
+        paths.append(relative)
+    if paths != sorted(set(paths)):
+        fail(f"{path.name} entries must be path-sorted and duplicate-free")
+    return entries
+
+
 def percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     index = max(0, math.ceil(len(ordered) * quantile) - 1)
@@ -191,10 +225,30 @@ def check(root: Path) -> dict[str, Any]:
     metrics = read_json(root / "metrics.json")
     exact_keys(metrics, [
         "schema_version", "run", "baseline", "correctness", "performance", "storage",
-        "git_export", "cleanup", "integrity", "evidence",
+        "git_export", "cleanup", "integrity", "git_state_preservation", "evidence",
     ], "metrics")
     if metrics["schema_version"] != SCHEMA_VERSION:
         fail(f"metrics schema_version must be {SCHEMA_VERSION}")
+
+    baseline_untracked = read_untracked_snapshot(root / "baseline-untracked.json")
+    final_untracked = read_untracked_snapshot(root / "final-untracked.json")
+    baseline_by_path = {entry["path"]: entry for entry in baseline_untracked}
+    final_by_path = {entry["path"]: entry for entry in final_untracked}
+    added_untracked = sorted(final_by_path.keys() - baseline_by_path.keys())
+    removed_untracked = sorted(baseline_by_path.keys() - final_by_path.keys())
+    modified_untracked = sorted(
+        path for path in baseline_by_path.keys() & final_by_path.keys()
+        if baseline_by_path[path] != final_by_path[path]
+    )
+    preserved_untracked = sum(
+        baseline_by_path[path] == final_by_path[path]
+        for path in baseline_by_path.keys() & final_by_path.keys()
+    )
+    if added_untracked or removed_untracked or modified_untracked:
+        fail(
+            "untracked state was not preserved: "
+            f"added={added_untracked} removed={removed_untracked} modified={modified_untracked}"
+        )
 
     run = metrics["run"]
     if not isinstance(run, dict): fail("run must be an object")
@@ -352,6 +406,28 @@ def check(root: Path) -> dict[str, Any]:
     if not isinstance(integrity, dict): fail("integrity must be an object")
     exact_keys(integrity, ["trail_doctor", "trail_fsck", "git_fsck", "conflict_control"], "integrity")
     if any(value != "ok" for value in integrity.values()): fail("doctor/fsck/conflict integrity control failed")
+
+    git_state = metrics["git_state_preservation"]
+    if not isinstance(git_state, dict): fail("git_state_preservation must be an object")
+    exact_keys(git_state, [
+        "tracked_worktree_clean", "index_clean", "preexisting_untracked_count",
+        "final_untracked_count", "preserved_untracked_count", "added_untracked_count",
+        "removed_untracked_count", "modified_untracked_count",
+    ], "git_state_preservation")
+    for key in ["tracked_worktree_clean", "index_clean"]:
+        if not boolean(git_state[key], f"git_state_preservation.{key}"):
+            fail(f"git_state_preservation.{key} must be true")
+    expected_git_state_counts = {
+        "preexisting_untracked_count": len(baseline_untracked),
+        "final_untracked_count": len(final_untracked),
+        "preserved_untracked_count": preserved_untracked,
+        "added_untracked_count": len(added_untracked),
+        "removed_untracked_count": len(removed_untracked),
+        "modified_untracked_count": len(modified_untracked),
+    }
+    for key, expected in expected_git_state_counts.items():
+        if integer(git_state[key], f"git_state_preservation.{key}") != expected:
+            fail(f"git_state_preservation.{key} does not match untracked snapshots")
 
     evidence = metrics["evidence"]
     if not isinstance(evidence, dict): fail("evidence must be an object")

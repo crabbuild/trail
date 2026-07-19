@@ -91,8 +91,7 @@ elif command[:2] == ["git","export"]:
 elif command[:2] == ["agent","mark-reviewed"]:
     emit({"status":"reviewed"})
 elif command[:2] == ["agent","apply"]:
-    dirty=list(workspace.glob(".trail-scale-dirty-*"))
-    if dirty:
+    if subprocess.call(["git","-C",str(workspace),"diff","--quiet","--"]):
         print(json.dumps({"code":"GIT_DIRTY","message":"dirty Git refused"}),file=sys.stderr); raise SystemExit(10)
     emit({"status":"ready"})
 elif command[:2] == ["lane","rm"]:
@@ -103,7 +102,10 @@ elif command[:2] == ["lane","rm"]:
     removed=locked(remove)
     if removed: shutil.rmtree(removed["workdir"],ignore_errors=True)
     emit({"removed":lane})
-elif command in (["doctor"],["fsck"]): emit({"ok":True})
+elif command in (["doctor"],["fsck"]):
+    if command == ["doctor"] and os.environ.get("FAKE_CREATE_UNTRACKED"):
+        (workspace/os.environ["FAKE_CREATE_UNTRACKED"]).write_bytes(b"unexpected\n")
+    emit({"ok":True})
 else:
     print("unsupported fake command: "+repr(command),file=sys.stderr); raise SystemExit(64)
 '''
@@ -161,6 +163,36 @@ class HarnessContractTests(unittest.TestCase):
         expected = (self.output / "expected-paths.txt").read_text().splitlines()
         self.assertEqual(len(expected), len(set(expected)))
         self.assertEqual(expected, (self.output / "final-git-paths.txt").read_text().splitlines())
+
+    def test_preexisting_untracked_files_are_preserved_and_attested(self) -> None:
+        expected = {
+            ".trailignore": b"target/\n",
+            "x.mm": b"x bytes\x00\xff",
+            "yy.m": b"y bytes\n",
+        }
+        for relative, content in expected.items():
+            (self.repo / relative).write_bytes(content)
+
+        result = self.run_harness()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            {relative: (self.repo / relative).read_bytes() for relative in expected},
+            expected,
+        )
+        baseline = json.loads((self.output / "baseline-untracked.json").read_text())
+        final = json.loads((self.output / "final-untracked.json").read_text())
+        self.assertEqual(baseline, final)
+        self.assertEqual(
+            [entry["path"] for entry in baseline["entries"]],
+            sorted(expected),
+        )
+
+    def test_unexpected_new_untracked_path_is_rejected(self) -> None:
+        result = self.run_harness(FAKE_CREATE_UNTRACKED="unexpected-user-file.txt")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-.trail untracked state changed", result.stderr)
 
     def test_invalid_concurrency_is_rejected_before_mutation(self) -> None:
         result = self.run_harness(TRAIL_SCALE_CONCURRENCY="3")

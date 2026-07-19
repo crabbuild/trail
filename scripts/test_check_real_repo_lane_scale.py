@@ -102,6 +102,15 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
     write_tsv(root / "lanes.tsv", checker.LANE_COLUMNS, lane_rows)
     write_tsv(root / "faults.tsv", checker.FAULT_COLUMNS, fault_rows)
     (root / "environment.json").write_text('{"platform":"contract"}\n', encoding="utf-8")
+    untracked = {
+        "schema_version": checker.UNTRACKED_SCHEMA_VERSION,
+        "algorithm": "sha256",
+        "entries": [
+            {"path": ".trailignore", "type": "regular", "digest": "d" * 64},
+        ],
+    }
+    for name in ("baseline-untracked.json", "final-untracked.json"):
+        (root / name).write_text(json.dumps(untracked, sort_keys=True) + "\n", encoding="utf-8")
 
     def perf(count: int) -> dict[str, object]:
         return {"count": count, "p50_seconds": wall, "p95_seconds": wall,
@@ -137,6 +146,13 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
                     "leaked_workdirs": 0},
         "integrity": {"trail_doctor": "ok", "trail_fsck": "ok",
                       "git_fsck": "ok", "conflict_control": "ok"},
+        "git_state_preservation": {"tracked_worktree_clean": True, "index_clean": True,
+                                   "preexisting_untracked_count": 1,
+                                   "final_untracked_count": 1,
+                                   "preserved_untracked_count": 1,
+                                   "added_untracked_count": 0,
+                                   "removed_untracked_count": 0,
+                                   "modified_untracked_count": 0},
         "evidence": {"result_rows": len(result_rows), "command_count": len(result_rows),
                      "fault_rows": len(fault_rows), "manifest_entries": 0},
     }
@@ -175,6 +191,16 @@ class CheckerContractTests(unittest.TestCase):
         (root / "metrics.json").write_text(json.dumps(metrics) + "\n")
         refresh_manifest(root)
         with self.assertRaisesRegex(checker.EvidenceError, "keys mismatch"):
+            checker.check(root)
+
+    def test_changed_preexisting_untracked_digest_is_rejected(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        final = json.loads((root / "final-untracked.json").read_text())
+        final["entries"][0]["digest"] = "e" * 64
+        (root / "final-untracked.json").write_text(json.dumps(final) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "untracked state was not preserved"):
             checker.check(root)
 
     def test_unexpected_git_path_is_rejected(self) -> None:

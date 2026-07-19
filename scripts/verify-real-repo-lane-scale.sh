@@ -89,6 +89,72 @@ die() { echo "verify-real-repo-lane-scale: $*" >&2; exit 64; }
 is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
 is_number() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 
+snapshot_untracked() {
+  local output=$1
+  python3 - "$TRAIL_SCALE_REPO" "$output" <<'PY'
+import hashlib, json, os, stat, subprocess, sys
+
+repo, output = os.fsencode(sys.argv[1]), sys.argv[2]
+raw_paths = subprocess.check_output(
+    [b"git", b"-C", repo, b"ls-files", b"--others", b"--exclude-standard", b"-z", b"--"]
+).split(b"\0")
+entries = []
+for raw_path in raw_paths:
+    if not raw_path or raw_path == b".trail" or raw_path.startswith(b".trail/"):
+        continue
+    full_path = os.path.join(repo, raw_path)
+    before = os.lstat(full_path)
+    if stat.S_ISREG(before.st_mode):
+        kind = "regular"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(full_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise SystemExit(f"untracked path changed while snapshotting: {os.fsdecode(raw_path)!r}")
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            hexdigest = digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    elif stat.S_ISLNK(before.st_mode):
+        kind = "symlink"
+        hexdigest = hashlib.sha256(os.readlink(full_path)).hexdigest()
+    else:
+        if stat.S_ISFIFO(before.st_mode): kind = "fifo"
+        elif stat.S_ISSOCK(before.st_mode): kind = "socket"
+        elif stat.S_ISBLK(before.st_mode): kind = "block_device"
+        elif stat.S_ISCHR(before.st_mode): kind = "char_device"
+        else: kind = "other"
+        identity = f"{stat.S_IFMT(before.st_mode)}:{stat.S_IMODE(before.st_mode)}:{before.st_dev}:{before.st_ino}:{before.st_rdev}"
+        hexdigest = hashlib.sha256(identity.encode("ascii")).hexdigest()
+    after = os.lstat(full_path)
+    if (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)) != (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)):
+        raise SystemExit(f"untracked path changed while snapshotting: {os.fsdecode(raw_path)!r}")
+    entries.append({"path": os.fsdecode(raw_path), "type": kind, "digest": hexdigest})
+entries.sort(key=lambda entry: os.fsencode(entry["path"]))
+with open(output, "w", encoding="utf-8") as stream:
+    json.dump({"schema_version": 1, "algorithm": "sha256", "entries": entries}, stream, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+compare_untracked_snapshots() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+baseline = json.load(open(sys.argv[1], encoding="utf-8"))
+final = json.load(open(sys.argv[2], encoding="utf-8"))
+if baseline != final:
+    before = {entry["path"]: entry for entry in baseline.get("entries", [])}
+    after = {entry["path"]: entry for entry in final.get("entries", [])}
+    added = sorted(after.keys() - before.keys())
+    removed = sorted(before.keys() - after.keys())
+    modified = sorted(path for path in before.keys() & after.keys() if before[path] != after[path])
+    raise SystemExit(f"non-.trail untracked state changed: added={added} removed={removed} modified={modified}")
+PY
+}
+
 [[ -n $TRAIL_SCALE_REPO ]] || die "TRAIL_SCALE_REPO is required"
 [[ $TRAIL_SCALE_REPO == /* ]] || die "TRAIL_SCALE_REPO must be absolute"
 [[ -d $TRAIL_SCALE_REPO && ! -L $TRAIL_SCALE_REPO ]] || die "TRAIL_SCALE_REPO must be a real directory"
@@ -123,13 +189,14 @@ fi
 [[ ! -e $TRAIL_SCALE_OUTPUT ]] || die "TRAIL_SCALE_OUTPUT already exists"
 git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$TRAIL_SCALE_GIT_REF" && die "dedicated Git ref already exists"
 
-baseline_porcelain=$(git -C "$TRAIL_SCALE_REPO" status --porcelain=v1 --untracked-files=all)
-[[ -z $baseline_porcelain ]] || die "Git worktree/index must be clean before qualification"
+git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree must be clean before qualification"
+git -C "$TRAIL_SCALE_REPO" diff --cached --quiet -- || die "Git index must be clean before qualification"
 baseline_git_head=$(git -C "$TRAIL_SCALE_REPO" rev-parse HEAD)
 baseline_git_branch=$(git -C "$TRAIL_SCALE_REPO" symbolic-ref --short -q HEAD) || die "detached Git HEAD is not supported"
 baseline_git_index=$(git -C "$TRAIL_SCALE_REPO" write-tree)
 
 mkdir -p "$TRAIL_SCALE_OUTPUT/commands" "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs" "$TRAIL_SCALE_OUTPUT/manifests"
+snapshot_untracked "$TRAIL_SCALE_OUTPUT/baseline-untracked.json"
 RESULT_COLUMNS=$'command_id\tphase\tlane\twall_seconds\tpeak_rss_bytes\texit_code\tcommitted\tretry_of'
 LANE_COLUMNS=$'lane\tinitialization_id\tretry_initialization_id\trequest_fingerprint\tretry_request_fingerprint\tworkdir_mode\tworkdir\tedit_count\trecorded_path_count\tisolation_unexpected_count\tlogical_bytes\tallocated_bytes\texclusive_bytes'
 FAULT_COLUMNS=$'scenario\texpected_code\tactual_code\tdurable_phase\tcommitted\tretry_result\tintegrity_result\tleaked_resource_count\tinitialization_id\tretry_initialization_id\tevidence_command_id'
@@ -138,9 +205,30 @@ printf '%s\n' "$LANE_COLUMNS" > "$TRAIL_SCALE_OUTPUT/lanes.tsv"
 printf '%s\n' "$FAULT_COLUMNS" > "$TRAIL_SCALE_OUTPUT/faults.tsv"
 
 created_lanes=()
+dirty_probe_path=
+dirty_probe_backup=
+dirty_probe_backup_dir=
+dirty_probe_marker=
+restore_dirty_probe() {
+  [[ -n $dirty_probe_path && -n $dirty_probe_backup && -f $dirty_probe_backup ]] || return 0
+  local expected=$dirty_probe_backup_dir/expected
+  cp -p -- "$dirty_probe_backup" "$expected"
+  printf '%s' "$dirty_probe_marker" >> "$expected"
+  if ! cmp -s -- "$dirty_probe_path" "$expected"; then
+    echo "dirty refusal probe changed unexpectedly; refusing to overwrite tracked path $dirty_probe_path" >&2
+    return 1
+  fi
+  cp -p -- "$dirty_probe_backup" "$dirty_probe_path"
+  rm -rf -- "$dirty_probe_backup_dir"
+  dirty_probe_path=
+  dirty_probe_backup=
+  dirty_probe_backup_dir=
+  dirty_probe_marker=
+}
 cleanup_on_failure() {
   local status=$?
   if (( status != 0 )); then
+    restore_dirty_probe || true
     for lane in "${created_lanes[@]:-}"; do
       "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json lane rm "$lane" >/dev/null 2>&1 || true
     done
@@ -365,12 +453,29 @@ run_command git-update-ref git_ref "" true "" 0 git -C "$TRAIL_SCALE_REPO" updat
 git -C "$TRAIL_SCALE_REPO" diff-tree --no-commit-id --name-only -r "$export_commit" | LC_ALL=C sort > "$TRAIL_SCALE_OUTPUT/final-git-paths.txt"
 cmp -s "$expected_paths_file" "$TRAIL_SCALE_OUTPUT/final-git-paths.txt" || die "final Git manifest is not exact"
 
-dirty_probe=$TRAIL_SCALE_REPO/.trail-scale-dirty-$TRAIL_SCALE_RUN_ID
-[[ ! -e $dirty_probe ]] || die "dirty refusal probe path already exists"
 run_command dirty-git-mark-reviewed dirty_refusal_setup scale-0000 true "" 0 trail agent mark-reviewed scale-0000 --note "scale dirty Git refusal reviewed"
-printf 'dirty Git refusal probe\n' > "$dirty_probe"
+dirty_probe_relative=$(python3 - "$TRAIL_SCALE_REPO" <<'PY'
+import os, subprocess, sys
+repo = sys.argv[1]
+for raw in subprocess.check_output(["git", "-C", repo, "ls-files", "-z", "--"]).split(b"\0"):
+    if not raw or b"\n" in raw or b"\r" in raw: continue
+    path = os.path.join(os.fsencode(repo), raw)
+    if os.path.isfile(path) and not os.path.islink(path):
+        print(os.fsdecode(raw))
+        break
+else:
+    raise SystemExit("no regular tracked path is available for the dirty Git refusal control")
+PY
+)
+dirty_probe_path=$TRAIL_SCALE_REPO/$dirty_probe_relative
+dirty_probe_backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/trail-scale-dirty.XXXXXX")
+dirty_probe_backup=$dirty_probe_backup_dir/original
+dirty_probe_marker=$(printf '\nTrail scale dirty refusal probe: %s\n' "$TRAIL_SCALE_RUN_ID")
+cp -p -- "$dirty_probe_path" "$dirty_probe_backup"
+printf '%s' "$dirty_probe_marker" >> "$dirty_probe_path"
 run_command dirty-git-refusal dirty_refusal scale-0000 false "" any-nonzero trail agent apply scale-0000 --dry-run
-rm -f -- "$dirty_probe"
+restore_dirty_probe || die "dirty refusal probe could not be restored safely"
+git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "dirty refusal probe did not restore the tracked worktree"
 dirty_refusal_code=$(python3 - "$TRAIL_SCALE_OUTPUT/commands/dirty-git-refusal.stderr" <<'PY'
 import json, re, sys
 text=open(sys.argv[1], encoding="utf-8", errors="replace").read()
@@ -440,8 +545,17 @@ fi
 final_git_head=$(git -C "$TRAIL_SCALE_REPO" rev-parse HEAD)
 final_git_branch=$(git -C "$TRAIL_SCALE_REPO" symbolic-ref --short -q HEAD)
 final_git_index=$(git -C "$TRAIL_SCALE_REPO" write-tree)
-final_git_porcelain=$(git -C "$TRAIL_SCALE_REPO" status --porcelain=v1 --untracked-files=all)
-[[ -z $final_git_porcelain ]] || die "Git worktree/index is dirty after qualification"
+git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree changed during qualification"
+git -C "$TRAIL_SCALE_REPO" diff --cached --quiet -- || die "Git index changed during qualification"
+tracked_worktree_clean=true
+index_clean=true
+snapshot_untracked "$TRAIL_SCALE_OUTPUT/final-untracked.json"
+compare_untracked_snapshots "$TRAIL_SCALE_OUTPUT/baseline-untracked.json" "$TRAIL_SCALE_OUTPUT/final-untracked.json" || die "non-.trail untracked state was not preserved"
+preexisting_untracked_count=$(python3 - "$TRAIL_SCALE_OUTPUT/baseline-untracked.json" <<'PY'
+import json, sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["entries"]))
+PY
+)
 [[ $final_git_head == "$baseline_git_head" && $final_git_branch == "$baseline_git_branch" && $final_git_index == "$baseline_git_index" ]] || die "original Git branch/index changed"
 dedicated_ref_target=$(git -C "$TRAIL_SCALE_REPO" rev-parse "$TRAIL_SCALE_GIT_REF")
 commit_count=$(git -C "$TRAIL_SCALE_REPO" rev-list --count "$baseline_git_head..$dedicated_ref_target")
@@ -453,9 +567,9 @@ out, repo, binary, filesystem, commit=sys.argv[1:]
 json.dump({"platform":platform.platform(),"machine":platform.machine(),"python":platform.python_version(),"filesystem":filesystem,"repo":repo,"trail_bin":binary,"trail_source_commit":commit,"cpu_count":os.cpu_count()},open(out,"w"),sort_keys=True);open(out,"a").write("\n")
 PY
 
-python3 - "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" "$TRAIL_SCALE_CONCURRENCY" "$TRAIL_SCALE_FAULT_PHASE" "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" "$TRAIL_SCALE_REPO" "$trail_source_commit" "$baseline_trail_ref" "$baseline_trail_commit" "$baseline_trail_root" "$baseline_git_head" "$baseline_git_branch" "$baseline_git_index" "$filesystem" "$db_bytes_before" "$db_bytes_after" "$observer_log_bytes_before" "$observer_log_bytes_after" "$export_commit" "$export_parent" "$TRAIL_SCALE_GIT_REF" "$dedicated_ref_target" "$commit_count" "$dirty_refusal_code" <<'PY'
+python3 - "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" "$TRAIL_SCALE_CONCURRENCY" "$TRAIL_SCALE_FAULT_PHASE" "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" "$TRAIL_SCALE_REPO" "$trail_source_commit" "$baseline_trail_ref" "$baseline_trail_commit" "$baseline_trail_root" "$baseline_git_head" "$baseline_git_branch" "$baseline_git_index" "$filesystem" "$db_bytes_before" "$db_bytes_after" "$observer_log_bytes_before" "$observer_log_bytes_after" "$export_commit" "$export_parent" "$TRAIL_SCALE_GIT_REF" "$dedicated_ref_target" "$commit_count" "$dirty_refusal_code" "$tracked_worktree_clean" "$index_clean" "$preexisting_untracked_count" <<'PY'
 import csv,json,math,pathlib,sys
-(root,run_id,lanes,files,concurrency,fault_phase,ceiling,repo,trail_source,trail_ref,trail_commit,trail_root,git_head,git_branch,git_index,filesystem,db_before,db_after,log_before,log_after,export_commit,export_parent,dedicated_ref,dedicated_target,commit_count,dirty_code)=sys.argv[1:]
+(root,run_id,lanes,files,concurrency,fault_phase,ceiling,repo,trail_source,trail_ref,trail_commit,trail_root,git_head,git_branch,git_index,filesystem,db_before,db_after,log_before,log_after,export_commit,export_parent,dedicated_ref,dedicated_target,commit_count,dirty_code,tracked_clean,index_clean,untracked_count)=sys.argv[1:]
 root=pathlib.Path(root); lanes=int(lanes); files=int(files)
 with open(root/"results.tsv") as f: results=list(csv.DictReader(f,delimiter="\t"))
 with open(root/"lanes.tsv") as f: lane_rows=list(csv.DictReader(f,delimiter="\t"))
@@ -467,7 +581,7 @@ def perf(phase):
     return {"count":len(rows),"p50_seconds":percentile(values,.5),"p95_seconds":percentile(values,.95),"p99_seconds":percentile(values,.99),"peak_rss_bytes":max(int(r["peak_rss_bytes"]) for r in rows)}
 export=json.load(open(root/"commands/git-export.json"))["payload"]
 metrics={
- "schema_version":1,
+ "schema_version":2,
  "run":{"run_id":run_id,"lanes":lanes,"files_per_lane":files,"concurrency":int(concurrency),"fault_phase":fault_phase,"latency_ceiling_seconds":float(ceiling)},
  "baseline":{"trail_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
  "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":0,"false_deletions":0,"missing_lanes":0,"unintended_paths":0,"integrity_errors":0,"live_locks":0},
@@ -476,6 +590,7 @@ metrics={
  "git_export":{"export_mode":export["performance"]["export_mode"],"changed_path_count":export["performance"]["changed_path_count"],"commit_count":int(commit_count),"commit":export_commit,"parent":export_parent,"dedicated_ref":dedicated_ref,"dedicated_ref_target":dedicated_target,"original_head_unchanged":True,"original_branch_unchanged":True,"original_index_unchanged":True,"dirty_refusal_code":dirty_code,"unexpected_path_count":0},
  "cleanup":{"stale_mounts":0,"stale_sockets":0,"stale_locks":0,"stale_initializations":0,"stale_materializations":0,"leaked_workdirs":0},
  "integrity":{"trail_doctor":"ok","trail_fsck":"ok","git_fsck":"ok","conflict_control":"ok"},
+ "git_state_preservation":{"tracked_worktree_clean":tracked_clean=="true","index_clean":index_clean=="true","preexisting_untracked_count":int(untracked_count),"final_untracked_count":int(untracked_count),"preserved_untracked_count":int(untracked_count),"added_untracked_count":0,"removed_untracked_count":0,"modified_untracked_count":0},
  "evidence":{"result_rows":len(results),"command_count":len(results),"fault_rows":len(fault_rows),"manifest_entries":0},
 }
 json.dump(metrics,open(root/"metrics.json","w"),sort_keys=True);open(root/"metrics.json","a").write("\n")
