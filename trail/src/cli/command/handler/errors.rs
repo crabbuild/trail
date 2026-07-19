@@ -78,7 +78,7 @@ fn render_cli_parse_error(err: &clap::Error, exit_code: i32) {
 
 pub(super) fn render_error(err: &Error, json: bool) {
     if json {
-        let value = structured_error_value(err);
+        let value = StructuredErrorEnvelope::from_error(err);
         let rendered = serde_json::to_string(&value)
             .unwrap_or_else(|_| structured_error_fallback(err).to_string());
         let _ = render_structured_error(&rendered);
@@ -86,25 +86,6 @@ pub(super) fn render_error(err: &Error, json: bool) {
     }
     let document = TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic_for_error(err)));
     let _ = render_error_document(&document, &default_error_options());
-}
-
-fn structured_error_value(err: &Error) -> serde_json::Value {
-    let mut value = serde_json::to_value(StructuredErrorEnvelope::from_error(err))
-        .unwrap_or_else(|_| serde_json::json!({}));
-    if let Error::LaneInitializationConflict {
-        lane,
-        existing_fingerprint,
-        requested_fingerprint,
-    } = err
-    {
-        value["error"]["status"] = serde_json::json!(409);
-        value["error"]["details"] = serde_json::json!({
-            "lane": lane,
-            "existing_fingerprint": existing_fingerprint,
-            "requested_fingerprint": requested_fingerprint,
-        });
-    }
-    value
 }
 
 fn structured_error_fallback(_err: &Error) -> &'static str {
@@ -430,7 +411,7 @@ mod tests {
             existing_fingerprint: "sha256:existing".into(),
             requested_fingerprint: "sha256:requested".into(),
         };
-        let value = structured_error_value(&error);
+        let value = serde_json::to_value(StructuredErrorEnvelope::from_error(&error)).unwrap();
 
         assert_eq!(value["error"]["code"], "LANE_INITIALIZATION_CONFLICT");
         assert_eq!(value["error"]["status"], 409);

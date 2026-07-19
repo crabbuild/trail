@@ -93,3 +93,37 @@ pub(crate) fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_initialization_conflict_tool_error_uses_shared_conflict_contract() {
+        let error = Error::LaneInitializationConflict {
+            lane: "agent-1".into(),
+            existing_fingerprint: "sha256:existing".into(),
+            requested_fingerprint: "sha256:requested".into(),
+        };
+        let value = tool_error_result(&error);
+
+        assert_eq!(value["isError"], true);
+        assert_eq!(
+            value["structuredContent"]["error"]["code"],
+            "LANE_INITIALIZATION_CONFLICT"
+        );
+        assert_eq!(value["structuredContent"]["error"]["status"], 409);
+        assert_eq!(
+            value["structuredContent"]["error"]["details"]["lane"],
+            "agent-1"
+        );
+        assert_eq!(
+            value["structuredContent"]["error"]["details"]["existing_fingerprint"],
+            "sha256:existing"
+        );
+        assert_eq!(
+            value["structuredContent"]["error"]["details"]["requested_fingerprint"],
+            "sha256:requested"
+        );
+    }
+}

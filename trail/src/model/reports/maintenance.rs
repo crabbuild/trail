@@ -121,6 +121,8 @@ pub struct StructuredErrorDetails {
     pub state: Option<String>,
     pub reason: Option<String>,
     pub recovery: Option<StructuredRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,7 +143,8 @@ impl StructuredErrorEnvelope {
             | crate::Error::StaleBranch(_)
             | crate::Error::WorkspaceLocked(_)
             | crate::Error::SchemaReinitializeRequired { .. }
-            | crate::Error::ChangeLedgerReconcileRequired { .. } => 409,
+            | crate::Error::ChangeLedgerReconcileRequired { .. }
+            | crate::Error::LaneInitializationConflict { .. } => 409,
             crate::Error::InvalidInput(_)
             | crate::Error::InvalidPath { .. }
             | crate::Error::IgnoredPath(_)
@@ -168,6 +171,18 @@ impl StructuredErrorEnvelope {
             ),
             _ => (None, None, None, None),
         };
+        let details = match error {
+            crate::Error::LaneInitializationConflict {
+                lane,
+                existing_fingerprint,
+                requested_fingerprint,
+            } => Some(serde_json::json!({
+                "lane": lane,
+                "existing_fingerprint": existing_fingerprint,
+                "requested_fingerprint": requested_fingerprint,
+            })),
+            _ => None,
+        };
         Self {
             error: StructuredErrorDetails {
                 code: error.code().to_string(),
@@ -178,6 +193,7 @@ impl StructuredErrorEnvelope {
                 state,
                 reason,
                 recovery: command.map(|command| StructuredRecovery { command }),
+                details,
             },
         }
     }
@@ -256,6 +272,29 @@ pub struct BackupRestoreReport {
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
+
+    #[test]
+    fn lane_initialization_conflict_has_shared_status_and_identity_details() {
+        let error = crate::Error::LaneInitializationConflict {
+            lane: "agent-1".into(),
+            existing_fingerprint: "sha256:existing".into(),
+            requested_fingerprint: "sha256:requested".into(),
+        };
+        let value = serde_json::to_value(StructuredErrorEnvelope::from_error(&error)).unwrap();
+
+        assert_eq!(value["error"]["code"], "LANE_INITIALIZATION_CONFLICT");
+        assert_eq!(value["error"]["status"], 409);
+        assert_eq!(value["error"]["exit"], 2);
+        assert_eq!(value["error"]["details"]["lane"], "agent-1");
+        assert_eq!(
+            value["error"]["details"]["existing_fingerprint"],
+            "sha256:existing"
+        );
+        assert_eq!(
+            value["error"]["details"]["requested_fingerprint"],
+            "sha256:requested"
+        );
+    }
 
     #[test]
     fn legacy_index_rebuild_report_defaults_path_index_repairs() {
