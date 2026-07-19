@@ -5,6 +5,9 @@ mod acp_harness;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -255,34 +258,7 @@ fn session_capability_combinations() -> Vec<Value> {
         .collect()
 }
 
-#[test]
-fn every_capability_shape_round_trips_through_the_real_relay_unchanged() {
-    let temp = acp_harness::workspace();
-    let agent = acp_harness::fixture_agent_command(
-        temp.path(),
-        "capability-matrix",
-        r#"#!/usr/bin/env python3
-import json
-import sys
-
-for line in sys.stdin:
-    request = json.loads(line)
-    meta = request["params"]["_meta"]
-    response = {
-        "jsonrpc": "2.0",
-        "id": request["id"],
-        "result": {
-            "protocolVersion": 1,
-            "agentCapabilities": meta["agentCapabilities"],
-            "_meta": {"clientCapabilities": request["params"]["clientCapabilities"]},
-        },
-    }
-    print(json.dumps(response, separators=(",", ":")), flush=True)
-"#,
-    );
-    let mut child = acp_harness::spawn_relay(temp.path(), &agent);
-    let (mut stdin, mut stdout) = acp_harness::relay_stdio(&mut child);
-
+fn capability_cases() -> Vec<(Value, Value)> {
     let mut cases = Vec::new();
     for prompt in boolean_combinations(&["image", "audio", "embeddedContext"]) {
         cases.push((json!({}), json!({"promptCapabilities": prompt})));
@@ -311,44 +287,236 @@ for line in sys.stdin:
         cases.push((json!({}), json!({"sessionCapabilities": session})));
     }
     assert_eq!(cases.len(), 8 + 4 + 8 + 3 + 243);
+    cases
+}
 
+fn capability_request(
+    index: usize,
+    client_capabilities: &Value,
+    agent_capabilities: &Value,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": index as u64,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": client_capabilities,
+            "_meta": {"agentCapabilities": agent_capabilities, "case": index},
+        },
+    })
+}
+
+fn capability_response(
+    index: usize,
+    client_capabilities: &Value,
+    agent_capabilities: &Value,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": index as u64,
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": agent_capabilities,
+            "_meta": {"clientCapabilities": client_capabilities},
+        },
+    })
+}
+
+fn capability_relay_options(workspace: &Path, agent: &[String]) -> trail::acp::AcpRelayOptions {
+    trail::acp::AcpRelayOptions {
+        workspace_root: workspace.to_path_buf(),
+        db_dir: workspace.join(".trail"),
+        lane: None,
+        from_ref: None,
+        provider: Some("conformance".to_string()),
+        model: None,
+        materialize: false,
+        workdir: None,
+        inject_mcp: false,
+        upstream_command: agent.to_vec(),
+        upstream_env: BTreeMap::new(),
+    }
+}
+
+fn json_frame(value: &Value) -> Vec<u8> {
+    let mut frame = serde_json::to_vec(value).unwrap();
+    frame.push(b'\n');
+    frame
+}
+
+fn without_trail_initialize_metadata(mut response: Value) -> Value {
+    response
+        .pointer_mut("/result/_meta")
+        .and_then(Value::as_object_mut)
+        .expect("initialize response metadata")
+        .remove("trail");
+    response
+}
+
+fn exchange_initialize_and_reap(
+    workspace: &Path,
+    agent: &[String],
+    request: &Value,
+) -> (std::io::Result<Output>, Result<Value, String>) {
+    let mut child = acp_harness::spawn_relay(workspace, agent);
+    let (mut stdin, mut stdout) = acp_harness::relay_stdio(&mut child);
+    let response = (|| -> Result<Value, String> {
+        serde_json::to_writer(&mut stdin, request).map_err(|error| error.to_string())?;
+        stdin.write_all(b"\n").map_err(|error| error.to_string())?;
+        stdin.flush().map_err(|error| error.to_string())?;
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if line.is_empty() {
+            return Err("relay closed before returning an ACP frame".to_string());
+        }
+        serde_json::from_str(line.trim_end()).map_err(|error| error.to_string())
+    })();
+    drop(stdin);
+    drop(stdout);
+    (child.wait_with_output(), response)
+}
+
+const CAPABILITY_AGENT: &str = r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    meta = request["params"]["_meta"]
+    response = {
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": meta["agentCapabilities"],
+            "_meta": {"clientCapabilities": request["params"]["clientCapabilities"]},
+        },
+    }
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#;
+
+#[test]
+fn every_capability_shape_round_trips_through_a_fresh_transform_pipeline() {
+    let temp = acp_harness::workspace();
+    let agent =
+        acp_harness::fixture_agent_command(temp.path(), "capability-matrix", CAPABILITY_AGENT);
+    let cases = capability_cases();
     let wire_validator =
         jsonschema::validator_for(&serde_json::from_str::<Value>(SCHEMA).unwrap()).unwrap();
-    for (index, (client_capabilities, agent_capabilities)) in cases.iter().enumerate() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": index as u64,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": 1,
-                "clientCapabilities": client_capabilities,
-                "_meta": {"agentCapabilities": agent_capabilities, "case": index},
-            },
-        });
+    let exchanges = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (client_capabilities, agent_capabilities))| {
+            let request = capability_request(index, client_capabilities, agent_capabilities);
+            let response = capability_response(index, client_capabilities, agent_capabilities);
+            assert!(
+                wire_validator.is_valid(&request),
+                "invalid generated case {index}: {request}"
+            );
+            assert!(wire_validator.is_valid(&response));
+            let request_frame = json_frame(&request);
+            let response_frame = json_frame(&response);
+            (request, response, request_frame, response_frame)
+        })
+        .collect::<Vec<_>>();
+    let connections = exchanges
+        .iter()
+        .map(|(_, _, request, response)| vec![(false, request.clone()), (true, response.clone())])
+        .collect();
+    let sample_groups = trail::acp::benchmark_acp_transform_connections(
+        capability_relay_options(temp.path(), &agent),
+        connections,
+    )
+    .unwrap_or_else(|error| panic!("production transform pipeline failed: {error}"));
+    assert_eq!(sample_groups.len(), exchanges.len());
+
+    for (index, ((request, response, request_frame, _), samples)) in
+        exchanges.into_iter().zip(sample_groups).enumerate()
+    {
+        assert_eq!(samples.len(), 2);
+        assert!(!samples[0].transformed, "request case {index} changed");
         assert!(
-            wire_validator.is_valid(&request),
-            "invalid generated case {index}: {request}"
+            samples[1].transformed,
+            "response case {index} was not relayed"
         );
-        acp_harness::write_json(&mut stdin, &request);
-        let response = acp_harness::read_json(&mut stdout);
+        assert_eq!(samples[0].forwarded, request_frame, "request case {index}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&samples[0].forwarded).unwrap(),
+            request
+        );
+        let forwarded_response = serde_json::from_slice::<Value>(&samples[1].forwarded).unwrap();
+        assert_eq!(forwarded_response["id"], json!(index as u64));
+        assert_eq!(
+            without_trail_initialize_metadata(forwarded_response.clone()),
+            response,
+            "response capability shape changed for case {index}"
+        );
+        assert!(wire_validator.is_valid(&forwarded_response));
+        assert_eq!(
+            forwarded_response["result"]["_meta"]["trail"]["relay"],
+            true
+        );
+        assert_eq!(
+            forwarded_response["result"]["_meta"]["trail"]["capture"],
+            true
+        );
+        eprintln!("ACP v1 capability combination: {index}");
+    }
+}
+
+#[test]
+fn representative_capability_shapes_use_fresh_real_stdio_connections() {
+    let temp = acp_harness::workspace();
+    let agent =
+        acp_harness::fixture_agent_command(temp.path(), "capability-stdio-smoke", CAPABILITY_AGENT);
+    let cases = capability_cases();
+    let wire_validator =
+        jsonschema::validator_for(&serde_json::from_str::<Value>(SCHEMA).unwrap()).unwrap();
+    // Prompt and MCP boolean minima/maxima: 0/7 and 8/11. Client fs/terminal
+    // minima/maxima: 12/19. Explicit session omitted/null/empty: 20/21/22.
+    // Session-capability ternary minima/all-null/maxima: 23/144/265.
+    const REPRESENTATIVE_CASES: [usize; 12] = [0, 7, 8, 11, 12, 19, 20, 21, 22, 23, 144, 265];
+    for index in REPRESENTATIVE_CASES {
+        let (client_capabilities, agent_capabilities) = &cases[index];
+        let request = capability_request(index, client_capabilities, agent_capabilities);
+        let expected_response = capability_response(index, client_capabilities, agent_capabilities);
+        assert!(wire_validator.is_valid(&request));
+
+        let (output, response) = exchange_initialize_and_reap(temp.path(), &agent, &request);
+        let output = output.unwrap_or_else(|error| panic!("wait failed for case {index}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "relay failed for capability case {index}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("trail acp relay negotiation warning"),
+            "case {index} emitted a negotiation warning: {stderr}"
+        );
+        let response = response
+            .unwrap_or_else(|error| panic!("relay response failed for case {index}: {error}"));
+        assert_eq!(response["id"], json!(index as u64), "response case {index}");
+        assert_eq!(
+            without_trail_initialize_metadata(response.clone()),
+            expected_response,
+            "response capability shape changed for case {index}"
+        );
+        assert_eq!(
+            response["result"]["_meta"]["trail"]["relay"], true,
+            "missing Trail relay metadata for case {index}"
+        );
+        assert_eq!(
+            response["result"]["_meta"]["trail"]["capture"], true,
+            "missing Trail capture metadata for case {index}"
+        );
         assert!(
             wire_validator.is_valid(&response),
             "invalid response case {index}: {response}"
         );
-        assert_eq!(response["result"]["agentCapabilities"], *agent_capabilities);
-        assert_eq!(
-            response["result"]["_meta"]["clientCapabilities"],
-            *client_capabilities
-        );
-        eprintln!("ACP v1 capability combination: {index}");
     }
-    drop(stdin);
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "relay failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[derive(Clone)]

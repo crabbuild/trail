@@ -442,6 +442,42 @@ pub struct AcpRelayBenchmarkSample {
     pub transformed: bool,
 }
 
+/// Runs each raw-frame connection through a fresh production transformation
+/// pipeline without starting durable capture. The immutable ACP contract is
+/// shared across connections. This is intentionally exposed only for
+/// exhaustive transformation conformance coverage.
+#[doc(hidden)]
+pub fn benchmark_acp_transform_connections(
+    options: AcpRelayOptions,
+    connections: Vec<Vec<(bool, Vec<u8>)>>,
+) -> Result<Vec<Vec<AcpRelayBenchmarkSample>>> {
+    let contract = Arc::new(AcpV1Contract::load()?);
+    let transform_options = TransformOptions::from_relay(&options);
+    let mut connection_samples = Vec::with_capacity(connections.len());
+    for frames in connections {
+        let mut pipeline = TransformPipeline::new(Arc::clone(&contract), transform_options.clone());
+        let mut samples = Vec::with_capacity(frames.len());
+        for (agent_to_client, raw) in frames {
+            let direction = if agent_to_client {
+                Direction::AgentToClient
+            } else {
+                Direction::ClientToAgent
+            };
+            let mut frame = Frame::parse(direction, raw).map_err(Error::Io)?;
+            let started = Instant::now();
+            pipeline.apply(&mut frame)?;
+            let transformed = frame.forward_bytes() != frame.raw_bytes();
+            samples.push(AcpRelayBenchmarkSample {
+                forwarded: frame.forward_bytes().to_vec(),
+                latency_micros: started.elapsed().as_micros(),
+                transformed,
+            });
+        }
+        connection_samples.push(samples);
+    }
+    Ok(connection_samples)
+}
+
 /// Runs raw frames through the same transformation and capture observer used by
 /// the stdio relay, without process or pipe overhead. This is intentionally
 /// exposed only for the correctness-preserving relay benchmark.
