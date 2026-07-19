@@ -6,7 +6,7 @@
 
 **Architecture:** A new Bash entry point owns validation, copy lifecycle, inner-harness invocation, proof creation, and transactional ref publication. Embedded Python helpers produce deterministic filesystem/Git snapshots and exact JSON bindings. A separate Python `unittest` suite supplies fake Trail and inner-harness executables and verifies the process-level contract.
 
-**Tech Stack:** Bash 3.2-compatible shell, Python 3 standard library, Git plumbing, macOS APFS `cp -c`, `unittest`.
+**Tech Stack:** Bash 3.2-compatible shell, Python 3 standard library plus direct macOS `clonefile(2)` binding, Git plumbing, `unittest`.
 
 ## Global Constraints
 
@@ -105,10 +105,10 @@ For counts `64 128`, use:
 
 ```bash
 copy=$(mktemp -d "$run_root/copy-$count.XXXXXX")
-/bin/cp -cRp "$source/." "$copy/"
+python3 scripts/apfs-clone-tree.py "$source" "$copy" "$run_dir/clone-manifest.json"
 ```
 
-Validate exact prefix/parent/realpath/device/APFS, compare the full inventories, validate and remove only `$copy/.trail`, invoke the pinned binary with `--workspace "$copy" --json init --from-git`, and create the exact owner JSON beneath the new `$copy/.trail`.
+Validate exact prefix/parent/realpath/device/APFS. Require a clonefile-only PASS manifest with complete syscall, hardlink, device, size, and digest accounting; compare full inventories; validate and remove only `$copy/.trail`; invoke the pinned binary with `--workspace "$copy" --json init --from-git`; and create the exact owner JSON beneath the new `$copy/.trail`. Never byte-copy-fallback a disposable tree.
 
 - [ ] **Step 5: Invoke the inner harness once**
 
@@ -143,11 +143,11 @@ Resolve the copy baseline, dedicated commit, and tree; require commit ancestry f
 
 - [ ] **Step 2: Add publication preflight**
 
-Before any run, derive both final source refs and require both absent when publication is enabled. Recheck absence and the complete source invariant after both proofs, immediately before object import.
+Before any run, derive both final source refs and require both absent in every publish mode, distinguishing absent exit 1 from `show-ref` errors. Recheck absence and the complete source invariant after both proofs, immediately before object import.
 
-- [ ] **Step 3: Import and atomically create refs**
+- [ ] **Step 3: Revalidate, import, and atomically create refs**
 
-Fetch each exact proof commit using `git fetch --no-tags --no-write-fetch-head BUNDLE COMMIT`, verify imported commit/tree identities, then use one `git update-ref --stdin` transaction with two `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation.
+Revalidate the exact proof schema/bindings, all stored hashes, checker PASS, bundle verification and exact heads, and copy commit/tree/ancestry. Fetch each exact proof commit using `git fetch --no-tags --no-write-fetch-head BUNDLE COMMIT`, verify imported commit/tree identities, then use one `git update-ref --stdin` transaction with two `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation.
 
 - [ ] **Step 4: Recheck final source state**
 
@@ -206,4 +206,3 @@ Expected: only the new orchestrator, its new test, and approved docs are changed
 git add scripts/verify-real-repo-lane-scale-matrix.sh scripts/test_verify_real_repo_lane_scale_matrix.py
 git commit -m "test: orchestrate disposable Superset scale matrix"
 ```
-

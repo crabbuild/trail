@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+APFS_CLONE_TREE_HELPER=$SCRIPT_DIR/apfs-clone-tree.py
 
 TRAIL_BIN=${TRAIL_BIN:-}
 TRAIL_SCALE_REPO=${TRAIL_SCALE_REPO:-}
@@ -14,6 +15,9 @@ TRAIL_SCALE_MATRIX_PUBLISH=${TRAIL_SCALE_MATRIX_PUBLISH:-0}
 TRAIL_SCALE_FILES_PER_LANE=${TRAIL_SCALE_FILES_PER_LANE:-50}
 TRAIL_SCALE_FAULT_PHASE=${TRAIL_SCALE_FAULT_PHASE:-all}
 TRAIL_SCALE_LATENCY_CEILING_SECONDS=${TRAIL_SCALE_LATENCY_CEILING_SECONDS:-120}
+active_inner_pid=
+active_inner_run_dir=
+active_inner_pgid_file=
 
 die() {
   echo "verify-real-repo-lane-scale-matrix: $*" >&2
@@ -23,6 +27,44 @@ die() {
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
+
+handle_signal() {
+  local name=$1
+  local number=$2
+  local status=$((128 + number))
+  trap - INT TERM HUP
+  if [[ -n $active_inner_pid ]]; then
+    local pgid=$active_inner_pid
+    if [[ -f $active_inner_pgid_file ]]; then
+      local recorded
+      recorded=$(sed -n '1p' "$active_inner_pgid_file" 2>/dev/null || true)
+      [[ $recorded =~ ^[1-9][0-9]*$ && $recorded == "$active_inner_pid" ]] && pgid=$recorded
+    fi
+    kill -s "$name" -- "-$pgid" 2>/dev/null || kill -s "$name" "$active_inner_pid" 2>/dev/null || true
+    python3 - "$pgid" "$active_inner_pid" >/dev/null 2>&1 <<'PY' &
+import os, signal, sys, time
+pgid,pid=map(int,sys.argv[1:])
+time.sleep(5)
+try: os.killpg(pgid,signal.SIGKILL)
+except ProcessLookupError:
+    try: os.kill(pid,signal.SIGKILL)
+    except ProcessLookupError: pass
+PY
+    local watchdog=$!
+    wait "$active_inner_pid" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    if [[ -n $active_inner_run_dir && -d $active_inner_run_dir ]]; then
+      printf '{"schema_version":1,"status":"FAIL","signal":"%s","exit_status":%s,"inner_pid":%s}\n' \
+        "$name" "$status" "$active_inner_pid" > "$active_inner_run_dir/signal-failure.json"
+    fi
+  fi
+  exit "$status"
+}
+
+trap 'handle_signal INT 2' INT
+trap 'handle_signal TERM 15' TERM
+trap 'handle_signal HUP 1' HUP
 
 device_id() {
   python3 - "$1" <<'PY'
@@ -82,6 +124,57 @@ print(path)
 PY
 }
 
+secure_byte_copy_binary() {
+  python3 - "$1" "$2" <<'PY'
+import errno, os, stat, sys
+source,destination=sys.argv[1:]
+before=os.lstat(source)
+if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+    raise SystemExit("binary source is not a regular non-symlink file")
+source_flags=os.O_RDONLY | getattr(os,"O_NOFOLLOW",0)
+destination_flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os,"O_NOFOLLOW",0)
+source_fd=os.open(source,source_flags)
+try:
+    opened=os.fstat(source_fd)
+    fingerprint=lambda value:(value.st_dev,value.st_ino,value.st_mode,value.st_size,
+                              value.st_mtime_ns,value.st_ctime_ns)
+    if fingerprint(opened) != fingerprint(before):
+        raise SystemExit("binary source raced before copy")
+    destination_fd=os.open(destination,destination_flags,0o555)
+    try:
+        while True:
+            chunk=os.read(source_fd,1024*1024)
+            if not chunk: break
+            view=memoryview(chunk)
+            while view:
+                written=os.write(destination_fd,view)
+                if written <= 0: raise OSError(errno.EIO,"short binary write")
+                view=view[written:]
+        os.fchmod(destination_fd,0o555)
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    if fingerprint(os.fstat(source_fd)) != fingerprint(before) or fingerprint(os.lstat(source)) != fingerprint(before):
+        raise SystemExit("binary source raced during copy")
+finally:
+    os.close(source_fd)
+parent_fd=os.open(os.path.dirname(destination),os.O_RDONLY | getattr(os,"O_DIRECTORY",0))
+try: os.fsync(parent_fd)
+finally: os.close(parent_fd)
+PY
+}
+
+assert_pinned_binary() {
+  python3 - "$pinned_trail" <<'PY'
+import os, stat, sys
+metadata=os.lstat(sys.argv[1])
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit("pinned binary is not a regular non-symlink file")
+PY
+  [[ $(sha256_file "$pinned_trail") == "$pinned_trail_sha" ]] ||
+    die "pinned TRAIL_BIN changed"
+}
+
 normalized_absent_path() {
   python3 - "$1" <<'PY'
 import os, stat, sys
@@ -105,6 +198,19 @@ left,right=map(os.path.realpath,sys.argv[1:])
 overlap=os.path.commonpath([left,right]) in {left,right}
 raise SystemExit(0 if overlap else 1)
 PY
+}
+
+require_ref_absent() {
+  local ref=$1
+  set +e
+  git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$ref"
+  local code=$?
+  set -e
+  case $code in
+    0) die "final run ref already exists: $ref" ;;
+    1) return 0 ;;
+    *) die "git show-ref operational failure for $ref (exit $code)" ;;
+  esac
 }
 
 capture_inventory() {
@@ -133,8 +239,7 @@ def visit(directory):
         path=entry.path
         relative=os.path.relpath(path,root).replace(os.sep,"/")
         first=relative.split("/",1)[0]
-        if mode in {"source","worktree"} and first == ".trail": continue
-        if mode == "worktree" and first == ".git": continue
+        if mode == "checkout" and first == ".git": continue
         metadata=os.lstat(path)
         permission=stat.S_IMODE(metadata.st_mode)
         row={"path":relative,"mode":permission}
@@ -210,8 +315,8 @@ assert_source_unchanged() {
   local phase=$1
   local current=$TRAIL_SCALE_MATRIX_OUTPUT/source-current.json
   local inventory=$TRAIL_SCALE_MATRIX_OUTPUT/source-current-inventory.json
-  capture_inventory "$TRAIL_SCALE_REPO" source "$inventory"
-  capture_source_snapshot "$TRAIL_SCALE_REPO" source "$current" "$inventory"
+  capture_inventory "$TRAIL_SCALE_REPO" full "$inventory"
+  capture_source_snapshot "$TRAIL_SCALE_REPO" full "$current" "$inventory"
   cmp -s "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline.json" "$current" ||
     die "source repository drifted during $phase"
 }
@@ -274,6 +379,27 @@ PY
   printf '%s\n' "$owner"
 }
 
+validate_owner_file() {
+  local owner=$1
+  local copy=$2
+  local evidence=$3
+  local run_id=$4
+  python3 - "$owner" "$TRAIL_SCALE_REPO" "$copy" "$evidence" "$run_id" <<'PY'
+import json, os, stat, sys
+owner,source,copy,output,run_id=sys.argv[1:]
+expected_path=os.path.join(copy,".trail","scale-disposable-owner.json")
+if owner != expected_path: raise SystemExit("owner binding path mismatch")
+metadata=os.lstat(owner)
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit("owner binding file is unsafe")
+value=json.load(open(owner,encoding="utf-8"))
+expected={"schema_version":1,"kind":"trail_scale_disposable_workspace",
+          "canonical_repo":source,"disposable_repo":copy,
+          "output":os.path.abspath(os.path.normpath(output)),"run_id":run_id}
+if value != expected: raise SystemExit("owner binding content mismatch")
+PY
+}
+
 validate_checker_pass() {
   local checker=$1
   local count=$2
@@ -289,6 +415,53 @@ if not isinstance(value,dict) or value.get("status") != "PASS" or value.get("lan
 PY
 }
 
+validate_clone_manifest() {
+  local manifest=$1
+  local copy=$2
+  python3 - "$manifest" "$TRAIL_SCALE_REPO" "$copy" "$source_device" <<'PY'
+import json, os, stat, sys
+path,source,destination,device=sys.argv[1:]
+metadata=os.lstat(path)
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit("clone manifest is not a regular non-symlink file")
+value=json.load(open(path,encoding="utf-8"))
+if value.get("schema_version") != 1 or value.get("status") != "PASS":
+    raise SystemExit("clone manifest does not record PASS")
+if value.get("clone_api") != "clonefile(2)" or value.get("byte_copy_fallback") is not False:
+    raise SystemExit("clone manifest does not prove clonefile-only operation")
+if value.get("source") != source or value.get("destination") != destination:
+    raise SystemExit("clone manifest path binding mismatch")
+if str(value.get("source_device")) != device or str(value.get("destination_device")) != device:
+    raise SystemExit("clone manifest device binding mismatch")
+counters=value.get("counters")
+if not isinstance(counters,dict): raise SystemExit("clone manifest counters missing")
+attempted=counters.get("clonefile_calls_attempted")
+succeeded=counters.get("clonefile_calls_succeeded")
+hardlinks=counters.get("hardlinks_created")
+regular=counters.get("regular_paths")
+if not all(isinstance(item,int) and item >= 0 for item in [attempted,succeeded,hardlinks,regular]):
+    raise SystemExit("clone manifest counters invalid")
+if attempted != succeeded or regular != succeeded + hardlinks:
+    raise SystemExit("clone manifest regular-file accounting mismatch")
+if counters.get("byte_copy_calls") != 0 or counters.get("special_entries_rejected") != 0:
+    raise SystemExit("clone manifest records fallback or special entries")
+calls=value.get("clonefile_calls")
+if not isinstance(calls,list) or len(calls) != attempted:
+    raise SystemExit("clone manifest call list incomplete")
+for call in calls:
+    if call.get("success") is not True:
+        raise SystemExit("clone manifest contains a failed call")
+    if str(call.get("source_device")) != device or str(call.get("destination_device")) != device:
+        raise SystemExit("clone call device mismatch")
+    if call.get("size") != call.get("destination_size"):
+        raise SystemExit("clone call size mismatch")
+for left,right in [("source_tree_sha256","destination_tree_sha256"),
+                   ("source_inventory_sha256","destination_inventory_sha256")]:
+    if not isinstance(value.get(left),str) or value[left] != value.get(right):
+        raise SystemExit(f"clone manifest digest mismatch: {left}")
+PY
+}
+
 run_inner_harness() {
   local count=$1
   local copy=$2
@@ -297,6 +470,10 @@ run_inner_harness() {
   local git_ref=$5
   local owner=$6
   local run_dir=$7
+  local pgid_file=$run_dir/inner.pgid
+  local completion_file=$run_dir/inner.supervisor-complete
+  assert_pinned_binary
+  validate_owner_file "$owner" "$copy" "$evidence" "$run_id" || die "owner binding rejected before $count-lane inner run"
   set +e
   TRAIL_BIN=$pinned_trail \
   TRAIL_SCALE_REPO=$copy \
@@ -314,14 +491,114 @@ run_inner_harness() {
   TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=$fault_driver_sha \
   TRAIL_SCALE_DISPOSABLE_WORKSPACE=1 \
   TRAIL_SCALE_DISPOSABLE_OWNER_FILE=$owner \
-  "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr"
+  python3 - "$pgid_file" "$completion_file" "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr" <<'PY' &
+import os, signal, subprocess, sys
+ready,completion,program=sys.argv[1:]
+os.setpgid(0,0)
+descriptor=os.open(ready,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+try:
+    os.write(descriptor,(str(os.getpid())+"\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+def restore_signals():
+    for number in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+        signal.signal(number,signal.SIG_DFL)
+child=subprocess.Popen([program],env=os.environ,preexec_fn=restore_signals)
+for number in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+    signal.signal(number,signal.SIG_IGN)
+code=child.wait()
+status=code if code >= 0 else 128-code
+descriptor=os.open(completion,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+try:
+    os.write(descriptor,(str(status)+"\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+raise SystemExit(status)
+PY
+  active_inner_pid=$!
+  active_inner_run_dir=$run_dir
+  active_inner_pgid_file=$pgid_file
+  while [[ ! -f $completion_file ]]; do
+    state=$(ps -o stat= -p "$active_inner_pid" 2>/dev/null | tr -d '[:space:]')
+    [[ -z $state || $state == Z* ]] && break
+    /bin/sleep 0.1
+  done
+  wait "$active_inner_pid"
   local code=$?
+  active_inner_pid=
+  active_inner_run_dir=
+  active_inner_pgid_file=
   set -e
   printf '%s\n' "$code" > "$run_dir/inner.exit-code"
   assert_source_unchanged "$count-lane inner run"
+  validate_owner_file "$owner" "$copy" "$evidence" "$run_id" || die "owner binding rejected after $count-lane inner run"
   (( code == 0 )) || die "inner harness failed for $count lanes with exit $code; evidence retained at $run_dir"
   [[ -f $evidence/checker.out ]] || die "inner harness omitted checker.out for $count lanes"
   validate_checker_pass "$evidence/checker.out" "$count" || die "inner checker rejected $count-lane evidence"
+}
+
+revalidate_run_proof() {
+  local count=$1
+  local copy=$2
+  local evidence=$3
+  local run_id=$4
+  local git_ref=$5
+  local baseline=$6
+  local run_dir=$7
+  local proof=$run_dir/proof.json
+  python3 - "$proof" "$count" "$run_id" "$copy" "$evidence" "$git_ref" "$baseline" \
+    "$run_dir/final.bundle" "$pinned_trail_sha" <<'PY'
+import hashlib, json, os, stat, sys
+proof_path,count,run_id,copy,evidence,ref,baseline,bundle,binary_sha=sys.argv[1:]
+expected_keys={"schema_version","lanes","run_id","copy","evidence","ref","baseline",
+               "commit","tree","bundle","bundle_sha256","checker_sha256","binary_sha256"}
+metadata=os.lstat(proof_path)
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    raise SystemExit("proof is not a regular non-symlink file")
+value=json.load(open(proof_path,encoding="utf-8"))
+if set(value) != expected_keys: raise SystemExit("proof schema is not exact")
+expected={"schema_version":1,"lanes":int(count),"run_id":run_id,"copy":copy,
+          "evidence":evidence,"ref":ref,"baseline":baseline,"bundle":bundle,
+          "binary_sha256":binary_sha}
+for key,item in expected.items():
+    if value.get(key) != item: raise SystemExit(f"proof binding mismatch: {key}")
+def digest(path):
+    metadata=os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"proof artifact is unsafe: {path}")
+    result=hashlib.sha256()
+    with open(path,"rb") as stream:
+        while True:
+            chunk=stream.read(1024*1024)
+            if not chunk: break
+            result.update(chunk)
+    return result.hexdigest()
+if digest(bundle) != value["bundle_sha256"]: raise SystemExit("bundle hash mismatch")
+checker=os.path.join(evidence,"checker.out")
+if digest(checker) != value["checker_sha256"]: raise SystemExit("checker hash mismatch")
+PY
+  [[ $? -eq 0 ]] || return 1
+  local identities
+  identities=$(python3 - "$proof" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8")); print(value["commit"]); print(value["tree"])
+PY
+) || return 1
+  local commit
+  local tree
+  commit=$(printf '%s\n' "$identities" | sed -n '1p')
+  tree=$(printf '%s\n' "$identities" | sed -n '2p')
+  [[ $(git -C "$copy" rev-parse "$git_ref^{commit}") == "$commit" ]] || return 1
+  [[ $(git -C "$copy" rev-parse "$commit^{tree}") == "$tree" ]] || return 1
+  git -C "$copy" merge-base --is-ancestor "$baseline" "$commit" || return 1
+  validate_checker_pass "$evidence/checker.out" "$count" || return 1
+  git -C "$copy" bundle verify "$run_dir/final.bundle" >/dev/null 2>&1 || return 1
+  local heads
+  heads=$(git -C "$copy" bundle list-heads "$run_dir/final.bundle") || return 1
+  [[ $heads == "$commit $git_ref" ]] || return 1
+  assert_pinned_binary
 }
 
 create_run_proof() {
@@ -364,11 +641,11 @@ PY
 verify_postpublication_source() {
   local proof64=$1
   local proof128=$2
-  local worktree_inventory=$TRAIL_SCALE_MATRIX_OUTPUT/source-postpublish-worktree.json
+  local worktree_inventory=$TRAIL_SCALE_MATRIX_OUTPUT/source-postpublish-checkout.json
   local source_snapshot=$TRAIL_SCALE_MATRIX_OUTPUT/source-postpublish.json
-  capture_inventory "$TRAIL_SCALE_REPO" worktree "$worktree_inventory"
-  capture_source_snapshot "$TRAIL_SCALE_REPO" worktree "$source_snapshot" "$worktree_inventory"
-  python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/source-worktree-baseline.json" "$source_snapshot" \
+  capture_inventory "$TRAIL_SCALE_REPO" checkout "$worktree_inventory"
+  capture_source_snapshot "$TRAIL_SCALE_REPO" checkout "$source_snapshot" "$worktree_inventory"
+  python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/source-checkout-baseline.json" "$source_snapshot" \
     "$proof64" "$proof128" <<'PY'
 import json, sys
 before=json.load(open(sys.argv[1],encoding="utf-8")); after=json.load(open(sys.argv[2],encoding="utf-8"))
@@ -403,6 +680,8 @@ git -C "$TRAIL_SCALE_REPO" symbolic-ref -q HEAD >/dev/null || die "source HEAD m
 TRAIL_BIN=$(canonical_executable "$TRAIL_BIN") || die "TRAIL_BIN must be an absolute executable regular file without symlink traversal"
 TRAIL_SCALE_INNER_HARNESS=$(canonical_executable "$TRAIL_SCALE_INNER_HARNESS") ||
   die "TRAIL_SCALE_INNER_HARNESS must be an executable regular file without symlink traversal"
+APFS_CLONE_TREE_HELPER=$(canonical_executable "$APFS_CLONE_TREE_HELPER") ||
+  die "APFS clone-tree helper must be an executable regular file without symlink traversal"
 fault_driver=${TRAIL_SCALE_FAULT_DRIVER:-$TRAIL_SCALE_INNER_HARNESS}
 [[ $fault_driver == /* ]] || die "TRAIL_SCALE_FAULT_DRIVER must be absolute"
 fault_driver=$(canonical_executable "$fault_driver") ||
@@ -431,29 +710,26 @@ ref128=refs/heads/codex/trail-scale-$TRAIL_SCALE_MATRIX_RUN_ID-128
 [[ $ref64 != "$ref128" ]] || die "matrix refs are not unique"
 git check-ref-format "$ref64" >/dev/null 2>&1 || die "TRAIL_SCALE_MATRIX_RUN_ID does not produce a valid Git ref"
 git check-ref-format "$ref128" >/dev/null 2>&1 || die "TRAIL_SCALE_MATRIX_RUN_ID does not produce a valid Git ref"
-if [[ $TRAIL_SCALE_MATRIX_PUBLISH == 1 ]]; then
-  git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$ref64" && die "64-lane publication ref already exists"
-  git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$ref128" && die "128-lane publication ref already exists"
-fi
+require_ref_absent "$ref64"
+require_ref_absent "$ref128"
 
 mkdir -- "$TRAIL_SCALE_MATRIX_OUTPUT"
 mkdir -- "$TRAIL_SCALE_MATRIX_OUTPUT/pinned" "$TRAIL_SCALE_MATRIX_OUTPUT/runs"
-capture_inventory "$TRAIL_SCALE_REPO" source "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline-inventory.json"
-capture_source_snapshot "$TRAIL_SCALE_REPO" source "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline.json" \
+capture_inventory "$TRAIL_SCALE_REPO" full "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline-inventory.json"
+capture_source_snapshot "$TRAIL_SCALE_REPO" full "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline.json" \
   "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline-inventory.json"
-capture_inventory "$TRAIL_SCALE_REPO" worktree "$TRAIL_SCALE_MATRIX_OUTPUT/source-worktree-baseline-inventory.json"
-capture_source_snapshot "$TRAIL_SCALE_REPO" worktree "$TRAIL_SCALE_MATRIX_OUTPUT/source-worktree-baseline.json" \
-  "$TRAIL_SCALE_MATRIX_OUTPUT/source-worktree-baseline-inventory.json"
-capture_inventory "$TRAIL_SCALE_REPO" full "$TRAIL_SCALE_MATRIX_OUTPUT/source-full-inventory.json"
+capture_inventory "$TRAIL_SCALE_REPO" checkout "$TRAIL_SCALE_MATRIX_OUTPUT/source-checkout-baseline-inventory.json"
+capture_source_snapshot "$TRAIL_SCALE_REPO" checkout "$TRAIL_SCALE_MATRIX_OUTPUT/source-checkout-baseline.json" \
+  "$TRAIL_SCALE_MATRIX_OUTPUT/source-checkout-baseline-inventory.json"
 
 pinned_trail=$TRAIL_SCALE_MATRIX_OUTPUT/pinned/trail
-/bin/cp -cp "$TRAIL_BIN" "$pinned_trail"
-chmod 0555 "$pinned_trail"
+secure_byte_copy_binary "$TRAIL_BIN" "$pinned_trail" || die "secure pinned TRAIL_BIN byte copy failed"
 pinned_trail_sha=$(sha256_file "$pinned_trail")
 [[ $pinned_trail_sha == "$(sha256_file "$TRAIL_BIN")" ]] || die "pinned TRAIL_BIN digest mismatch"
 "$pinned_trail" --version > "$TRAIL_SCALE_MATRIX_OUTPUT/pinned/version.txt" 2>&1 || die "pinned TRAIL_BIN --version failed"
 "$pinned_trail" init --help > "$TRAIL_SCALE_MATRIX_OUTPUT/pinned/init-help.txt" 2>&1 || die "pinned TRAIL_BIN init --help failed"
 grep -q -- '--from-git' "$TRAIL_SCALE_MATRIX_OUTPUT/pinned/init-help.txt" || die "pinned TRAIL_BIN lacks init --from-git"
+chmod 0555 "$TRAIL_SCALE_MATRIX_OUTPUT/pinned"
 
 trail_source_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 fault_driver_sha=$(sha256_file "$fault_driver")
@@ -465,21 +741,32 @@ for count in 64 128; do
   copy=$(mktemp -d "$TRAIL_SCALE_MATRIX_OUTPUT/copy-$count.XXXXXX")
   copy=$(validate_copy_target "$copy" "$count") || die "mktemp returned an unsafe $count-lane copy path"
   [[ $(filesystem_type "$copy") == apfs ]] || die "$count-lane copy is not on APFS"
-  /bin/cp -cRp "$TRAIL_SCALE_REPO/." "$copy/"
+  clone_manifest=$run_dir/clone-manifest.json
+  python3 "$APFS_CLONE_TREE_HELPER" "$TRAIL_SCALE_REPO" "$copy" "$clone_manifest" ||
+    die "clonefile-only tree clone failed for $count lanes; evidence retained at $run_dir"
+  validate_clone_manifest "$clone_manifest" "$copy" || die "clone manifest rejected for $count lanes"
   capture_inventory "$copy" full "$run_dir/copy-before-trail-removal.json"
-  python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/source-full-inventory.json" "$run_dir/copy-before-trail-removal.json" <<'PY' || die "APFS copy inventory mismatch"
+  python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/source-baseline-inventory.json" "$run_dir/copy-before-trail-removal.json" <<'PY' || die "APFS copy inventory mismatch"
 import json, sys
 left=json.load(open(sys.argv[1],encoding="utf-8")); right=json.load(open(sys.argv[2],encoding="utf-8"))
 if left["entries"] != right["entries"]: raise SystemExit("copy did not preserve every source entry")
 PY
   validate_and_remove_copied_trail "$copy"
+  assert_pinned_binary
   "$pinned_trail" --workspace "$copy" --json init --from-git > "$run_dir/init.json" 2> "$run_dir/init.stderr" ||
     die "copy-local trail init --from-git failed for $count lanes"
+  assert_pinned_binary
   evidence=$run_dir/evidence
   run_id=$TRAIL_SCALE_MATRIX_RUN_ID-$count
   if [[ $count == 64 ]]; then git_ref=$ref64; else git_ref=$ref128; fi
   owner=$(write_owner_file "$copy" "$evidence" "$run_id")
+  validate_owner_file "$owner" "$copy" "$evidence" "$run_id" || die "owner binding rejected after creation"
   baseline=$(git -C "$copy" rev-parse HEAD)
+  if [[ $count == 64 ]]; then
+    copy64=$copy; evidence64=$evidence; run_id64=$run_id; baseline64=$baseline
+  else
+    copy128=$copy; evidence128=$evidence; run_id128=$run_id; baseline128=$baseline
+  fi
   assert_source_unchanged "$count-lane copy preparation"
   run_inner_harness "$count" "$copy" "$evidence" "$run_id" "$git_ref" "$owner" "$run_dir"
   create_run_proof "$count" "$copy" "$evidence" "$run_id" "$git_ref" "$baseline" "$run_dir"
@@ -492,8 +779,13 @@ proof128=$TRAIL_SCALE_MATRIX_OUTPUT/runs/128/proof.json
 assert_source_unchanged "pre-publication"
 
 if [[ $TRAIL_SCALE_MATRIX_PUBLISH == 1 ]]; then
-  git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$ref64" && die "64-lane publication ref appeared before CAS"
-  git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$ref128" && die "128-lane publication ref appeared before CAS"
+  revalidate_run_proof 64 "$copy64" "$evidence64" "$run_id64" "$ref64" "$baseline64" \
+    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/64" || die "proof revalidation failed for 64 lanes"
+  revalidate_run_proof 128 "$copy128" "$evidence128" "$run_id128" "$ref128" "$baseline128" \
+    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/128" || die "proof revalidation failed for 128 lanes"
+  assert_source_unchanged "proof revalidation"
+  require_ref_absent "$ref64"
+  require_ref_absent "$ref128"
   commit64=$(proof_field "$proof64" commit)
   commit128=$(proof_field "$proof128" commit)
   bundle64=$(proof_field "$proof64" bundle)

@@ -24,13 +24,13 @@ Optional environment:
 The inner harness receives these additional exact markers:
 
 - `TRAIL_SCALE_DISPOSABLE_WORKSPACE=1`
-- `TRAIL_SCALE_DISPOSABLE_OWNER_FILE=<absolute owner file under copied .trail>`
+- `TRAIL_SCALE_DISPOSABLE_OWNER_FILE=<exact COPY/.trail/scale-disposable-owner.json>`
 
 The owner file is a regular non-symlink JSON file created after copy-local Trail initialization. It has exactly `{schema_version: 1, kind: "trail_scale_disposable_workspace", canonical_repo, disposable_repo, output, run_id}` and binds the resolved source, resolved copy, normalized absolute evidence output, and exact run ID. The hardened inner harness is expected to validate both variables and the exact binding before exercising mutation authority. It must continue to honor explicit `TRAIL_SCALE_REPO`, `TRAIL_SCALE_OUTPUT`, `TRAIL_SCALE_RUN_ID`, `TRAIL_SCALE_GIT_REF`, `TRAIL_SCALE_LANES`, candidate identity, and fault-attestation inputs, and must leave a JSON checker result with `status: PASS` in `checker.out` on success.
 
 ## Preflight and source invariant
 
-The orchestrator rejects relative, symlinked, missing, overlapping, non-Git, dirty tracked/index, cross-device, or non-APFS inputs. The candidate binary and inner harness are regular absolute executable files. A private, read-only COW copy of `TRAIL_BIN` is made under the output root, its SHA-256 is checked, and `trail init --help` must successfully advertise `--from-git` before any copied `.trail` is removed.
+The orchestrator rejects relative, symlinked, missing, overlapping, non-Git, dirty tracked/index, cross-device, or non-APFS inputs. The candidate binary and inner harness are regular absolute executable files. A private, read-only byte copy of `TRAIL_BIN` is securely made under the output root, its SHA-256 is checked, and `trail init --help` must successfully advertise `--from-git` before any copied `.trail` is removed.
 
 Before copying, the orchestrator records:
 
@@ -38,14 +38,14 @@ Before copying, the orchestrator records:
 - sorted complete Git ref names and targets;
 - porcelain status including ignored/untracked entries;
 - the exact Git index file type, mode, and digest;
-- every source filesystem entry except the root `.trail` subtree, including directories, regular files, symlinks, ignored entries, modes, sizes, and content/target digests;
+- every source filesystem entry including the root `.trail` subtree, directories, regular files, symlinks, ignored entries, modes, sizes, and content/target digests;
 - a full copy-comparison inventory including `.git` and `.trail` before copied Trail state is removed.
 
-The source invariant is rechecked after preparation, after each inner run, before optional publication, and after publication. Before publication every snapshot must match byte-for-byte. After publication, worktree/status/HEAD/index/non-`.trail` worktree state must still match, and the only ref additions may be the two exact run refs.
+The source invariant is rechecked after preparation, after each inner run, before optional publication, and after publication. Before publication every snapshot, including the source root `.trail`, must match byte-for-byte. After publication, worktree/status/HEAD/index state including `.trail` must still match, and the only ref additions may be the two exact run refs.
 
 ## Copy and run lifecycle
 
-For lane counts 64 and 128, the orchestrator obtains an exact empty destination from `mktemp -d "$output/copy-$count.XXXXXX"`. It verifies the destination's canonical parent, prefix, device, and APFS type, then uses macOS `cp -cRp source/. destination/` to preserve Git metadata plus tracked, untracked, ignored, directory, and symlink state using APFS COW clones.
+For lane counts 64 and 128, the orchestrator obtains an exact empty destination from `mktemp -d "$output/copy-$count.XXXXXX"`. It verifies the destination's canonical parent, prefix, device, and APFS type, then invokes `scripts/apfs-clone-tree.py`. The helper calls macOS `clonefile(2)` directly once for every unique regular-file inode and recreates additional paths as hardlinks. It never falls back to byte copying. Directories, modes, timestamps, symlinks, Git metadata, tracked, untracked, and ignored entries are preserved; special entries, source races, and any failed clone syscall abort with a retained FAIL manifest. The PASS manifest binds source/destination devices, accounts for every regular path and syscall, records source/destination sizes, and requires matching independent tree/inventory digests.
 
 The full source and copy inventories must match before mutation. Only `destination/.trail` may then be recursively removed, after checking the exact canonical destination, target type, prefix, device, and parent relationship. The pinned Trail binary initializes the copy with:
 
@@ -61,19 +61,25 @@ An inner run passes only when its process exits zero and its `checker.out` is a 
 
 After each pass the orchestrator resolves the dedicated ref, verifies the commit descends from the copy's original HEAD, records the commit and tree IDs, creates a Git bundle containing the dedicated ref, verifies the bundle, and writes a JSON proof plus SHA-256 digests.
 
-Only after both proofs pass may `TRAIL_SCALE_MATRIX_PUBLISH=1` change the source Git database. Both bundles are fetched with `--no-write-fetch-head`, their exact commit/tree identities are rechecked, then one `git update-ref --stdin` transaction creates both dedicated refs with absent-only CAS semantics. A pre-existing or racing ref aborts publication; master, HEAD, index, worktree, and every other ref remain unchanged.
+Both final run refs must be absent before any copy regardless of publish mode, and `git show-ref` operational failures are not treated as absence. Only after both proofs pass may `TRAIL_SCALE_MATRIX_PUBLISH=1` change the source Git database. Immediately before import, the orchestrator revalidates each exact proof schema/binding, binary/checker/bundle hash, checker PASS, copy commit/tree/ancestry, `git bundle verify`, and the bundle's single exact `list-heads` result. Both bundles are then fetched with `--no-write-fetch-head`, followed by one `git update-ref --stdin` transaction with absent-only create semantics. A pre-existing or racing ref aborts publication; master, HEAD, index, worktree, and every other ref remain unchanged.
+
+The release binary pin is deliberately separate from tree cloning: it is a byte copy created with `O_NOFOLLOW|O_EXCL`, complete-write checks, file and directory `fsync`, mode `0555`, and a non-writable pin directory. Its digest is checked before initialization, before each inner invocation, and after each run.
 
 ## Failure handling and tests
 
 There is no automatic recursive cleanup of run copies. This intentionally retains evidence and avoids destructive recovery logic. The only recursive deletion is the copied `.trail`, guarded by exact target validations.
 
+The inner harness runs in a dedicated child process group. `INT`, `TERM`, and `HUP` traps forward the signal to that group, wait for it (with a bounded KILL watchdog), retain a signal-failure marker, and exit with the conventional `128 + signal` status so no inner process is orphaned.
+
 The new test file `scripts/test_verify_real_repo_lane_scale_matrix.py` uses a fake immutable Trail CLI and fake inner harness. It proves:
 
 - two independent 64/128 invocations and distinct `.trail`, run, ref, and evidence identities;
-- tracked, untracked, ignored, directory, and symlink preservation in both copies;
+- tracked, untracked, ignored, directory, symlink, hardlink, mode, and timestamp preservation in both copies;
+- direct clonefile failure without byte-copy fallback, complete manifests, special-entry/race rejection, and device/size/digest accounting;
 - removal only of copied pre-existing `.trail` and initialization of fresh copy-local Trail state;
 - failure containment and retained evidence/copies;
-- exact source HEAD/ref/index/status/filesystem preservation;
+- exact source HEAD/ref/index/status/filesystem preservation including source `.trail`;
 - bundle/commit/tree proof production;
 - optional publication of two unique refs without moving the source checkout;
-- refusal when either publication ref already exists, with no partial new ref.
+- refusal when either publication ref already exists or ref lookup errors, with no partial new ref;
+- owner/proof/bundle/checker/binary tamper rejection and INT/TERM/HUP child-group containment.
