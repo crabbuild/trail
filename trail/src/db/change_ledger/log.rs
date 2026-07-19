@@ -10,7 +10,7 @@ pub(crate) use codec::authenticate_segment_for_deletion;
 #[cfg(test)]
 pub(crate) use codec::recover_segments;
 pub(crate) use codec::{recover_segments_from_connection, recover_segments_from_directory};
-pub(crate) use writer::{DaemonLaunchBinding, SegmentWriter};
+pub(crate) use writer::{workspace_db_dir_for_database, DaemonLaunchBinding, SegmentWriter};
 
 #[cfg(all(test, target_os = "linux"))]
 use codec::open_segment_no_follow;

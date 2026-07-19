@@ -1148,7 +1148,7 @@ impl Drop for SegmentWriter {
     }
 }
 
-fn workspace_db_dir_for_database(database_path: &Path) -> Result<PathBuf> {
+pub(crate) fn workspace_db_dir_for_database(database_path: &Path) -> Result<PathBuf> {
     let parent = database_path.parent().ok_or_else(|| {
         Error::InvalidInput("observer database path has no workspace directory".into())
     })?;

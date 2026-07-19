@@ -507,6 +507,52 @@ fn database_only_observer_rows_and_incomplete_materialization_cannot_qualify() {
 }
 
 #[test]
+fn fully_authenticated_legacy_lane_backfills_observer_ready() {
+    let fixture = Schema18Fixture::clean();
+    insert_legacy_lane(
+        &fixture,
+        "authenticated",
+        "lane_authenticated",
+        &complete_legacy_metadata(serde_json::json!([])),
+    );
+    trail::test_support::install_schema_v18_authenticated_lane_evidence(
+        fixture.workspace(),
+        "lane_authenticated",
+    )
+    .unwrap();
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    let (scope_id, segment_path): (String, String) = conn
+        .query_row(
+            "SELECT scope.scope_id,segment.segment_path
+             FROM changed_path_scopes scope
+             JOIN changed_path_observer_segments segment ON segment.scope_id=scope.scope_id
+             WHERE scope.owner_id='lane_authenticated'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+    assert!(fixture
+        .workspace()
+        .join(".trail/observer-segments")
+        .join(&scope_id)
+        .join(&segment_path)
+        .is_file());
+    assert!(!fixture
+        .workspace()
+        .join(".trail/index/observer-segments")
+        .join(&scope_id)
+        .exists());
+
+    let db = Trail::open(fixture.workspace()).unwrap();
+    let report = db.lane_initialization("authenticated").unwrap().unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(report.last_error_code, None);
+    assert_eq!(report.last_error_message, None);
+    assert_eq!(report.repair_command, None);
+}
+
+#[test]
 fn expiry_boundary_cannot_split_phase_from_repair_fields() {
     let fixture = Schema18Fixture::with_clean_and_inconsistent_lanes();
     let conn = Connection::open(fixture.db_path()).unwrap();

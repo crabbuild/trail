@@ -50,6 +50,14 @@ pub mod test_support {
         crate::db::schema_v19_backfill_times_remaining()
     }
 
+    pub fn install_schema_v18_authenticated_lane_evidence(
+        workspace: &std::path::Path,
+        lane_id: &str,
+    ) -> Result<(), String> {
+        crate::db::install_schema_v18_authenticated_lane_evidence(workspace, lane_id)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn changed_path_command_flow() -> std::result::Result<(), String> {
         crate::db::run_command_flow()
     }

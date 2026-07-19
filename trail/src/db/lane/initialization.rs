@@ -22,6 +22,191 @@ pub(crate) fn schema_v19_backfill_times_remaining() -> usize {
     SCHEMA_V19_BACKFILL_TIMES.with(|installed| installed.borrow().len())
 }
 
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn install_schema_v18_authenticated_lane_evidence(
+    workspace: &Path,
+    lane_id: &str,
+) -> Result<()> {
+    let workspace = canonicalize_lossless(workspace)?;
+    let database_path = workspace.join(".trail/index/trail.sqlite");
+    let workdir;
+    let ref_name;
+    let ref_generation;
+    let head_change;
+    let head_root;
+    {
+        let conn = Connection::open(&database_path)?;
+        (workdir, ref_name, ref_generation, head_change, head_root) = conn.query_row(
+            "SELECT branch.workdir,branch.ref_name,ref.generation,
+                    branch.head_change,branch.head_root
+             FROM lane_branches branch
+             JOIN refs ref ON ref.name=branch.ref_name
+             WHERE branch.lane_id=?1 AND branch.status='active'",
+            [lane_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+    }
+    let workdir = canonicalize_lossless(Path::new(&workdir))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(workdir.join(".trail"), fs::Permissions::from_mode(0o700))?;
+    }
+    Connection::open(&database_path)?.execute(
+        "UPDATE lane_branches SET workdir=?1 WHERE lane_id=?2 AND status='active'",
+        params![workdir.to_string_lossy().as_ref(), lane_id],
+    )?;
+    let filesystem_identity = super::workdir::materialized_lane_root_identity(&workdir)
+        .map_err(|error| Error::Corrupt(format!("fixture root identity: {error}")))?;
+    let filesystem_identity_text = hex::encode(&filesystem_identity);
+    let workspace_id = WorkspaceId::new(workspace.to_string_lossy().as_bytes());
+    let scope_id = crate::db::change_ledger::materialized_lane_scope_id(&workspace_id.0, lane_id);
+    let scope_text = scope_id.to_text();
+    let provider_identity = [0x77_u8; 32];
+    let provider_text = hex::encode(provider_identity);
+    let policy_fingerprint = [0xaa_u8; 32];
+    let policy_text = hex::encode(policy_fingerprint);
+    let now = now_ts();
+    {
+        let conn = Connection::open(&database_path)?;
+        crate::db::util::apply_sqlite_pragmas(&conn)?;
+        conn.execute(
+            "INSERT INTO changed_path_scopes(
+                 scope_id,scope_kind,owner_id,scope_root,scope_root_identity,
+                 filesystem_identity,filesystem_kind,case_sensitive,ref_name,
+                 ref_generation,change_id,baseline_root_id,policy_fingerprint,
+                 policy_dependency_generation,trust_state,trust_reason,epoch,
+                 provider_id,provider_identity,durable_cursor,linearizable_fence,
+                 rename_pairing,overflow_scope,filesystem_supported,clean_proof_allowed,
+                 power_loss_durability,durable_offset,folded_offset,created_at,updated_at)
+             VALUES(?1,'materialized_lane',?2,?3,?4,?4,'native',1,?5,?6,?7,?8,?9,1,
+                    'reconciling','schema18_authenticated_fixture',1,?10,?10,1,1,1,0,1,1,1,
+                    0,0,?11,?11)",
+            params![
+                scope_text,
+                lane_id,
+                workdir.to_string_lossy().as_ref(),
+                filesystem_identity_text,
+                ref_name,
+                ref_generation,
+                head_change,
+                head_root,
+                policy_text,
+                provider_text,
+                now,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO changed_path_policy_dependencies(
+                 scope_id,dependency_identity,dependency_kind,content_identity,
+                 metadata_identity,observable,generation,last_source_sequence,
+                 created_at,updated_at)
+             VALUES(?1,'builtin:recording-policy','builtin',?2,?3,1,1,1,?4,?4)",
+            params![scope_text, vec![0x11_u8; 32], vec![0x22_u8; 32], now],
+        )?;
+    }
+    let owner_token = [0xbb_u8; 32];
+    let segment_directory = workspace.join(".trail/observer-segments").join(&scope_text);
+    let mut writer = crate::db::change_ledger::SegmentWriter::acquire(
+        &database_path,
+        &segment_directory,
+        scope_id,
+        1,
+        owner_token,
+        &provider_text,
+        Vec::new(),
+        std::time::Duration::from_secs(3_600),
+    )
+    .map_err(|error| Error::Corrupt(format!("fixture segment acquire: {error}")))?;
+    let cut = writer
+        .append_and_flush(&[crate::db::change_ledger::ObserverRecord {
+            sequence: 1,
+            source: crate::db::change_ledger::EvidenceSource::Observer,
+            path: crate::db::change_ledger::LedgerPath::parse("authenticated.txt")?,
+            flags: crate::db::change_ledger::EvidenceFlags::CREATE,
+            provider_cursor: vec![1],
+        }])
+        .map_err(|error| Error::Corrupt(format!("fixture segment append: {error}")))?;
+    drop(writer);
+    let owner_text = hex::encode(owner_token);
+    let process_start_identity = crate::db::util::process_liveness::current_process_start_token();
+    let conn = Connection::open(&database_path)?;
+    conn.execute(
+        "UPDATE changed_path_observer_owners
+         SET provider_identity=?1,fence_nonce=?2,
+             daemon_launch_nonce=?3,daemon_pid=?4,
+             daemon_process_start_identity=?5,updated_at=?6
+         WHERE scope_id=?7 AND epoch=1 AND owner_token=?8",
+        params![
+            provider_text,
+            vec![0x33_u8; 24],
+            hex::encode([0xcc_u8; 32]),
+            i64::from(std::process::id()),
+            process_start_identity,
+            now_ts(),
+            scope_text,
+            owner_text,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE changed_path_observer_segments
+         SET folded_end_offset=durable_end_offset,updated_at=?1
+         WHERE scope_id=?2 AND epoch=1 AND segment_id=?3",
+        params![now_ts(), scope_text, cut.segment_id],
+    )?;
+    conn.execute(
+        "UPDATE changed_path_scopes
+         SET trust_state='trusted',trust_reason='authenticated_clean_checkpoint',
+             durable_offset=?1,folded_offset=?1,observer_owner_token=?2,
+             observer_heartbeat_at=?3,updated_at=?3
+         WHERE scope_id=?4 AND epoch=1",
+        params![cut.durable_end_offset, owner_text, now_ts(), scope_text],
+    )?;
+    drop(conn);
+    let sparse_selection_fingerprint =
+        super::workdir::actual_sparse_selection_fingerprint_read_only(&workdir)
+            .map_err(|error| Error::Corrupt(format!("fixture sparse fingerprint: {error}")))?;
+    super::workdir::write_materialized_lane_marker_v2_for_test(
+        &workdir,
+        &super::workdir::MaterializedLaneMarkerV2 {
+            version: super::workdir::MATERIALIZED_LANE_MARKER_VERSION,
+            scope_id,
+            filesystem_identity,
+            ref_name,
+            ref_generation: u64::try_from(ref_generation)
+                .map_err(|_| Error::Corrupt("negative fixture ref generation".into()))?,
+            root_id: ObjectId(head_root),
+            policy_fingerprint,
+            epoch: 1,
+            provider_cut: crate::db::change_ledger::EvidenceCut {
+                source: crate::db::change_ledger::EvidenceSource::Observer,
+                sequence: cut.last_sequence,
+                durable_offset: cut.durable_end_offset,
+                folded_offset: cut.durable_end_offset,
+            },
+            provider_segment_id: cut.segment_id,
+            sparse_selection_fingerprint,
+        },
+    )
+    .map_err(|error| Error::Corrupt(format!("fixture marker write: {error}")))?;
+    let conn = Connection::open(&database_path)?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(Error::WorkspaceLocked(
+            "authenticated schema18 fixture checkpoint remained busy".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn schema_v19_backfill_now() -> i64 {
     #[cfg(any(test, debug_assertions))]
     if let Some(now) =
@@ -508,10 +693,9 @@ fn authenticated_legacy_observer_evidence(
         [],
         |row| row.get(0),
     )?;
-    let Some(database_dir) = Path::new(&database_path).parent() else {
-        return Ok(false);
-    };
-    let segment_directory = database_dir
+    let workspace_db_dir =
+        crate::db::change_ledger::workspace_db_dir_for_database(Path::new(&database_path))?;
+    let segment_directory = workspace_db_dir
         .join("observer-segments")
         .join(&evidence.scope_id);
     let segment_directory =

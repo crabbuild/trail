@@ -21,6 +21,11 @@ pub(crate) use marker::{
     actual_sparse_selection_fingerprint_read_only, materialized_lane_root_identity,
     read_materialized_lane_marker_v2,
 };
+#[cfg(any(test, debug_assertions))]
+pub(crate) use marker::{
+    write_materialized_lane_marker_v2_for_test, MaterializedLaneMarkerV2,
+    MATERIALIZED_LANE_MARKER_VERSION,
+};
 pub(crate) use materialize::*;
 #[cfg(debug_assertions)]
 pub(crate) use record::{

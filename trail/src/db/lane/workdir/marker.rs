@@ -355,6 +355,16 @@ pub(crate) fn read_materialized_lane_marker_v2(
     Ok(Some(marker))
 }
 
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn write_materialized_lane_marker_v2_for_test(
+    workdir: &Path,
+    marker: &MaterializedLaneMarkerV2,
+) -> Result<()> {
+    let metadata = secure_marker_directory(workdir, true)?
+        .ok_or_else(|| Error::Corrupt("lane marker directory disappeared".into()))?;
+    metadata.write_atomic_regular(MARKER_FILE, &serde_json::to_vec(marker)?)
+}
+
 pub(crate) fn materialized_lane_root_identity(workdir: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {

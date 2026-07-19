@@ -8,8 +8,8 @@ mod initialization;
 pub(crate) use initialization::backfill_lane_initializations_v19;
 #[cfg(any(test, debug_assertions))]
 pub(crate) use initialization::{
-    clear_schema_v19_backfill_times, install_schema_v19_backfill_times,
-    schema_v19_backfill_times_remaining,
+    clear_schema_v19_backfill_times, install_schema_v18_authenticated_lane_evidence,
+    install_schema_v19_backfill_times, schema_v19_backfill_times_remaining,
 };
 mod leases;
 mod lifecycle;

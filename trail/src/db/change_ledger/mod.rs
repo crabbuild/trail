@@ -63,9 +63,10 @@ pub(crate) use projection::{
 
 #[allow(unused_imports)]
 pub(crate) use log::{
-    recover_segments_from_connection, recover_segments_from_directory, AuthenticatedSegment,
-    DaemonLaunchBinding, DurableCut, ObserverRecord, ObserverWriterBinding, PersistedLogLimits,
-    RecoveredTail, RecoveryError, RecoveryScope, SegmentWriter,
+    recover_segments_from_connection, recover_segments_from_directory,
+    workspace_db_dir_for_database, AuthenticatedSegment, DaemonLaunchBinding, DurableCut,
+    ObserverRecord, ObserverWriterBinding, PersistedLogLimits, RecoveredTail, RecoveryError,
+    RecoveryScope, SegmentWriter,
 };
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub(crate) use observer::linux::{
