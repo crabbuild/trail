@@ -147,11 +147,11 @@ Before any run, derive both final source refs and require both absent in every p
 
 - [ ] **Step 3: Revalidate, import, and atomically create refs**
 
-Parse each proof once and capture its validated commit/tree/ref/digest. Revalidate the exact schema/bindings, all stored hashes, checker PASS, bundle verification and exact heads, and the exact one-commit parent topology while securely staging the already-open bundle. Rehash each read-only staged bundle immediately before fetching its captured ref with `git fetch --no-tags --no-write-fetch-head STAGED_BUNDLE REF`, verify imported commit/tree identities from captured values, then use one `git update-ref --stdin` transaction with two captured `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation or proof/bundle TOCTOU substitution.
+Parse each original proof once and capture its validated commit/tree/ref/digest. Revalidate the exact schema/bindings, all stored hashes, checker PASS, bundle verification and exact heads, and the exact one-commit parent topology while securely staging the already-open bundle; write a sealed proof record bound to that staged path and digest. Rehash each read-only staged bundle immediately before fetching its captured ref with `git fetch --no-tags --no-write-fetch-head STAGED_BUNDLE REF`, verify imported commit/tree identities from captured values, then use one `git update-ref --stdin` transaction with two captured `create REF COMMIT` commands. This makes absence the CAS condition and prevents partial ref creation or proof/bundle TOCTOU substitution.
 
 - [ ] **Step 4: Recheck final source state**
 
-Require unchanged source HEAD, symbolic HEAD, index, worktree/status/inventory, and unchanged original refs. Require exactly the two derived ref additions at the proof commits. Write `matrix-summary.json` only after this verification.
+Require unchanged source HEAD, symbolic HEAD, index, worktree/status/inventory, and unchanged original refs. Require exactly the two derived ref additions at the proof commits. Write `matrix-summary.json` only after this verification and only from the sealed proof records, never by reopening the mutable originals.
 
 - [ ] **Step 5: Run all focused tests GREEN**
 

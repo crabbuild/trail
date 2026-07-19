@@ -511,6 +511,21 @@ class DisposableScaleMatrixTests(unittest.TestCase):
         commit128 = self.git("rev-parse", "refs/heads/codex/trail-scale-contract-128")
         self.assertNotEqual(commit64, baseline)
         self.assertNotEqual(commit128, baseline)
+        summary = json.loads(
+            (self.output / "matrix-summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["status"], "PASS")
+        self.assertTrue(summary["published"])
+        for run, published_commit in zip(summary["runs"], (commit64, commit128), strict=True):
+            staged_bundle = Path(run["bundle"])
+            self.assertEqual(run["commit"], published_commit)
+            self.assertEqual(run["tree"], self.git("rev-parse", published_commit + "^{tree}"))
+            self.assertEqual(staged_bundle.parent, self.output / "publication-stage")
+            self.assertEqual(sha256(staged_bundle.read_bytes()), run["bundle_sha256"])
+            heads = subprocess.check_output(
+                ["git", "bundle", "list-heads", str(staged_bundle)], text=True
+            ).strip()
+            self.assertEqual(heads, f'{run["commit"]} {run["ref"]}')
 
     def test_clonefile_failure_aborts_without_byte_copy_fallback(self) -> None:
         interposer = self.build_clonefile_failure_interposer()
@@ -776,6 +791,18 @@ class DisposableScaleMatrixTests(unittest.TestCase):
 
     def test_hup_is_forwarded_to_inner_group_and_retains_marker(self) -> None:
         self.assert_signal_forwarded(signal.SIGHUP, "HUP")
+
+    def test_signal_during_launch_registration_window_is_contained(self) -> None:
+        result = self.run_matrix(extra_env={"TRAIL_SCALE_TEST_SIGNAL_AT_LAUNCH": "TERM"})
+        self.assertEqual(result.returncode, 128 + signal.SIGTERM, result.stderr)
+        self.assertEqual(self.calls(), [])
+        run_dir = self.output / "runs/64"
+        self.assertFalse((run_dir / "inner.pgid").exists())
+        marker = run_dir / "signal-failure.json"
+        self.assertTrue(marker.is_file())
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(value["signal"], "TERM")
+        self.assertEqual(value["exit_status"], 128 + signal.SIGTERM)
 
     def assert_signal_forwarded(self, signal_number: int, signal_name: str) -> None:
         pid_file = self.root / f"blocking-inner-{signal_name}.json"

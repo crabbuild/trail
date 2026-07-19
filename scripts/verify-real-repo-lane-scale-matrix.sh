@@ -18,6 +18,10 @@ TRAIL_SCALE_LATENCY_CEILING_SECONDS=${TRAIL_SCALE_LATENCY_CEILING_SECONDS:-120}
 active_inner_pid=
 active_inner_run_dir=
 active_inner_pgid_file=
+active_inner_group_ready_file=
+active_inner_registration_pending=0
+pending_signal_name=
+pending_signal_number=
 
 die() {
   echo "verify-real-repo-lane-scale-matrix: $*" >&2
@@ -32,8 +36,21 @@ handle_signal() {
   local name=$1
   local number=$2
   local status=$((128 + number))
+  if [[ $active_inner_registration_pending == 1 && -z $active_inner_pid ]]; then
+    if [[ -z $pending_signal_name ]]; then
+      pending_signal_name=$name
+      pending_signal_number=$number
+    fi
+    return 0
+  fi
   trap - INT TERM HUP
   if [[ -n $active_inner_pid ]]; then
+    local group_waits=0
+    while [[ -n $active_inner_group_ready_file && ! -f $active_inner_group_ready_file ]] &&
+          kill -0 "$active_inner_pid" 2>/dev/null && (( group_waits < 500 )); do
+      /bin/sleep 0.01
+      group_waits=$((group_waits + 1))
+    done
     local pgid=$active_inner_pid
     if [[ -f $active_inner_pgid_file ]]; then
       local recorded
@@ -471,9 +488,15 @@ run_inner_harness() {
   local owner=$6
   local run_dir=$7
   local pgid_file=$run_dir/inner.pgid
+  local group_ready_file=$run_dir/inner.group-ready
   local completion_file=$run_dir/inner.supervisor-complete
+  local registration_file=$run_dir/inner.parent-registered
   assert_pinned_binary
   validate_owner_file "$owner" "$copy" "$evidence" "$run_id" || die "owner binding rejected before $count-lane inner run"
+  active_inner_run_dir=$run_dir
+  active_inner_pgid_file=$pgid_file
+  active_inner_group_ready_file=$group_ready_file
+  active_inner_registration_pending=1
   set +e
   TRAIL_BIN=$pinned_trail \
   TRAIL_SCALE_REPO=$copy \
@@ -491,10 +514,29 @@ run_inner_harness() {
   TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=$fault_driver_sha \
   TRAIL_SCALE_DISPOSABLE_WORKSPACE=1 \
   TRAIL_SCALE_DISPOSABLE_OWNER_FILE=$owner \
-  python3 - "$pgid_file" "$completion_file" "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr" <<'PY' &
-import os, signal, subprocess, sys
-ready,completion,program=sys.argv[1:]
+  python3 - "$pgid_file" "$group_ready_file" "$completion_file" "$registration_file" "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr" <<'PY' &
+import os, signal, subprocess, sys, time
+ready,group_ready,completion,registration,program=sys.argv[1:]
 os.setpgid(0,0)
+descriptor=os.open(group_ready,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+try:
+    os.write(descriptor,(str(os.getpid())+"\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+while True:
+    try:
+        descriptor=os.open(registration,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    except FileNotFoundError:
+        time.sleep(0.01)
+        continue
+    try:
+        registered=os.read(descriptor,64).decode("ascii").strip()
+    finally:
+        os.close(descriptor)
+    if registered != str(os.getpid()):
+        raise SystemExit("parent registration PID mismatch")
+    break
 descriptor=os.open(ready,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
 try:
     os.write(descriptor,(str(os.getpid())+"\n").encode())
@@ -517,9 +559,28 @@ finally:
     os.close(descriptor)
 raise SystemExit(status)
 PY
+  if [[ -n ${TRAIL_SCALE_TEST_SIGNAL_AT_LAUNCH:-} ]]; then
+    kill -s "$TRAIL_SCALE_TEST_SIGNAL_AT_LAUNCH" "$$"
+  fi
   active_inner_pid=$!
-  active_inner_run_dir=$run_dir
-  active_inner_pgid_file=$pgid_file
+  active_inner_registration_pending=0
+  if [[ -n $pending_signal_name ]]; then
+    local recorded_signal_name=$pending_signal_name
+    local recorded_signal_number=$pending_signal_number
+    pending_signal_name=
+    pending_signal_number=
+    handle_signal "$recorded_signal_name" "$recorded_signal_number"
+  fi
+  python3 - "$registration_file" "$active_inner_pid" <<'PY'
+import os, sys
+path,pid=sys.argv[1:]
+descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+try:
+    os.write(descriptor,(pid+"\n").encode("ascii"))
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
   while [[ ! -f $completion_file ]]; do
     state=$(ps -o stat= -p "$active_inner_pid" 2>/dev/null | tr -d '[:space:]')
     [[ -z $state || $state == Z* ]] && break
@@ -530,6 +591,8 @@ PY
   active_inner_pid=
   active_inner_run_dir=
   active_inner_pgid_file=
+  active_inner_group_ready_file=
+  active_inner_registration_pending=0
   set -e
   printf '%s\n' "$code" > "$run_dir/inner.exit-code"
   assert_source_unchanged "$count-lane inner run"
@@ -548,6 +611,7 @@ revalidate_run_proof() {
   local baseline=$6
   local run_dir=$7
   local staged_bundle=$8
+  local staged_proof=$9
   local proof=$run_dir/proof.json
   local captured
   captured=$(python3 - "$proof" "$count" "$run_id" "$copy" "$evidence" "$git_ref" "$baseline" \
@@ -615,18 +679,23 @@ parent_fd=os.open(os.path.dirname(staged),os.O_RDONLY|getattr(os,"O_DIRECTORY",0
 try: os.fsync(parent_fd)
 finally: os.close(parent_fd)
 print(value["commit"]); print(value["tree"]); print(value["ref"]); print(staged); print(bundle_sha)
+print(value["checker_sha256"]); print(value["binary_sha256"])
 PY
   ) || return 1
   local commit
   local tree
   local captured_ref
   local bundle_sha
+  local checker_sha
+  local captured_binary_sha
   commit=$(printf '%s\n' "$captured" | sed -n '1p')
   tree=$(printf '%s\n' "$captured" | sed -n '2p')
   captured_ref=$(printf '%s\n' "$captured" | sed -n '3p')
   staged_bundle=$(printf '%s\n' "$captured" | sed -n '4p')
   bundle_sha=$(printf '%s\n' "$captured" | sed -n '5p')
-  [[ $(printf '%s\n' "$captured" | wc -l | tr -d '[:space:]') == 5 ]] || return 1
+  checker_sha=$(printf '%s\n' "$captured" | sed -n '6p')
+  captured_binary_sha=$(printf '%s\n' "$captured" | sed -n '7p')
+  [[ $(printf '%s\n' "$captured" | wc -l | tr -d '[:space:]') == 7 ]] || return 1
   [[ $captured_ref == "$git_ref" ]] || return 1
   [[ $(git -C "$copy" rev-parse "$git_ref^{commit}") == "$commit" ]] || return 1
   [[ $(git -C "$copy" rev-parse "$commit^{tree}") == "$tree" ]] || return 1
@@ -637,7 +706,35 @@ PY
   heads=$(git -C "$copy" bundle list-heads "$staged_bundle") || return 1
   [[ $heads == "$commit $git_ref" ]] || return 1
   assert_pinned_binary
-  printf '%s\n%s\n%s\n%s\n%s\n' "$commit" "$tree" "$captured_ref" "$staged_bundle" "$bundle_sha"
+  [[ $captured_binary_sha == "$pinned_trail_sha" ]] || return 1
+  python3 - "$staged_proof" "$count" "$run_id" "$copy" "$evidence" "$captured_ref" \
+    "$baseline" "$commit" "$tree" "$staged_bundle" "$bundle_sha" "$checker_sha" \
+    "$captured_binary_sha" <<'PY'
+import json, os, sys
+(path,count,run_id,copy,evidence,ref,baseline,commit,tree,bundle,bundle_sha,
+ checker_sha,binary_sha)=sys.argv[1:]
+value={"schema_version":1,"lanes":int(count),"run_id":run_id,"copy":copy,
+       "evidence":evidence,"ref":ref,"baseline":baseline,"commit":commit,"tree":tree,
+       "bundle":bundle,"bundle_sha256":bundle_sha,"checker_sha256":checker_sha,
+       "binary_sha256":binary_sha}
+descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o444)
+try:
+    data=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode("utf-8")
+    view=memoryview(data)
+    while view:
+        written=os.write(descriptor,view)
+        if written <= 0: raise OSError("short sealed proof write")
+        view=view[written:]
+    os.fchmod(descriptor,0o444)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+parent=os.open(os.path.dirname(path),os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try: os.fsync(parent)
+finally: os.close(parent)
+PY
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$commit" "$tree" "$captured_ref" "$staged_bundle" "$bundle_sha" "$staged_proof"
 }
 
 assert_staged_bundle() {
@@ -832,31 +929,32 @@ PY
   assert_source_unchanged "$count-lane run"
 done
 
-proof64=$TRAIL_SCALE_MATRIX_OUTPUT/runs/64/proof.json
-proof128=$TRAIL_SCALE_MATRIX_OUTPUT/runs/128/proof.json
 assert_source_unchanged "pre-publication"
 
+publication_stage=$TRAIL_SCALE_MATRIX_OUTPUT/publication-stage
+mkdir -- "$publication_stage"
+publication64=$(revalidate_run_proof 64 "$copy64" "$evidence64" "$run_id64" "$ref64" "$baseline64" \
+  "$TRAIL_SCALE_MATRIX_OUTPUT/runs/64" "$publication_stage/64.bundle" "$publication_stage/64.proof.json") ||
+  die "proof revalidation failed for 64 lanes"
+publication128=$(revalidate_run_proof 128 "$copy128" "$evidence128" "$run_id128" "$ref128" "$baseline128" \
+  "$TRAIL_SCALE_MATRIX_OUTPUT/runs/128" "$publication_stage/128.bundle" "$publication_stage/128.proof.json") ||
+  die "proof revalidation failed for 128 lanes"
+chmod 0555 "$publication_stage"
+commit64=$(printf '%s\n' "$publication64" | sed -n '1p')
+tree64=$(printf '%s\n' "$publication64" | sed -n '2p')
+publish_ref64=$(printf '%s\n' "$publication64" | sed -n '3p')
+bundle64=$(printf '%s\n' "$publication64" | sed -n '4p')
+bundle_sha64=$(printf '%s\n' "$publication64" | sed -n '5p')
+sealed_proof64=$(printf '%s\n' "$publication64" | sed -n '6p')
+commit128=$(printf '%s\n' "$publication128" | sed -n '1p')
+tree128=$(printf '%s\n' "$publication128" | sed -n '2p')
+publish_ref128=$(printf '%s\n' "$publication128" | sed -n '3p')
+bundle128=$(printf '%s\n' "$publication128" | sed -n '4p')
+bundle_sha128=$(printf '%s\n' "$publication128" | sed -n '5p')
+sealed_proof128=$(printf '%s\n' "$publication128" | sed -n '6p')
+assert_source_unchanged "proof revalidation"
+
 if [[ $TRAIL_SCALE_MATRIX_PUBLISH == 1 ]]; then
-  publication_stage=$TRAIL_SCALE_MATRIX_OUTPUT/publication-stage
-  mkdir -- "$publication_stage"
-  publication64=$(revalidate_run_proof 64 "$copy64" "$evidence64" "$run_id64" "$ref64" "$baseline64" \
-    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/64" "$publication_stage/64.bundle") ||
-    die "proof revalidation failed for 64 lanes"
-  publication128=$(revalidate_run_proof 128 "$copy128" "$evidence128" "$run_id128" "$ref128" "$baseline128" \
-    "$TRAIL_SCALE_MATRIX_OUTPUT/runs/128" "$publication_stage/128.bundle") ||
-    die "proof revalidation failed for 128 lanes"
-  chmod 0555 "$publication_stage"
-  commit64=$(printf '%s\n' "$publication64" | sed -n '1p')
-  tree64=$(printf '%s\n' "$publication64" | sed -n '2p')
-  publish_ref64=$(printf '%s\n' "$publication64" | sed -n '3p')
-  bundle64=$(printf '%s\n' "$publication64" | sed -n '4p')
-  bundle_sha64=$(printf '%s\n' "$publication64" | sed -n '5p')
-  commit128=$(printf '%s\n' "$publication128" | sed -n '1p')
-  tree128=$(printf '%s\n' "$publication128" | sed -n '2p')
-  publish_ref128=$(printf '%s\n' "$publication128" | sed -n '3p')
-  bundle128=$(printf '%s\n' "$publication128" | sed -n '4p')
-  bundle_sha128=$(printf '%s\n' "$publication128" | sed -n '5p')
-  assert_source_unchanged "proof revalidation"
   require_ref_absent "$publish_ref64"
   require_ref_absent "$publish_ref128"
   assert_staged_bundle "$bundle64" "$bundle_sha64" || die "staged 64-lane bundle changed before fetch"
@@ -877,7 +975,7 @@ if [[ $TRAIL_SCALE_MATRIX_PUBLISH == 1 ]]; then
 fi
 
 python3 - "$TRAIL_SCALE_MATRIX_OUTPUT/matrix-summary.json" "$TRAIL_SCALE_MATRIX_RUN_ID" \
-  "$TRAIL_SCALE_MATRIX_PUBLISH" "$TRAIL_SCALE_REPO" "$proof64" "$proof128" <<'PY'
+  "$TRAIL_SCALE_MATRIX_PUBLISH" "$TRAIL_SCALE_REPO" "$sealed_proof64" "$sealed_proof128" <<'PY'
 import json, sys
 path,run_id,published,source,*proof_paths=sys.argv[1:]
 proofs=[json.load(open(item,encoding="utf-8")) for item in proof_paths]
