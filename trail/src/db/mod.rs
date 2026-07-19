@@ -104,7 +104,11 @@ static SCHEMA_VALIDATION_SERVERS: OnceLock<Mutex<HashMap<PathBuf, ActiveSchemaVa
 static NEXT_SCHEMA_VALIDATION_SERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
+type SchemaValidationFailureHook = Box<dyn FnOnce(&Path) + Send>;
+#[cfg(test)]
+static SCHEMA_VALIDATION_FAILURES: OnceLock<
+    Mutex<HashMap<PathBuf, Option<SchemaValidationFailureHook>>>,
+> = OnceLock::new();
 #[cfg(test)]
 type SchemaSnapshotGenerationHook = Box<dyn FnOnce(&Path) + Send>;
 #[cfg(test)]
@@ -262,9 +266,28 @@ fn clear_schema_wal_digest_attempt_hook(path: &Path) {
 #[cfg(test)]
 fn fail_next_schema_validation(
     db_path: &Path,
-) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, ()> {
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, Option<SchemaValidationFailureHook>>
+{
     let failures = SCHEMA_VALIDATION_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    crate::test_support::scoped_state::ScopedTestState::install(failures, db_path.to_path_buf(), ())
+    crate::test_support::scoped_state::ScopedTestState::install(
+        failures,
+        db_path.to_path_buf(),
+        None,
+    )
+}
+
+#[cfg(test)]
+fn fail_next_schema_validation_with_hook(
+    db_path: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, Option<SchemaValidationFailureHook>>
+{
+    let failures = SCHEMA_VALIDATION_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    crate::test_support::scoped_state::ScopedTestState::install(
+        failures,
+        db_path.to_path_buf(),
+        Some(Box::new(hook)),
+    )
 }
 
 #[cfg(test)]
@@ -1751,14 +1774,16 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     #[cfg(test)]
     schema_validation_process_test_probe()?;
     #[cfg(test)]
-    if SCHEMA_VALIDATION_FAILURES
+    if let Some(hook) = SCHEMA_VALIDATION_FAILURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(db_path)
-        .is_some()
     {
         std::thread::sleep(Duration::from_millis(100));
+        if let Some(hook) = hook {
+            hook(db_path);
+        }
         return Err(schema_reinitialize_error(
             "injected schema validation leader failure",
         ));

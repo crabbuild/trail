@@ -2096,11 +2096,8 @@ mod schema_handoff_tests {
                 [],
             )
             .unwrap();
-        let _failure = fail_next_schema_validation(&db_path);
-        let advancing_path = db_path.clone();
-        let advancing = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            let connection = Connection::open(advancing_path).unwrap();
+        let _failure = fail_next_schema_validation_with_hook(&db_path, move |path| {
+            let connection = Connection::open(path).unwrap();
             connection
                 .execute(
                     "UPDATE schema_meta SET value='snapshot-error-retry' WHERE key='app.version'",
@@ -2110,7 +2107,6 @@ mod schema_handoff_tests {
         });
 
         Trail::open(root.path()).unwrap();
-        advancing.join().unwrap();
         assert_eq!(schema_validation_count(&db_path), 2);
         drop(writer);
     }
