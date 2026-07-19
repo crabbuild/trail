@@ -113,8 +113,92 @@ static NEXT_SCHEMA_SNAPSHOT_GENERATION_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
-static NEXT_SCHEMA_VALIDATION_SERVER_DELAYS: OnceLock<Mutex<HashMap<PathBuf, (u64, u64)>>> =
-    OnceLock::new();
+static NEXT_SCHEMA_VALIDATION_SERVER_GATES: OnceLock<
+    Mutex<HashMap<PathBuf, SchemaValidationServerTestGates>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Default)]
+struct SchemaValidationServerTestGates {
+    start: Option<Arc<SchemaValidationServerTestGate>>,
+    shutdown: Option<Arc<SchemaValidationServerTestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SchemaValidationServerTestGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl SchemaValidationServerTestGate {
+    fn block(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.0 && !timeout.timed_out(),
+            "schema server did not reach test gate"
+        );
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct SchemaValidationServerTestGateGuard {
+    _scope: crate::test_support::scoped_state::ScopedTestState<
+        PathBuf,
+        SchemaValidationServerTestGates,
+    >,
+    gate: Arc<SchemaValidationServerTestGate>,
+}
+
+#[cfg(test)]
+impl SchemaValidationServerTestGateGuard {
+    fn wait_until_blocked(&self) {
+        self.gate.wait_until_blocked();
+    }
+
+    fn release(&self) {
+        self.gate.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SchemaValidationServerTestGateGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 type SchemaSocketAuthorityHook = Box<dyn FnOnce(&Path) + Send>;
@@ -208,43 +292,53 @@ fn run_schema_snapshot_generation_hook(db_path: &Path) {
 }
 
 #[cfg(test)]
-fn delay_next_schema_validation_server_start_for_test(
+fn block_next_schema_validation_server_start_for_test(
     db_path: &Path,
-    delay: Duration,
-) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, (u64, u64)> {
-    let delays = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS.get_or_init(|| Mutex::new(HashMap::new()));
-    crate::test_support::scoped_state::ScopedTestState::install(
-        delays,
+) -> SchemaValidationServerTestGateGuard {
+    let gate = Arc::new(SchemaValidationServerTestGate::default());
+    let gates = NEXT_SCHEMA_VALIDATION_SERVER_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let scope = crate::test_support::scoped_state::ScopedTestState::install(
+        gates,
         db_path.to_path_buf(),
-        (delay.as_millis() as u64, 0),
-    )
+        SchemaValidationServerTestGates {
+            start: Some(gate.clone()),
+            shutdown: None,
+        },
+    );
+    SchemaValidationServerTestGateGuard {
+        _scope: scope,
+        gate,
+    }
 }
 
 #[cfg(test)]
-fn delay_next_schema_validation_server_shutdown_for_test(
+fn block_next_schema_validation_server_shutdown_for_test(
     db_path: &Path,
-    delay: Duration,
-) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, (u64, u64)> {
-    let delays = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS.get_or_init(|| Mutex::new(HashMap::new()));
-    crate::test_support::scoped_state::ScopedTestState::install(
-        delays,
+) -> SchemaValidationServerTestGateGuard {
+    let gate = Arc::new(SchemaValidationServerTestGate::default());
+    let gates = NEXT_SCHEMA_VALIDATION_SERVER_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let scope = crate::test_support::scoped_state::ScopedTestState::install(
+        gates,
         db_path.to_path_buf(),
-        (0, delay.as_millis() as u64),
-    )
+        SchemaValidationServerTestGates {
+            start: None,
+            shutdown: Some(gate.clone()),
+        },
+    );
+    SchemaValidationServerTestGateGuard {
+        _scope: scope,
+        gate,
+    }
 }
 
 #[cfg(test)]
-fn take_schema_validation_server_delays_for_test(db_path: &Path) -> (Duration, Duration) {
-    let (start, shutdown) = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
+fn take_schema_validation_server_gates_for_test(db_path: &Path) -> SchemaValidationServerTestGates {
+    NEXT_SCHEMA_VALIDATION_SERVER_GATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(db_path)
-        .unwrap_or_default();
-    (
-        Duration::from_millis(start),
-        Duration::from_millis(shutdown),
-    )
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -516,11 +610,22 @@ pub(crate) fn preflight_existing_schema(
                 validated == &generation && validated_backend == &backend
             })
         {
-            let (parent_authority, main_authority) =
-                open_schema_main_authority(db_path, &generation)?;
             let authenticated_wal_digest = state.validated.as_ref().unwrap().2.clone();
             state.active_handoffs = state.active_handoffs.saturating_add(1);
             drop(state);
+            let (parent_authority, main_authority) =
+                match open_schema_main_authority(db_path, &generation) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        let mut state = entry
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.active_handoffs = state.active_handoffs.saturating_sub(1);
+                        entry.changed.notify_all();
+                        return Err(error);
+                    }
+                };
             return Ok(ValidatedSchemaGeneration {
                 db_path: db_path.to_path_buf(),
                 generation,
@@ -1157,16 +1262,18 @@ struct SchemaValidationServer {
     #[cfg(test)]
     panic_on_serve: bool,
     #[cfg(test)]
-    start_delay: Duration,
+    start_gate: Option<Arc<SchemaValidationServerTestGate>>,
     #[cfg(test)]
-    shutdown_delay: Duration,
+    shutdown_gate: Option<Arc<SchemaValidationServerTestGate>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SchemaValidationServer {
     #[cfg(test)]
     fn delay_start_for_test(&self) {
-        std::thread::sleep(self.start_delay);
+        if let Some(gate) = &self.start_gate {
+            gate.block();
+        }
     }
 
     #[cfg(not(test))]
@@ -1186,7 +1293,9 @@ impl SchemaValidationServer {
             shutdown,
         );
         #[cfg(test)]
-        std::thread::sleep(self.shutdown_delay);
+        if let Some(gate) = &self.shutdown_gate {
+            gate.block();
+        }
     }
 }
 
@@ -1516,8 +1625,7 @@ fn coordinate_schema_snapshot_validation(
                     }
                 };
                 #[cfg(test)]
-                let (start_delay, shutdown_delay) =
-                    take_schema_validation_server_delays_for_test(db_path);
+                let gates = take_schema_validation_server_gates_for_test(db_path);
                 let server = SchemaValidationServer {
                     listener,
                     nonce,
@@ -1531,9 +1639,9 @@ fn coordinate_schema_snapshot_validation(
                     #[cfg(test)]
                     panic_on_serve: false,
                     #[cfg(test)]
-                    start_delay,
+                    start_gate: gates.start,
                     #[cfg(test)]
-                    shutdown_delay,
+                    shutdown_gate: gates.shutdown,
                 };
                 start_schema_validation_server(db_path, server);
                 return (validation, None);

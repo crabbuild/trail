@@ -893,8 +893,8 @@ mod schema_handoff_tests {
                 _socket_cleanup: socket_cleanup,
                 _announcement_cleanup: announcement_cleanup,
                 panic_on_serve: false,
-                start_delay: Duration::ZERO,
-                shutdown_delay: Duration::ZERO,
+                start_gate: None,
+                shutdown_gate: None,
             },
             socket_path,
             lock_path,
@@ -1526,18 +1526,23 @@ mod schema_handoff_tests {
                 [],
             )
             .unwrap();
-        let barrier = Arc::new(Barrier::new(100));
-        let started = Instant::now();
+        let ready = Arc::new(Barrier::new(101));
+        let start = Arc::new(Barrier::new(101));
         let handles = (0..100)
             .map(|_| {
                 let root = root.path().to_path_buf();
-                let barrier = barrier.clone();
+                let ready = ready.clone();
+                let start = start.clone();
                 std::thread::spawn(move || {
-                    barrier.wait();
+                    ready.wait();
+                    start.wait();
                     Trail::open(root).map(drop)
                 })
             })
             .collect::<Vec<_>>();
+        ready.wait();
+        let started = Instant::now();
+        start.wait();
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
@@ -1922,12 +1927,8 @@ mod schema_handoff_tests {
         let db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
         let _failure = fail_next_schema_validation(&db_path);
-        let _shutdown_delay = delay_next_schema_validation_server_shutdown_for_test(
-            &db_path,
-            Duration::from_millis(300),
-        );
+        let server_gate = block_next_schema_validation_server_start_for_test(&db_path);
         let barrier = Arc::new(Barrier::new(16));
-        let started = Instant::now();
         let handles = (0..16)
             .map(|_| {
                 let root = root.path().to_path_buf();
@@ -1938,24 +1939,34 @@ mod schema_handoff_tests {
                 })
             })
             .collect::<Vec<_>>();
-        for handle in handles {
+        let (completed, received) = std::sync::mpsc::sync_channel(1);
+        let collector = std::thread::spawn(move || {
+            let results = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            completed.send(results).unwrap();
+        });
+        server_gate.wait_until_blocked();
+        for result in received.recv_timeout(Duration::from_secs(5)).unwrap() {
             assert!(matches!(
-                handle.join().unwrap(),
+                result,
                 Err(Error::SchemaReinitializeRequired { .. })
             ));
         }
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "invalid-schema peers paid the detached IPC fanout lifetime: {:?}",
-            started.elapsed()
-        );
-        let retry_started = Instant::now();
-        Trail::open(root.path()).unwrap();
-        assert!(
-            retry_started.elapsed() < Duration::from_millis(250),
-            "retry waited for the failed result server to retire: {:?}",
-            retry_started.elapsed()
-        );
+        collector.join().unwrap();
+
+        let retry_root = root.path().to_path_buf();
+        let (retried, retry_received) = std::sync::mpsc::sync_channel(1);
+        let retry = std::thread::spawn(move || {
+            retried.send(Trail::open(retry_root).map(drop)).unwrap();
+        });
+        retry_received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        server_gate.release();
+        retry.join().unwrap();
         assert_eq!(schema_validation_count(&db_path), 2);
     }
 
@@ -1966,18 +1977,19 @@ mod schema_handoff_tests {
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
         let db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
-        let _start_delay = delay_next_schema_validation_server_start_for_test(
-            &db_path,
-            Duration::from_millis(300),
-        );
-
-        let started = Instant::now();
-        Trail::open(root.path()).unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "production start rendezvoused with the delayed server thread: {:?}",
-            started.elapsed()
-        );
+        let server_gate = block_next_schema_validation_server_start_for_test(&db_path);
+        let workspace = root.path().to_path_buf();
+        let (opened, received) = std::sync::mpsc::sync_channel(1);
+        let foreground = std::thread::spawn(move || {
+            opened.send(Trail::open(workspace).map(drop)).unwrap();
+        });
+        server_gate.wait_until_blocked();
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        server_gate.release();
+        foreground.join().unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1987,11 +1999,10 @@ mod schema_handoff_tests {
         Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
         let canonical_db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
-        let _shutdown_delay = delay_next_schema_validation_server_shutdown_for_test(
-            &canonical_db_path,
-            Duration::from_millis(300),
-        );
+        let server_gate = block_next_schema_validation_server_shutdown_for_test(&canonical_db_path);
         Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&canonical_db_path), 1);
+        server_gate.wait_until_blocked();
 
         let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
         let writer = Connection::open(&db_path).unwrap();
@@ -2005,13 +2016,18 @@ mod schema_handoff_tests {
             )
             .unwrap();
 
-        let started = Instant::now();
-        Trail::open(root.path()).unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "replacement waited for the old result server: {:?}",
-            started.elapsed()
-        );
+        let workspace = root.path().to_path_buf();
+        let (opened, received) = std::sync::mpsc::sync_channel(1);
+        let foreground = std::thread::spawn(move || {
+            opened.send(Trail::open(workspace).map(drop)).unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        server_gate.release();
+        foreground.join().unwrap();
+        assert_eq!(schema_validation_count(&canonical_db_path), 2);
         drop(writer);
     }
 
