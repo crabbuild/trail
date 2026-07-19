@@ -457,9 +457,47 @@ fn first_status_publishes_a_ready_workspace_daemon() {
 }
 
 #[cfg(target_os = "macos")]
+fn external_volume_candidate_is_compatible(
+    is_directory: bool,
+    is_distinct_device: bool,
+    is_apfs: bool,
+) -> bool {
+    is_directory && is_distinct_device && is_apfs
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_is_apfs(path: &Path) -> bool {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut status: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut status) } != 0 {
+        return false;
+    }
+    unsafe { CStr::from_ptr(status.f_fstypename.as_ptr()) }
+        .to_str()
+        .is_ok_and(|filesystem| filesystem == "apfs")
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_volume_candidate_requires_distinct_apfs_directory() {
+    assert!(external_volume_candidate_is_compatible(true, true, true));
+    assert!(!external_volume_candidate_is_compatible(true, true, false));
+    assert!(!external_volume_candidate_is_compatible(true, false, true));
+    assert!(!external_volume_candidate_is_compatible(false, true, true));
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn external_volume_repo_direct_fences_home_git_config_and_reconciles_on_drift() {
-    let policy_home = tempfile::tempdir().unwrap();
+    let policy_home = tempfile::Builder::new()
+        .prefix("trail-external-policy-home-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let policy_device = fs::metadata(policy_home.path()).unwrap().dev();
     let workspace = fs::read_dir("/Volumes")
         .ok()
@@ -469,14 +507,18 @@ fn external_volume_repo_direct_fences_home_git_config_and_reconciles_on_drift() 
         .filter_map(|entry| {
             let path = entry.path();
             let metadata = fs::metadata(&path).ok()?;
-            (metadata.is_dir() && metadata.dev() != policy_device)
-                .then(|| {
-                    tempfile::Builder::new()
-                        .prefix("trail-external-policy-status-")
-                        .tempdir_in(path)
-                        .ok()
-                })
-                .flatten()
+            external_volume_candidate_is_compatible(
+                metadata.is_dir(),
+                metadata.dev() != policy_device,
+                filesystem_is_apfs(&path),
+            )
+            .then(|| {
+                tempfile::Builder::new()
+                    .prefix("trail-external-policy-status-")
+                    .tempdir_in(path)
+                    .ok()
+            })
+            .flatten()
         })
         .next();
     let Some(workspace) = workspace else {
