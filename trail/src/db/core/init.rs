@@ -4,17 +4,235 @@ const AUTO_MINIMAL_FILES_THRESHOLD: usize = 10_000;
 const AUTO_MINIMAL_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
 const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenRecoveryRound {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+struct OpenRecoveryState {
+    round: OpenRecoveryRound,
+    participants: usize,
+}
+
+struct OpenRecoveryEntry {
+    state: Mutex<OpenRecoveryState>,
+    changed: Condvar,
+}
+
+impl OpenRecoveryEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OpenRecoveryState {
+                round: OpenRecoveryRound::Pending,
+                participants: 1,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+// Ordinary opens construct independent read handles, but recovery mutates shared
+// workspace state under the write lock. Register before handle construction so
+// callers that overlap one active round share it. Completed rounds are never a
+// cache: a later registration always installs a fresh entry.
+static OPEN_RECOVERY_COHORTS: OnceLock<Mutex<HashMap<PathBuf, Arc<OpenRecoveryEntry>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static OPEN_RECOVERY_TEST_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn fail_next_open_recoveries(
+    db_dir: &Path,
+    count: usize,
+) -> crate::test_support::scoped_state::ScopedTestState<PathBuf, usize> {
+    let failures = OPEN_RECOVERY_TEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    crate::test_support::scoped_state::ScopedTestState::install(
+        failures,
+        db_dir.to_path_buf(),
+        count,
+    )
+}
+
+#[cfg(test)]
+fn take_open_recovery_failure(db_dir: &Path) -> bool {
+    let failures = OPEN_RECOVERY_TEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut failures = failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(remaining) = failures.get_mut(db_dir) else {
+        return false;
+    };
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
+enum OpenRecoveryRole {
+    Leader,
+    Succeeded,
+    Retry,
+}
+
+struct OpenRecoveryParticipant {
+    db_dir: PathBuf,
+    entry: Arc<OpenRecoveryEntry>,
+    leader: bool,
+}
+
+impl OpenRecoveryParticipant {
+    fn register(db_dir: &Path) -> Self {
+        let cohorts = OPEN_RECOVERY_COHORTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cohorts = cohorts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cohorts
+            .get(db_dir)
+            .and_then(|entry| {
+                let mut state = entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (state.round == OpenRecoveryRound::Pending).then(|| {
+                    state.participants = state.participants.saturating_add(1);
+                    entry.clone()
+                })
+            })
+            .unwrap_or_else(|| {
+                let entry = Arc::new(OpenRecoveryEntry::new());
+                cohorts.insert(db_dir.to_path_buf(), entry.clone());
+                entry
+            });
+        Self {
+            db_dir: db_dir.to_path_buf(),
+            entry,
+            leader: false,
+        }
+    }
+
+    fn await_role(&mut self) -> OpenRecoveryRole {
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            match state.round {
+                OpenRecoveryRound::Pending => {
+                    state.round = OpenRecoveryRound::Running;
+                    self.leader = true;
+                    return OpenRecoveryRole::Leader;
+                }
+                OpenRecoveryRound::Running => {
+                    state = self
+                        .entry
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                OpenRecoveryRound::Succeeded => return OpenRecoveryRole::Succeeded,
+                OpenRecoveryRound::Failed => return OpenRecoveryRole::Retry,
+            }
+        }
+    }
+
+    fn complete(&mut self, succeeded: bool) {
+        let cohorts = OPEN_RECOVERY_COHORTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let cohorts = cohorts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.round == OpenRecoveryRound::Running {
+            state.round = if succeeded {
+                OpenRecoveryRound::Succeeded
+            } else {
+                OpenRecoveryRound::Failed
+            };
+            self.entry.changed.notify_all();
+        }
+        self.leader = false;
+        drop(state);
+        drop(cohorts);
+    }
+}
+
+impl Drop for OpenRecoveryParticipant {
+    fn drop(&mut self) {
+        if self.leader {
+            self.complete(false);
+        }
+        let cohorts = OPEN_RECOVERY_COHORTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cohorts = cohorts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.participants = state.participants.saturating_sub(1);
+        if state.participants == 0
+            && cohorts
+                .get(&self.db_dir)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+        {
+            cohorts.remove(&self.db_dir);
+        }
+    }
+}
+
 #[cfg(test)]
 type SchemaPathHook = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
 thread_local! {
+    static OPEN_RECOVERY_COMPLETION_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
+        const { std::cell::RefCell::new(None) };
+    static OPEN_RECOVERY_RETRY_ENTRY_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
+        const { std::cell::RefCell::new(None) };
     static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
     static SCHEMA_PRIMARY_OPEN_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
     static SCHEMA_PROLLY_OPEN_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_open_recovery_completion_hook(hook: impl FnOnce(&Path) + 'static) {
+    OPEN_RECOVERY_COMPLETION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_open_recovery_completion_hook(db_dir: &Path) {
+    OPEN_RECOVERY_COMPLETION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
+#[cfg(test)]
+fn install_open_recovery_retry_entry_hook(hook: impl FnOnce(&Path) + 'static) {
+    OPEN_RECOVERY_RETRY_ENTRY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_open_recovery_retry_entry_hook(db_dir: &Path) {
+    OPEN_RECOVERY_RETRY_ENTRY_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -317,9 +535,15 @@ impl Trail {
         config: TrailConfig,
         schema_mode: SchemaOpenMode,
     ) -> Result<Self> {
+        let recovery = (schema_mode == SchemaOpenMode::Existing)
+            .then(|| OpenRecoveryParticipant::register(&db_dir));
         let db =
             Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode, false)?;
-        db.recover_after_open()?;
+        if let Some(recovery) = recovery {
+            db.recover_after_open_in_cohort(recovery)?;
+        } else {
+            db.recover_after_open()?;
+        }
         Ok(db)
     }
 
@@ -455,6 +679,13 @@ impl Trail {
     }
 
     pub(crate) fn recover_after_open(&self) -> Result<()> {
+        self.recover_after_open_with_participant(None)
+    }
+
+    fn recover_after_open_with_participant(
+        &self,
+        mut participant: Option<&mut OpenRecoveryParticipant>,
+    ) -> Result<()> {
         let lock_path = self.db_dir.join("lock");
         if lock_path.exists()
             && fs::read_to_string(&lock_path)
@@ -469,18 +700,59 @@ impl Trail {
         {
             // Legacy or manually managed writer locks have always allowed a read-only open.
             // Defer recovery until a later open after that writer releases its lock.
+            if let Some(participant) = participant {
+                participant.complete(true);
+            }
             return Ok(());
         }
-        match Self::with_write_lock_wait(Duration::from_secs(30), || {
+        let result = Self::with_write_lock_wait(Duration::from_secs(30), || {
             let _lock = self.acquire_write_lock()?;
-            self.recover_after_open_under_write_lock()
-        }) {
+            let result = self.recover_after_open_under_write_lock();
+            if let Some(participant) = participant.as_deref_mut() {
+                // Publish while the write lock is still held, so a producer cannot
+                // place a new recovery artifact between this round and its waiters.
+                participant
+                    .complete(result.is_ok() || matches!(&result, Err(Error::WorkspaceLocked(_))));
+                #[cfg(test)]
+                run_open_recovery_completion_hook(&self.db_dir);
+            }
+            result
+        });
+        let result = match result {
             Err(Error::WorkspaceLocked(_)) => Ok(()),
             result => result,
+        };
+        if let Some(participant) = participant
+            && participant.leader
+        {
+            // Lock-acquisition failures complete here; normal recovery completed
+            // above while exclusion was still held.
+            participant.complete(result.is_ok());
+        }
+        result
+    }
+
+    fn recover_after_open_in_cohort(&self, mut participant: OpenRecoveryParticipant) -> Result<()> {
+        match participant.await_role() {
+            OpenRecoveryRole::Leader => {
+                self.recover_after_open_with_participant(Some(&mut participant))
+            }
+            OpenRecoveryRole::Succeeded => Ok(()),
+            OpenRecoveryRole::Retry => {
+                // Preserve the pre-cohort exceptional path: after a shared
+                // leader failure, every follower retries recovery directly.
+                #[cfg(test)]
+                run_open_recovery_retry_entry_hook(&self.db_dir);
+                self.recover_after_open()
+            }
         }
     }
 
     fn recover_after_open_under_write_lock(&self) -> Result<()> {
+        #[cfg(test)]
+        if take_open_recovery_failure(&self.db_dir) {
+            return Err(Error::Corrupt("injected open recovery failure".into()));
+        }
         if self.has_pending_path_index_derived_repairs()? {
             self.drain_pending_path_index_derived_repairs()?;
         }
@@ -1552,6 +1824,223 @@ mod schema_handoff_tests {
             "100 shared schema opens exceeded the five second budget"
         );
         drop(writer);
+    }
+
+    #[test]
+    fn open_recovery_state_machine_closes_admission_and_preserves_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let db_dir = root.path();
+        let mut leader = OpenRecoveryParticipant::register(db_dir);
+        let mut follower = OpenRecoveryParticipant::register(db_dir);
+        assert!(Arc::ptr_eq(&leader.entry, &follower.entry));
+        {
+            let state = leader
+                .entry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(state.round, OpenRecoveryRound::Pending);
+            assert_eq!(state.participants, 2);
+        }
+
+        assert!(matches!(leader.await_role(), OpenRecoveryRole::Leader));
+        let mut replacement = OpenRecoveryParticipant::register(db_dir);
+        assert!(!Arc::ptr_eq(&leader.entry, &replacement.entry));
+        assert!(matches!(replacement.await_role(), OpenRecoveryRole::Leader));
+        {
+            let cohorts = OPEN_RECOVERY_COHORTS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(cohorts
+                .get(db_dir)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &replacement.entry)));
+        }
+
+        leader.complete(true);
+        assert!(matches!(follower.await_role(), OpenRecoveryRole::Succeeded));
+        drop(leader);
+        drop(follower);
+        {
+            let cohorts = OPEN_RECOVERY_COHORTS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(cohorts
+                .get(db_dir)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &replacement.entry)));
+        }
+
+        replacement.complete(true);
+        drop(replacement);
+        assert!(!OPEN_RECOVERY_COHORTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(db_dir));
+    }
+
+    #[test]
+    fn successful_open_recovery_completes_while_workspace_lock_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_dir = canonicalize_lossless(&root.path().join(".trail")).unwrap();
+        let db = Trail::open_without_recovering_derived_paths(root.path(), &db_dir).unwrap();
+        let recovery = OpenRecoveryParticipant::register(&db_dir);
+        let recovery_entry = recovery.entry.clone();
+        let observed = std::rc::Rc::new(Cell::new(false));
+        let hook_observed = observed.clone();
+        install_open_recovery_completion_hook(move |db_dir| {
+            assert_eq!(
+                recovery_entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .round,
+                OpenRecoveryRound::Succeeded
+            );
+            let (attempted, received) = std::sync::mpsc::sync_channel(1);
+            let competing_db_dir = db_dir.to_path_buf();
+            let competing = std::thread::spawn(move || {
+                attempted
+                    .send(acquire_workspace_lock(&competing_db_dir).map(drop))
+                    .unwrap();
+            });
+            assert!(matches!(
+                received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Err(Error::WorkspaceLocked(_))
+            ));
+            competing.join().unwrap();
+            hook_observed.set(true);
+        });
+
+        db.recover_after_open_in_cohort(recovery).unwrap();
+        assert!(observed.get());
+    }
+
+    #[test]
+    fn panicked_open_recovery_leader_wakes_registered_follower() {
+        let root = tempfile::tempdir().unwrap();
+        let mut leader = OpenRecoveryParticipant::register(root.path());
+        let mut follower = OpenRecoveryParticipant::register(root.path());
+        let (leader_started, leader_received) = std::sync::mpsc::sync_channel(1);
+        let (panic_now, panic_received) = std::sync::mpsc::sync_channel(1);
+        let panicked = std::thread::spawn(move || {
+            assert!(matches!(leader.await_role(), OpenRecoveryRole::Leader));
+            leader_started.send(()).unwrap();
+            panic_received.recv().unwrap();
+            panic!("injected open recovery leader panic");
+        });
+        leader_received
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let (followed, received) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            followed
+                .send(matches!(follower.await_role(), OpenRecoveryRole::Retry))
+                .unwrap();
+        });
+        panic_now.send(()).unwrap();
+        assert!(panicked.join().is_err());
+        assert!(received.recv_timeout(Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn failed_open_recovery_followers_retry_directly_and_remain_bounded() {
+        for (failure_count, expected_follower_successes) in [(1, 2), (3, 0)] {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_dir = canonicalize_lossless(&root.path().join(".trail")).unwrap();
+            let leader_db =
+                Trail::open_without_recovering_derived_paths(root.path(), &db_dir).unwrap();
+            let follower_dbs = (0..2)
+                .map(|_| {
+                    Trail::open_without_recovering_derived_paths(root.path(), &db_dir).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let leader = OpenRecoveryParticipant::register(&db_dir);
+            let original_entry = leader.entry.clone();
+            let followers = (0..2)
+                .map(|_| OpenRecoveryParticipant::register(&db_dir))
+                .collect::<Vec<_>>();
+            let _failures = fail_next_open_recoveries(&db_dir, failure_count);
+            let leader_result = leader_db.recover_after_open_in_cohort(leader);
+            assert!(matches!(
+                &leader_result,
+                Err(Error::Corrupt(message)) if message == "injected open recovery failure"
+            ));
+
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let (entered, received) = std::sync::mpsc::channel();
+            let handles = follower_dbs
+                .into_iter()
+                .zip(followers)
+                .map(|(db, follower)| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    std::thread::spawn(move || {
+                        install_open_recovery_retry_entry_hook(move |_| {
+                            entered.send(()).unwrap();
+                            let (released, changed) = &*release;
+                            let mut released = released
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            while !*released {
+                                released = changed
+                                    .wait(released)
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            }
+                        });
+                        db.recover_after_open_in_cohort(follower)
+                    })
+                })
+                .collect::<Vec<_>>();
+            drop(entered);
+            for _ in 0..2 {
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            {
+                let state = original_entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert_eq!(state.round, OpenRecoveryRound::Failed);
+                assert_eq!(state.participants, 2);
+            }
+            {
+                let cohorts = OPEN_RECOVERY_COHORTS
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(cohorts
+                    .get(&db_dir)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &original_entry)));
+            }
+            {
+                let (released, changed) = &*release;
+                *released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                changed.notify_all();
+            }
+            let results = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                expected_follower_successes
+            );
+            assert!(results.iter().filter_map(|result| result.as_ref().err()).all(
+                |error| matches!(error, Error::Corrupt(message) if message == "injected open recovery failure")
+            ));
+            assert!(!OPEN_RECOVERY_COHORTS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&db_dir));
+        }
     }
 
     #[test]
