@@ -392,15 +392,52 @@ TRAIL_SCALE_OUTPUT=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1
 [[ $TRAIL_SCALE_DISPOSABLE_WORKSPACE == 1 ]] || die "qualification requires an explicit disposable workspace contract"
 [[ $TRAIL_SCALE_DISPOSABLE_OWNER_FILE == /* && -f $TRAIL_SCALE_DISPOSABLE_OWNER_FILE && ! -L $TRAIL_SCALE_DISPOSABLE_OWNER_FILE ]] || die "TRAIL_SCALE_DISPOSABLE_OWNER_FILE must be an absolute regular non-symlink file"
 python3 - "$TRAIL_SCALE_DISPOSABLE_OWNER_FILE" "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" <<'PY' || die "disposable workspace owner contract is invalid"
-import json,pathlib,sys
+import json,os,pathlib,platform,re,stat,subprocess,sys
 owner,repo,output,run_id=sys.argv[1:]
-owner_path=pathlib.Path(owner).resolve(); repo_path=pathlib.Path(repo).resolve(); trail=(repo_path/".trail").resolve()
-if trail not in owner_path.parents: raise SystemExit("owner file is outside disposable .trail")
-value=json.load(open(owner_path,encoding="utf-8"))
+repo_path=pathlib.Path(repo).resolve()
+owner_path=pathlib.Path(owner)
+expected_owner=repo_path/".trail"/"scale-disposable-owner.json"
+if owner_path != expected_owner: raise SystemExit(f"owner file must use exact reserved path {expected_owner}")
+descriptor=os.open(owner,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+    info=os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode): raise SystemExit("owner file is not regular")
+    payload=os.read(descriptor,65537)
+finally: os.close(descriptor)
+if len(payload)>65536: raise SystemExit("owner file exceeds 64 KiB")
+value=json.loads(payload.decode("utf-8"))
 if set(value)!={"schema_version","kind","canonical_repo","disposable_repo","output","run_id"}: raise SystemExit("owner keys mismatch")
 canonical=pathlib.Path(value["canonical_repo"]).resolve()
 expected={"schema_version":1,"kind":"trail_scale_disposable_workspace","canonical_repo":str(canonical),"disposable_repo":str(repo_path),"output":str(pathlib.Path(output)),"run_id":run_id}
-if value!=expected or not canonical.is_dir() or canonical==repo_path: raise SystemExit("owner values do not bind this run")
+if value!=expected: raise SystemExit("owner values do not bind this run")
+if canonical==repo_path or canonical in repo_path.parents or repo_path in canonical.parents:
+    raise SystemExit("canonical and disposable repositories must not overlap")
+def real_git_worktree(path):
+    git_dir=path/".git"
+    if not path.is_dir() or path.is_symlink() or not git_dir.is_dir() or git_dir.is_symlink(): return False
+    try:
+        inside=subprocess.check_output(["git","-C",str(path),"rev-parse","--is-inside-work-tree"],text=True,stderr=subprocess.DEVNULL,timeout=10).strip()
+        top=pathlib.Path(subprocess.check_output(["git","-C",str(path),"rev-parse","--show-toplevel"],text=True,stderr=subprocess.DEVNULL,timeout=10).strip()).resolve()
+    except (OSError,subprocess.CalledProcessError,subprocess.TimeoutExpired): return False
+    return inside=="true" and top==path
+if not real_git_worktree(canonical) or not real_git_worktree(repo_path):
+    raise SystemExit("canonical and disposable repositories must be real Git worktrees with real .git directories")
+if os.stat(canonical).st_dev != os.stat(repo_path).st_dev:
+    raise SystemExit("canonical and disposable repositories must use the same filesystem device")
+def filesystem_personality(path):
+    device=subprocess.check_output(["df","-P",str(path)],text=True,stderr=subprocess.STDOUT,timeout=10).splitlines()[-1].split()[0]
+    result=subprocess.check_output(["diskutil","info",device],text=True,stderr=subprocess.STDOUT,timeout=10)
+    match=re.search(r"^\s*File System Personality:\s*(.+?)\s*$",result,re.M)
+    if not match: raise SystemExit(f"cannot determine File System Personality for {path}")
+    return match.group(1)
+system=platform.system()
+if system=="Darwin":
+    try: personalities=[filesystem_personality(canonical),filesystem_personality(repo_path)]
+    except (OSError,subprocess.CalledProcessError,subprocess.TimeoutExpired) as error:
+        raise SystemExit(f"cannot authenticate APFS disposable workspace: {error}")
+    if any("APFS" not in value.upper() for value in personalities):
+        raise SystemExit(f"Darwin disposable workspace requires APFS for both repositories, got {personalities}")
+elif system!="Linux": raise SystemExit(f"disposable workspace contract is unsupported on {system}")
 PY
 [[ ! -e $TRAIL_SCALE_OUTPUT ]] || die "TRAIL_SCALE_OUTPUT already exists"
 python3 - "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT" <<'PY' || die "unsafe output placement"

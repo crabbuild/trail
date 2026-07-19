@@ -217,6 +217,7 @@ class HarnessContractTests(unittest.TestCase):
         self.fault = root / "fake-fault"
         self.repo.mkdir()
         self.original_repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.original_repo)], check=True)
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "trail@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Trail"], check=True)
@@ -261,9 +262,10 @@ class HarnessContractTests(unittest.TestCase):
         attestation_sha = __import__("hashlib").sha256(attestation.read_bytes()).hexdigest()
         run_id = overrides.get("TRAIL_SCALE_RUN_ID", "contract")
         output = Path(overrides.get("TRAIL_SCALE_OUTPUT", self.output)).absolute()
-        owner = self.repo / ".trail/disposable-owner.json"
+        owner = Path(overrides.pop("_OWNER_PATH", self.repo / ".trail/scale-disposable-owner.json"))
+        canonical_repo = Path(overrides.pop("_OWNER_CANONICAL_REPO", self.original_repo)).resolve()
         owner.write_text(json.dumps({"schema_version": 1, "kind": "trail_scale_disposable_workspace",
-            "canonical_repo": str(self.original_repo.resolve()), "disposable_repo": str(self.repo.resolve()),
+            "canonical_repo": str(canonical_repo), "disposable_repo": str(self.repo.resolve()),
             "output": str(output), "run_id": run_id}, sort_keys=True) + "\n")
         env = dict(os.environ, TRAIL_BIN=str(binary_path), TRAIL_SCALE_REPO=str(self.repo),
                    TRAIL_SCALE_LANES="2", TRAIL_SCALE_FILES_PER_LANE="2",
@@ -387,6 +389,46 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 64)
         self.assertIn("disposable workspace", result.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_owner_file_must_use_the_exact_reserved_path(self) -> None:
+        result = self.run_harness(_OWNER_PATH=str(self.repo / ".trail/alternate-owner.json"))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("exact reserved path", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_canonical_repository_must_be_a_real_git_worktree(self) -> None:
+        non_git = self.repo.parent / "not-git"
+        non_git.mkdir()
+        result = self.run_harness(_OWNER_CANONICAL_REPO=str(non_git))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("real Git worktrees", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_canonical_and_disposable_repositories_cannot_overlap(self) -> None:
+        nested = self.repo / "canonical-child"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(nested)], check=True)
+        result = self.run_harness(_OWNER_CANONICAL_REPO=str(nested))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("must not overlap", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_canonical_and_disposable_repositories_must_share_a_device(self) -> None:
+        if os.stat(self.repo).st_dev == os.stat("/tmp").st_dev:
+            self.skipTest("no second filesystem is available")
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw:
+            canonical = Path(raw) / "canonical"
+            subprocess.run(["git", "init", "-q", "-b", "main", str(canonical)], check=True)
+            result = self.run_harness(_OWNER_CANONICAL_REPO=str(canonical))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("same filesystem device", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_darwin_owner_preflight_requires_apfs_source_and_copy(self) -> None:
+        source = HARNESS.read_text(encoding="utf-8")
+        self.assertIn('platform.system() == "Darwin"', source)
+        self.assertIn("File System Personality", source)
+        self.assertIn("APFS", source)
 
     def test_trail_head_must_be_main(self) -> None:
         (self.repo / ".trail/HEAD").write_text("feature\n", encoding="utf-8")
