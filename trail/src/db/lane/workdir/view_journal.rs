@@ -171,6 +171,16 @@ pub(crate) struct ViewJournalCut {
     pub(crate) recovery_qualified: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViewJournalRecoveryState {
+    pub(crate) generation: u64,
+    pub(crate) base_sequence: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) mutation_base_hash: String,
+    pub(crate) whiteout_base_hash: String,
+    pub(crate) recovery_qualified: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ViewGenerationLeaseRecord {
     generation: u64,
@@ -978,6 +988,56 @@ impl ViewMutationJournal {
             }
         }
     }
+}
+
+pub(crate) fn recovery_state(upperdir: &Path) -> Result<ViewJournalRecoveryState> {
+    let (state, journal) = authenticated_recovery_journal(upperdir)?;
+    Ok(ViewJournalRecoveryState {
+        generation: state.active_generation,
+        base_sequence: state.base_sequence,
+        last_sequence: journal.last_sequence(),
+        mutation_base_hash: state.mutation_base_hash,
+        whiteout_base_hash: state.whiteout_base_hash,
+        recovery_qualified: true,
+    })
+}
+
+pub(crate) fn authenticated_recovery_cut_hashes(
+    upperdir: &Path,
+    sequence: u64,
+) -> Result<(String, String)> {
+    let (state, journal) = authenticated_recovery_journal(upperdir)?;
+    if sequence == state.base_sequence {
+        return Ok((state.mutation_base_hash, state.whiteout_base_hash));
+    }
+    if sequence == journal.last_sequence() {
+        return Ok((journal.mutation_hash, journal.whiteout_hash));
+    }
+    Err(Error::Corrupt(format!(
+        "workspace journal cannot authenticate recovery cut {sequence} in generation {}",
+        state.active_generation
+    )))
+}
+
+fn authenticated_recovery_journal(
+    upperdir: &Path,
+) -> Result<(ViewJournalState, ViewMutationJournal)> {
+    let layout = ViewUpperLayout::from_source_upper(upperdir.to_path_buf());
+    let state = read_journal_state(&layout)?;
+    let journal = ViewMutationJournal::open(upperdir)?;
+    if journal.generation != state.active_generation
+        || journal.base_sequence != state.base_sequence
+        || !journal.qualified
+        || !journal.whiteouts_qualified
+    {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: upperdir.display().to_string(),
+            state: "unqualified_view_journal_recovery".into(),
+            reason: "workspace checkpoint recovery requires authenticated state, mutation and whiteout journals, and tail identity".into(),
+            command: "trail ledger reconcile".into(),
+        });
+    }
+    Ok((state, journal))
 }
 
 fn mutation_record_hash(record: &ViewMutationRecord) -> Result<String> {

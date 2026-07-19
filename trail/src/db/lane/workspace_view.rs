@@ -1,8 +1,32 @@
-use super::workdir::{ViewIntentWriter, ViewJournalCut, ViewMutationBarrier, ViewMutationJournal};
+use super::workdir::{
+    authenticated_recovery_cut_hashes, recovery_state, ViewIntentWriter, ViewJournalCut,
+    ViewMutationBarrier, ViewMutationJournal,
+};
 use super::*;
+use std::cmp::Ordering;
 
 const VIEW_JOURNAL_FILE: &str = "mutation-journal.jsonl";
 const VIEW_UNMOUNT_REQUEST_FILE: &str = "unmount-request.json";
+
+fn checkpoint_marker_matches(
+    marker: Option<&serde_json::Value>,
+    view_id: &str,
+    root_id: &str,
+    sequence: u64,
+    generation: u64,
+    mutation_cut_hash: &str,
+    whiteout_cut_hash: &str,
+) -> bool {
+    marker.is_some_and(|marker| {
+        marker["view_id"].as_str() == Some(view_id)
+            && marker["root_id"].as_str() == Some(root_id)
+            && marker["journal_sequence"].as_u64() == Some(sequence)
+            && marker["generation"].as_u64() == Some(generation)
+            && marker["recovery_qualified"].as_bool() == Some(true)
+            && marker["mutation_cut_hash"].as_str() == Some(mutation_cut_hash)
+            && marker["whiteout_cut_hash"].as_str() == Some(whiteout_cut_hash)
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceViewPaths {
@@ -321,7 +345,10 @@ impl Trail {
     }
 
     pub(crate) fn workspace_view_paths_for_lane_name(&self, lane: &str) -> WorkspaceViewPaths {
-        let lane_id = format!("lane_{}", crate::ids::short_hash(lane.as_bytes(), 8));
+        let lane_id = self
+            .lane_branch(lane)
+            .map(|branch| branch.lane_id)
+            .unwrap_or_else(|_| format!("lane_{}", crate::ids::short_hash(lane.as_bytes(), 8)));
         self.workspace_view_paths_for_lane_id(&lane_id)
     }
 
@@ -612,17 +639,45 @@ impl Trail {
         {
             let path = Path::new(&meta_dir).join("clean-checkpoint.json");
             let read_barrier = ViewMutationBarrier::shared(Path::new(&meta_dir))?;
-            let marker = fs::read(&path)
+            let source_upper = Path::new(&source_upper);
+            let read_journal = recovery_state(source_upper)?;
+            let read_marker = fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            let mirror_matches = marker.as_ref().is_some_and(|marker| {
-                marker["view_id"].as_str() == Some(view_id.as_str())
-                    && marker["root_id"].as_str() == Some(checkpoint_root.as_str())
-                    && marker["journal_sequence"].as_u64() == Some(checkpoint_seq)
-                    && marker["generation"].as_u64() == Some(generation)
-                    && marker["recovery_qualified"].as_bool() == Some(true)
-            });
-            if mirror_matches
+            let authenticated_clean_cut = match (
+                read_journal.generation.cmp(&generation),
+                read_journal.last_sequence.cmp(&checkpoint_seq),
+            ) {
+                (Ordering::Equal, Ordering::Equal | Ordering::Greater)
+                    if read_journal.base_sequence == checkpoint_seq =>
+                {
+                    checkpoint_marker_matches(
+                        read_marker.as_ref(),
+                        &view_id,
+                        &checkpoint_root,
+                        checkpoint_seq,
+                        generation,
+                        &read_journal.mutation_base_hash,
+                        &read_journal.whiteout_base_hash,
+                    )
+                }
+                (Ordering::Greater, _)
+                    if read_journal.generation == generation.saturating_add(1)
+                        && read_journal.base_sequence == checkpoint_seq =>
+                {
+                    checkpoint_marker_matches(
+                        read_marker.as_ref(),
+                        &view_id,
+                        &checkpoint_root,
+                        checkpoint_seq,
+                        generation,
+                        &read_journal.mutation_base_hash,
+                        &read_journal.whiteout_base_hash,
+                    )
+                }
+                _ => false,
+            };
+            if authenticated_clean_cut
                 && read_barrier.checkpoint_sequence() == checkpoint_seq
                 && read_barrier.checkpoint_generation() == generation
             {
@@ -631,8 +686,8 @@ impl Trail {
             drop(read_barrier);
 
             let mut barrier = ViewMutationBarrier::exclusive(Path::new(&meta_dir))?;
-            let journal = ViewMutationJournal::open(Path::new(&source_upper))?;
-            if !journal.recovery_is_qualified() {
+            let journal = recovery_state(source_upper)?;
+            if !journal.recovery_qualified {
                 return Err(Error::ChangeLedgerReconcileRequired {
                     scope: view_id,
                     state: "unqualified_view_journal".into(),
@@ -641,14 +696,6 @@ impl Trail {
                             .into(),
                     command: "trail ledger reconcile".into(),
                 });
-            }
-            if checkpoint_seq > journal.last_sequence() {
-                return Err(Error::Corrupt(format!(
-                    "SQLite workspace checkpoint {} is ahead of durable journal sequence {} for `{}`",
-                    checkpoint_seq,
-                    journal.last_sequence(),
-                    view_id,
-                )));
             }
             let head = self.get_ref(&ref_name)?;
             if head.root_id.0 != checkpoint_root {
@@ -660,31 +707,88 @@ impl Trail {
             let marker = fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            let mirror_matches = marker.as_ref().is_some_and(|marker| {
-                marker["view_id"].as_str() == Some(view_id.as_str())
-                    && marker["root_id"].as_str() == Some(checkpoint_root.as_str())
-                    && marker["journal_sequence"].as_u64() == Some(checkpoint_seq)
-                    && marker["generation"].as_u64() == Some(generation)
-                    && marker["recovery_qualified"].as_bool() == Some(true)
-            });
-            if !mirror_matches {
+            let (mutation_cut_hash, whiteout_cut_hash, rotate) = match (
+                journal.generation.cmp(&generation),
+                journal.last_sequence.cmp(&checkpoint_seq),
+            ) {
+                (Ordering::Equal, Ordering::Equal | Ordering::Greater) => {
+                    if journal.base_sequence != checkpoint_seq {
+                        return Err(Error::Corrupt(format!(
+                            "workspace checkpoint/journal base cut is contradictory for `{view_id}`"
+                        )));
+                    }
+                    (
+                        journal.mutation_base_hash.clone(),
+                        journal.whiteout_base_hash.clone(),
+                        false,
+                    )
+                }
+                (Ordering::Less, Ordering::Equal)
+                    if generation == journal.generation.saturating_add(1) =>
+                {
+                    let (mutation, whiteout) =
+                        authenticated_recovery_cut_hashes(source_upper, checkpoint_seq)?;
+                    (mutation, whiteout, true)
+                }
+                (Ordering::Greater, _)
+                    if journal.generation == generation.saturating_add(1)
+                        && journal.base_sequence == checkpoint_seq =>
+                {
+                    if !checkpoint_marker_matches(
+                        marker.as_ref(),
+                        &view_id,
+                        &checkpoint_root,
+                        checkpoint_seq,
+                        generation,
+                        &journal.mutation_base_hash,
+                        &journal.whiteout_base_hash,
+                    ) {
+                        return Err(Error::Corrupt(format!(
+                            "workspace checkpoint marker cannot authenticate the rotated journal cut for `{view_id}`"
+                        )));
+                    }
+                    (
+                        journal.mutation_base_hash.clone(),
+                        journal.whiteout_base_hash.clone(),
+                        false,
+                    )
+                }
+                _ => {
+                    return Err(Error::Corrupt(format!(
+                        "workspace checkpoint/journal cut is contradictory for `{view_id}`"
+                    )))
+                }
+            };
+            if !checkpoint_marker_matches(
+                marker.as_ref(),
+                &view_id,
+                &checkpoint_root,
+                checkpoint_seq,
+                generation,
+                &mutation_cut_hash,
+                &whiteout_cut_hash,
+            ) {
                 let checkpoint = serde_json::json!({
-                    "view_id": view_id,
-                    "root_id": checkpoint_root,
+                    "view_id": &view_id,
+                    "root_id": &checkpoint_root,
                     "operation": serde_json::Value::Null,
                     "journal_sequence": checkpoint_seq,
-                    "journal_qualified": journal.is_qualified(),
+                    "journal_qualified": true,
                     "recovery_qualified": true,
                     "generation": generation,
+                    "mutation_cut_hash": mutation_cut_hash,
+                    "whiteout_cut_hash": whiteout_cut_hash,
                     "completed_at": now_ts(),
                 });
                 write_file_atomic(&path, &serde_json::to_vec_pretty(&checkpoint)?, false)?;
             }
-            ViewMutationJournal::rotate_after_checkpoint(
-                Path::new(&source_upper),
-                checkpoint_seq,
-                generation,
-            )?;
+            if rotate {
+                ViewMutationJournal::rotate_after_checkpoint(
+                    source_upper,
+                    checkpoint_seq,
+                    generation,
+                )?;
+            }
             barrier.record_checkpoint_cut(checkpoint_seq, generation)?;
         }
         Ok(())
@@ -1170,6 +1274,25 @@ impl Trail {
         journal_qualified: bool,
         barrier: &mut ViewMutationBarrier,
     ) -> Result<()> {
+        let source_upper = Path::new(&view.source_upper);
+        let journal = recovery_state(source_upper)?;
+        let rotate = if journal.generation == generation
+            && journal.base_sequence == sequence
+            && journal.last_sequence >= sequence
+        {
+            false
+        } else if journal.generation.saturating_add(1) == generation
+            && journal.last_sequence == sequence
+        {
+            true
+        } else {
+            return Err(Error::Corrupt(format!(
+                "workspace checkpoint/journal cut is contradictory for `{}`",
+                view.view_id
+            )));
+        };
+        let (mutation_cut_hash, whiteout_cut_hash) =
+            authenticated_recovery_cut_hashes(source_upper, sequence)?;
         let checkpoint = serde_json::json!({
             "view_id": view.view_id,
             "root_id": root_id.0,
@@ -1178,6 +1301,8 @@ impl Trail {
             "journal_qualified": journal_qualified,
             "recovery_qualified": true,
             "generation": generation,
+            "mutation_cut_hash": mutation_cut_hash,
+            "whiteout_cut_hash": whiteout_cut_hash,
             "completed_at": now_ts(),
         });
         write_file_atomic(
@@ -1186,11 +1311,10 @@ impl Trail {
             false,
         )?;
         test_crash_point("checkpoint_after_clean_marker");
-        ViewMutationJournal::rotate_after_checkpoint(
-            Path::new(&view.source_upper),
-            sequence,
-            generation,
-        )?;
+        if rotate {
+            ViewMutationJournal::rotate_after_checkpoint(source_upper, sequence, generation)?;
+        }
+        test_crash_point("checkpoint_after_rotation");
         barrier.record_checkpoint_cut(sequence, generation)?;
         Ok(())
     }
@@ -1923,8 +2047,34 @@ mod tests {
             .create(VIEW_ROOT_INO, "after-crash.rs", 0o644, true)
             .unwrap();
         core.write(newer.ino, 0, b"uncheckpointed\n").unwrap();
+        let target = core.mkdir(VIEW_ROOT_INO, "target", 0o755).unwrap();
+        let artifact = core.create(target.ino, "artifact", 0o644, true).unwrap();
+        core.write(artifact.ino, 0, b"generated\n").unwrap();
+        let secret = core
+            .create(VIEW_ROOT_INO, ".env.local", 0o600, true)
+            .unwrap();
+        core.write(secret.ino, 0, b"private\n").unwrap();
         drop(core);
         let view = db.lane_workspace_view("crash").unwrap().unwrap();
+        let journal_before = recovery_state(&paths.source_upper).unwrap();
+        let mutation_path = if journal_before.generation == 0 {
+            paths.meta_dir.join("mutation-journal.jsonl")
+        } else {
+            paths.meta_dir.join(format!(
+                "mutation-journal.g{}.jsonl",
+                journal_before.generation
+            ))
+        };
+        let whiteout_path = if journal_before.generation == 0 {
+            paths.meta_dir.join("whiteout-journal.jsonl")
+        } else {
+            paths.meta_dir.join(format!(
+                "whiteout-journal.g{}.jsonl",
+                journal_before.generation
+            ))
+        };
+        let mutation_bytes_before = fs::read(&mutation_path).unwrap();
+        let whiteout_bytes_before = fs::read(&whiteout_path).unwrap();
         fs::write(
             Path::new(&view.meta_dir).join("clean-checkpoint.json"),
             b"stale postcommit mirror",
@@ -1934,6 +2084,12 @@ mod tests {
 
         let reopened = Trail::open(temp.path()).unwrap();
         reopened.recover_workspace_views().unwrap();
+        reopened.recover_workspace_views().unwrap();
+        let journal_after = recovery_state(&paths.source_upper).unwrap();
+        assert_eq!(journal_after.generation, journal_before.generation);
+        assert_eq!(journal_after.last_sequence, journal_before.last_sequence);
+        assert_eq!(fs::read(&mutation_path).unwrap(), mutation_bytes_before);
+        assert_eq!(fs::read(&whiteout_path).unwrap(), whiteout_bytes_before);
         let recovered = reopened.lane_workspace_view("crash").unwrap().unwrap();
         assert_eq!(recovered.checkpoint_seq, checkpoint.journal_sequence);
         assert_eq!(recovered.checkpoint_root, Some(checkpoint.root_id));
@@ -1942,11 +2098,88 @@ mod tests {
                 .unwrap()
                 .contains("uncheckpointed")
         );
+        assert_eq!(
+            fs::read_to_string(paths.generated_upper.join("target/artifact")).unwrap(),
+            "generated\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.scratch_upper.join(".env.local")).unwrap(),
+            "private\n"
+        );
         let readiness = reopened.lane_readiness("crash").unwrap();
         assert!(readiness
             .blockers
             .iter()
             .any(|issue| issue.code == "uncheckpointed_source_changes"));
+    }
+
+    #[test]
+    fn rotated_checkpoint_recovery_requires_authenticated_marker_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "rotated-authority",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        db.recover_workspace_views().unwrap();
+        let view = db
+            .lane_workspace_view("rotated-authority")
+            .unwrap()
+            .unwrap();
+        let marker_path = Path::new(&view.meta_dir).join("clean-checkpoint.json");
+        let authenticated_marker = fs::read(&marker_path).unwrap();
+        ViewMutationJournal::rotate_after_checkpoint(
+            Path::new(&view.source_upper),
+            view.checkpoint_seq,
+            view.generation + 1,
+        )
+        .unwrap();
+
+        db.recover_workspace_views().unwrap();
+        db.recover_workspace_views().unwrap();
+
+        fs::remove_file(&marker_path).unwrap();
+        assert!(db.recover_workspace_views().is_err());
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&authenticated_marker).unwrap();
+        legacy.as_object_mut().unwrap().remove("mutation_cut_hash");
+        fs::write(&marker_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        assert!(db.recover_workspace_views().is_err());
+
+        let mut contradictory: serde_json::Value =
+            serde_json::from_slice(&authenticated_marker).unwrap();
+        contradictory["whiteout_cut_hash"] = serde_json::Value::String("contradictory".into());
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&contradictory).unwrap(),
+        )
+        .unwrap();
+        assert!(db.recover_workspace_views().is_err());
+
+        fs::write(&marker_path, &authenticated_marker).unwrap();
+        ViewMutationJournal::rotate_after_checkpoint(
+            Path::new(&view.source_upper),
+            view.checkpoint_seq,
+            view.generation + 2,
+        )
+        .unwrap();
+        assert!(db.recover_workspace_views().is_err());
     }
 
     #[test]
