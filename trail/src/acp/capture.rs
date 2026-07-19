@@ -25,6 +25,9 @@ const CAPTURE_PROJECT_LOCK_WAIT: Duration = Duration::from_millis(250);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+// Test-only liveness cap for observing detached cleanup after the unchanged shutdown deadline.
+#[cfg(test)]
+const CAPTURE_TEST_WORKER_COMPLETION_LIVENESS_CAP: Duration = Duration::from_secs(10);
 static SPILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -108,6 +111,15 @@ fn wait_for_capture_worker_test_pause(workspace_root: &Path) {
     }
 }
 
+#[cfg(test)]
+fn wait_for_capture_test_signal(signal: &AtomicBool, timeout: Duration, message: &str) {
+    let deadline = Instant::now() + timeout;
+    while !signal.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "{message}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CapturedFrame {
     pub connection_id: String,
@@ -170,6 +182,8 @@ pub(crate) struct CaptureIngress {
     spill: Arc<SpillStore>,
     spill_mode: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
+    #[cfg(test)]
+    worker_completed: Arc<AtomicBool>,
     pending_finish: Arc<Mutex<Option<RelayFinishReason>>>,
     done_rx: Mutex<mpsc::Receiver<()>>,
 }
@@ -185,6 +199,8 @@ impl CaptureIngress {
         let health = Arc::new(CaptureHealth::new());
         let spill_mode = Arc::new(AtomicBool::new(false));
         let stopping = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_completed = Arc::new(AtomicBool::new(false));
         let pending_finish = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::sync_channel(ACP_CAPTURE_QUEUE_CAPACITY);
         let (done_tx, done_rx) = mpsc::channel();
@@ -192,12 +208,16 @@ impl CaptureIngress {
         let worker_spill = Arc::clone(&spill);
         let worker_spill_mode = Arc::clone(&spill_mode);
         let worker_stopping = Arc::clone(&stopping);
+        #[cfg(test)]
+        let worker_completion_signal = Arc::clone(&worker_completed);
         let worker_pending_finish = Arc::clone(&pending_finish);
         let worker = thread::Builder::new()
             .name("trail-acp-capture".to_string())
             .spawn(move || {
                 #[cfg(test)]
                 wait_for_capture_worker_test_pause(&_workspace_root);
+                #[cfg(test)]
+                drop(_workspace_root);
                 let panic_health = Arc::clone(&worker_health);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     capture_worker(
@@ -215,6 +235,10 @@ impl CaptureIngress {
                         "ACP capture worker panicked".to_string(),
                     ));
                 }
+                drop(outcome);
+                drop(panic_health);
+                #[cfg(test)]
+                worker_completion_signal.store(true, Ordering::Release);
                 let _ = done_tx.send(());
             })
             .map_err(Error::Io)?;
@@ -225,6 +249,8 @@ impl CaptureIngress {
             spill,
             spill_mode,
             stopping,
+            #[cfg(test)]
+            worker_completed,
             pending_finish,
             done_rx: Mutex::new(done_rx),
         })
@@ -311,9 +337,10 @@ impl CaptureIngress {
 
     #[allow(dead_code)]
     pub(crate) fn shutdown(mut self, timeout: Duration) -> CaptureShutdownReport {
+        let deadline = Instant::now() + timeout;
         self.stopping.store(true, Ordering::Release);
         self.tx.take();
-        let completed = self.wait_for_worker(timeout);
+        let completed = self.wait_for_worker(deadline.saturating_duration_since(Instant::now()));
         if !completed {
             self.worker.take();
             self.health.record_error(&Error::InvalidInput(format!(
@@ -348,8 +375,8 @@ impl CaptureIngress {
             .done_rx
             .get_mut()
             .is_ok_and(|done_rx| done_rx.recv_timeout(timeout).is_ok());
-        if completed && let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if completed {
+            drop(self.worker.take());
         }
         completed
     }
@@ -1316,31 +1343,33 @@ mod tests {
                 .unwrap();
         }
         ingress.finish(RelayFinishReason::EditorEof);
+        let stopping = Arc::clone(&ingress.stopping);
+        let worker_completed = Arc::clone(&ingress.worker_completed);
+        let shutdown_thread = thread::spawn(move || {
+            let shutdown_started = Instant::now();
+            let report = ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
+            (shutdown_started.elapsed(), report)
+        });
+        wait_for_capture_test_signal(
+            &stopping,
+            CAPTURE_SHUTDOWN_TIMEOUT,
+            "shutdown did not publish stopping state",
+        );
         paused.store(false, Ordering::Release);
-        let shutdown_started = Instant::now();
-        let report = ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
-        assert!(shutdown_started.elapsed() < CAPTURE_SHUTDOWN_TIMEOUT + Duration::from_millis(250));
+        let (shutdown_elapsed, report) = shutdown_thread.join().unwrap();
+        assert!(shutdown_elapsed < CAPTURE_SHUTDOWN_TIMEOUT + Duration::from_millis(250));
         assert!(
             report.spilled >= 1,
             "the bounded queue never entered spill mode"
         );
         drop(lock);
+        wait_for_capture_test_signal(
+            &worker_completed,
+            CAPTURE_TEST_WORKER_COMPLETION_LIVENESS_CAP,
+            "capture worker did not complete durable spill cleanup",
+        );
 
         let spill_dir = temp.path().join(".trail/acp-ingress");
-        if report.degraded {
-            let preservation_deadline = Instant::now() + CAPTURE_SHUTDOWN_TIMEOUT;
-            loop {
-                let (preserved, finish_preserved) = preserved_spill_state(&spill_dir);
-                if preserved.len() == usize::try_from(FRAME_COUNT).unwrap() && finish_preserved {
-                    break;
-                }
-                assert!(
-                    Instant::now() < preservation_deadline,
-                    "timed-out worker did not finish preserving every frame and finish reason"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
         assert_eq!(
             projection_attempts.load(Ordering::Relaxed),
             0,
@@ -1375,6 +1404,7 @@ mod tests {
             ),
             spill_mode: Arc::new(AtomicBool::new(false)),
             stopping: Arc::new(AtomicBool::new(false)),
+            worker_completed: Arc::new(AtomicBool::new(false)),
             pending_finish: Arc::new(Mutex::new(None)),
             done_rx: Mutex::new(done_rx),
         };
@@ -1440,9 +1470,22 @@ mod tests {
             "recovery-connection".to_string(),
         )
         .unwrap();
+        let stopping = Arc::clone(&ingress.stopping);
+        let worker_completed = Arc::clone(&ingress.worker_completed);
+        let shutdown_thread = thread::spawn(move || ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT));
+        wait_for_capture_test_signal(
+            &stopping,
+            CAPTURE_SHUTDOWN_TIMEOUT,
+            "shutdown did not publish stopping state",
+        );
         paused.store(false, Ordering::Release);
-        ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
+        shutdown_thread.join().unwrap();
         drop(lock);
+        wait_for_capture_test_signal(
+            &worker_completed,
+            CAPTURE_TEST_WORKER_COMPLETION_LIVENESS_CAP,
+            "capture worker did not complete durable replay cleanup",
+        );
 
         assert_eq!(
             projection_attempts.load(Ordering::Relaxed),
