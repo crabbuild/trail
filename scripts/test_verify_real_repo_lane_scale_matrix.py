@@ -243,6 +243,19 @@ os.execv(real, [real, *args])
 '''
 
 
+PYTHON_REGISTRATION_WRAPPER = r'''#!/bin/sh
+if [ "$1" = "-" ] && [ "${2##*/}" = "inner.parent-registered" ]; then
+    printf '%s\n' "$3" > "$FAKE_SUPERVISOR_PID_CAPTURE"
+    if [ "$FAKE_REGISTRATION_WRITER_MODE" = "kill-parent" ]; then
+        kill -KILL "$PPID"
+        exit 74
+    fi
+    exit 73
+fi
+exec "$FAKE_REAL_PYTHON" "$@"
+'''
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -803,6 +816,83 @@ class DisposableScaleMatrixTests(unittest.TestCase):
         value = json.loads(marker.read_text(encoding="utf-8"))
         self.assertEqual(value["signal"], "TERM")
         self.assertEqual(value["exit_status"], 128 + signal.SIGTERM)
+
+    def test_registration_write_failure_stops_supervisor_and_retains_marker(self) -> None:
+        process, supervisor_pid, terminated, _ = self.run_with_failed_registration("fail")
+        self.assertTrue(terminated, "registration failure left the supervisor wait unbounded")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(process_exists(supervisor_pid))
+        self.assertEqual(self.calls(), [])
+        marker = self.output / "runs/64/registration-failure.json"
+        self.assertTrue(marker.is_file())
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(value["status"], "FAIL")
+        self.assertEqual(value["writer_exit_status"], 73)
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-64"))
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-128"))
+
+    def test_supervisor_exits_if_parent_dies_before_registration(self) -> None:
+        process, supervisor_pid, terminated, supervisor_terminated = \
+            self.run_with_failed_registration("kill-parent")
+        self.assertTrue(terminated, "killed parent did not exit")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertTrue(supervisor_terminated,
+                        "supervisor did not bound its parent-registration wait")
+        self.assertFalse(process_exists(supervisor_pid))
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-64"))
+        self.assertFalse(self.git_ref_exists("refs/heads/codex/trail-scale-contract-128"))
+
+    def run_with_failed_registration(
+        self, mode: str
+    ) -> tuple[subprocess.Popen[str], int | None, bool, bool]:
+        wrapper_dir = self.root / f"registration-{mode}-bin"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "python3"
+        wrapper.write_text(PYTHON_REGISTRATION_WRAPPER, encoding="utf-8")
+        wrapper.chmod(0o755)
+        real_python = shutil.which("python3")
+        assert real_python is not None
+        pid_capture = self.root / f"registration-{mode}-supervisor.pid"
+        env = self.matrix_env(extra_env={
+            "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+            "FAKE_REAL_PYTHON": real_python,
+            "FAKE_REGISTRATION_WRITER_MODE": mode,
+            "FAKE_SUPERVISOR_PID_CAPTURE": str(pid_capture),
+        })
+        process = subprocess.Popen(
+            ["bash", str(ORCHESTRATOR)], env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+        supervisor_pid: int | None = None
+        terminated = False
+        supervisor_terminated = False
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not pid_capture.is_file():
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(pid_capture.is_file(), "registration writer did not capture supervisor PID")
+            supervisor_pid = int(pid_capture.read_text(encoding="ascii").strip())
+            try:
+                process.communicate(timeout=3)
+                terminated = True
+            except subprocess.TimeoutExpired:
+                terminated = False
+            if terminated and mode == "kill-parent":
+                deadline = time.monotonic() + 3
+                while process_exists(supervisor_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                supervisor_terminated = not process_exists(supervisor_pid)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            if supervisor_pid is not None and process_exists(supervisor_pid):
+                os.kill(supervisor_pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        return process, supervisor_pid, terminated, supervisor_terminated
 
     def assert_signal_forwarded(self, signal_number: int, signal_name: str) -> None:
         pid_file = self.root / f"blocking-inner-{signal_name}.json"

@@ -32,18 +32,8 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-handle_signal() {
+terminate_active_inner_group() {
   local name=$1
-  local number=$2
-  local status=$((128 + number))
-  if [[ $active_inner_registration_pending == 1 && -z $active_inner_pid ]]; then
-    if [[ -z $pending_signal_name ]]; then
-      pending_signal_name=$name
-      pending_signal_number=$number
-    fi
-    return 0
-  fi
-  trap - INT TERM HUP
   if [[ -n $active_inner_pid ]]; then
     local group_waits=0
     while [[ -n $active_inner_group_ready_file && ! -f $active_inner_group_ready_file ]] &&
@@ -71,10 +61,25 @@ PY
     wait "$active_inner_pid" 2>/dev/null || true
     kill "$watchdog" 2>/dev/null || true
     wait "$watchdog" 2>/dev/null || true
-    if [[ -n $active_inner_run_dir && -d $active_inner_run_dir ]]; then
-      printf '{"schema_version":1,"status":"FAIL","signal":"%s","exit_status":%s,"inner_pid":%s}\n' \
-        "$name" "$status" "$active_inner_pid" > "$active_inner_run_dir/signal-failure.json"
+  fi
+}
+
+handle_signal() {
+  local name=$1
+  local number=$2
+  local status=$((128 + number))
+  if [[ $active_inner_registration_pending == 1 && -z $active_inner_pid ]]; then
+    if [[ -z $pending_signal_name ]]; then
+      pending_signal_name=$name
+      pending_signal_number=$number
     fi
+    return 0
+  fi
+  trap - INT TERM HUP
+  terminate_active_inner_group "$name"
+  if [[ -n $active_inner_pid && -n $active_inner_run_dir && -d $active_inner_run_dir ]]; then
+    printf '{"schema_version":1,"status":"FAIL","signal":"%s","exit_status":%s,"inner_pid":%s}\n' \
+      "$name" "$status" "$active_inner_pid" > "$active_inner_run_dir/signal-failure.json"
   fi
   exit "$status"
 }
@@ -514,9 +519,11 @@ run_inner_harness() {
   TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=$fault_driver_sha \
   TRAIL_SCALE_DISPOSABLE_WORKSPACE=1 \
   TRAIL_SCALE_DISPOSABLE_OWNER_FILE=$owner \
-  python3 - "$pgid_file" "$group_ready_file" "$completion_file" "$registration_file" "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr" <<'PY' &
+  python3 - "$pgid_file" "$group_ready_file" "$completion_file" "$registration_file" "$$" "$TRAIL_SCALE_INNER_HARNESS" >"$run_dir/inner.stdout" 2>"$run_dir/inner.stderr" <<'PY' &
 import os, signal, subprocess, sys, time
-ready,group_ready,completion,registration,program=sys.argv[1:]
+ready,group_ready,completion,registration,parent_pid,program=sys.argv[1:]
+parent_pid=int(parent_pid)
+registration_deadline=time.monotonic()+5
 os.setpgid(0,0)
 descriptor=os.open(group_ready,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
 try:
@@ -525,6 +532,10 @@ try:
 finally:
     os.close(descriptor)
 while True:
+    if os.getppid() != parent_pid:
+        raise SystemExit("parent exited before supervisor registration")
+    if time.monotonic() >= registration_deadline:
+        raise SystemExit("parent registration timed out")
     try:
         descriptor=os.open(registration,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
     except FileNotFoundError:
@@ -581,6 +592,20 @@ try:
 finally:
     os.close(descriptor)
 PY
+  local registration_status=$?
+  if (( registration_status != 0 )); then
+    trap - INT TERM HUP
+    terminate_active_inner_group TERM
+    printf '{"schema_version":1,"status":"FAIL","phase":"parent-registration","writer_exit_status":%s,"supervisor_pid":%s}\n' \
+      "$registration_status" "$active_inner_pid" > "$run_dir/registration-failure.json"
+    active_inner_pid=
+    active_inner_run_dir=
+    active_inner_pgid_file=
+    active_inner_group_ready_file=
+    active_inner_registration_pending=0
+    set -e
+    die "inner supervisor parent registration failed for $count lanes with exit $registration_status; evidence retained at $run_dir"
+  fi
   while [[ ! -f $completion_file ]]; do
     state=$(ps -o stat= -p "$active_inner_pid" 2>/dev/null | tr -d '[:space:]')
     [[ -z $state || $state == Z* ]] && break
