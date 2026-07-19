@@ -2272,7 +2272,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 18
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 19
         }));
     }
 
@@ -2462,9 +2462,11 @@ fn trail_refuses_workspaces_with_newer_schema_versions() {
         Ok(_) => panic!("opening a future schema should fail"),
         Err(err) => err,
     };
-    assert!(err
-        .to_string()
-        .contains("schema version 999 is newer than supported version"));
+    assert!(matches!(
+        err,
+        Error::SchemaReinitializeRequired { ref found, .. }
+            if found.contains("found version 999; expected version 19")
+    ));
 }
 
 #[test]
@@ -9916,7 +9918,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
     );
     assert_eq!(http_bad_turn.status, 400);
 
-    let mcp_read_only = trail::mcp::handle_json_rpc(
+    let mcp_status = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -9929,7 +9931,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
         }),
     )
     .unwrap();
-    assert_eq!(mcp_read_only["result"]["isError"], false);
+    assert_eq!(mcp_status["result"]["isError"], false);
 
     let mcp_set = trail::mcp::handle_json_rpc(
         &mut db,
@@ -10157,7 +10159,12 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
                 .and_then(|summary| summary["change_id"].as_str())
                 .is_some()
     }));
-    assert!(!audits.iter().any(|audit| audit.command == "trail.status"));
+    assert!(audits.iter().any(|audit| {
+        audit.actor == "mcp:stdio"
+            && audit.surface == "mcp"
+            && audit.command == "trail.status"
+            && audit.status == "ok"
+    }));
 }
 
 #[test]
@@ -10925,8 +10932,9 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
     )
     .unwrap();
     let view = db.lane_workspace_view("surface").unwrap().unwrap();
+    let mounted = db.start_lane_workspace_mount("surface").unwrap();
     fs::write(
-        Path::new(&view.source_upper).join("surface.txt"),
+        Path::new(&mounted.mountpoint).join("surface.txt"),
         "surface parity\n",
     )
     .unwrap();
@@ -11728,12 +11736,13 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
         generation["generation_id"]
     );
 
-    let view = db.lane_workspace_view("env-http").unwrap().unwrap();
+    let mounted = db.start_lane_workspace_mount("env-http").unwrap();
     fs::write(
-        Path::new(&view.source_upper).join("package-lock.json"),
+        Path::new(&mounted.mountpoint).join("package-lock.json"),
         r#"{"name":"env-surface","version":"1.0.1","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.1"}}}"#,
     )
     .unwrap();
+    db.request_lane_workspace_unmount("env-http").unwrap();
     db.checkpoint_lane_workspace("env-http", Some("change lock".to_string()))
         .unwrap();
     db.lane_readiness("env-http").unwrap();
@@ -20141,14 +20150,16 @@ fn layered_lane_update_preserves_lane_changes_and_advances_its_pinned_base() {
         false,
     )
     .unwrap();
-    let view_before = db.lane_workspace_view("updatable").unwrap().unwrap();
+    let mounted = db.start_lane_workspace_mount("updatable").unwrap();
     fs::write(
-        Path::new(&view_before.source_upper).join("lane-only.txt"),
+        Path::new(&mounted.mountpoint).join("lane-only.txt"),
         "lane\n",
     )
     .unwrap();
+    db.request_lane_workspace_unmount("updatable").unwrap();
     db.checkpoint_lane_workspace("updatable", Some("lane change".to_string()))
         .unwrap();
+    let view_before_update = db.lane_workspace_view("updatable").unwrap().unwrap();
 
     fs::write(temp.path().join("main-only.txt"), "main\n").unwrap();
     let main_record = db
@@ -20179,7 +20190,7 @@ fn layered_lane_update_preserves_lane_changes_and_advances_its_pinned_base() {
     assert_eq!(details.branch.base_change, main_record.operation.unwrap());
     assert_eq!(details.branch.head_change, update.operation);
     let view_after = db.lane_workspace_view("updatable").unwrap().unwrap();
-    assert_eq!(view_after.generation, view_before.generation + 1);
+    assert_eq!(view_after.generation, view_before_update.generation + 1);
     assert_eq!(view_after.base_change, update.operation);
     assert_eq!(view_after.base_root, update.root_id);
     assert_eq!(
