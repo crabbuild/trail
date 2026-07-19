@@ -64,6 +64,9 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
     executed_driver_bytes = b"fixture fault driver\n"
     executed_driver_sha = hashlib.sha256(executed_driver_bytes).hexdigest()
     (root / "fault-driver-executed").write_bytes(executed_driver_bytes)
+    candidate_bytes = b"fixture candidate binary\n"
+    candidate_sha = hashlib.sha256(candidate_bytes).hexdigest()
+    (root / "candidate-trail").write_bytes(candidate_bytes)
 
     def command(command_id: str, phase: str, lane: str = "", seconds: float = wall) -> None:
         result_rows.append({
@@ -75,6 +78,12 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         (commands / f"{command_id}.stdout").write_text("{}\n", encoding="utf-8")
         (commands / f"{command_id}.stderr").write_text("\n", encoding="utf-8")
         (commands / f"{command_id}.rss").write_text("4096\n", encoding="utf-8")
+        (commands / f"{command_id}.supervisor.json").write_text(json.dumps({
+            "schema_version": 1, "elapsed_seconds": seconds,
+            "peak_process_tree_rss_bytes": 4096, "timed_out": False,
+            "interrupted_signal": None, "stdout_truncated": False,
+            "stderr_truncated": False, "max_output_bytes_per_stream": 16777216,
+        }) + "\n", encoding="utf-8")
 
     command("baseline-status", "baseline")
     (commands / "baseline-status.json").write_text(json.dumps({
@@ -87,7 +96,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         init_id = f"init-{index:04d}"
         fingerprint = f"fingerprint-{index:04d}"
         for file_index in range(files):
-            expected_paths.append(f".trail-scale/{run_id}/{lane}/file-{file_index:04d}.txt")
+            expected_paths.append(f"tracked/{lane}/file-{file_index:04d}.txt")
         lane_rows.append({
             "lane": lane, "initialization_id": init_id,
             "retry_initialization_id": init_id, "request_fingerprint": fingerprint,
@@ -95,9 +104,18 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
             "workdir": f"/tmp/{lane}", "edit_count": str(files),
             "recorded_path_count": str(files), "isolation_unexpected_count": "0",
             "logical_bytes": "100", "allocated_bytes": "80", "exclusive_bytes": "10",
+            "clone_count": "8", "shared_physical_bytes": "50", "shared_extent_bytes": "50",
+            "changed_bytes": "10", "physical_sharing": "verified", "physical_sharing_evidence": "fixture",
         })
         for phase in checker.LANE_PHASES:
             command(f"{phase}-{index:04d}", phase, lane)
+        (commands / f"status-{index}.json").write_text(json.dumps({
+            "actual_exit_code": 0,
+            "payload": {"workdir_changed_paths": [
+                {"path": f"tracked/{lane}/file-{file_index:04d}.txt"}
+                for file_index in range(files)
+            ]},
+        }) + "\n", encoding="utf-8")
     command("queue-run", "queue_run")
     command("git-export", "git_export")
     command("trail-doctor", "integrity")
@@ -122,8 +140,8 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
             "integrity_result": "harness_control_exit_0" if scenario == "dirty_git_export_refusal" else "focused_test_exit_0",
             "leaked_resource_count": "0", "initialization_id": "", "retry_initialization_id": "",
             "evidence_command_id": command_id,
-            "evidence_kind": "harness_control" if scenario == "dirty_git_export_refusal" else "focused_test_aggregate",
-            "source_commit": "2" * 40, "binary_sha256": "1" * 64,
+            "evidence_kind": "harness_control" if scenario == "dirty_git_export_refusal" else "aggregate_source_test",
+            "source_commit": "2" * 40, "binary_sha256": candidate_sha,
             "binary_exercised": "true" if scenario == "dirty_git_export_refusal" else "false",
             "test_target": "" if scenario == "dirty_git_export_refusal" else FAULT_TESTS[scenario][0],
             "test_name": "" if scenario == "dirty_git_export_refusal" else FAULT_TESTS[scenario][1],
@@ -156,7 +174,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         "platform": {"description": "Darwin-contract", "machine": "test", "python": "3"},
         "filesystem": {"repo_device": 1, "output_device": 1, "same_device": True,
                        "repo_filesystem": "testfs", "output_filesystem": "testfs"},
-        "binary": {"path": "/tmp/trail", "sha256": "1" * 64,
+        "binary": {"path": str((root / "candidate-trail").resolve()), "sha256": candidate_sha,
                    "size_bytes": 123, "version": "trail 1.0.0"},
         "source": {"repo": "/tmp/source", "commit": "2" * 40,
                    "tree_clean": True, "submodules_clean": True,
@@ -169,7 +187,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
                          "executed_sha256": executed_driver_sha,
                          "executed_digest_verified_each_probe": True},
         "candidate_relationship": {"kind": "locally_bound_unproven_build",
-                                   "expected_binary_sha256": "1" * 64,
+                                   "expected_binary_sha256": candidate_sha,
                                    "expected_source_commit": "2" * 40},
     }
     (root / "environment.json").write_text(json.dumps(environment, sort_keys=True) + "\n", encoding="utf-8")
@@ -240,18 +258,19 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
 
     baseline_path_state = {
         "schema_version": 1, "tree": "b" * 40,
-        "entries": [{"path": "README.md", "mode": "100644", "type": "blob", "object": "d" * 40}],
-    }
-    final_path_state = {
-        "schema_version": 1, "tree": "e" * 40,
-        "entries": sorted(baseline_path_state["entries"] + [
-            {"path": path, "mode": "100644", "type": "blob", "object": f"{index + 1:040x}"}
+        "entries": sorted([{"path": "README.md", "mode": "100644", "type": "blob", "object": "d" * 40}] + [
+            {"path": path, "mode": "100644", "type": "blob", "object": f"{index + 100:040x}"}
             for index, path in enumerate(expected_paths)
         ], key=lambda row: row["path"]),
     }
+    final_path_state = {
+        "schema_version": 1, "tree": "e" * 40,
+        "entries": [({**row, "object": f"{index + 1:040x}"} if row["path"] in expected_paths else row)
+                    for index, row in enumerate(baseline_path_state["entries"])],
+    }
     path_changes = {
         "schema_version": 1, "baseline_tree": "b" * 40, "final_tree": "e" * 40,
-        "changes": [{"status": "A", "path": path} for path in expected_paths],
+        "changes": [{"status": "M", "path": path} for path in expected_paths],
     }
     for name, payload in (("baseline-path-state.json", baseline_path_state),
                           ("final-path-state.json", final_path_state),
@@ -288,9 +307,16 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
                         "queue_run": perf(1), "git_export": perf(1),
                         "latency_ceiling_enforced": lanes <= 64},
         "storage": {"db_bytes_before": 1000, "db_bytes_after": 2000,
+                    "db_wal_bytes_before": 100, "db_wal_bytes_after": 200,
+                    "db_shm_bytes_before": 32768, "db_shm_bytes_after": 32768,
+                    "repo_disk_bytes_before": 10000, "repo_disk_bytes_after": 12000,
+                    "trail_disk_bytes_before": 5000, "trail_disk_bytes_after": 7000,
+                    "output_disk_bytes_after": 2000,
                     "observer_log_bytes_before": 0, "observer_log_bytes_after": 100,
                     "logical_lane_bytes": lanes * 100, "allocated_lane_bytes": lanes * 80,
-                    "exclusive_lane_bytes": lanes * 10},
+                    "exclusive_lane_bytes": lanes * 10, "clone_count": lanes * 8,
+                    "shared_physical_bytes": lanes * 50, "shared_extent_bytes": lanes * 50,
+                    "changed_bytes": lanes * 10},
         "git_export": {"export_mode": "mapped_delta", "changed_path_count": lanes * files,
                        "commit_count": 1, "commit": "c" * 40, "parent": "a" * 40,
                        "dedicated_ref": "refs/heads/codex/trail-scale-contract",
@@ -334,6 +360,22 @@ class CheckerContractTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.assertEqual(checker.check(root)["status"], "PASS")
 
+    def test_accepts_honest_unattributed_native_cow_accounting(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        with (root / "lanes.tsv").open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.DictReader(stream, delimiter="\t"))
+        for row in rows:
+            row.update(exclusive_bytes="0", shared_physical_bytes="0", shared_extent_bytes="",
+                       physical_sharing="unknown",
+                       physical_sharing_evidence="allocated_blocks_do_not_prove_apfs_extent_sharing")
+        write_tsv(root / "lanes.tsv", checker.LANE_COLUMNS, rows)
+        metrics = json.loads((root / "metrics.json").read_text())
+        metrics["storage"].update(exclusive_lane_bytes=0, shared_physical_bytes=0, shared_extent_bytes=0)
+        (root / "metrics.json").write_text(json.dumps(metrics) + "\n")
+        refresh_manifest(root)
+        self.assertEqual(checker.check(root)["status"], "PASS")
+
     def test_missing_evidence_is_rejected(self) -> None:
         temp, root = self.artifact()
         self.addCleanup(temp.cleanup)
@@ -368,7 +410,7 @@ class CheckerContractTests(unittest.TestCase):
         with (root / "final-git-paths.txt").open("a") as stream:
             stream.write("outside.txt\n")
         refresh_manifest(root)
-        with self.assertRaisesRegex(checker.EvidenceError, "final Git path manifest"):
+        with self.assertRaisesRegex(checker.EvidenceError, "final.Git.path|final-git-paths"):
             checker.check(root)
 
     def test_cleanup_leak_is_rejected(self) -> None:
@@ -496,7 +538,7 @@ class CheckerContractTests(unittest.TestCase):
         rows = checker.read_tsv(root / "faults.tsv", checker.FAULT_COLUMNS)
         for row in rows:
             if row["scenario"] != "dirty_git_export_refusal":
-                row["evidence_kind"] = "externally_attested_focused_test"
+                row["evidence_kind"] = "externally_attested_source_test"
         write_tsv(root / "faults.tsv", checker.FAULT_COLUMNS, rows)
         metrics = json.loads((root / "metrics.json").read_text())
         metrics["evidence"]["manifest_entries"] += 1

@@ -47,8 +47,12 @@ def emit(value): print(json.dumps(value,sort_keys=True))
 def git(*git_args,env=None,input=None):
     return subprocess.check_output(["git","-C",str(workspace),*git_args],env=env,input=input,text=True).strip()
 def lane_paths(lane):
-    state=locked(); workdir=pathlib.Path(state["lanes"][lane]["workdir"]); root=workdir/".trail-scale"
-    return sorted(str(path.relative_to(workdir)) for path in root.rglob("*") if path.is_file()) if root.exists() else []
+    state=locked(); workdir=pathlib.Path(state["lanes"][lane]["workdir"])
+    paths=[]
+    for relative in git("ls-files").splitlines():
+        source=workspace/relative; candidate=workdir/relative
+        if source.is_file() and candidate.is_file() and source.read_bytes()!=candidate.read_bytes(): paths.append(relative)
+    return sorted(paths)
 
 if command == ["status"]:
     if os.environ.get("FAKE_STATUS_MUTATES"):
@@ -70,6 +74,11 @@ elif command[:2] == ["lane","spawn"]:
     preexisting=lane in locked()["lanes"]
     locked(spawn); pathlib.Path(workdir).mkdir(parents=True,exist_ok=True)
     if not preexisting:
+        for relative in git("ls-files").splitlines():
+            source=workspace/relative; destination=pathlib.Path(workdir)/relative
+            if source.is_file() and not source.is_symlink():
+                destination.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(source,destination)
+    if not preexisting:
         with sqlite3.connect(db_path) as db:
             db.execute("INSERT INTO lanes(lane_id,name) VALUES(?,?)", ("id-"+lane,lane))
             db.execute("INSERT INTO lane_branches(lane_id,ref_name,status,workdir,base_change,head_change) VALUES(?,?,?,?,?,?)", ("id-"+lane,"refs/lanes/"+lane,"active",workdir,"basechange","basechange"))
@@ -81,19 +90,28 @@ elif command[:2] == ["lane","spawn"]:
 elif command[:2] == ["lane","status"]:
     lane=command[2]; paths=lane_paths(lane); emit({"lane":{"record":{"name":lane},"branch":{}},"changed_paths":[],"queued_merges":0,"workdir_state":"dirty_untracked","workdir_changed_paths":[{"path":p} for p in paths],"latest_test":None})
 elif command[:2] == ["lane","space"]:
-    emit({"view_id":"view","logical_visible_bytes":100,"shared_physical_bytes":50,"lane_exclusive_physical_bytes":10,"shared_extent_bytes":50,"reclaimable_cache_bytes":0,"uncheckpointed_source_bytes":0,"generated_upper_bytes":0,"scratch_upper_bytes":0,"physical_accounting":"native_clone_extents","backend":"native-cow","logical_file_count":2,"filesystem_allocated_bytes":80,"changed_since_baseline_bytes":10,"clone_count":1,"physical_sharing":"verified","physical_sharing_evidence":"fake"})
+    unknown=bool(os.environ.get("FAKE_COW_UNKNOWN"))
+    emit({"view_id":"view","logical_visible_bytes":100,"shared_physical_bytes":0 if unknown else 50,"lane_exclusive_physical_bytes":0 if unknown else 10,"shared_extent_bytes":None if unknown else 50,"reclaimable_cache_bytes":0,"uncheckpointed_source_bytes":0,"generated_upper_bytes":0,"scratch_upper_bytes":0,"physical_accounting":"allocated-blocks-unattributed" if unknown else "native_clone_extents","backend":"native-cow","logical_file_count":2,"filesystem_allocated_bytes":80,"changed_since_baseline_bytes":10,"clone_count":1,"physical_sharing":"unknown" if unknown else "verified","physical_sharing_evidence":"allocated_blocks_do_not_prove_apfs_extent_sharing" if unknown else "fake"})
 elif command[:2] == ["lane","record"]:
     lane=command[2]; paths=lane_paths(lane)
+    if "--preview" in command:
+        emit({"lane_id":lane,"preview":True,"changed_paths":[{"path":p} for p in paths]}); raise SystemExit(0)
     locked(lambda state: state["lanes"][lane].update(paths=paths))
     emit({"lane_id":lane,"operation":"record-"+lane,"root_id":"root-"+lane,"changed_paths":[{"path":p} for p in paths],"path_index":{"mode":"indexed","lookup_count":len(paths),"full_root_path_load_count":0,"full_filesystem_path_scan_count":0}})
 elif command[:2] == ["lane","readiness"]:
     emit({"lane":{"record":{"name":command[2]},"branch":{}},"ready":True,"status":"ready","blockers":[],"warnings":[],"changed_paths":[],"workdir_state":"clean","workdir_changed_paths":[],"queued_merges":0,"pending_approvals":[],"conflicts":[],"latest_test":None})
 elif command[:2] == ["lane","handoff"]:
     emit({"lane":{"record":{"name":command[2]},"branch":{}},"readiness":{"ready":True},"current_session":None,"recent_sessions":[],"recent_events":[],"recent_spans":[],"recent_operations":[],"next_steps":[]})
+elif command[:2] == ["lane","refresh-preview"]:
+    emit({"lane":command[2],"target":"refs/branches/main","behind":0,"conflicts":[]})
+elif command[:2] == ["lane","merge"] and "--dry-run" in command:
+    emit({"lane":command[2],"target":"refs/branches/main","dry_run":True,"conflicts":[]})
 elif command[:3] == ["lane","merge-queue","add"]:
     with sqlite3.connect(db_path) as db:
         db.execute("INSERT INTO lane_merge_queue(queue_id,lane_id,target_ref,status) VALUES(?,?,?,?)", ("q-"+command[3],"id-"+command[3],"refs/branches/main","queued"))
     emit({"lane":command[3],"status":"queued"})
+elif command[:3] == ["lane","merge-queue","explain"]:
+    emit({"lane":command[3],"status":"queued","ready":True,"blockers":[],"conflicts":[]})
 elif command[:3] == ["lane","merge-queue","run"]:
     def merge(state): state["main_paths"]=sorted({p for lane in state["lanes"].values() for p in lane["paths"]})
     locked(merge)
@@ -104,6 +122,9 @@ elif command[:3] == ["lane","merge-queue","run"]:
 elif command[:1] == ["diff"]:
     emit({"from":"basechange","to":"finalchange","files":[{"path":p} for p in locked()["main_paths"]]})
 elif command[:2] == ["git","export"]:
+    if "--output" in command:
+        pathlib.Path(command[command.index("--output")+1]).write_text("fake patch preview\n")
+        emit({"status":"patch_written"}); raise SystemExit(0)
     paths=locked()["main_paths"]
     index=trail/"fake-export-index"; env=dict(os.environ,GIT_INDEX_FILE=str(index))
     subprocess.check_call(["git","-C",str(workspace),"read-tree","HEAD"],env=env,stdout=subprocess.DEVNULL)
@@ -143,6 +164,8 @@ elif command in (["doctor"],["fsck"]):
     if command == ["doctor"] and os.environ.get("FAKE_LEAK_JOURNAL"):
         journal=trail/"materialization-operations"; journal.mkdir(parents=True,exist_ok=True)
         (journal/os.environ["FAKE_LEAK_JOURNAL"]).write_text('{"state":"preparing"}\n')
+    if command == ["fsck"] and os.environ.get("FAKE_FAIL_TRAIL_FSCK"):
+        print(json.dumps({"errors":["injected"]}),file=sys.stderr); raise SystemExit(12)
     emit({"status":"ok","checks":[]} if command == ["doctor"] else {"checked_refs":1,"checked_roots":1,"checked_texts":1,"errors":[]})
 else:
     print("unsupported fake command: "+repr(command),file=sys.stderr); raise SystemExit(64)
@@ -188,15 +211,21 @@ class HarnessContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.repo = root / "repo"
+        self.original_repo = root / "original-repo"
         self.output = root / "evidence"
         self.fake = root / "fake-trail"
         self.fault = root / "fake-fault"
         self.repo.mkdir()
+        self.original_repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "trail@example.com"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Trail"], check=True)
         (self.repo / ".gitignore").write_text(".trail/\n", encoding="utf-8")
         (self.repo / "README.md").write_text("baseline\n", encoding="utf-8")
+        for index in range(8):
+            path = self.repo / "tracked" / f"file-{index:04d}.txt"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f"baseline {index}\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "baseline"], check=True)
         (self.repo / ".trail/index").mkdir(parents=True)
@@ -230,11 +259,19 @@ class HarnessContractTests(unittest.TestCase):
             "fault_driver_sha256": fault_sha, "source_commit": source_commit,
             "binary_sha256": binary_sha, "test_contract": "trail-task12-exact-one-v1"}, sort_keys=True) + "\n")
         attestation_sha = __import__("hashlib").sha256(attestation.read_bytes()).hexdigest()
+        run_id = overrides.get("TRAIL_SCALE_RUN_ID", "contract")
+        output = Path(overrides.get("TRAIL_SCALE_OUTPUT", self.output)).absolute()
+        owner = self.repo / ".trail/disposable-owner.json"
+        owner.write_text(json.dumps({"schema_version": 1, "kind": "trail_scale_disposable_workspace",
+            "canonical_repo": str(self.original_repo.resolve()), "disposable_repo": str(self.repo.resolve()),
+            "output": str(output), "run_id": run_id}, sort_keys=True) + "\n")
         env = dict(os.environ, TRAIL_BIN=str(binary_path), TRAIL_SCALE_REPO=str(self.repo),
                    TRAIL_SCALE_LANES="2", TRAIL_SCALE_FILES_PER_LANE="2",
-                   TRAIL_SCALE_CONCURRENCY="2", TRAIL_SCALE_RUN_ID="contract",
-                   TRAIL_SCALE_OUTPUT=str(self.output),
+                   TRAIL_SCALE_CONCURRENCY="2", TRAIL_SCALE_RUN_ID=run_id,
+                   TRAIL_SCALE_OUTPUT=str(output),
                    TRAIL_SCALE_GIT_REF="refs/heads/codex/trail-scale-contract",
+                   TRAIL_SCALE_DISPOSABLE_WORKSPACE="1",
+                   TRAIL_SCALE_DISPOSABLE_OWNER_FILE=str(owner),
                    TRAIL_SCALE_FAULT_DRIVER=str(self.fault),
                    TRAIL_SCALE_EXPECTED_BINARY_SHA256=binary_sha,
                    TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=source_commit,
@@ -273,6 +310,9 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual({row["lane"] for row in lanes}, {"scale-0000", "scale-0001"})
         self.assertTrue(all(row["initialization_id"] == row["retry_initialization_id"] for row in lanes))
         expected = (self.output / "expected-paths.txt").read_text().splitlines()
+        baseline_paths = {row["path"] for row in json.loads((self.output / "baseline-path-state.json").read_text())["entries"]}
+        self.assertLessEqual(set(expected), baseline_paths)
+        self.assertTrue(all(row["status"] == "M" for row in json.loads((self.output / "path-changes.json").read_text())["changes"]))
         self.assertEqual(len(expected), len(set(expected)))
         self.assertEqual(expected, (self.output / "final-git-paths.txt").read_text().splitlines())
         final = json.loads((self.output / "final-resources.json").read_text())["resources"]
@@ -286,6 +326,10 @@ class HarnessContractTests(unittest.TestCase):
         executed = self.output / environment["fault_driver"]["executed_evidence_path"]
         self.assertEqual(__import__("hashlib").sha256(executed.read_bytes()).hexdigest(),
                          environment["fault_driver"]["executed_sha256"])
+        for index in range(2):
+            for prefix in ("record-preview", "refresh-preview", "merge-dry-run", "queue-explain"):
+                self.assertTrue((self.output / "commands" / f"{prefix}-{index}.json").is_file())
+        self.assertTrue((self.output / "commands/git-export-preview.json").is_file())
 
     def test_candidate_filesystem_fault_probe_dispatches_native_exact_test(self) -> None:
         result = self.run_candidate_fault_probe("filesystem_replacement")
@@ -337,6 +381,36 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 64)
         self.assertIn("cannot exceed TRAIL_SCALE_LANES", result.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_exclusive_workspace_contract_is_required_before_mutation(self) -> None:
+        result = self.run_harness(TRAIL_SCALE_DISPOSABLE_WORKSPACE="")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("disposable workspace", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_trail_head_must_be_main(self) -> None:
+        (self.repo / ".trail/HEAD").write_text("feature\n", encoding="utf-8")
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("Trail HEAD must be main", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_edit_caps_are_enforced_before_mutation(self) -> None:
+        result = self.run_harness(TRAIL_SCALE_FILES_PER_LANE="513")
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("cannot exceed 512", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_output_cannot_be_placed_in_git_metadata(self) -> None:
+        result = self.run_harness(TRAIL_SCALE_OUTPUT=str(self.repo / ".git" / "evidence"))
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("output placement", result.stderr)
+
+    def test_failure_never_publishes_final_ref(self) -> None:
+        result = self.run_harness(FAKE_FAIL_TRAIL_FSCK="1")
+        self.assertNotEqual(result.returncode, 0)
+        refs = subprocess.check_output(["git", "-C", str(self.repo), "for-each-ref", "--format=%(refname)", "refs/heads/codex"], text=True)
+        self.assertNotIn("refs/heads/codex/trail-scale-contract", refs)
 
     def test_unmapped_baseline_is_rejected_before_lane_mutation(self) -> None:
         with sqlite3.connect(self.repo / ".trail/index/trail.sqlite") as db:
@@ -486,6 +560,13 @@ class HarnessContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("concurrent lane workloads failed", result.stderr)
 
+    def test_honest_unknown_cow_extent_attribution_is_accepted(self) -> None:
+        result = self.run_harness(FAKE_COW_UNKNOWN="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with (self.output / "lanes.tsv").open() as stream:
+            lanes = list(csv.DictReader(stream, delimiter="\t"))
+        self.assertTrue(all(row["physical_sharing"] == "unknown" and row["shared_extent_bytes"] == "" for row in lanes))
+
     def test_cleanup_failure_propagates(self) -> None:
         result = self.run_harness(FAKE_FAIL_CLEANUP="scale-0001")
         self.assertNotEqual(result.returncode, 0)
@@ -505,6 +586,12 @@ class HarnessContractTests(unittest.TestCase):
         source = HARNESS.read_text(encoding="utf-8")
         for flag in ("--force", "--allow-stale", "--allow-ignored", "--direct"):
             self.assertNotIn(flag, source)
+
+    def test_harness_uses_full_git_fsck_and_honest_source_test_label(self) -> None:
+        source = HARNESS.read_text(encoding="utf-8")
+        self.assertIn("git -C \"$TRAIL_SCALE_REPO\" fsck --full", source)
+        self.assertIn('evidence_kind="aggregate_source_test"', source)
+        self.assertNotIn('evidence_kind="focused_test_aggregate"', source)
 
 
 if __name__ == "__main__":

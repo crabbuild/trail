@@ -8,10 +8,12 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
 FAULT_PROJECT_ROOT=${TRAIL_FAULT_PROJECT_ROOT:-$PROJECT_ROOT}
+TRAIL_SCALE_COMMAND_RUNNER=${TRAIL_SCALE_COMMAND_RUNNER:-$SCRIPT_DIR/scale-command-runner.py}
 
 fault_probe() {
   local scenario=${1:-}
-  local test_target test_name durable_phase committed retry_result test_output test_count
+  local test_target test_name durable_phase committed retry_result test_output test_count probe_dir probe_code
+  local -a cargo_command
   case "$scenario" in
     after_reservation|after_materialization|after_association|after_reconciliation|after_marker|after_spawn_event)
       test_target=lane_initialization_faults
@@ -63,16 +65,24 @@ fault_probe() {
       durable_phase=control committed=false retry_result=refused_without_mutation ;;
     *) echo "unsupported fault scenario: $scenario" >&2; return 64 ;;
   esac
+  [[ -f $TRAIL_SCALE_COMMAND_RUNNER ]] || { echo "bounded command runner is missing" >&2; return 1; }
   if [[ $test_target == lib ]]; then
-    test_output=$(cd "$FAULT_PROJECT_ROOT" && cargo test -p trail "$test_name" --lib -- --exact --nocapture 2>&1) || {
-      printf '%s\n' "$test_output" >&2
-      return 1
-    }
+    cargo_command=(cargo test --manifest-path "$FAULT_PROJECT_ROOT/Cargo.toml" -p trail "$test_name" --lib -- --exact --nocapture)
   else
-    test_output=$(cd "$FAULT_PROJECT_ROOT" && cargo test -p trail --test "$test_target" "$test_name" -- --exact --nocapture 2>&1) || {
-      printf '%s\n' "$test_output" >&2
-      return 1
-    }
+    cargo_command=(cargo test --manifest-path "$FAULT_PROJECT_ROOT/Cargo.toml" -p trail --test "$test_target" "$test_name" -- --exact --nocapture)
+  fi
+  probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/trail-scale-fault.XXXXXX") || return 1
+  set +e
+  python3 "$TRAIL_SCALE_COMMAND_RUNNER" --timeout-seconds "${TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS:-300}" \
+    --max-output-bytes "${TRAIL_SCALE_MAX_OUTPUT_BYTES:-16777216}" --stdout "$probe_dir/stdout" \
+    --stderr "$probe_dir/stderr" --rss "$probe_dir/rss" --meta "$probe_dir/meta" -- "${cargo_command[@]}"
+  probe_code=$?
+  set -e
+  test_output=$(cat "$probe_dir/stdout" "$probe_dir/stderr")
+  rm -rf -- "$probe_dir"
+  if (( probe_code != 0 )); then
+    printf '%s\n' "$test_output" >&2
+    return 1
   fi
   printf '%s\n' "$test_output" >&2
   test_count=$(TRAIL_FAULT_TEST_OUTPUT="$test_output" python3 - "$test_name" <<'PY'
@@ -125,6 +135,10 @@ TRAIL_SCALE_EXPECTED_SOURCE_COMMIT=${TRAIL_SCALE_EXPECTED_SOURCE_COMMIT:-}
 TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256=${TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256:-}
 TRAIL_SCALE_FAULT_ATTESTATION=${TRAIL_SCALE_FAULT_ATTESTATION:-}
 TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256=${TRAIL_SCALE_EXPECTED_FAULT_ATTESTATION_SHA256:-}
+TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS=${TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS:-300}
+TRAIL_SCALE_MAX_OUTPUT_BYTES=${TRAIL_SCALE_MAX_OUTPUT_BYTES:-16777216}
+TRAIL_SCALE_DISPOSABLE_WORKSPACE=${TRAIL_SCALE_DISPOSABLE_WORKSPACE:-}
+TRAIL_SCALE_DISPOSABLE_OWNER_FILE=${TRAIL_SCALE_DISPOSABLE_OWNER_FILE:-}
 
 die() { echo "verify-real-repo-lane-scale: $*" >&2; exit 64; }
 is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
@@ -346,7 +360,15 @@ for value_name in TRAIL_SCALE_LANES TRAIL_SCALE_FILES_PER_LANE TRAIL_SCALE_CONCU
   is_uint "$value" && (( value > 0 )) || die "$value_name must be a positive integer"
 done
 (( TRAIL_SCALE_LANES <= 128 )) || die "TRAIL_SCALE_LANES cannot exceed 128"
+(( TRAIL_SCALE_FILES_PER_LANE <= 512 )) || die "TRAIL_SCALE_FILES_PER_LANE cannot exceed 512"
+(( TRAIL_SCALE_LANES * TRAIL_SCALE_FILES_PER_LANE <= 65536 )) || die "total edits cannot exceed 65536"
 (( TRAIL_SCALE_CONCURRENCY <= TRAIL_SCALE_LANES )) || die "TRAIL_SCALE_CONCURRENCY cannot exceed TRAIL_SCALE_LANES"
+is_number "$TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS" || die "TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS must be positive"
+python3 - "$TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS" <<'PY' || die "TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS must be positive"
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
+PY
+is_uint "$TRAIL_SCALE_MAX_OUTPUT_BYTES" && (( TRAIL_SCALE_MAX_OUTPUT_BYTES > 0 )) || die "TRAIL_SCALE_MAX_OUTPUT_BYTES must be a positive integer"
 is_number "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" || die "TRAIL_SCALE_LATENCY_CEILING_SECONDS must be positive"
 python3 - "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" <<'PY' || die "TRAIL_SCALE_LATENCY_CEILING_SECONDS must be positive"
 import sys
@@ -366,7 +388,35 @@ if [[ -z $TRAIL_SCALE_OUTPUT ]]; then
   TRAIL_SCALE_OUTPUT=$TRAIL_SCALE_REPO/.trail/benchmarks/real-repo-lane-scale-$TRAIL_SCALE_RUN_ID
 fi
 [[ $TRAIL_SCALE_OUTPUT == /* ]] || die "TRAIL_SCALE_OUTPUT must be absolute"
+TRAIL_SCALE_OUTPUT=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$TRAIL_SCALE_OUTPUT")
+[[ $TRAIL_SCALE_DISPOSABLE_WORKSPACE == 1 ]] || die "qualification requires an explicit disposable workspace contract"
+[[ $TRAIL_SCALE_DISPOSABLE_OWNER_FILE == /* && -f $TRAIL_SCALE_DISPOSABLE_OWNER_FILE && ! -L $TRAIL_SCALE_DISPOSABLE_OWNER_FILE ]] || die "TRAIL_SCALE_DISPOSABLE_OWNER_FILE must be an absolute regular non-symlink file"
+python3 - "$TRAIL_SCALE_DISPOSABLE_OWNER_FILE" "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" <<'PY' || die "disposable workspace owner contract is invalid"
+import json,pathlib,sys
+owner,repo,output,run_id=sys.argv[1:]
+owner_path=pathlib.Path(owner).resolve(); repo_path=pathlib.Path(repo).resolve(); trail=(repo_path/".trail").resolve()
+if trail not in owner_path.parents: raise SystemExit("owner file is outside disposable .trail")
+value=json.load(open(owner_path,encoding="utf-8"))
+if set(value)!={"schema_version","kind","canonical_repo","disposable_repo","output","run_id"}: raise SystemExit("owner keys mismatch")
+canonical=pathlib.Path(value["canonical_repo"]).resolve()
+expected={"schema_version":1,"kind":"trail_scale_disposable_workspace","canonical_repo":str(canonical),"disposable_repo":str(repo_path),"output":str(pathlib.Path(output)),"run_id":run_id}
+if value!=expected or not canonical.is_dir() or canonical==repo_path: raise SystemExit("owner values do not bind this run")
+PY
 [[ ! -e $TRAIL_SCALE_OUTPUT ]] || die "TRAIL_SCALE_OUTPUT already exists"
+python3 - "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT" <<'PY' || die "unsafe output placement"
+import os, pathlib, sys
+repo=pathlib.Path(sys.argv[1]).resolve(); raw_output=pathlib.Path(sys.argv[2]); output=raw_output.resolve()
+git=(repo/".git").resolve(); trail=(repo/".trail").resolve()
+if output == repo or output == git or git in output.parents:
+    raise SystemExit("output placement overlaps repository or Git metadata")
+if repo in output.parents and not (output == trail or trail in output.parents):
+    raise SystemExit("output placement inside repository must remain under .trail")
+ancestor=raw_output
+while True:
+    if ancestor.exists() and ancestor.is_symlink(): raise SystemExit("output placement has a symlink ancestor")
+    if ancestor.exists() or ancestor.parent==ancestor: break
+    ancestor=ancestor.parent
+PY
 git -C "$TRAIL_SCALE_REPO" show-ref --verify --quiet "$TRAIL_SCALE_GIT_REF" && die "dedicated Git ref already exists"
 
 git -C "$TRAIL_SCALE_REPO" diff --quiet -- || die "tracked Git worktree must be clean before qualification"
@@ -383,8 +433,6 @@ db_path=$TRAIL_SCALE_REPO/.trail/index/trail.sqlite
 candidate_binary_sha256=$(sha256_file "$TRAIL_BIN")
 [[ $candidate_binary_sha256 == "$TRAIL_SCALE_EXPECTED_BINARY_SHA256" ]] || die "candidate binary SHA-256 does not match TRAIL_SCALE_EXPECTED_BINARY_SHA256"
 candidate_binary_size=$(stat -f %z "$TRAIL_BIN" 2>/dev/null || stat -c %s "$TRAIL_BIN")
-candidate_binary_version=$("$TRAIL_BIN" --version 2>&1) || die "candidate binary --version failed"
-[[ -n $candidate_binary_version && $candidate_binary_version != *$'\n'* ]] || die "candidate binary version must be one non-empty line"
 trail_source_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 [[ $trail_source_commit == "$TRAIL_SCALE_EXPECTED_SOURCE_COMMIT" ]] || die "source commit does not match TRAIL_SCALE_EXPECTED_SOURCE_COMMIT"
 source_status_baseline=$(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=normal)
@@ -427,6 +475,7 @@ head_file=$TRAIL_SCALE_REPO/.trail/HEAD
 [[ -f $head_file && ! -L $head_file ]] || die "Trail HEAD file is missing or unsafe"
 baseline_trail_branch=$(tr -d '\n' < "$head_file")
 [[ $baseline_trail_branch =~ ^[A-Za-z0-9._/-]+$ ]] || die "Trail HEAD branch is invalid"
+[[ $baseline_trail_branch == main ]] || die "Trail HEAD must be main"
 baseline_trail_ref=refs/branches/$baseline_trail_branch
 read -r baseline_trail_commit baseline_trail_root < <(python3 - "$db_path" "$baseline_trail_ref" "$baseline_git_head" "$TRAIL_SCALE_LANES" <<'PY'
 import sqlite3, sys
@@ -453,6 +502,31 @@ PY
 ) || die "mapped_delta/lane/queue preflight failed"
 
 mkdir -p "$TRAIL_SCALE_OUTPUT/commands" "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs" "$TRAIL_SCALE_OUTPUT/manifests"
+original_candidate_binary=$TRAIL_BIN
+candidate_binary_executable=$TRAIL_SCALE_OUTPUT/candidate-trail
+python3 - "$original_candidate_binary" "$candidate_binary_executable" "$candidate_binary_sha256" <<'PY' || die "could not create immutable candidate binary copy"
+import hashlib, os, stat, sys
+source,destination,expected=sys.argv[1:]
+fd=os.open(source,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+    info=os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode): raise SystemExit("candidate is not regular")
+    chunks=[]; digest=hashlib.sha256()
+    while chunk:=os.read(fd,1024*1024): chunks.append(chunk); digest.update(chunk)
+finally: os.close(fd)
+if digest.hexdigest()!=expected: raise SystemExit("candidate changed before immutable copy")
+out=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o500)
+try:
+    for chunk in chunks:
+        view=memoryview(chunk)
+        while view: view=view[os.write(out,view):]
+    os.fsync(out)
+finally: os.close(out)
+PY
+TRAIL_BIN=$candidate_binary_executable
+[[ $(sha256_file "$TRAIL_BIN") == "$candidate_binary_sha256" ]] || die "immutable candidate binary digest mismatch"
+candidate_binary_version=$("$TRAIL_BIN" --version 2>&1) || die "immutable candidate binary --version failed"
+[[ -n $candidate_binary_version && $candidate_binary_version != *$'\n'* ]] || die "candidate binary version must be one non-empty line"
 fault_driver_executed_evidence_path=fault-driver-executed
 fault_driver_executable=$TRAIL_SCALE_OUTPUT/$fault_driver_executed_evidence_path
 python3 - "$TRAIL_SCALE_FAULT_DRIVER" "$fault_driver_executable" "$fault_driver_sha256" <<'PY' || die "could not create exact immutable fault-driver evidence copy"
@@ -491,7 +565,7 @@ snapshot_untracked "$TRAIL_SCALE_OUTPUT/baseline-untracked.json"
 capture_resource_inventory "$TRAIL_SCALE_OUTPUT/baseline-resources.json"
 capture_git_path_state "$baseline_git_head" "$TRAIL_SCALE_OUTPUT/baseline-path-state.json"
 RESULT_COLUMNS=$'command_id\tphase\tlane\twall_seconds\tpeak_rss_bytes\texit_code\tcommitted\tretry_of'
-LANE_COLUMNS=$'lane\tinitialization_id\tretry_initialization_id\trequest_fingerprint\tretry_request_fingerprint\tworkdir_mode\tworkdir\tedit_count\trecorded_path_count\tisolation_unexpected_count\tlogical_bytes\tallocated_bytes\texclusive_bytes'
+LANE_COLUMNS=$'lane\tinitialization_id\tretry_initialization_id\trequest_fingerprint\tretry_request_fingerprint\tworkdir_mode\tworkdir\tedit_count\trecorded_path_count\tisolation_unexpected_count\tlogical_bytes\tallocated_bytes\texclusive_bytes\tclone_count\tshared_physical_bytes\tshared_extent_bytes\tchanged_bytes\tphysical_sharing\tphysical_sharing_evidence'
 FAULT_COLUMNS=$'scenario\texpected_code\tactual_code\tdurable_phase\tcommitted\tretry_result\tintegrity_result\tleaked_resource_count\tinitialization_id\tretry_initialization_id\tevidence_command_id\tevidence_kind\tsource_commit\tbinary_sha256\tbinary_exercised\ttest_target\ttest_name\ttest_count'
 printf '%s\n' "$RESULT_COLUMNS" > "$TRAIL_SCALE_OUTPUT/results.tsv"
 printf '%s\n' "$LANE_COLUMNS" > "$TRAIL_SCALE_OUTPUT/lanes.tsv"
@@ -537,12 +611,17 @@ PY
 cleanup_on_failure() {
   local status=$?
   if (( status != 0 )); then
+    [[ -z ${staging_ref:-} ]] || git -C "$TRAIL_SCALE_REPO" update-ref -d "$staging_ref" >/dev/null 2>&1 || true
     restore_dirty_probe || true
     for marker in "$owned_lanes_dir"/*; do
       [[ -f $marker ]] || continue
       lane=${marker##*/}
       if verify_owned_lane_marker "$marker"; then
-        "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json lane rm "$lane" >/dev/null 2>&1 || true
+        cleanup_prefix=$TRAIL_SCALE_OUTPUT/commands/failure-cleanup-${lane}
+        python3 "$SCRIPT_DIR/scale-command-runner.py" --timeout-seconds "$TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS" \
+          --max-output-bytes "$TRAIL_SCALE_MAX_OUTPUT_BYTES" --stdout "$cleanup_prefix.stdout" \
+          --stderr "$cleanup_prefix.stderr" --rss "$cleanup_prefix.rss" --meta "$cleanup_prefix.supervisor.json" -- \
+          "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json lane rm "$lane" >/dev/null 2>&1 || true
       else
         echo "refusing failure cleanup for $lane because stable ownership changed" >&2
       fi
@@ -551,7 +630,9 @@ cleanup_on_failure() {
   fi
   return "$status"
 }
-trap cleanup_on_failure EXIT INT TERM
+trap cleanup_on_failure EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 trail() { "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json "$@"; }
 now_seconds() { python3 - <<'PY'
@@ -568,26 +649,24 @@ run_command() {
   local json_file="$TRAIL_SCALE_OUTPUT/commands/$command_id.json"
   local rss_file="$TRAIL_SCALE_OUTPUT/commands/$command_id.rss"
   local row_file="$TRAIL_SCALE_OUTPUT/rows/$command_id.tsv"
-  local start end elapsed pid rss peak=1 actual_code normalized_code
-  start=$(now_seconds)
+  local meta_file="$TRAIL_SCALE_OUTPUT/commands/$command_id.supervisor.json"
+  local elapsed peak actual_code normalized_code
+  if [[ ${1:-} == trail ]]; then
+    shift
+    set -- "$TRAIL_BIN" --workspace "$TRAIL_SCALE_REPO" --json "$@"
+  fi
   set +e
-  "$@" >"$stdout" 2>"$stderr" &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    rss=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1; exit}')
-    if [[ $rss =~ ^[0-9]+$ ]] && (( rss * 1024 > peak )); then peak=$((rss * 1024)); fi
-    sleep 0.02
-  done
-  wait "$pid"
+  python3 "$SCRIPT_DIR/scale-command-runner.py" \
+    --timeout-seconds "$TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS" \
+    --max-output-bytes "$TRAIL_SCALE_MAX_OUTPUT_BYTES" \
+    --stdout "$stdout" --stderr "$stderr" --rss "$rss_file" --meta "$meta_file" -- "$@"
   actual_code=$?
   set -e
-  end=$(now_seconds)
-  elapsed=$(python3 - "$start" "$end" <<'PY'
-import sys
-print(f"{float(sys.argv[2])-float(sys.argv[1]):.6f}")
+  read -r elapsed peak < <(python3 - "$meta_file" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1])); print(f"{v['elapsed_seconds']:.6f}",v["peak_process_tree_rss_bytes"])
 PY
-)
-  printf '%s\n' "$peak" > "$rss_file"
+  )
   python3 - "$command_id" "$phase" "$lane" "$actual_code" "$expected_code" "$stdout" "$stderr" "$json_file" <<'PY'
 import json, pathlib, sys
 command_id, phase, lane, actual, expected, stdout, stderr, output = sys.argv[1:]
@@ -658,24 +737,35 @@ run_command baseline-status baseline "" true "" 0 trail status
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.root_id) == "$baseline_trail_root" ]] || die "Trail root changed after preflight"
 capture_resource_inventory "$TRAIL_SCALE_OUTPUT/runtime-resources.json"
 db_bytes_before=$(stat -f %z "$db_path" 2>/dev/null || stat -c %s "$db_path")
+file_bytes() { [[ -f $1 ]] && (stat -f %z "$1" 2>/dev/null || stat -c %s "$1") || echo 0; }
+disk_bytes() { du -sk "$1" | awk '{printf "%.0f\n", $1*1024}'; }
+db_wal_bytes_before=$(file_bytes "$db_path-wal")
+db_shm_bytes_before=$(file_bytes "$db_path-shm")
+repo_disk_bytes_before=$(disk_bytes "$TRAIL_SCALE_REPO")
+trail_disk_bytes_before=$(disk_bytes "$TRAIL_SCALE_REPO/.trail")
 observer_log_bytes_before=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -exec stat -f %z {} \; 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
 if [[ -z $observer_log_bytes_before ]]; then
   observer_log_bytes_before=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
 fi
 
 expected_paths_file=$TRAIL_SCALE_OUTPUT/expected-paths.txt
-: > "$expected_paths_file"
-for ((index=0; index<TRAIL_SCALE_LANES; index++)); do
-  lane=$(printf 'scale-%04d' "$index")
-  lane_manifest=$TRAIL_SCALE_OUTPUT/manifests/$lane.expected.txt
-  : > "$lane_manifest"
-  for ((file_index=0; file_index<TRAIL_SCALE_FILES_PER_LANE; file_index++)); do
-    path=$(printf '.trail-scale/%s/%s/file-%04d.txt' "$TRAIL_SCALE_RUN_ID" "$lane" "$file_index")
-    printf '%s\n' "$path" >> "$lane_manifest"
-    printf '%s\n' "$path" >> "$expected_paths_file"
-  done
-done
-LC_ALL=C sort -o "$expected_paths_file" "$expected_paths_file"
+python3 - "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT/manifests" "$expected_paths_file" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" <<'PY' || die "repository lacks enough safe existing regular tracked files"
+import os, pathlib, subprocess, sys
+repo, manifests, expected, lanes, files=sys.argv[1],pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]),int(sys.argv[4]),int(sys.argv[5])
+paths=[]
+for raw in subprocess.check_output(["git","-C",repo,"ls-files","-z","--"]).split(b"\0"):
+    if not raw or b"\n" in raw or b"\r" in raw or b"\t" in raw: continue
+    relative=os.fsdecode(raw); target=pathlib.Path(repo)/relative
+    if target.is_file() and not target.is_symlink(): paths.append(relative)
+paths=sorted(set(paths),key=os.fsencode)
+needed=lanes*files
+if len(paths)<needed: raise SystemExit(f"need {needed} regular tracked files, found {len(paths)}")
+selected=paths[:needed]
+expected.write_text("".join(path+"\n" for path in sorted(selected,key=os.fsencode)),encoding="utf-8")
+for index in range(lanes):
+    lane=f"scale-{index:04d}"; allocation=selected[index*files:(index+1)*files]
+    (manifests/f"{lane}.expected.txt").write_text("".join(path+"\n" for path in sorted(allocation,key=os.fsencode)),encoding="utf-8")
+PY
 
 spawn_one() {
   local index=$1 lane workdir
@@ -737,20 +827,44 @@ lane_workload() {
   lane_manifest=$TRAIL_SCALE_OUTPUT/manifests/$lane.expected.txt
   while IFS= read -r relative; do
     target=$workdir/$relative
-    mkdir -p "$(dirname -- "$target")"
-    printf 'trail-scale run=%s lane=%s path=%s\n' "$TRAIL_SCALE_RUN_ID" "$lane" "$relative" > "$target"
+    [[ -f $target && ! -L $target ]] || { echo "$lane selected path is not a regular materialized file: $relative" >&2; return 1; }
+    printf '\ntrail-scale run=%s lane=%s path=%s\n' "$TRAIL_SCALE_RUN_ID" "$lane" "$relative" >> "$target"
   done < "$lane_manifest"
   run_command "status-$index" status "$lane" true "" 0 trail lane status "$lane"
   actual_status=$TRAIL_SCALE_OUTPUT/manifests/$lane.status.txt
   json_payload_paths "$TRAIL_SCALE_OUTPUT/commands/status-$index.json" workdir_changed_paths "$actual_status"
   cmp -s "$lane_manifest" "$actual_status" || { echo "$lane isolation manifest mismatch" >&2; return 1; }
   run_command "space-$index" space "$lane" true "" 0 trail lane space "$lane"
+  python3 - "$TRAIL_SCALE_OUTPUT/commands/space-$index.json" <<'PY' || return 1
+import json,sys
+v=json.load(open(sys.argv[1]))["payload"]
+required={"clone_count","shared_physical_bytes","lane_exclusive_physical_bytes","shared_extent_bytes","changed_since_baseline_bytes","physical_sharing","physical_sharing_evidence","physical_accounting","filesystem_allocated_bytes","logical_visible_bytes"}
+missing=required-set(v) if isinstance(v,dict) else required
+if missing: raise SystemExit(f"incomplete native-COW space evidence: {sorted(missing)}")
+for key in {"clone_count","shared_physical_bytes","lane_exclusive_physical_bytes","filesystem_allocated_bytes","logical_visible_bytes"}:
+    if isinstance(v[key],bool) or not isinstance(v[key],int) or v[key]<0: raise SystemExit(f"invalid native-COW metric {key}")
+if v["clone_count"]<=0 or isinstance(v["changed_since_baseline_bytes"],bool) or not isinstance(v["changed_since_baseline_bytes"],int) or v["changed_since_baseline_bytes"]<=0:
+    raise SystemExit("native-COW evidence must include clones and positive changed bytes")
+if not isinstance(v["physical_sharing_evidence"],str) or not v["physical_sharing_evidence"]: raise SystemExit("native-COW sharing evidence is missing")
+if v["physical_sharing"]=="verified":
+    if isinstance(v["shared_extent_bytes"],bool) or not isinstance(v["shared_extent_bytes"],int) or v["shared_extent_bytes"]<=0 or v["shared_physical_bytes"]<=0:
+        raise SystemExit("verified sharing requires positive shared extent/physical bytes")
+elif v["physical_sharing"]=="unknown":
+    if v["shared_extent_bytes"] is not None or v["shared_physical_bytes"]!=0 or v["lane_exclusive_physical_bytes"]!=0 or "unattributed" not in v["physical_accounting"]:
+        raise SystemExit("unknown sharing must remain null/zero and explicitly unattributed")
+else: raise SystemExit("native-COW physical sharing is neither verified nor honestly unknown")
+PY
+  run_command "record-preview-$index" record_preview "$lane" false "" 0 trail lane record "$lane" --preview
+  json_payload_paths "$TRAIL_SCALE_OUTPUT/commands/record-preview-$index.json" changed_paths "$TRAIL_SCALE_OUTPUT/manifests/$lane.preview.txt"
+  cmp -s "$lane_manifest" "$TRAIL_SCALE_OUTPUT/manifests/$lane.preview.txt" || return 1
   run_command "record-$index" record "$lane" true "" 0 trail lane record "$lane" -m "scale record $lane"
   actual_record=$TRAIL_SCALE_OUTPUT/manifests/$lane.record.txt
   json_payload_paths "$TRAIL_SCALE_OUTPUT/commands/record-$index.json" changed_paths "$actual_record"
   cmp -s "$lane_manifest" "$actual_record" || { echo "$lane record manifest mismatch" >&2; return 1; }
   run_command "readiness-$index" readiness "$lane" true "" 0 trail lane readiness "$lane"
   [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/readiness-$index.json" ready) == true ]] || return 1
+  run_command "refresh-preview-$index" refresh_preview "$lane" false "" 0 trail lane refresh-preview "$lane" --target main
+  run_command "merge-dry-run-$index" merge_dry_run "$lane" false "" 0 trail lane merge "$lane" --into main --dry-run
   run_command "handoff-$index" handoff "$lane" true "" 0 trail lane handoff "$lane"
   python3 - "$lane" "$index" "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_FILES_PER_LANE" <<'PY'
 import json, pathlib, sys
@@ -762,7 +876,8 @@ if spawn["initialization_id"] != retry["initialization_id"] or spawn["request_fi
 row = [lane, spawn["initialization_id"], retry["initialization_id"], spawn["request_fingerprint"],
        retry["request_fingerprint"], spawn["workdir_mode"], spawn["workdir"], str(files), str(files), "0",
        str(space["logical_visible_bytes"]), str(space["filesystem_allocated_bytes"]),
-       str(space["lane_exclusive_physical_bytes"])]
+       str(space["lane_exclusive_physical_bytes"]),str(space["clone_count"]),str(space["shared_physical_bytes"]),
+       "" if space["shared_extent_bytes"] is None else str(space["shared_extent_bytes"]),str(space["changed_since_baseline_bytes"]),space["physical_sharing"],space["physical_sharing_evidence"]]
 (root/f"rows/lane-{index}.tsv").write_text("\t".join(row)+"\n")
 PY
 }
@@ -771,6 +886,7 @@ run_parallel_indices lane_workload || die "one or more concurrent lane workloads
 for ((index=0; index<TRAIL_SCALE_LANES; index++)); do
   lane=$(printf 'scale-%04d' "$index")
   run_command "queue-add-$index" queue_add "$lane" true "" 0 trail lane merge-queue add "$lane" --into main
+  run_command "queue-explain-$index" queue_explain "$lane" false "" 0 trail lane merge-queue explain "$lane"
 done
 capture_resource_inventory "$TRAIL_SCALE_OUTPUT/active-resources.json"
 run_command queue-run queue_run "" true "" 0 trail lane merge-queue run
@@ -778,13 +894,16 @@ run_command final-diff final_diff "" true "" 0 trail diff "$baseline_trail_commi
 json_payload_paths "$TRAIL_SCALE_OUTPUT/commands/final-diff.json" files "$TRAIL_SCALE_OUTPUT/final-trail-paths.txt"
 cmp -s "$expected_paths_file" "$TRAIL_SCALE_OUTPUT/final-trail-paths.txt" || die "final Trail manifest is not exact"
 
+run_command git-export-preview git_export_preview "" false "" 0 trail git export "$baseline_trail_commit..main" --output "$TRAIL_SCALE_OUTPUT/git-export-preview.patch"
+[[ -s $TRAIL_SCALE_OUTPUT/git-export-preview.patch ]] || die "Git patch export preview is empty"
 run_command git-export git_export "" true "" 0 trail git export "$baseline_trail_commit..main" -m "Trail lane scale $TRAIL_SCALE_RUN_ID"
 export_mode=$(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/git-export.json" performance.export_mode)
 [[ $export_mode == mapped_delta ]] || die "Git export did not use mapped_delta"
 export_commit=$(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/git-export.json" commit)
 export_parent=$(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/git-export.json" parent)
 [[ $export_parent == "$baseline_git_head" ]] || die "Git export parent does not match baseline Git HEAD"
-run_command git-update-ref git_ref "" true "" 0 git -C "$TRAIL_SCALE_REPO" update-ref "$TRAIL_SCALE_GIT_REF" "$export_commit" ""
+staging_ref=refs/trail-scale-staging/$TRAIL_SCALE_RUN_ID-$$
+run_command git-stage-ref git_ref_staging "" true "" 0 git -C "$TRAIL_SCALE_REPO" update-ref "$staging_ref" "$export_commit" ""
 git -C "$TRAIL_SCALE_REPO" diff-tree --no-commit-id --name-only -r "$export_commit" | LC_ALL=C sort > "$TRAIL_SCALE_OUTPUT/final-git-paths.txt"
 cmp -s "$expected_paths_file" "$TRAIL_SCALE_OUTPUT/final-git-paths.txt" || die "final Git manifest is not exact"
 capture_git_path_state "$export_commit" "$TRAIL_SCALE_OUTPUT/final-path-state.json"
@@ -847,7 +966,7 @@ PY
     rm -f "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe.json" "$TRAIL_SCALE_OUTPUT/commands/$command_id.probe-output.json"
   else
     [[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "executed fault-driver digest changed before $scenario"
-    run_command "$command_id" fault "" false "" 0 env TRAIL_FAULT_PROJECT_ROOT="$PROJECT_ROOT" "$fault_driver_executable" --fault-probe "$scenario"
+    run_command "$command_id" fault "" false "" 0 env TRAIL_FAULT_PROJECT_ROOT="$PROJECT_ROOT" TRAIL_SCALE_COMMAND_RUNNER="$SCRIPT_DIR/scale-command-runner.py" TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS="$TRAIL_SCALE_COMMAND_TIMEOUT_SECONDS" TRAIL_SCALE_MAX_OUTPUT_BYTES="$TRAIL_SCALE_MAX_OUTPUT_BYTES" "$fault_driver_executable" --fault-probe "$scenario"
     [[ $(sha256_file "$fault_driver_executable") == "$fault_driver_sha256" ]] || die "executed fault-driver digest changed after $scenario"
   fi
   python3 - "$TRAIL_SCALE_OUTPUT/commands/$command_id.json" "$command_id" "$TRAIL_SCALE_OUTPUT/rows/faultrow-$fault_index.tsv" "$trail_source_commit" "$candidate_binary_sha256" "$fault_qualification_kind" <<'PY'
@@ -870,7 +989,7 @@ else:
         raise SystemExit("focused fault probe must execute exactly one test")
     if not isinstance(payload["test_target"],str) or not payload["test_target"] or not isinstance(payload["test_name"],str) or not payload["test_name"]:
         raise SystemExit("focused fault probe lacks exact test identity")
-    evidence_kind="focused_test_aggregate" if sys.argv[5] == "candidate_harness" else "externally_attested_focused_test"
+    evidence_kind="aggregate_source_test" if sys.argv[5] == "candidate_harness" else "externally_attested_source_test"
     binary_exercised=False
 base_keys=keys[:10]
 values=[payload[k] for k in base_keys]+[sys.argv[2],evidence_kind,sys.argv[4],sys.argv[5],binary_exercised,payload["test_target"],payload["test_name"],payload["test_count"]]
@@ -891,7 +1010,7 @@ for marker in "$owned_lanes_dir"/*; do
 done
 run_command trail-doctor integrity "" true "" 0 trail doctor
 run_command trail-fsck integrity "" true "" 0 trail fsck
-run_command git-fsck integrity "" true "" 0 git -C "$TRAIL_SCALE_REPO" fsck --no-dangling
+run_command git-fsck integrity "" true "" 0 git -C "$TRAIL_SCALE_REPO" fsck --full
 capture_resource_inventory "$TRAIL_SCALE_OUTPUT/final-resources.json"
 rm -rf -- "$owned_lanes_dir"
 
@@ -901,6 +1020,11 @@ for ((index=0; index<fault_index; index++)); do cat "$TRAIL_SCALE_OUTPUT/rows/fa
 rm -rf -- "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs"
 
 db_bytes_after=$(stat -f %z "$db_path" 2>/dev/null || stat -c %s "$db_path")
+db_wal_bytes_after=$(file_bytes "$db_path-wal")
+db_shm_bytes_after=$(file_bytes "$db_path-shm")
+repo_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_REPO")
+trail_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_REPO/.trail")
+output_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_OUTPUT")
 observer_log_bytes_after=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -exec stat -f %z {} \; 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
 if [[ -z $observer_log_bytes_after ]]; then
   observer_log_bytes_after=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
@@ -920,7 +1044,7 @@ print(len(json.load(open(sys.argv[1], encoding="utf-8"))["entries"]))
 PY
 )
 [[ $final_git_head == "$baseline_git_head" && $final_git_branch == "$baseline_git_branch" && $final_git_index == "$baseline_git_index" ]] || die "original Git branch/index changed"
-dedicated_ref_target=$(git -C "$TRAIL_SCALE_REPO" rev-parse "$TRAIL_SCALE_GIT_REF")
+dedicated_ref_target=$export_commit
 commit_count=$(git -C "$TRAIL_SCALE_REPO" rev-list --count "$baseline_git_head..$dedicated_ref_target")
 filesystem_type() {
   python3 - "$1" <<'PY'
@@ -961,9 +1085,9 @@ data={
 json.dump(data,open(out,"w"),sort_keys=True);open(out,"a").write("\n")
 PY
 
-python3 - "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" "$TRAIL_SCALE_CONCURRENCY" "$TRAIL_SCALE_FAULT_PHASE" "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" "$TRAIL_SCALE_REPO" "$trail_source_commit" "$baseline_trail_ref" "$baseline_trail_commit" "$baseline_trail_root" "$baseline_git_head" "$baseline_git_branch" "$baseline_git_index" "$repo_filesystem" "$db_bytes_before" "$db_bytes_after" "$observer_log_bytes_before" "$observer_log_bytes_after" "$export_commit" "$export_parent" "$TRAIL_SCALE_GIT_REF" "$dedicated_ref_target" "$commit_count" "$dirty_refusal_code" "$tracked_worktree_clean" "$index_clean" "$preexisting_untracked_count" <<'PY'
+python3 - "$TRAIL_SCALE_OUTPUT" "$TRAIL_SCALE_RUN_ID" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" "$TRAIL_SCALE_CONCURRENCY" "$TRAIL_SCALE_FAULT_PHASE" "$TRAIL_SCALE_LATENCY_CEILING_SECONDS" "$TRAIL_SCALE_REPO" "$trail_source_commit" "$baseline_trail_ref" "$baseline_trail_commit" "$baseline_trail_root" "$baseline_git_head" "$baseline_git_branch" "$baseline_git_index" "$repo_filesystem" "$db_bytes_before" "$db_bytes_after" "$observer_log_bytes_before" "$observer_log_bytes_after" "$export_commit" "$export_parent" "$TRAIL_SCALE_GIT_REF" "$dedicated_ref_target" "$commit_count" "$dirty_refusal_code" "$tracked_worktree_clean" "$index_clean" "$preexisting_untracked_count" "$db_wal_bytes_before" "$db_wal_bytes_after" "$db_shm_bytes_before" "$db_shm_bytes_after" "$repo_disk_bytes_before" "$repo_disk_bytes_after" "$trail_disk_bytes_before" "$trail_disk_bytes_after" "$output_disk_bytes_after" <<'PY'
 import csv,json,math,pathlib,sys
-(root,run_id,lanes,files,concurrency,fault_phase,ceiling,repo,trail_source,trail_ref,trail_commit,trail_root,git_head,git_branch,git_index,filesystem,db_before,db_after,log_before,log_after,export_commit,export_parent,dedicated_ref,dedicated_target,commit_count,dirty_code,tracked_clean,index_clean,untracked_count)=sys.argv[1:]
+(root,run_id,lanes,files,concurrency,fault_phase,ceiling,repo,trail_source,trail_ref,trail_commit,trail_root,git_head,git_branch,git_index,filesystem,db_before,db_after,log_before,log_after,export_commit,export_parent,dedicated_ref,dedicated_target,commit_count,dirty_code,tracked_clean,index_clean,untracked_count,wal_before,wal_after,shm_before,shm_after,repo_disk_before,repo_disk_after,trail_disk_before,trail_disk_after,output_disk_after)=sys.argv[1:]
 root=pathlib.Path(root); lanes=int(lanes); files=int(files)
 with open(root/"results.tsv") as f: results=list(csv.DictReader(f,delimiter="\t"))
 with open(root/"lanes.tsv") as f: lane_rows=list(csv.DictReader(f,delimiter="\t"))
@@ -1008,8 +1132,8 @@ baseline_by_path={row["path"]:row for row in baseline_path_state["entries"]}
 final_by_path={row["path"]:row for row in final_path_state["entries"]}
 deleted_paths=set(baseline_by_path)-set(final_by_path)
 modified_baseline={path for path in set(baseline_by_path)&set(final_by_path) if baseline_by_path[path] != final_by_path[path]}
-unexpected_changes=[row for row in path_changes if row["status"] != "A" or row["path"] not in set(expected_paths)]
-added_changes={row["path"] for row in path_changes if row["status"] == "A"}
+unexpected_changes=[row for row in path_changes if row["status"] != "M" or row["path"] not in set(expected_paths)]
+changed_paths={row["path"] for row in path_changes if row["status"] == "M"}
 doctor_wrapper=json.load(open(root/"commands/trail-doctor.json")); fsck_wrapper=json.load(open(root/"commands/trail-fsck.json")); git_fsck_wrapper=json.load(open(root/"commands/git-fsck.json"))
 integrity_commands={
  "trail-doctor":doctor_wrapper["actual_exit_code"] == 0 and isinstance(doctor_wrapper.get("payload"),dict) and doctor_wrapper["payload"].get("status")=="ok",
@@ -1017,12 +1141,12 @@ integrity_commands={
  "git-fsck":git_fsck_wrapper["actual_exit_code"] == 0,
 }
 metrics={
- "schema_version":5,
+ "schema_version":6,
  "run":{"run_id":run_id,"lanes":lanes,"files_per_lane":files,"concurrency":int(concurrency),"fault_phase":fault_phase,"latency_ceiling_seconds":float(ceiling)},
  "baseline":{"trail_commit":trail_commit,"trail_source_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
- "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline)+len(added_changes^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
+ "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline^set(expected_paths))+len(changed_paths^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
  "performance":{"spawn":perf("spawn"),"record":perf("record"),"queue_run":perf("queue_run"),"git_export":perf("git_export"),"latency_ceiling_enforced":lanes<=64},
- "storage":{"db_bytes_before":int(db_before),"db_bytes_after":int(db_after),"observer_log_bytes_before":int(log_before),"observer_log_bytes_after":int(log_after),"logical_lane_bytes":sum(int(r["logical_bytes"]) for r in lane_rows),"allocated_lane_bytes":sum(int(r["allocated_bytes"]) for r in lane_rows),"exclusive_lane_bytes":sum(int(r["exclusive_bytes"]) for r in lane_rows)},
+ "storage":{"db_bytes_before":int(db_before),"db_bytes_after":int(db_after),"db_wal_bytes_before":int(wal_before),"db_wal_bytes_after":int(wal_after),"db_shm_bytes_before":int(shm_before),"db_shm_bytes_after":int(shm_after),"repo_disk_bytes_before":int(repo_disk_before),"repo_disk_bytes_after":int(repo_disk_after),"trail_disk_bytes_before":int(trail_disk_before),"trail_disk_bytes_after":int(trail_disk_after),"output_disk_bytes_after":int(output_disk_after),"observer_log_bytes_before":int(log_before),"observer_log_bytes_after":int(log_after),"logical_lane_bytes":sum(int(r["logical_bytes"]) for r in lane_rows),"allocated_lane_bytes":sum(int(r["allocated_bytes"]) for r in lane_rows),"exclusive_lane_bytes":sum(int(r["exclusive_bytes"]) for r in lane_rows),"clone_count":sum(int(r["clone_count"]) for r in lane_rows),"shared_physical_bytes":sum(int(r["shared_physical_bytes"]) for r in lane_rows),"shared_extent_bytes":sum(int(r["shared_extent_bytes"] or 0) for r in lane_rows),"changed_bytes":sum(int(r["changed_bytes"]) for r in lane_rows)},
  "git_export":{"export_mode":export["performance"]["export_mode"],"changed_path_count":export["performance"]["changed_path_count"],"commit_count":int(commit_count),"commit":export_commit,"parent":export_parent,"dedicated_ref":dedicated_ref,"dedicated_ref_target":dedicated_target,"original_head_unchanged":True,"original_branch_unchanged":True,"original_index_unchanged":True,"dirty_refusal_code":dirty_code,"unexpected_path_count":len(set(git_paths)^set(expected_paths))},
  "cleanup":cleanup,
  "audit_history":{"retired_lane_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["lanes"]),"removed_lane_branch_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["lane_branches"]),"terminal_queue_rows":sum(row.get("lane_id") in run_lane_ids for row in final_resources["merge_queue"])},
@@ -1042,5 +1166,8 @@ json.dump(data,open(path,"w"),sort_keys=True);open(path,"a").write("\n")
 PY
 (cd "$TRAIL_SCALE_OUTPUT" && find . -type f ! -name evidence-manifest.sha256 ! -name checker.out ! -name checker.err -print | LC_ALL=C sort | sed 's#^./##' | while IFS= read -r file; do digest=$(shasum -a 256 "$file" | awk '{print $1}'); printf '%s  %s\n' "$digest" "$file"; done > evidence-manifest.sha256)
 python3 "$SCRIPT_DIR/check-real-repo-lane-scale.py" "$TRAIL_SCALE_OUTPUT" | tee "$TRAIL_SCALE_OUTPUT/checker.out"
+git -C "$TRAIL_SCALE_REPO" update-ref -d "$staging_ref"
+staging_ref=
+git -C "$TRAIL_SCALE_REPO" update-ref "$TRAIL_SCALE_GIT_REF" "$export_commit" ""
 trap - EXIT INT TERM
 echo "real-repository lane scale evidence: $TRAIL_SCALE_OUTPUT"

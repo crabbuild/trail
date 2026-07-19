@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
@@ -25,6 +25,8 @@ LANE_COLUMNS = [
     "retry_request_fingerprint", "workdir_mode", "workdir", "edit_count",
     "recorded_path_count", "isolation_unexpected_count", "logical_bytes",
     "allocated_bytes", "exclusive_bytes",
+    "clone_count", "shared_physical_bytes", "shared_extent_bytes", "changed_bytes",
+    "physical_sharing", "physical_sharing_evidence",
 ]
 FAULT_COLUMNS = [
     "scenario", "expected_code", "actual_code", "durable_phase", "committed",
@@ -422,7 +424,7 @@ def percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
-def check_manifest(root: Path) -> set[str]:
+def check_manifest(root: Path) -> dict[str, str]:
     manifest_path = root / "evidence-manifest.sha256"
     entries: dict[str, str] = {}
     try:
@@ -455,7 +457,7 @@ def check_manifest(root: Path) -> set[str]:
         fail(f"evidence file set mismatch: missing={sorted(expected_files-actual_files)} unknown={sorted(actual_files-expected_files)}")
     if not ROOT_FILES.issubset(actual_files):
         fail(f"missing root evidence files: {sorted(ROOT_FILES-actual_files)}")
-    return set(entries)
+    return entries
 
 
 def check(root: Path) -> dict[str, Any]:
@@ -463,6 +465,12 @@ def check(root: Path) -> dict[str, Any]:
         fail("artifact directory must be a real directory")
     manifest_entries = check_manifest(root)
     environment = check_environment(root / "environment.json")
+    candidate_path = (root / "candidate-trail").resolve()
+    if Path(environment["binary"]["path"]).resolve() != candidate_path:
+        fail("environment binary path is not the immutable evidence copy")
+    if ("candidate-trail" not in manifest_entries
+            or manifest_entries["candidate-trail"] != environment["binary"]["sha256"]):
+        fail("immutable candidate binary is not digest-bound in the evidence manifest")
     baseline_resources = read_resource_inventory(root / "baseline-resources.json")
     runtime_resources = read_resource_inventory(root / "runtime-resources.json")
     active_resources = read_resource_inventory(root / "active-resources.json")
@@ -553,6 +561,21 @@ def check(root: Path) -> dict[str, Any]:
         for suffix in ("json", "stdout", "stderr", "rss"):
             relative = f"commands/{command_id}.{suffix}"
             if relative not in manifest_entries: fail(f"missing command evidence {relative}")
+        supervisor_relative = f"commands/{command_id}.supervisor.json"
+        if supervisor_relative not in manifest_entries: fail(f"missing command supervisor evidence {supervisor_relative}")
+        supervisor = read_json(root / supervisor_relative)
+        exact_keys(supervisor, ["schema_version", "elapsed_seconds", "peak_process_tree_rss_bytes", "timed_out",
+                                "interrupted_signal", "stdout_truncated", "stderr_truncated",
+                                "max_output_bytes_per_stream"], f"{command_id} supervisor")
+        if supervisor["schema_version"] != 1 or boolean(supervisor["timed_out"], f"{command_id}.timed_out"):
+            fail(f"{command_id}: command timed out")
+        if supervisor["interrupted_signal"] is not None:
+            fail(f"{command_id}: command was interrupted")
+        if boolean(supervisor["stdout_truncated"], f"{command_id}.stdout_truncated") or boolean(supervisor["stderr_truncated"], f"{command_id}.stderr_truncated"):
+            fail(f"{command_id}: command evidence was truncated")
+        if integer(supervisor["peak_process_tree_rss_bytes"], f"{command_id}.peak_process_tree_rss_bytes", 1) != int(row["peak_rss_bytes"]):
+            fail(f"{command_id}: process-tree RSS differs from results.tsv")
+        integer(supervisor["max_output_bytes_per_stream"], f"{command_id}.max_output_bytes_per_stream", 1)
     baseline_status_rows = [row for row in results
                             if row["command_id"] == "baseline-status" and row["phase"] == "baseline"]
     if len(baseline_status_rows) != 1:
@@ -583,6 +606,17 @@ def check(root: Path) -> dict[str, Any]:
         parse_int(row["logical_bytes"], f"{lane} logical_bytes", 1)
         parse_int(row["allocated_bytes"], f"{lane} allocated_bytes", 1)
         parse_int(row["exclusive_bytes"], f"{lane} exclusive_bytes")
+        parse_int(row["clone_count"], f"{lane} clone_count", 1)
+        shared_physical = parse_int(row["shared_physical_bytes"], f"{lane} shared_physical_bytes")
+        parse_int(row["changed_bytes"], f"{lane} changed_bytes", 1)
+        if not row["physical_sharing_evidence"]: fail(f"{lane}: physical sharing evidence is missing")
+        if row["physical_sharing"] == "verified":
+            parse_int(row["shared_extent_bytes"], f"{lane} shared_extent_bytes", 1)
+            if shared_physical <= 0: fail(f"{lane}: verified sharing requires positive shared bytes")
+        elif row["physical_sharing"] == "unknown":
+            if row["shared_extent_bytes"] or shared_physical != 0 or parse_int(row["exclusive_bytes"], f"{lane} exclusive_bytes") != 0:
+                fail(f"{lane}: unknown sharing must keep extent and attribution empty/zero")
+        else: fail(f"{lane}: physical sharing is neither verified nor honestly unknown")
         for phase in LANE_PHASES:
             matches = [r for r in results if r["lane"] == lane and r["phase"] == phase]
             if len(matches) != 1: fail(f"{lane}: expected exactly one {phase} command, got {len(matches)}")
@@ -679,10 +713,19 @@ def check(root: Path) -> dict[str, Any]:
     if len(expected_paths) != expected_count: fail(f"expected-paths count must be exactly {expected_count}")
     if expected_paths != final_trail_paths: fail("final Trail path manifest differs from expected paths")
     if expected_paths != final_git_paths: fail("final Git path manifest differs from expected paths")
+    allocated: list[str] = []
     for lane in lane_names:
-        prefix = f".trail-scale/{run['run_id']}/{lane}/"
-        lane_paths = [path for path in expected_paths if path.startswith(prefix)]
-        if len(lane_paths) != files_per_lane: fail(f"{lane}: expected-path allocation is not exact/disjoint")
+        lane_index = int(lane.removeprefix("scale-"))
+        status = read_json(root / f"commands/status-{lane_index}.json").get("payload")
+        changed = status.get("workdir_changed_paths") if isinstance(status, dict) else None
+        if not isinstance(changed, list) or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) for row in changed):
+            fail(f"{lane}: status lacks exact path allocation evidence")
+        lane_paths = sorted(row["path"] for row in changed)
+        if len(lane_paths) != files_per_lane or len(set(lane_paths)) != files_per_lane:
+            fail(f"{lane}: expected-path allocation is not exact/disjoint")
+        allocated.extend(lane_paths)
+    if sorted(allocated) != expected_paths or len(set(allocated)) != expected_count:
+        fail("lane path allocations are not collectively exact and disjoint")
 
     baseline_tree, baseline_entries = read_path_state(root / "baseline-path-state.json")
     final_tree, final_entries = read_path_state(root / "final-path-state.json")
@@ -699,9 +742,11 @@ def check(root: Path) -> dict[str, Any]:
     change_deleted = sorted(row["path"] for row in path_changes if row["status"] == "D")
     if deleted_paths != change_deleted:
         fail("false deletion evidence disagrees with exact path state")
-    added_changes = sorted(row["path"] for row in path_changes if row["status"] == "A")
+    modified_changes = sorted(row["path"] for row in path_changes if row["status"] == "M")
     unexpected_change_rows = [row for row in path_changes
-                              if row["status"] != "A" or row["path"] not in set(expected_paths)]
+                              if row["status"] != "M" or row["path"] not in set(expected_paths)]
+    if any(path not in baseline_by_path for path in expected_paths):
+        fail("expected edits must target existing baseline paths")
 
     correctness = metrics["correctness"]
     if not isinstance(correctness, dict): fail("correctness must be an object")
@@ -714,8 +759,9 @@ def check(root: Path) -> dict[str, Any]:
         "missing_lanes": len(set(lane_names) - set(active_lanes)),
         "unintended_paths": (len(set(final_trail_paths) ^ set(expected_paths))
                              + len(set(final_git_paths) ^ set(expected_paths))
-                             + len(unexpected_change_rows) + len(modified_baseline)
-                             + len(set(added_changes) ^ set(expected_paths))),
+                             + len(unexpected_change_rows)
+                             + len(set(modified_baseline) ^ set(expected_paths))
+                             + len(set(modified_changes) ^ set(expected_paths))),
         "integrity_errors": 0,
         "live_locks": resource_added_count(runtime_resources, final_resources, "lock_paths") + resource_added_count(runtime_resources, final_resources, "leases"),
     }
@@ -747,10 +793,28 @@ def check(root: Path) -> dict[str, Any]:
 
     storage = metrics["storage"]
     if not isinstance(storage, dict): fail("storage must be an object")
-    exact_keys(storage, ["db_bytes_before", "db_bytes_after", "observer_log_bytes_before", "observer_log_bytes_after", "logical_lane_bytes", "allocated_lane_bytes", "exclusive_lane_bytes"], "storage")
+    exact_keys(storage, ["db_bytes_before", "db_bytes_after", "db_wal_bytes_before", "db_wal_bytes_after",
+                         "db_shm_bytes_before", "db_shm_bytes_after", "repo_disk_bytes_before", "repo_disk_bytes_after",
+                         "trail_disk_bytes_before", "trail_disk_bytes_after", "output_disk_bytes_after",
+                         "observer_log_bytes_before", "observer_log_bytes_after", "logical_lane_bytes",
+                         "allocated_lane_bytes", "exclusive_lane_bytes", "clone_count", "shared_physical_bytes",
+                         "shared_extent_bytes", "changed_bytes"], "storage")
     for key in storage:
         integer(storage[key], f"storage.{key}")
     if storage["db_bytes_before"] <= 0 or storage["db_bytes_after"] <= 0: fail("database byte evidence must be non-zero")
+    for key in ["repo_disk_bytes_before", "repo_disk_bytes_after", "trail_disk_bytes_before", "trail_disk_bytes_after", "output_disk_bytes_after", "clone_count", "changed_bytes"]:
+        if storage[key] <= 0: fail(f"storage.{key} must be positive")
+    derived_storage = {
+        "logical_lane_bytes": sum(int(row["logical_bytes"]) for row in lane_rows),
+        "allocated_lane_bytes": sum(int(row["allocated_bytes"]) for row in lane_rows),
+        "exclusive_lane_bytes": sum(int(row["exclusive_bytes"]) for row in lane_rows),
+        "clone_count": sum(int(row["clone_count"]) for row in lane_rows),
+        "shared_physical_bytes": sum(int(row["shared_physical_bytes"]) for row in lane_rows),
+        "shared_extent_bytes": sum(int(row["shared_extent_bytes"] or 0) for row in lane_rows),
+        "changed_bytes": sum(int(row["changed_bytes"]) for row in lane_rows),
+    }
+    for key, expected in derived_storage.items():
+        if storage[key] != expected: fail(f"storage.{key} does not match lane evidence")
     if storage["logical_lane_bytes"] != sum(int(row["logical_bytes"]) for row in lane_rows): fail("logical lane bytes do not match lanes.tsv")
     if storage["allocated_lane_bytes"] != sum(int(row["allocated_bytes"]) for row in lane_rows): fail("allocated lane bytes do not match lanes.tsv")
     if storage["exclusive_lane_bytes"] != sum(int(row["exclusive_bytes"]) for row in lane_rows): fail("exclusive lane bytes do not match lanes.tsv")
@@ -789,9 +853,9 @@ def check(root: Path) -> dict[str, Any]:
             if row["test_target"] or row["test_name"] or parse_int(row["test_count"], f"{scenario} test_count") != 0:
                 fail(f"{scenario}: harness control must not claim a Cargo test")
         else:
-            expected_kind = ("focused_test_aggregate"
+            expected_kind = ("aggregate_source_test"
                              if environment["fault_driver"]["qualification_kind"] == "candidate_harness"
-                             else "externally_attested_focused_test")
+                             else "externally_attested_source_test")
             if row["evidence_kind"] != expected_kind or row["binary_exercised"] != "false" or row["integrity_result"] != "focused_test_exit_0":
                 fail(f"{scenario}: focused-test evidence linkage is malformed")
             if row["initialization_id"] or row["retry_initialization_id"]:
