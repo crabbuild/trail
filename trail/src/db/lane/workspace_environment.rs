@@ -3090,19 +3090,10 @@ impl Trail {
         ) {
             ensure_restricted_recipe_sandbox_available()?;
         }
-        #[cfg(target_os = "windows")]
-        let staging_parent = std::env::temp_dir();
-        #[cfg(not(target_os = "windows"))]
-        let staging_parent = PathBuf::from("/tmp");
-        if !staging_parent.is_dir() {
-            return Err(Error::InvalidInput(
-                "writable-private environment staging requires an available host temporary directory"
-                    .to_string(),
-            ));
-        }
+        let staging_parent = workspace_environment_temporary_parent()?;
         let staging = tempfile::Builder::new()
             .prefix("trail-private-environment-")
-            .tempdir_in(staging_parent)?;
+            .tempdir_in(&staging_parent)?;
         let root = fs::canonicalize(staging.path())?;
         let restricted = matches!(
             plan.sandbox_policy,
@@ -3136,19 +3127,10 @@ impl Trail {
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         ) {
             ensure_restricted_recipe_sandbox_available()?;
-            #[cfg(target_os = "windows")]
-            let sandbox_parent = std::env::temp_dir();
-            #[cfg(not(target_os = "windows"))]
-            let sandbox_parent = Path::new("/tmp");
-            if !sandbox_parent.is_dir() {
-                return Err(Error::InvalidInput(
-                    "restricted command recipes require an available host temporary directory"
-                        .to_string(),
-                ));
-            }
+            let sandbox_parent = workspace_environment_temporary_parent()?;
             let sandbox = tempfile::Builder::new()
                 .prefix("trail-environment-")
-                .tempdir_in(sandbox_parent)?;
+                .tempdir_in(&sandbox_parent)?;
             let sandbox_root = fs::canonicalize(sandbox.path())?;
             let outputs =
                 self.execute_workspace_environment_plan_in_directory(plan, &sandbox_root, true)?;
@@ -5689,6 +5671,28 @@ fn ensure_restricted_recipe_sandbox_available() -> Result<()> {
     }
 }
 
+pub(super) fn workspace_environment_temporary_parent() -> Result<PathBuf> {
+    let candidate = std::env::temp_dir();
+    validate_workspace_environment_temporary_parent(&candidate)
+}
+
+fn validate_workspace_environment_temporary_parent(candidate: &Path) -> Result<PathBuf> {
+    if !candidate.is_absolute() {
+        return Err(Error::InvalidInput(format!(
+            "workspace environment temporary directory `{}` is not absolute",
+            candidate.display()
+        )));
+    }
+    let canonical = fs::canonicalize(candidate)?;
+    if !canonical.is_dir() {
+        return Err(Error::InvalidInput(format!(
+            "workspace environment temporary path `{}` is not a directory",
+            candidate.display()
+        )));
+    }
+    Ok(canonical)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn sandbox_profile_escape(path: &Path) -> String {
     path.to_string_lossy()
@@ -5699,6 +5703,28 @@ pub(super) fn sandbox_profile_escape(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_environment_temporary_parent_honors_process_configuration() {
+        assert_eq!(
+            workspace_environment_temporary_parent().unwrap(),
+            fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_environment_temporary_parent_rejects_relative_paths() {
+        let error =
+            validate_workspace_environment_temporary_parent(Path::new("relative/tmp")).unwrap_err();
+        assert!(error.to_string().contains("is not absolute"));
+    }
+
+    #[test]
+    fn workspace_environment_temporary_parent_rejects_files() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = validate_workspace_environment_temporary_parent(file.path()).unwrap_err();
+        assert!(error.to_string().contains("is not a directory"));
+    }
 
     fn cache_test_plan(
         db: &Trail,

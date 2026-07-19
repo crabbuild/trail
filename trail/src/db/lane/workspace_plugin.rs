@@ -17,7 +17,8 @@ use trail_environment_adapter_sdk::{
 };
 
 use super::workspace_environment::{
-    WorkspaceEnvironmentCache, WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
+    workspace_environment_temporary_parent, WorkspaceEnvironmentCache,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
     WorkspaceEnvironmentCommand, WorkspaceEnvironmentDependency, WorkspaceEnvironmentEdgeType,
     WorkspaceEnvironmentExternalArtifact, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
     WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
@@ -1124,18 +1125,10 @@ impl Trail {
         let mut request_bytes = Vec::new();
         write_frame(&mut request_bytes, request, MAX_FRAME_BYTES)
             .map_err(|error| Error::Serialization(error.to_string()))?;
-        #[cfg(target_os = "windows")]
-        let sandbox_parent = std::env::temp_dir();
-        #[cfg(not(target_os = "windows"))]
-        let sandbox_parent = PathBuf::from("/tmp");
-        if !sandbox_parent.is_dir() {
-            return Err(Error::InvalidInput(
-                "adapter plugins require an available host temporary directory".to_string(),
-            ));
-        }
+        let sandbox_parent = workspace_environment_temporary_parent()?;
         let sandbox = tempfile::Builder::new()
             .prefix("trail-adapter-plugin-")
-            .tempdir_in(sandbox_parent)?;
+            .tempdir_in(&sandbox_parent)?;
         let sandbox_root = fs::canonicalize(sandbox.path())?;
         let executable_name = plugin
             .executable_path
