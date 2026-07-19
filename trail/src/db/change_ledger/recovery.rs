@@ -2315,6 +2315,7 @@ fn scopes_with_pending_intents(conn: &Connection) -> Result<Vec<ExpectedScope>> 
 mod harness {
     use rusqlite::{params, Connection};
     use std::fs::OpenOptions;
+    use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -4588,7 +4589,7 @@ mod harness {
                 .env("TRAIL_TEST_DELETION_CRASH_WORKSPACE", root.path())
                 .env("TRAIL_TEST_DELETION_CRASH_LANE", &lane)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             wait_for_crash_handshake(&mut child, &ready, phase);
@@ -4730,7 +4731,7 @@ mod harness {
                     &fixture.db.workspace_root,
                 )
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             wait_for_crash_handshake(&mut child, &ready, phase);
@@ -5037,7 +5038,7 @@ mod harness {
             .env("TRAIL_TEST_BACKUP_RESTORE_WORKSPACE", workspace)
             .env("TRAIL_TEST_BACKUP_RESTORE_BACKUP", backup)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if phase == "restore_during_rollback" {
             command.env("TRAIL_TEST_RESTORE_FORCE_ROLLBACK", "1");
         }
@@ -5052,17 +5053,78 @@ mod harness {
         ready: &std::path::Path,
         phase: &str,
     ) {
+        const MAX_CRASH_HELPER_STDERR: usize = 64 * 1024;
+        let mut stderr = child
+            .stderr
+            .take()
+            .expect("changed-path crash helper stderr must be piped");
+        let stderr_drain = std::thread::spawn(move || {
+            let mut retained = Vec::with_capacity(MAX_CRASH_HELPER_STDERR);
+            let mut buffer = [0_u8; 8192];
+            let mut truncated = false;
+            let mut read_error = None;
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let remaining = MAX_CRASH_HELPER_STDERR.saturating_sub(retained.len());
+                        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                        truncated |= read > remaining;
+                    }
+                    Err(error) => {
+                        read_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            (retained, truncated, read_error)
+        });
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if ready.is_file() {
                 return;
             }
             if let Some(status) = child.try_wait().unwrap() {
-                panic!("changed-path crash helper exited at {phase} before handshake: {status}");
+                let diagnostics = crash_helper_stderr_diagnostics(stderr_drain);
+                panic!(
+                    "changed-path crash helper exited at phase {phase} before handshake; \
+                     child status: {status}; stderr: {diagnostics}"
+                );
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("timed out waiting for changed-path crash helper at {phase}");
+        let _ = child.kill();
+        let status = child
+            .wait()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("unavailable ({error})"));
+        let diagnostics = crash_helper_stderr_diagnostics(stderr_drain);
+        panic!(
+            "timed out waiting for changed-path crash helper at phase {phase}; \
+             child status: {status}; stderr: {diagnostics}"
+        );
+    }
+
+    fn crash_helper_stderr_diagnostics(
+        drain: std::thread::JoinHandle<(Vec<u8>, bool, Option<String>)>,
+    ) -> String {
+        match drain.join() {
+            Ok((bytes, truncated, read_error)) => {
+                let mut diagnostics = if bytes.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                if truncated {
+                    diagnostics.push_str(" [truncated at 65536 bytes]");
+                }
+                if let Some(error) = read_error {
+                    diagnostics.push_str(&format!(" [stderr read failed: {error}]"));
+                }
+                diagnostics
+            }
+            Err(_) => "<stderr drain panicked>".to_string(),
+        }
     }
 
     fn run_real_crash_scenario(workspace: &std::path::Path) -> Result<()> {
@@ -5158,15 +5220,18 @@ mod harness {
         }])?;
         let durable = writer.flush_durable()?;
         writer.rotate()?;
-        drop(writer);
         db.conn.execute(
-            "UPDATE changed_path_observer_owners SET provider_identity=?1,fence_nonce=?2
-             WHERE scope_id=?3",
+            "UPDATE changed_path_observer_owners
+             SET provider_identity=?1,fence_nonce=?2 WHERE scope_id=?3",
             params![
                 hex::encode(&expected.provider_identity),
                 b"crash-fence".as_slice(),
                 scope_id,
             ],
+        )?;
+        db.conn.execute(
+            "UPDATE changed_path_scopes SET observer_owner_token=?1 WHERE scope_id=?2",
+            params![hex::encode(owner_token), scope_id],
         )?;
         db.conn.execute(
             "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
@@ -5249,7 +5314,9 @@ mod harness {
             complete_policy_interval: true,
             persisted_evidence_through_end: true,
         };
-        mark_filesystem_applied(&ledger, &expected, &intent, &proof)?;
+        let filesystem_applied = mark_filesystem_applied(&ledger, &expected, &intent, &proof);
+        drop(writer);
+        filesystem_applied?;
 
         db.conn.execute(
             "UPDATE refs SET change_id=?1,root_id=?2,operation_id=?3,generation=?4,updated_at=?5

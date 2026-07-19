@@ -821,28 +821,43 @@ mod tests {
 
     #[test]
     fn missing_and_empty_legacy_git_config_selectors_are_persisted() {
-        for (value, target) in [
-            (
-                OsString::from("config/missing-legacy.gitconfig"),
-                PathBuf::from("config/missing-legacy.gitconfig"),
-            ),
-            (OsString::new(), PathBuf::new()),
-        ] {
-            let mut fixture = Fixture::new();
-            fixture.git_env.push(("GIT_CONFIG".into(), value));
+        let mut missing_fixture = Fixture::new();
+        missing_fixture.git_env.push((
+            "GIT_CONFIG".into(),
+            "config/missing-legacy.gitconfig".into(),
+        ));
+        let missing = missing_fixture.compile(&mut PolicyDependencyMetrics::default());
+        let missing_path = lexical_normalize(
+            &missing_fixture
+                .root()
+                .join("config/missing-legacy.gitconfig"),
+        );
+        assert!(missing.dependencies.iter().any(|dependency| {
+            dependency.kind == PolicyDependencyKind::GitConfig
+                && dependency.identity == dependency_path_identity_with_case(&missing_path, true)
+        }));
 
-            let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
-            let target = lexical_normalize(&fixture.root().join(target));
+        let absent_fixture = Fixture::new();
+        let absent = absent_fixture.compile(&mut PolicyDependencyMetrics::default());
+        let mut empty_fixture = Fixture::new();
+        empty_fixture
+            .git_env
+            .push(("GIT_CONFIG".into(), OsString::new()));
+        let empty = empty_fixture.compile(&mut PolicyDependencyMetrics::default());
+        let selector_identity = format!(
+            "git-env:{}",
+            hex::encode(os_str_bytes(OsStr::new("GIT_CONFIG")))
+        );
 
-            assert!(
-                policy.dependencies.iter().any(|dependency| {
-                    dependency.kind == PolicyDependencyKind::GitConfig
-                        && dependency.identity == dependency_path_identity_with_case(&target, true)
-                }),
-                "missing selected config dependency {}",
-                target.display()
-            );
-        }
+        assert_ne!(absent.fingerprint, empty.fingerprint);
+        assert!(empty.dependencies.iter().any(|dependency| {
+            dependency.kind == PolicyDependencyKind::GitConfig
+                && dependency.identity == selector_identity
+                && dependency.content_identity == digest(b"")
+        }));
+        assert!(!empty.dependencies.iter().any(|dependency| {
+            dependency.identity == dependency_path_identity_with_case(empty_fixture.root(), true)
+        }));
     }
 
     #[test]
@@ -2401,12 +2416,14 @@ fn discover_git_dependencies(
         .map(|path| resolve_git_cwd_path(&cwd, path))
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
     if let Some(selected) = git_environment_value(context, "GIT_CONFIG") {
-        insert_git_dependency_path(
-            &mut paths,
-            context.case_sensitive,
-            resolve_git_cwd_path(&cwd, PathBuf::from(selected)),
-            PolicyDependencyKind::GitConfig,
-        );
+        if !selected.is_empty() {
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
+                resolve_git_cwd_path(&cwd, PathBuf::from(selected)),
+                PolicyDependencyKind::GitConfig,
+            );
+        }
     }
     if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
         if !global.is_empty() {

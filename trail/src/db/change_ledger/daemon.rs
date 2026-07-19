@@ -370,6 +370,7 @@ fn prepare_materialized_lane_daemon_inner(
                 startup_policy_retry_delay(retries);
                 continue;
             }
+            Err(error @ Error::ChangeLedgerReconcileRequired { .. }) => return Err(error),
             Err(error) => {
                 return Err(Error::DaemonUnavailable(format!(
                     "materialized-lane observer startup failed: {error}"
@@ -393,6 +394,7 @@ fn prepare_materialized_lane_daemon_inner(
                 retries += 1;
                 startup_policy_retry_delay(retries);
             }
+            Err(error @ Error::ChangeLedgerReconcileRequired { .. }) => return Err(error),
             Err(error) => {
                 return Err(Error::DaemonUnavailable(format!(
                     "materialized-lane initial full reconciliation failed: {error}"
