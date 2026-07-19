@@ -120,31 +120,31 @@ impl Trail {
             owners.push(view.view_id.as_str());
         }
         let roots = branch.workdir.as_deref().into_iter().collect::<Vec<_>>();
+        let retired_segments = retire_deletion_scopes(
+            &self.conn,
+            &self.sqlite_path,
+            &owners,
+            &roots,
+            &[branch.ref_name.as_str()],
+        )?;
+        remove_retired_segments(&self.conn, &retired_segments)?;
+        remove_ref_file(&self.db_dir, &branch.ref_name)?;
+        if let Some(workdir) = &branch.workdir {
+            let path = PathBuf::from(workdir);
+            if path.exists() {
+                fs::remove_dir_all(&path)?;
+            }
+        }
+        for backend in ["fuse-cow", "nfs-cow", "dokan-cow"] {
+            let state = self.db_dir.join(backend).join(lane);
+            if state.exists() {
+                fs::remove_dir_all(state)?;
+            }
+        }
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let removal = (|| -> Result<()> {
-            let retired_segments = retire_deletion_scopes(
-                &self.conn,
-                &self.sqlite_path,
-                &owners,
-                &roots,
-                &[branch.ref_name.as_str()],
-            )?;
-            remove_retired_segments(&self.conn, &retired_segments)?;
-            remove_ref_file(&self.db_dir, &branch.ref_name)?;
             self.conn
                 .execute("DELETE FROM refs WHERE name = ?1", params![branch.ref_name])?;
-            if let Some(workdir) = &branch.workdir {
-                let path = PathBuf::from(workdir);
-                if path.exists() {
-                    fs::remove_dir_all(&path)?;
-                }
-            }
-            for backend in ["fuse-cow", "nfs-cow", "dokan-cow"] {
-                let state = self.db_dir.join(backend).join(lane);
-                if state.exists() {
-                    fs::remove_dir_all(state)?;
-                }
-            }
             let removed_at = now_ts();
             let retired_ref = format!("retired/{}/{}", branch.lane_id, removed_at);
             self.conn.execute(
