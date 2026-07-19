@@ -97,6 +97,45 @@ fn trail_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/trail"))
 }
 
+#[cfg(unix)]
+fn spawn_test_workspace_lock_holder(workspace: &Path) -> (Child, std::process::ChildStdin) {
+    let mut child = Command::new(trail_bin())
+        .arg("__test-workspace-lock-holder")
+        .arg(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "READY\n", "workspace lock holder was not ready");
+    (child, stdin)
+}
+
+#[cfg(unix)]
+fn release_test_workspace_lock_holder(mut child: Child, stdin: std::process::ChildStdin) {
+    drop(stdin);
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "workspace lock holder failed\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "workspace lock holder wrote stderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn cli_reports_package_version() {
     let output = Command::new(trail_bin()).arg("--version").output().unwrap();
@@ -6404,21 +6443,11 @@ fn acp_relay_drains_delayed_terminal_frames_and_spill_before_finalizing() {
     stdout.read_line(&mut line).unwrap();
     assert!(line.contains(session_id));
 
-    let lock_path = temp.path().join(".trail/lock");
-    fs::write(
-        &lock_path,
-        format!("pid={} created_at=0", std::process::id()),
-    )
-    .unwrap();
-    let lock_remover = {
-        let lock_path = lock_path.clone();
+    let (lock_holder, lock_stdin) = spawn_test_workspace_lock_holder(temp.path());
+    let lock_releaser = {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(350));
-            match fs::remove_file(lock_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("failed to release capture writer lock: {error}"),
-            }
+            release_test_workspace_lock_holder(lock_holder, lock_stdin);
         })
     };
     writeln!(
@@ -6438,7 +6467,7 @@ fn acp_relay_drains_delayed_terminal_frames_and_spill_before_finalizing() {
         .read_to_string(&mut stderr)
         .unwrap();
     let status = child.wait().unwrap();
-    lock_remover.join().unwrap();
+    lock_releaser.join().unwrap();
     assert!(
         status.success(),
         "relay failed\nstdout:\n{remaining_stdout}\nstderr:\n{stderr}"
@@ -6513,21 +6542,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
     let init_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(init_response["result"]["_meta"]["trail"]["relay"], true);
 
-    let lock_path = temp.path().join(".trail/lock");
-    fs::write(
-        &lock_path,
-        format!("pid={} created_at=0", std::process::id()),
-    )
-    .unwrap();
-    let lock_remover = {
-        let lock_path = lock_path.clone();
+    let (lock_holder, lock_stdin) = spawn_test_workspace_lock_holder(temp.path());
+    let lock_releaser = {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            match fs::remove_file(lock_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("failed to release transient writer lock: {error}"),
-            }
+            release_test_workspace_lock_holder(lock_holder, lock_stdin);
         })
     };
 
@@ -6541,7 +6560,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
     stdout.read_line(&mut line).unwrap();
     let session_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(session_response["result"]["sessionId"], "sess_wait");
-    lock_remover.join().unwrap();
+    lock_releaser.join().unwrap();
 
     writeln!(
         stdin,
