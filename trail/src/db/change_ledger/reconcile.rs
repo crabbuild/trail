@@ -30,6 +30,19 @@ const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 // final CAS and SQLite commit.
 const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+type PersistedPrefixScopeRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    i64,
+);
+#[cfg(test)]
+type FinalPublicationHook = Box<dyn FnOnce(&rusqlite::Connection)>;
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 type InitialScanHook = Box<dyn FnOnce() -> Result<()> + Send>;
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
@@ -288,7 +301,7 @@ struct ProvenPrefixRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReconcileMode {
     Full,
-    ProvenPrefixes(ProvenPrefixSet),
+    ProvenPrefixes(Box<ProvenPrefixSet>),
 }
 
 impl ReconcileMode {
@@ -356,7 +369,7 @@ pub(crate) struct ReconciliationAttempt {
     root: PinnedWorktreeRoot,
     report: ChangeLedgerReconcileReport,
     #[cfg(test)]
-    final_publication_hook: Option<Box<dyn FnOnce(&rusqlite::Connection)>>,
+    final_publication_hook: Option<FinalPublicationHook>,
 }
 
 pub(crate) fn persisted_proven_prefixes(
@@ -381,17 +394,7 @@ pub(crate) fn persisted_proven_prefixes(
         durable_offset,
         folded_offset,
         continuity_generation,
-    ): (
-        String,
-        String,
-        String,
-        String,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        i64,
-        i64,
-        i64,
-    ) = ledger.conn.query_row(
+    ): PersistedPrefixScopeRow = ledger.conn.query_row(
         "SELECT trust_state,trust_reason,provider_id,provider_identity,
                 provider_cursor,provider_fence,durable_offset,folded_offset,
                 continuity_generation
@@ -3889,7 +3892,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "final_lease_horizon",
         )
         .unwrap();
@@ -4371,7 +4374,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "prefix_refresh",
         )
         .unwrap();
@@ -4415,7 +4418,7 @@ mod tests {
                 &observer,
                 &fixture.expected,
                 &fixture.policy,
-                ReconcileMode::ProvenPrefixes(proof),
+                ReconcileMode::ProvenPrefixes(Box::new(proof)),
                 "stale_prefix_proof",
             )
             .is_err());
@@ -4451,7 +4454,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "stale_prefix_start",
         )
         .is_err());
@@ -4475,7 +4478,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "stale_prefix_publish",
         )
         .unwrap();
@@ -4574,7 +4577,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "prefix_replace",
         )
         .unwrap();
@@ -4666,7 +4669,7 @@ mod tests {
             &observer,
             &fixture.expected,
             &fixture.policy,
-            ReconcileMode::ProvenPrefixes(proof),
+            ReconcileMode::ProvenPrefixes(Box::new(proof)),
             "per_prefix_cut",
         )
         .unwrap();

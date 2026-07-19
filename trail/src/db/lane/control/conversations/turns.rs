@@ -1,5 +1,12 @@
 use super::*;
 
+type LaneTurnEventInput = (
+    String,
+    Option<serde_json::Value>,
+    Option<String>,
+    Option<String>,
+);
+
 impl Trail {
     pub fn begin_lane_session_turn(
         &mut self,
@@ -66,10 +73,10 @@ impl Trail {
 
         let branch = self.lane_branch_for_turn(lane, from, base_change)?;
 
-        if let Some(expected_base) = base_change {
-            if branch.head_change.0 != expected_base {
-                return Err(Error::StaleBranch(branch.ref_name));
-            }
+        if let Some(expected_base) = base_change
+            && branch.head_change.0 != expected_base
+        {
+            return Err(Error::StaleBranch(branch.ref_name));
         }
 
         let session_id = self.allocate_session_id(&branch.lane_id, session_title.as_deref());
@@ -170,12 +177,7 @@ impl Trail {
     pub(crate) fn add_lane_turn_events_batch(
         &mut self,
         turn_id: &str,
-        events: Vec<(
-            String,
-            Option<serde_json::Value>,
-            Option<String>,
-            Option<String>,
-        )>,
+        events: Vec<LaneTurnEventInput>,
     ) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);

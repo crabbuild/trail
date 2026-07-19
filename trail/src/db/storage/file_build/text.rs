@@ -1,6 +1,10 @@
 use super::*;
 
 impl Trail {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the fixed text-build identity state"
+    )]
     pub(crate) fn build_text_content(
         &self,
         bytes: &[u8],
@@ -57,10 +61,11 @@ impl Trail {
             let text_hash = new_hashes[idx].clone();
             decrement_hash_count(&mut future_hash_counts, &text_hash);
             let mut matched_idx = None;
-            if let Some(old) = previous.get(idx) {
-                if old.text_hash == text_hash && !used_old.contains(&idx) {
-                    matched_idx = Some(idx);
-                }
+            if let Some(old) = previous.get(idx)
+                && old.text_hash == text_hash
+                && !used_old.contains(&idx)
+            {
+                matched_idx = Some(idx);
             }
             if matched_idx.is_none() {
                 matched_idx = previous_by_hash.get(&text_hash).and_then(|candidates| {
@@ -80,17 +85,17 @@ impl Trail {
                     })
                     .map(|(old_idx, _)| old_idx);
             }
-            if matched_idx.is_none() {
-                if let Some(old) = previous.get(idx) {
-                    let old_has_future_match = future_hash_counts
-                        .get(&old.text_hash)
-                        .is_some_and(|count| *count > 0)
-                        || new_lines.iter().skip(idx + 1).any(|future| {
-                            line_similarity(&old.text, &future.text) >= similarity_threshold
-                        });
-                    if !used_old.contains(&idx) && !old_has_future_match {
-                        matched_idx = Some(idx);
-                    }
+            if matched_idx.is_none()
+                && let Some(old) = previous.get(idx)
+            {
+                let old_has_future_match = future_hash_counts
+                    .get(&old.text_hash)
+                    .is_some_and(|count| *count > 0)
+                    || new_lines.iter().skip(idx + 1).any(|future| {
+                        line_similarity(&old.text, &future.text) >= similarity_threshold
+                    });
+                if !used_old.contains(&idx) && !old_has_future_match {
+                    matched_idx = Some(idx);
                 }
             }
             let entry = if let Some(old_idx) = matched_idx {

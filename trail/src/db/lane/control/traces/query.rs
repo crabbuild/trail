@@ -402,13 +402,11 @@ fn lane_trace_span_events_sql(
         sql.push_str(" = ?");
         values.push(turn_id.clone());
     }
-    if include_trace_id {
-        if let Some(trace_id) = &filters.trace_id {
-            sql.push_str(" AND ");
-            sql.push_str(trace_column);
-            sql.push_str(" = ?");
-            values.push(trace_id.clone());
-        }
+    if include_trace_id && let Some(trace_id) = &filters.trace_id {
+        sql.push_str(" AND ");
+        sql.push_str(trace_column);
+        sql.push_str(" = ?");
+        values.push(trace_id.clone());
     }
     (sql, values)
 }

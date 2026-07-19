@@ -135,10 +135,10 @@ impl Trail {
         F: FnOnce(&Path) -> Result<PathBuf>,
     {
         let cache_key = self.workspace_layer_cache_key(key)?;
-        if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)? {
-            if layer.state == "ready" {
-                return self.verify_workspace_layer_for_attach(&layer.layer_id);
-            }
+        if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
+            && layer.state == "ready"
+        {
+            return self.verify_workspace_layer_for_attach(&layer.layer_id);
         }
         let lock_path = self
             .db_dir
@@ -162,10 +162,10 @@ impl Trail {
                     };
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)? {
-                        if layer.state == "ready" {
-                            return self.verify_workspace_layer_for_attach(&layer.layer_id);
-                        }
+                    if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
+                        && layer.state == "ready"
+                    {
+                        return self.verify_workspace_layer_for_attach(&layer.layer_id);
                     }
                     if build_lock_is_stale(&lock_path)? {
                         let stale = lock_path.with_extension(format!("stale.{}", now_ts()));
@@ -191,11 +191,11 @@ impl Trail {
                 "workspace cache builder quota exceeded (limit {builder_limit})"
             )));
         }
-        if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)? {
-            if layer.state == "ready" {
-                drop(guard);
-                return self.verify_workspace_layer_for_attach(&layer.layer_id);
-            }
+        if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
+            && layer.state == "ready"
+        {
+            drop(guard);
+            return self.verify_workspace_layer_for_attach(&layer.layer_id);
         }
         let build_dir = self.db_dir.join("cache/staging").join(format!(
             "input_{}",
@@ -1216,13 +1216,13 @@ impl Trail {
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Err(Error::InvalidInput(format!(
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                     "workspace view `{}` for lane `{lane}` has an active writer; run `trail lane unmount {lane}` before changing environment bindings",
                     view.view_id
                 )));
-            }
         }
 
         let mut requested_keys = BTreeMap::new();
@@ -1403,13 +1403,13 @@ impl Trail {
                 .as_deref()
                 .map(|layer_id| self.verify_workspace_layer_for_attach(layer_id))
                 .transpose()?;
-            if let Some(layer) = &layer {
-                if layer.kind != activation.kind {
-                    return Err(Error::Corrupt(format!(
-                        "component `{}` declares kind `{}` but layer `{}` has kind `{}`",
-                        activation.component_id, activation.kind, layer.layer_id, layer.kind
-                    )));
-                }
+            if let Some(layer) = &layer
+                && layer.kind != activation.kind
+            {
+                return Err(Error::Corrupt(format!(
+                    "component `{}` declares kind `{}` but layer `{}` has kind `{}`",
+                    activation.component_id, activation.kind, layer.layer_id, layer.kind
+                )));
             }
             let mut previous_stmt = self.conn.prepare(
                 "SELECT mount_path, kind, policy, binding_identity
@@ -2080,6 +2080,10 @@ impl Trail {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable workspace-layer binding schema"
+    )]
     fn bind_workspace_layer(
         &self,
         lane: &str,
@@ -2097,13 +2101,13 @@ impl Trail {
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Err(Error::InvalidInput(format!(
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                     "workspace view `{}` for lane `{lane}` has an active writer; run `trail lane unmount {lane}` before changing layer bindings",
                     view.view_id,
                 )));
-            }
         }
         let mount_path = normalize_relative_path(mount_path)?;
         if normalized_environment.is_some() {
@@ -2213,12 +2217,12 @@ impl Trail {
                 let _ = self.conn.execute_batch(
                     "ROLLBACK TO SAVEPOINT trail_layer_activation; RELEASE SAVEPOINT trail_layer_activation",
                 );
-                if let Some((mut core, reset)) = prepared_reset.take() {
-                    if let Err(rollback_err) = reset.rollback(&mut core) {
-                        return Err(Error::Corrupt(format!(
+                if let Some((mut core, reset)) = prepared_reset.take()
+                    && let Err(rollback_err) = reset.rollback(&mut core)
+                {
+                    return Err(Error::Corrupt(format!(
                             "workspace layer activation failed ({err}); restoring private generated state also failed ({rollback_err}); durable recovery intent was retained"
                         )));
-                    }
                 }
                 return Err(err);
             }
@@ -2400,7 +2404,8 @@ impl Trail {
                      WHERE view_id = ?1 AND component_id = ?2
                      ORDER BY dependency_component_id",
                 )?;
-                let dependencies = dependency_stmt
+
+                dependency_stmt
                     .query_map(params![view_id, &component.component_id], |row| {
                         Ok(EnvironmentGenerationDependencyReport {
                             component_id: row.get(0)?,
@@ -2408,8 +2413,7 @@ impl Trail {
                             edge_type: row.get(2)?,
                         })
                     })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                dependencies
+                    .collect::<std::result::Result<Vec<_>, _>>()?
             };
             component.dependencies = dependencies;
             let mut output_stmt = self.conn.prepare(
@@ -3066,6 +3070,12 @@ pub(crate) fn make_tree_writable(path: &Path) {
                 continue;
             }
             let mut permissions = metadata.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(permissions.mode() | 0o200);
+            }
+            #[cfg(not(unix))]
             permissions.set_readonly(false);
             let _ = fs::set_permissions(entry.path(), permissions);
         }
@@ -3081,6 +3091,12 @@ fn make_layer_root_writable(path: &Path) -> Result<()> {
         )));
     }
     let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions)?;
     Ok(())
@@ -3341,13 +3357,13 @@ fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
                 .to_string_lossy(),
         )?;
         let folded_path = rel.to_lowercase();
-        if let Some(previous) = folded.insert(folded_path, rel.clone()) {
-            if previous != rel {
-                return Err(Error::InvalidPath {
-                    path: rel,
-                    reason: format!("case-insensitive layer collision with `{previous}`"),
-                });
-            }
+        if let Some(previous) = folded.insert(folded_path, rel.clone())
+            && previous != rel
+        {
+            return Err(Error::InvalidPath {
+                path: rel,
+                reason: format!("case-insensitive layer collision with `{previous}`"),
+            });
         }
         let target = safe_join(destination, &rel)?;
         let kind = entry.file_type();
@@ -3808,7 +3824,7 @@ mod tests {
         let seed_a2 = tempfile::tempdir().unwrap();
         fs::write(seed_a2.path().join("value"), "a2\n").unwrap();
         let a2 = make_activation("a", "2", Vec::new(), ".generated/a", seed_a2.path());
-        db.replace_declared_workspace_layers("dependencies", &[a2.clone()])
+        db.replace_declared_workspace_layers("dependencies", std::slice::from_ref(&a2))
             .unwrap();
         let current = db
             .active_environment_generation("dependencies")
@@ -3962,7 +3978,7 @@ mod tests {
             ".generated/provider",
             provider_seed_2.path(),
         );
-        db.replace_declared_workspace_layers("runtime-edges", &[provider_2.clone()])
+        db.replace_declared_workspace_layers("runtime-edges", std::slice::from_ref(&provider_2))
             .unwrap();
         let generation = db
             .active_environment_generation("runtime-edges")
@@ -4899,6 +4915,12 @@ mod tests {
         .unwrap();
         let file = Path::new(&layer.storage_path).join("index.js");
         let mut permissions = fs::metadata(&file).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(false);
         fs::set_permissions(&file, permissions).unwrap();
         fs::write(&file, "tampered!\n").unwrap();

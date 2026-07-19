@@ -157,7 +157,7 @@ pub(crate) fn sensitive_assignment_span(line: &str, lower: &str) -> Option<(usiz
             let key_idx = search_from + relative_idx;
             let rest_start = key_idx + key.len();
             let rest = &lower[rest_start..];
-            let Some(separator_relative_idx) = rest.find(|ch| ch == ':' || ch == '=') else {
+            let Some(separator_relative_idx) = rest.find([':', '=']) else {
                 search_from = rest_start;
                 continue;
             };

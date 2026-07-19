@@ -167,20 +167,20 @@ fn resolve_registry_launch(
     agent: &RegistryAgent,
     cache_dir: Option<&Path>,
 ) -> Result<(Vec<String>, BTreeMap<String, String>)> {
-    if let Some(distribution) = &agent.distribution.npx {
-        if command_in_path("npx") {
-            let mut command = vec!["npx".to_string(), "--yes".to_string()];
-            command.push(distribution.package.clone());
-            command.extend(distribution.args.clone());
-            return Ok((command, BTreeMap::new()));
-        }
+    if let Some(distribution) = &agent.distribution.npx
+        && command_in_path("npx")
+    {
+        let mut command = vec!["npx".to_string(), "--yes".to_string()];
+        command.push(distribution.package.clone());
+        command.extend(distribution.args.clone());
+        return Ok((command, BTreeMap::new()));
     }
-    if let Some(distribution) = &agent.distribution.uvx {
-        if command_in_path("uvx") {
-            let mut command = vec!["uvx".to_string(), distribution.package.clone()];
-            command.extend(distribution.args.clone());
-            return Ok((command, BTreeMap::new()));
-        }
+    if let Some(distribution) = &agent.distribution.uvx
+        && command_in_path("uvx")
+    {
+        let mut command = vec!["uvx".to_string(), distribution.package.clone()];
+        command.extend(distribution.args.clone());
+        return Ok((command, BTreeMap::new()));
     }
 
     let platform = current_platform();

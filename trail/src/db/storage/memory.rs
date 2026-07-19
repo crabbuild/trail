@@ -296,7 +296,7 @@ impl Trail {
                 });
             }
         }
-        results.sort_by(|left, right| compare_memory_results(left, right));
+        results.sort_by(compare_memory_results);
         results.truncate(top_k);
         values.clear();
         Ok(results)
@@ -360,7 +360,7 @@ impl Trail {
         let mut results = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)?;
-        results.sort_by(|left, right| compare_memory_results(left, right));
+        results.sort_by(compare_memory_results);
         results.truncate(top_k);
         Ok(Some(results))
     }
@@ -880,7 +880,7 @@ fn encode_f32_vec(vector: &[f32]) -> Vec<u8> {
 }
 
 fn decode_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return Err(Error::Corrupt(
             "stored memory embedding has invalid byte length".to_string(),
         ));

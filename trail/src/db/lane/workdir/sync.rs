@@ -61,7 +61,8 @@ impl Trail {
             None
         };
         let head = self.get_ref(&branch.ref_name)?;
-        let mut entries = self.load_root_files_for_paths(&head.root_id, &[path.clone()])?;
+        let mut entries =
+            self.load_root_files_for_paths(&head.root_id, std::slice::from_ref(&path))?;
         let entry = entries
             .remove(&path)
             .ok_or_else(|| Error::InvalidInput(format!("lane `{lane}` has no file `{path}`")))?;
@@ -463,6 +464,10 @@ impl Trail {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the fixed NFS COW sync contract"
+    )]
     fn sync_nfs_cow_lane_workdir(
         &mut self,
         lane: &str,

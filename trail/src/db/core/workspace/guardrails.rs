@@ -95,45 +95,45 @@ impl Trail {
             approval.action == action && matches!(approval.status.as_str(), "approved" | "rejected")
         });
         let mut satisfied_approvals = Vec::new();
-        if matching_pending.is_empty() {
-            if let Some(approval) = latest_decided_matching_approval {
-                match approval.status.as_str() {
-                    "approved" => {
-                        let approval_ids = vec![approval.approval_id.clone()];
-                        for reason in reasons
-                            .iter_mut()
-                            .filter(|reason| reason.severity == "approval_required")
-                        {
-                            let original_details = reason.details.take();
-                            reason.severity = "allowed".to_string();
-                            reason.details = Some(serde_json::json!({
-                                "approval_ids": approval_ids.clone(),
-                                "original_severity": "approval_required",
-                                "original_details": original_details
-                            }));
-                        }
-                        reasons.push(guardrail_reason(
-                            "approval_satisfied",
-                            "allowed",
-                            "matching approved human approval satisfies approval-required guardrails",
-                            Some(serde_json::json!({ "approval_ids": approval_ids.clone() })),
-                        ));
-                        satisfied_approvals.push(approval.clone());
+        if matching_pending.is_empty()
+            && let Some(approval) = latest_decided_matching_approval
+        {
+            match approval.status.as_str() {
+                "approved" => {
+                    let approval_ids = vec![approval.approval_id.clone()];
+                    for reason in reasons
+                        .iter_mut()
+                        .filter(|reason| reason.severity == "approval_required")
+                    {
+                        let original_details = reason.details.take();
+                        reason.severity = "allowed".to_string();
+                        reason.details = Some(serde_json::json!({
+                            "approval_ids": approval_ids.clone(),
+                            "original_severity": "approval_required",
+                            "original_details": original_details
+                        }));
                     }
-                    "rejected" => {
-                        reasons.push(guardrail_reason(
-                            "approval_rejected",
-                            "blocked",
-                            "matching human approval was rejected",
-                            Some(serde_json::json!({
-                                "approval_id": approval.approval_id.clone(),
-                                "reviewer": approval.reviewer.clone(),
-                                "note": approval.note.clone()
-                            })),
-                        ));
-                    }
-                    _ => {}
+                    reasons.push(guardrail_reason(
+                        "approval_satisfied",
+                        "allowed",
+                        "matching approved human approval satisfies approval-required guardrails",
+                        Some(serde_json::json!({ "approval_ids": approval_ids.clone() })),
+                    ));
+                    satisfied_approvals.push(approval.clone());
                 }
+                "rejected" => {
+                    reasons.push(guardrail_reason(
+                        "approval_rejected",
+                        "blocked",
+                        "matching human approval was rejected",
+                        Some(serde_json::json!({
+                            "approval_id": approval.approval_id.clone(),
+                            "reviewer": approval.reviewer.clone(),
+                            "note": approval.note.clone()
+                        })),
+                    ));
+                }
+                _ => {}
             }
         }
 

@@ -21,7 +21,7 @@ pub(crate) fn route_request_result(
     }
 
     if request.method == "GET" && path == "/v1/health" {
-        return Ok(utils::json_response(
+        return utils::json_response(
             200,
             "OK",
             &serde_json::json!({
@@ -29,7 +29,7 @@ pub(crate) fn route_request_result(
                 "service": "trail",
                 "version": env!("CARGO_PKG_VERSION")
             }),
-        )?);
+        );
     }
 
     if !utils::authorized(&request, auth) {

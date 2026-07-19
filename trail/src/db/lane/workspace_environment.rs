@@ -1589,12 +1589,12 @@ impl Trail {
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Err(Error::InvalidInput(format!(
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                     "lane `{lane}` has an active workspace writer in process {pid}; run `trail lane unmount {lane}` before synchronizing its environment"
                 )));
-            }
         }
 
         let (source_root, plan) = self.resolve_workspace_environment_plan(
@@ -1774,12 +1774,12 @@ impl Trail {
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Err(Error::InvalidInput(format!(
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                     "lane `{lane}` has an active workspace writer in process {pid}; run `trail lane unmount {lane}` before synchronizing its environment"
                 )));
-            }
         }
         let discovery = self.discover_workspace_environment(lane, discovery_root)?;
         if !discovery.conflicts.is_empty() {
@@ -3148,7 +3148,7 @@ impl Trail {
             }
             let sandbox = tempfile::Builder::new()
                 .prefix("trail-environment-")
-                .tempdir_in(&sandbox_parent)?;
+                .tempdir_in(sandbox_parent)?;
             let sandbox_root = fs::canonicalize(sandbox.path())?;
             let outputs =
                 self.execute_workspace_environment_plan_in_directory(plan, &sandbox_root, true)?;
@@ -3348,13 +3348,13 @@ impl Trail {
                     plan.component_id
                 ))
             })?;
-            if let Ok(metadata) = fs::symlink_metadata(&cache.storage_path) {
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    return Err(Error::InvalidInput(format!(
-                        "environment cache namespace `{}` is not a real directory",
-                        cache.namespace_id
-                    )));
-                }
+            if let Ok(metadata) = fs::symlink_metadata(&cache.storage_path)
+                && (!metadata.is_dir() || metadata.file_type().is_symlink())
+            {
+                return Err(Error::InvalidInput(format!(
+                    "environment cache namespace `{}` is not a real directory",
+                    cache.namespace_id
+                )));
             }
             fs::create_dir_all(&cache.storage_path)?;
             let namespace_parent = fs::canonicalize(self.db_dir.join("cache/namespaces"))?;
@@ -3852,6 +3852,7 @@ impl Trail {
         let projection = self.project_entry_file(entry)?;
         fs::copy(projection, &destination)?;
         let mut permissions = fs::metadata(&destination)?.permissions();
+        #[cfg(not(unix))]
         permissions.set_readonly(false);
         #[cfg(unix)]
         permissions.set_mode(if entry.executable {
@@ -4777,10 +4778,10 @@ fn environment_path_ancestor<'a, T>(
             prefix.push('/');
         }
         prefix.push_str(segment);
-        if segments.peek().is_some() {
-            if let Some((stored, value)) = paths.get_key_value(&prefix) {
-                return Some((stored, value));
-            }
+        if segments.peek().is_some()
+            && let Some((stored, value)) = paths.get_key_value(&prefix)
+        {
+            return Some((stored, value));
         }
     }
     None
@@ -5014,13 +5015,12 @@ fn environment_dependency_activations(
             if let Some(input_name) = dependency
                 .edge_type
                 .identity_input_name(&dependency.component_id)
+                && plan.layer_key.inputs.get(&input_name) != Some(&dependency.component_key)
             {
-                if plan.layer_key.inputs.get(&input_name) != Some(&dependency.component_key) {
-                    return Err(Error::Corrupt(format!(
-                        "finalized environment component `{}` omitted identity edge `{}`",
-                        plan.component_id, input_name
-                    )));
-                }
+                return Err(Error::Corrupt(format!(
+                    "finalized environment component `{}` omitted identity edge `{}`",
+                    plan.component_id, input_name
+                )));
             }
             Ok((
                 dependency.component_id.clone(),
@@ -5172,8 +5172,8 @@ pub(super) fn validate_environment_runtime_declaration_report(
             resource.name
         )));
     }
-    if let Some(target) = resource.volume_target.as_deref() {
-        if target.len() > 4096
+    if let Some(target) = resource.volume_target.as_deref()
+        && (target.len() > 4096
             || !target.starts_with('/')
             || target.contains('\\')
             || target.chars().any(char::is_control)
@@ -5183,13 +5183,12 @@ pub(super) fn validate_environment_runtime_declaration_report(
                 .any(|segment| segment.is_empty() || segment == "." || segment == "..")
             || ["/proc", "/sys", "/dev", "/run", "/etc"]
                 .iter()
-                .any(|reserved| target == *reserved || target.starts_with(&format!("{reserved}/")))
-        {
-            return Err(Error::InvalidInput(format!(
-                "runtime resource `{}` has invalid or reserved volume target `{target}`",
-                resource.name
-            )));
-        }
+                .any(|reserved| target == *reserved || target.starts_with(&format!("{reserved}/"))))
+    {
+        return Err(Error::InvalidInput(format!(
+            "runtime resource `{}` has invalid or reserved volume target `{target}`",
+            resource.name
+        )));
     }
     if resource.secrets.len() > 16 {
         return Err(Error::InvalidInput(format!(
@@ -5335,13 +5334,12 @@ struct WorkspaceEnvironmentCacheUseGuard {
 impl Drop for WorkspaceEnvironmentCacheUseGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.lease_path);
-        if let Some((path, token)) = &self.exclusive {
-            if fs::read_to_string(path)
+        if let Some((path, token)) = &self.exclusive
+            && fs::read_to_string(path)
                 .ok()
                 .is_some_and(|owner| owner == *token)
-            {
-                let _ = fs::remove_file(path);
-            }
+        {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -5399,7 +5397,7 @@ pub(super) fn environment_cache_namespace_has_live_leases(
 
 fn normalize_workspace_environment_dependencies(
     component_id: &str,
-    dependencies: &mut Vec<WorkspaceEnvironmentDependency>,
+    dependencies: &mut [WorkspaceEnvironmentDependency],
 ) -> Result<()> {
     dependencies.sort_by(|left, right| left.component_id.cmp(&right.component_id));
     for pair in dependencies.windows(2) {

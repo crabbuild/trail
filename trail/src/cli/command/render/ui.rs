@@ -597,7 +597,7 @@ pub(crate) fn sanitize_inline(value: &str) -> String {
 pub(crate) fn sanitize_patch(value: &str) -> String {
     value
         .lines()
-        .map(|line| sanitize_patch_line(line))
+        .map(sanitize_patch_line)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -957,7 +957,7 @@ impl<'a, W: Write> Renderer<'a, W> {
 
     fn checklist(&mut self, checks: &[UiCheck], indent: usize) -> io::Result<()> {
         let mut checks = checks.to_vec();
-        checks.sort_by(|left, right| check_rank(left.state).cmp(&check_rank(right.state)));
+        checks.sort_by_key(|check| check_rank(check.state));
         let label_width = checks
             .iter()
             .map(|check| display_width(&sanitize_inline(&check.label)))
@@ -1009,7 +1009,7 @@ impl<'a, W: Write> Renderer<'a, W> {
         let rule = self
             .options
             .unicode("─", "-")
-            .repeat(self.options.width.saturating_sub(indent).min(72).max(8));
+            .repeat(self.options.width.saturating_sub(indent).clamp(8, 72));
         self.line_indented(&rule, UiTone::Muted, false, indent)?;
         for line in sanitize_patch(text).lines() {
             let tone = if line.starts_with('+') && !line.starts_with("+++") {
@@ -1220,7 +1220,7 @@ fn change_bar(additions: u64, deletions: u64) -> String {
         return String::new();
     }
     let width = total.min(20) as usize;
-    let plus = usize::try_from((additions * width as u64 + total - 1) / total).unwrap_or(width);
+    let plus = usize::try_from((additions * width as u64).div_ceil(total)).unwrap_or(width);
     format!(
         "{}{}",
         "+".repeat(plus),

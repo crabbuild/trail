@@ -709,13 +709,13 @@ impl Trail {
             else {
                 return Ok(false);
             };
-            return match parent.open_dir(leaf) {
+            match parent.open_dir(leaf) {
                 Ok(directory) => {
                     Ok(directory.identity()? == (record.owned_device, record.owned_inode))
                 }
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error),
-            };
+            }
         }
     }
 }

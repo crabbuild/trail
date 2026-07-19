@@ -120,15 +120,15 @@ impl Trail {
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Ok(workspace_mount_report(
-                    &view,
-                    Some(pid),
-                    Some(token.to_string()),
-                    view.status == "mounted",
-                ));
-            }
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Ok(workspace_mount_report(
+                &view,
+                Some(pid),
+                Some(token.to_string()),
+                view.status == "mounted",
+            ));
         }
         let workspace_root = self.workspace_root.clone();
         let db_dir = self.db_dir.clone();
@@ -164,17 +164,16 @@ impl Trail {
             let current = self.lane_workspace_view(&lane)?.ok_or_else(|| {
                 Error::Corrupt(format!("workspace view for lane `{lane}` disappeared"))
             })?;
-            if current.status == "mounted" {
-                if let (Some(pid), Some(token)) =
+            if current.status == "mounted"
+                && let (Some(pid), Some(token)) =
                     (current.owner_pid, current.owner_start_token.clone())
-                {
-                    return Ok(workspace_mount_report(
-                        &current,
-                        Some(pid),
-                        Some(token),
-                        true,
-                    ));
-                }
+            {
+                return Ok(workspace_mount_report(
+                    &current,
+                    Some(pid),
+                    Some(token),
+                    true,
+                ));
             }
             if Instant::now() >= deadline {
                 let stop_path = Path::new(&view.meta_dir).join(VIEW_UNMOUNT_REQUEST_FILE);
@@ -1322,6 +1321,10 @@ impl Trail {
         Ok(sequence)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the authenticated checkpoint record"
+    )]
     pub(crate) fn repair_workspace_checkpoint_mirror(
         &self,
         lane: &str,
@@ -1357,6 +1360,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the authenticated checkpoint record"
+    )]
     fn write_workspace_checkpoint_mirror(
         &self,
         view: &LaneWorkspaceViewReport,
@@ -1628,6 +1635,25 @@ fn materialized_workdir_usage(path: &Path) -> Result<DirectoryUsage> {
 fn file_physical_bytes(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn process_resident_bytes() -> u64 {
+    fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|value| value.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages.saturating_mul(4096))
+        .unwrap_or(0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn process_resident_bytes() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+        unsafe { usage.assume_init().ru_maxrss as u64 }
+    } else {
+        0
+    }
 }
 
 #[cfg(not(unix))]
@@ -2850,25 +2876,6 @@ mod tests {
                 "indexed_paths_per_view": 1,
             })
         );
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-fn process_resident_bytes() -> u64 {
-    fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|value| value.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages.saturating_mul(4096))
-        .unwrap_or(0)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-fn process_resident_bytes() -> u64 {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
-        unsafe { usage.assume_init().ru_maxrss as u64 }
-    } else {
-        0
     }
 }
 

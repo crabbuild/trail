@@ -28,20 +28,18 @@ pub(crate) fn merge_files_with_resolution(
                     merged.remove(&path);
                 }
             },
-            (true, true) => {
-                if entry_hash(target_entry) != entry_hash(source_entry) {
-                    if !conflict_paths.contains(&path) {
-                        unresolved.push(format!("conflict path `{path}` was not recorded"));
-                        continue;
-                    }
-                    if take == ConflictTake::Source {
-                        match source_entry {
-                            Some(entry) => {
-                                merged.insert(path.clone(), entry.clone());
-                            }
-                            None => {
-                                merged.remove(&path);
-                            }
+            (true, true) if entry_hash(target_entry) != entry_hash(source_entry) => {
+                if !conflict_paths.contains(&path) {
+                    unresolved.push(format!("conflict path `{path}` was not recorded"));
+                    continue;
+                }
+                if take == ConflictTake::Source {
+                    match source_entry {
+                        Some(entry) => {
+                            merged.insert(path.clone(), entry.clone());
+                        }
+                        None => {
+                            merged.remove(&path);
                         }
                     }
                 }

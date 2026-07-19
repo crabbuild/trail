@@ -198,6 +198,10 @@ fn publish_dirty_alignment_in_transaction(
 /// recover and durably prepare, apply+sync+verify under a qualified observer
 /// interval, and atomically publish operation/ref/lane/ledger/ack/terminal
 /// state. Ref and marker mirrors are repaired only after SQLite commit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the atomic ref publication protocol phases"
+)]
 pub(crate) fn run_ref_advancing_projection<A, M>(
     db: &mut crate::Trail,
     expected: &ExpectedScope,

@@ -708,19 +708,18 @@ impl ViewCore {
             format!("{path}/")
         };
         for binding in &self.layers {
-            if let Some(remainder) = binding.mount_path.strip_prefix(&prefix) {
-                if let Some(name) = remainder.split('/').next() {
-                    if !name.is_empty() {
-                        names.insert(name.to_string());
-                    }
-                }
+            if let Some(remainder) = binding.mount_path.strip_prefix(&prefix)
+                && let Some(name) = remainder.split('/').next()
+                && !name.is_empty()
+            {
+                names.insert(name.to_string());
             }
         }
-        if let Some(layer_dir) = self.layer_path(&path)? {
-            if let Ok(dir) = fs::read_dir(layer_dir) {
-                for entry in dir.flatten() {
-                    names.insert(entry.file_name().to_string_lossy().into_owned());
-                }
+        if let Some(layer_dir) = self.layer_path(&path)?
+            && let Ok(dir) = fs::read_dir(layer_dir)
+        {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
             }
         }
         for class in [
@@ -2235,7 +2234,7 @@ fn create_view_symlink(_target: &Path, _destination: &Path) -> std::io::Result<(
 
 #[cfg(unix)]
 fn metadata_mode(metadata: &fs::Metadata, _directory: bool) -> u32 {
-    metadata.mode() as u32 & 0o777
+    metadata.mode() & 0o777
 }
 
 fn copy_up_mode(metadata: &fs::Metadata) -> u32 {

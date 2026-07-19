@@ -194,7 +194,14 @@ fn register_sqlite_vec_extension() {
     REGISTER.call_once(|| {
         // sqlite-vec exposes a C extension entrypoint; register it before opening benchmark connections.
         let result = unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
+            sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *const i8,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> i32,
+            >(sqlite3_vec_init as *const ())))
         };
         assert_eq!(result, SQLITE_OK, "failed to register sqlite-vec extension");
     });
@@ -563,7 +570,7 @@ fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn encode_f32_vec(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -625,6 +632,10 @@ fn apply_pragmas(conn: &Connection) {
     conn.pragma_update(None, "temp_store", "MEMORY").unwrap();
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the fixed benchmark result columns"
+)]
 fn print_row(
     operation: &str,
     rows: usize,

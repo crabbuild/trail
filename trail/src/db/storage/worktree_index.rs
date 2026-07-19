@@ -286,9 +286,9 @@ impl Trail {
             };
             let mut pending = vec![(prefix_dir, prefix.clone())];
             while let Some((directory, relative_dir)) = pending.pop() {
-                let mut entries =
+                let entries =
                     Dir::read_from(&directory).map_err(|error| Error::Io(error.into()))?;
-                while let Some(entry) = entries.next() {
+                for entry in entries {
                     let entry = entry.map_err(|error| Error::Io(error.into()))?;
                     let name_bytes = entry.file_name().to_bytes();
                     if matches!(name_bytes, b"." | b"..") {

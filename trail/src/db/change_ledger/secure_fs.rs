@@ -644,8 +644,7 @@ fn descriptor_identity_from_stat(metadata: rustix::fs::Stat) -> Result<(u64, u64
     Ok((
         u64::try_from(metadata.st_dev)
             .map_err(|_| Error::Corrupt("negative filesystem device identity".into()))?,
-        u64::try_from(metadata.st_ino)
-            .map_err(|_| Error::Corrupt("negative filesystem inode identity".into()))?,
+        metadata.st_ino,
     ))
 }
 

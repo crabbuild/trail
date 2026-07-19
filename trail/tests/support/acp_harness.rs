@@ -46,7 +46,7 @@ pub fn fixture_agent_command(workspace: &Path, scenario: &str, source: &str) -> 
         let mut permissions = fs::metadata(&launcher).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&launcher, permissions).unwrap();
-        return vec![launcher.to_string_lossy().into_owned()];
+        vec![launcher.to_string_lossy().into_owned()]
     }
 
     #[cfg(windows)]

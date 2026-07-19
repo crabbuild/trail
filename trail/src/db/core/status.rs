@@ -66,12 +66,11 @@ impl Trail {
         } else {
             None
         };
-        if branch == current_branch {
-            if let Some(report) =
+        if branch == current_branch
+            && let Some(report) =
                 self.status_from_daemon_snapshot(&branch, &head, daemon_snapshot.as_ref())?
-            {
-                return Ok(report);
-            }
+        {
+            return Ok(report);
         }
         let snapshot_generation = daemon_snapshot.as_ref().map(|snapshot| match snapshot {
             DaemonWorktreeSnapshot::Clean { generation, .. }
@@ -143,19 +142,18 @@ impl Trail {
                 reason: "record uncheckpointed workspace changes".to_string(),
             });
         }
-        if let Ok(acp_sessions) = self.list_lane_acp_sessions(None) {
-            if let Some(session) = acp_sessions.sessions.first() {
-                if let Ok(lane_name) = self.resolve_lane_handle(&session.lane_id) {
-                    suggestions.push(StatusSuggestion {
-                        command: format!("trail transcript {lane_name}"),
-                        reason: "review the latest captured agent session".to_string(),
-                    });
-                    suggestions.push(StatusSuggestion {
-                        command: format!("trail lane review {lane_name}"),
-                        reason: "inspect checkpoint evidence before merge or rewind".to_string(),
-                    });
-                }
-            }
+        if let Ok(acp_sessions) = self.list_lane_acp_sessions(None)
+            && let Some(session) = acp_sessions.sessions.first()
+            && let Ok(lane_name) = self.resolve_lane_handle(&session.lane_id)
+        {
+            suggestions.push(StatusSuggestion {
+                command: format!("trail transcript {lane_name}"),
+                reason: "review the latest captured agent session".to_string(),
+            });
+            suggestions.push(StatusSuggestion {
+                command: format!("trail lane review {lane_name}"),
+                reason: "inspect checkpoint evidence before merge or rewind".to_string(),
+            });
         }
         if suggestions.is_empty() {
             suggestions.push(StatusSuggestion {
@@ -234,7 +232,7 @@ impl Trail {
                 generation: _,
                 root_id: Some(root_id),
             } => {
-                if self.clean_baseline_matches_visible_root(Some(&root_id), &head.root_id) {
+                if self.clean_baseline_matches_visible_root(Some(root_id), &head.root_id) {
                     Ok(Some(clean_status_report(branch, head)))
                 } else {
                     Ok(None)
@@ -247,13 +245,13 @@ impl Trail {
                 let policy = self.workspace_ignore_policy_snapshot();
                 let snapshot = self.selected_worktree_snapshot_for_root_with_policy(
                     &head.root_id,
-                    &paths,
+                    paths,
                     &policy,
                 )?;
                 let changed_paths = snapshot.summaries;
                 self.reconcile_daemon_status_paths(
                     &head.root_id,
-                    &paths,
+                    paths,
                     &changed_paths,
                     *generation,
                 );

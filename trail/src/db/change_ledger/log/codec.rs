@@ -452,7 +452,7 @@ fn recover_segments_with_connection(
     }
     let epoch = sql_i64(expected.epoch, "observer epoch")
         .map_err(|error| RecoveryError::new(error.to_string()))?;
-    validate_recovery_owner(&connection, expected, epoch)?;
+    validate_recovery_owner(connection, expected, epoch)?;
     let segment_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM changed_path_observer_segments
@@ -474,7 +474,7 @@ fn recover_segments_with_connection(
                 RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
             })?;
         }
-        validate_recovery_owner(&connection, expected, epoch)?;
+        validate_recovery_owner(connection, expected, epoch)?;
         return Ok(RecoveredTail {
             records: Vec::new(),
             record_boundaries: Vec::new(),
@@ -641,19 +641,19 @@ fn recover_segments_with_connection(
                 "observer tail record count exceeds persisted limit",
             ));
         }
-        if let Some(first) = recovered.records.first() {
-            if first_sequence != first.sequence {
-                return Err(RecoveryError::new(
-                    "observer segment first sequence metadata mismatch",
-                ));
-            }
+        if let Some(first) = recovered.records.first()
+            && first_sequence != first.sequence
+        {
+            return Err(RecoveryError::new(
+                "observer segment first sequence metadata mismatch",
+            ));
         }
-        if let Some(metadata_last) = row.last_sequence {
-            if db_u64(metadata_last, "last observer sequence")? != recovered.last_sequence {
-                return Err(RecoveryError::new(
-                    "observer segment last sequence metadata mismatch",
-                ));
-            }
+        if let Some(metadata_last) = row.last_sequence
+            && db_u64(metadata_last, "last observer sequence")? != recovered.last_sequence
+        {
+            return Err(RecoveryError::new(
+                "observer segment last sequence metadata mismatch",
+            ));
         }
         let segment_hash: [u8; 32] = Sha256::digest(&bytes).into();
         if row.state == "sealed" {
@@ -719,7 +719,7 @@ fn recover_segments_with_connection(
             let published = filename.to_str().is_some_and(|filename| {
                 filename.len() <= MAX_SEGMENT_FILENAME_BYTES
                     && is_strictly_published_filename(
-                        &connection,
+                        connection,
                         &expected.scope_id,
                         filename,
                         segment_directory,
@@ -762,7 +762,7 @@ fn recover_segments_with_connection(
             RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
         })?;
     }
-    validate_recovery_owner(&connection, expected, epoch)?;
+    validate_recovery_owner(connection, expected, epoch)?;
     Ok(recovered)
 }
 

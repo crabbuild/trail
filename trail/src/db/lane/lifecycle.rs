@@ -140,8 +140,8 @@ impl Trail {
                 Err(Error::CommittedRepairRequired {
                     lane: repaired.lane_name,
                     initialization_id: repaired.initialization_id,
-                    request_fingerprint: repaired.request_fingerprint,
-                    operation_id: repaired.operation_id,
+                    request_fingerprint: Box::new(repaired.request_fingerprint),
+                    operation_id: Box::new(repaired.operation_id),
                     phase: LaneInitializationPhase::RepairRequired,
                     committed: true,
                     repair: repaired.repair_command.unwrap_or_else(|| {
@@ -225,9 +225,10 @@ impl Trail {
             LaneWorkdirMode::Virtual
         } else if !sparse_paths.is_empty() {
             LaneWorkdirMode::Sparse
-        } else if custom_workdir || materialize == Some(true) {
-            LaneWorkdirMode::Auto
-        } else if self.default_lane_materialize_for_ref(from)? {
+        } else if custom_workdir
+            || materialize == Some(true)
+            || self.default_lane_materialize_for_ref(from)?
+        {
             LaneWorkdirMode::Auto
         } else {
             LaneWorkdirMode::Virtual
@@ -275,6 +276,10 @@ impl Trail {
         self.spawn_lane_with_workdir_paths(name, from, materialize, provider, model, workdir, &[])
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserves the public lane spawn compatibility contract"
+    )]
     pub fn spawn_lane_with_workdir_paths(
         &mut self,
         name: &str,
@@ -297,6 +302,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserves the public lane spawn compatibility contract"
+    )]
     pub fn spawn_lane_with_workdir_paths_and_neighbors(
         &mut self,
         name: &str,
@@ -329,6 +338,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserves the public lane spawn compatibility contract"
+    )]
     pub fn spawn_lane_with_workdir_mode_paths_and_neighbors(
         &mut self,
         name: &str,
@@ -354,6 +367,10 @@ impl Trail {
     }
 
     #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserves the fault-harness lane spawn contract"
+    )]
     pub fn spawn_lane_with_deferred_initial_ledger(
         &mut self,
         name: &str,
@@ -1035,8 +1052,8 @@ impl Trail {
                 Err(Error::CommittedRepairRequired {
                     lane: repaired.lane_name,
                     initialization_id: repaired.initialization_id,
-                    request_fingerprint: repaired.request_fingerprint,
-                    operation_id: repaired.operation_id,
+                    request_fingerprint: Box::new(repaired.request_fingerprint),
+                    operation_id: Box::new(repaired.operation_id),
                     phase: LaneInitializationPhase::RepairRequired,
                     committed: true,
                     repair: repaired.repair_command.unwrap_or_else(|| {
@@ -1504,10 +1521,10 @@ impl Trail {
     }
 
     pub(crate) fn lane_report_sparse_paths(&self, branch: &LaneBranch) -> Result<Vec<String>> {
-        if let Some(workdir) = &branch.workdir {
-            if let Some(paths) = self.lane_sparse_workdir_paths(branch, Path::new(workdir))? {
-                return Ok(paths);
-            }
+        if let Some(workdir) = &branch.workdir
+            && let Some(paths) = self.lane_sparse_workdir_paths(branch, Path::new(workdir))?
+        {
+            return Ok(paths);
         }
         Ok(self
             .lane_sparse_paths_from_metadata(&branch.lane_id)?
@@ -1634,13 +1651,13 @@ impl Trail {
                 ),
             });
         }
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() {
-                return Err(Error::InvalidPath {
-                    path: path.to_string_lossy().to_string(),
-                    reason: "lane workdir cannot be a symlink".to_string(),
-                });
-            }
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().to_string(),
+                reason: "lane workdir cannot be a symlink".to_string(),
+            });
         }
         Ok(())
     }

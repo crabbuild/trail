@@ -165,9 +165,7 @@ pub fn handle_json_rpc(db: &mut Trail, request: Value) -> Option<Value> {
         ));
     }
 
-    if id.is_none() {
-        return None;
-    }
+    id.as_ref()?;
     let id = id.unwrap();
 
     match method {

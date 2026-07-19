@@ -1680,10 +1680,10 @@ fn wait_for_child_exit(child: &mut Child) {
 
 fn wait_for_daemon_endpoint(path: &Path) -> serde_json::Value {
     for _ in 0..100 {
-        if let Ok(bytes) = fs::read(path) {
-            if let Ok(value) = serde_json::from_slice(&bytes) {
-                return value;
-            }
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            return value;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -5228,7 +5228,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     let status_after_archive = run_trail_json(temp.path(), &["agent", "status"]);
     assert_eq!(status_after_archive["status"], "empty");
 
-    let unarchived = run_trail_json(temp.path(), &["agent", "unarchive", &task_name]);
+    let unarchived = run_trail_json(temp.path(), &["agent", "unarchive", task_name]);
     assert_eq!(unarchived["archived"], false);
     assert_eq!(unarchived["previous_archived"], true);
     assert_eq!(unarchived["task"]["archived"], false);
@@ -5251,7 +5251,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         &[
             "agent",
             "continue",
-            &task_name,
+            task_name,
             "--provider",
             "claude-code",
             "--name",

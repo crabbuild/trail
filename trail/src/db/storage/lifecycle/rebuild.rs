@@ -621,18 +621,17 @@ impl Trail {
                  FROM pending_path_index_derived_repairs \
                  ORDER BY ref_name, repair_kind",
             )?;
-            let repairs = stmt
-                .query_map([], |row| {
-                    Ok(PendingPathIndexDerivedRepair {
-                        ref_name: row.get(0)?,
-                        repair_kind: row.get(1)?,
-                        old_root: ObjectId(row.get(2)?),
-                        new_root: ObjectId(row.get(3)?),
-                        new_change: ChangeId(row.get(4)?),
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            repairs
+
+            stmt.query_map([], |row| {
+                Ok(PendingPathIndexDerivedRepair {
+                    ref_name: row.get(0)?,
+                    repair_kind: row.get(1)?,
+                    old_root: ObjectId(row.get(2)?),
+                    new_root: ObjectId(row.get(3)?),
+                    new_change: ChangeId(row.get(4)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         for repair in pending {
@@ -833,33 +832,33 @@ impl Trail {
         let lane = self.lane_record(&branch.lane_id)?;
         let mut checkpoint_view_id = None;
         let mut retarget_checkpoint_marker = false;
-        if let Some(view) = self.lane_workspace_view(&lane.name)? {
-            if view.checkpoint_root.as_ref() == Some(&reference.root_id) {
-                checkpoint_view_id = Some(view.view_id.clone());
-                let path = Path::new(&view.meta_dir).join("clean-checkpoint.json");
-                match fs::read(&path) {
-                    Ok(bytes) => {
-                        let marker: serde_json::Value =
-                            serde_json::from_slice(&bytes).map_err(|err| {
-                                Error::Corrupt(format!(
-                                    "workspace checkpoint marker `{}` cannot be retargeted: {err}",
-                                    path.display()
-                                ))
-                            })?;
-                        if marker["view_id"].as_str() != Some(view.view_id.as_str())
-                            || marker["root_id"].as_str() != Some(reference.root_id.0.as_str())
-                            || marker["journal_sequence"].as_u64() != Some(view.checkpoint_seq)
-                        {
-                            return Err(Error::Corrupt(format!(
+        if let Some(view) = self.lane_workspace_view(&lane.name)?
+            && view.checkpoint_root.as_ref() == Some(&reference.root_id)
+        {
+            checkpoint_view_id = Some(view.view_id.clone());
+            let path = Path::new(&view.meta_dir).join("clean-checkpoint.json");
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let marker: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|err| {
+                            Error::Corrupt(format!(
+                                "workspace checkpoint marker `{}` cannot be retargeted: {err}",
+                                path.display()
+                            ))
+                        })?;
+                    if marker["view_id"].as_str() != Some(view.view_id.as_str())
+                        || marker["root_id"].as_str() != Some(reference.root_id.0.as_str())
+                        || marker["journal_sequence"].as_u64() != Some(view.checkpoint_seq)
+                    {
+                        return Err(Error::Corrupt(format!(
                                 "workspace checkpoint marker `{}` does not match its clean lane baseline",
                                 path.display()
                             )));
-                        }
-                        retarget_checkpoint_marker = true;
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(Error::Io(err)),
+                    retarget_checkpoint_marker = true;
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(Error::Io(err)),
             }
         }
         Ok(PreparedLaneRepair {

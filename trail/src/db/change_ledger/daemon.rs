@@ -23,6 +23,19 @@ use super::{
 use crate::error::{Error, Result};
 use crate::Trail;
 
+type ControlledProjectionScopeRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    i64,
+);
+type ObserverSegmentStateRow = (i64, i64, Option<String>, Option<String>, String, String);
+
 pub(crate) struct WorkspaceDaemonProof {
     pub(crate) scope_id: String,
     pub(crate) epoch: u64,
@@ -715,17 +728,7 @@ where
         max_log_bytes,
         max_segment_bytes,
         max_tail_records,
-    ): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<Vec<u8>>,
-        i64,
-        i64,
-        i64,
-    ) = db.conn.query_row(
+    ): ControlledProjectionScopeRow = db.conn.query_row(
         "SELECT scope.scope_root_identity,scope.filesystem_identity,
                 scope.provider_id,scope.provider_identity,owner.owner_token,owner.fence_nonce,
                 scope.max_observer_log_bytes,scope.max_segment_bytes,
@@ -2058,8 +2061,8 @@ impl WorkspaceDaemonRuntime {
             ],
         )?;
         if segment_changed != 1 || scope_changed != 1 {
-            let segment_state: Option<(i64, i64, Option<String>, Option<String>, String, String)> =
-                tx.query_row(
+            let segment_state: Option<ObserverSegmentStateRow> = tx
+                .query_row(
                     "SELECT durable_end_offset,folded_end_offset,previous_segment_id,
                             previous_segment_hash,state,owner_token
                      FROM changed_path_observer_segments
@@ -2302,14 +2305,14 @@ impl PlatformObserver {
                 provider_identity,
                 fence_nonce,
             )?;
-            return Ok(Self::MacOs(
+            Ok(Self::MacOs(
                 super::observer::macos::MacOsFseventsObserver::start(
                     root,
                     Box::new(durability),
                     resume,
                     dependencies,
                 )?,
-            ));
+            ))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {

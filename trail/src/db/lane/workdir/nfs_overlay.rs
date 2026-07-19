@@ -508,21 +508,20 @@ mod macos {
 
     fn recover_stale_mount(mountpoint: &Path, state: &Path) -> Result<()> {
         let mut known_dead_owner = false;
-        if let Ok(bytes) = fs::read(state) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64) {
-                    let token = value
-                        .get("process_start_token")
-                        .and_then(serde_json::Value::as_str);
-                    if token.is_some_and(|token| process_matches_start_token(pid as u32, token)) {
-                        return Err(Error::InvalidInput(format!(
-                            "nfs-cow mount `{}` is already active in process {pid}",
-                            mountpoint.display()
-                        )));
-                    }
-                    known_dead_owner = true;
-                }
+        if let Ok(bytes) = fs::read(state)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(pid) = value.get("pid").and_then(serde_json::Value::as_i64)
+        {
+            let token = value
+                .get("process_start_token")
+                .and_then(serde_json::Value::as_str);
+            if token.is_some_and(|token| process_matches_start_token(pid as u32, token)) {
+                return Err(Error::InvalidInput(format!(
+                    "nfs-cow mount `{}` is already active in process {pid}",
+                    mountpoint.display()
+                )));
             }
+            known_dead_owner = true;
         }
         if known_dead_owner {
             force_unmount_stale_without_probe(mountpoint)?;

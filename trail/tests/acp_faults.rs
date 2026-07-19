@@ -269,8 +269,7 @@ fn multiple_sessions_and_opposite_direction_cancellation_races_do_not_cross_corr
     let agent = acp_harness::fixture_agent_command(
         temp.path(),
         "sessions-cancellation",
-        &format!(
-            r#"#!/usr/bin/env python3
+        r#"#!/usr/bin/env python3
 import json
 import sys
 
@@ -278,15 +277,14 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method == "initialize":
-        print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}, separators=(",", ":")), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"protocolVersion":1,"agentCapabilities":{}}}, separators=(",", ":")), flush=True)
     elif method == "session/new":
-        print(json.dumps({{"jsonrpc":"2.0","id":message["id"],"result":{{"sessionId":"session-" + str(message["id"])}}}}, separators=(",", ":")), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":{"sessionId":"session-" + str(message["id"])}}, separators=(",", ":")), flush=True)
     elif method == "session/prompt":
         request_id = message["id"]
-        print(json.dumps({{"jsonrpc":"2.0","method":"$/cancel_request","params":{{"requestId":request_id}}}}, separators=(",", ":")), flush=True)
-        print(json.dumps({{"jsonrpc":"2.0","id":request_id,"result":{{"stopReason":"cancelled"}}}}, separators=(",", ":")), flush=True)
-"#
-        ),
+        print(json.dumps({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":request_id}}, separators=(",", ":")), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":request_id,"result":{"stopReason":"cancelled"}}, separators=(",", ":")), flush=True)
+"#,
     );
     let mut child = acp_harness::spawn_relay(temp.path(), &agent);
     let (mut stdin, mut stdout) = acp_harness::relay_stdio(&mut child);

@@ -178,14 +178,12 @@ impl Trail {
         }
         for edit in &patch.edits {
             let (path, size_bytes) = match edit {
-                PatchEdit::Write { path, content, .. } => {
-                    (path.as_str(), content.as_bytes().len() as u64)
-                }
+                PatchEdit::Write { path, content, .. } => (path.as_str(), content.len() as u64),
                 PatchEdit::WriteBytes {
                     path, bytes_hex, ..
                 } => (path.as_str(), bytes_hex.len().div_ceil(2) as u64),
                 PatchEdit::ReplaceLine { path, new_text, .. } => {
-                    (path.as_str(), new_text.as_bytes().len() as u64)
+                    (path.as_str(), new_text.len() as u64)
                 }
                 PatchEdit::Delete { .. } | PatchEdit::Rename { .. } => continue,
             };
@@ -200,13 +198,13 @@ impl Trail {
     }
 
     fn ensure_patch_secret_scan(&self, patch: &PatchDocument) -> Result<()> {
-        if let Some(message) = &patch.message {
-            if contains_sensitive_text(message) {
-                return Err(Error::PatchRejected(
-                    "secret scan rejected patch message; remove credentials from the patch payload"
-                        .to_string(),
-                ));
-            }
+        if let Some(message) = &patch.message
+            && contains_sensitive_text(message)
+        {
+            return Err(Error::PatchRejected(
+                "secret scan rejected patch message; remove credentials from the patch payload"
+                    .to_string(),
+            ));
         }
         for edit in &patch.edits {
             match edit {
@@ -293,30 +291,27 @@ impl Trail {
             return Ok(preview);
         }
 
-        if self.config.lane.enforce_sparse_paths {
-            if let Some(workdir) = &branch.workdir {
-                if let Some(allowlist) =
-                    self.lane_sparse_workdir_paths(branch, Path::new(workdir))?
-                {
-                    let blocked = paths
+        if self.config.lane.enforce_sparse_paths
+            && let Some(workdir) = &branch.workdir
+            && let Some(allowlist) = self.lane_sparse_workdir_paths(branch, Path::new(workdir))?
+        {
+            let blocked = paths
+                .iter()
+                .filter(|path| {
+                    !allowlist
                         .iter()
-                        .filter(|path| {
-                            !allowlist
-                                .iter()
-                                .any(|selected| path_matches_selection(path, selected))
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !blocked.is_empty() {
-                        preview.allowed = false;
-                        preview.error = Some(format!(
-                            "lane sparse path boundary blocks path(s): {}; allowed path(s): {}",
-                            blocked.join(", "),
-                            allowlist.join(", ")
-                        ));
-                        return Ok(preview);
-                    }
-                }
+                        .any(|selected| path_matches_selection(path, selected))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !blocked.is_empty() {
+                preview.allowed = false;
+                preview.error = Some(format!(
+                    "lane sparse path boundary blocks path(s): {}; allowed path(s): {}",
+                    blocked.join(", "),
+                    allowlist.join(", ")
+                ));
+                return Ok(preview);
             }
         }
 

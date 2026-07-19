@@ -5,12 +5,15 @@ const AUTO_MINIMAL_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
 const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
 
 #[cfg(test)]
+type SchemaPathHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
-    static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+    static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
-    static SCHEMA_PRIMARY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+    static SCHEMA_PRIMARY_OPEN_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
-    static SCHEMA_PROLLY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+    static SCHEMA_PROLLY_OPEN_HOOK: std::cell::RefCell<Option<SchemaPathHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

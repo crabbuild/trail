@@ -157,6 +157,10 @@ impl Trail {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable merge-result row schema"
+    )]
     pub(crate) fn insert_merge_result_for_refs(
         &self,
         lane_queue_id: Option<&str>,

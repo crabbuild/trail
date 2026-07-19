@@ -696,18 +696,17 @@ impl Trail {
         let mut report = RootMaterializationReport::default();
         self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
             let mut chunk_report = None;
-            if clean_index_available {
-                if let Some(source_stamps) =
+            if clean_index_available
+                && let Some(source_stamps) =
                     self.workspace_file_stamps_if_clean_index_matches(root_id, &chunk)?
-                {
-                    chunk_report = materialize_from_workspace_cow_report(
-                        &self.workspace_root,
-                        output_root,
-                        &chunk,
-                        &source_stamps,
-                        durable,
-                    )?;
-                }
+            {
+                chunk_report = materialize_from_workspace_cow_report(
+                    &self.workspace_root,
+                    output_root,
+                    &chunk,
+                    &source_stamps,
+                    durable,
+                )?;
             }
 
             let chunk_report = match chunk_report {
@@ -747,13 +746,13 @@ impl Trail {
         self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
             for path in chunk.keys() {
                 let folded = path.to_lowercase();
-                if let Some(previous) = seen.insert(folded, path.clone()) {
-                    if previous != *path {
-                        return Err(Error::InvalidPath {
-                            path: path.clone(),
-                            reason: format!("case-insensitive path collision with `{previous}`"),
-                        });
-                    }
+                if let Some(previous) = seen.insert(folded, path.clone())
+                    && previous != *path
+                {
+                    return Err(Error::InvalidPath {
+                        path: path.clone(),
+                        reason: format!("case-insensitive path collision with `{previous}`"),
+                    });
                 }
             }
             Ok(())
@@ -778,6 +777,12 @@ fn sha256_projection_file(path: &Path) -> Result<String> {
 fn make_projection_writable(path: &Path) -> Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     if permissions.readonly() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(false);
         fs::set_permissions(path, permissions)?;
     }
@@ -939,6 +944,23 @@ fn push_dependency_candidate(out: &mut BTreeSet<String>, path: &str) {
     if let Ok(path) = normalize_relative_path(path) {
         out.insert(path);
     }
+}
+
+pub(crate) fn validate_full_text_blob(content: &TextContent, blob: &Blob) -> Result<()> {
+    if blob.content_hash != content.content_hash {
+        return Err(Error::Corrupt(format!(
+            "full text blob hash {} does not match text content hash {}",
+            blob.content_hash, content.content_hash
+        )));
+    }
+    if blob.bytes.len() as u64 != content.byte_count {
+        return Err(Error::Corrupt(format!(
+            "full text blob byte_count {} does not match text content byte_count {}",
+            blob.bytes.len(),
+            content.byte_count
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1234,21 +1256,4 @@ mod tests {
         assert_eq!(repaired, path);
         assert_eq!(fs::read(repaired).unwrap(), b"a1\n");
     }
-}
-
-pub(crate) fn validate_full_text_blob(content: &TextContent, blob: &Blob) -> Result<()> {
-    if blob.content_hash != content.content_hash {
-        return Err(Error::Corrupt(format!(
-            "full text blob hash {} does not match text content hash {}",
-            blob.content_hash, content.content_hash
-        )));
-    }
-    if blob.bytes.len() as u64 != content.byte_count {
-        return Err(Error::Corrupt(format!(
-            "full text blob byte_count {} does not match text content byte_count {}",
-            blob.bytes.len(),
-            content.byte_count
-        )));
-    }
-    Ok(())
 }

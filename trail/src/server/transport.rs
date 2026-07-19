@@ -226,14 +226,14 @@ pub fn serve_unix_listener_with_auth_and_timeout(
     loop {
         let (mut stream, _) = listener.accept()?;
         let _ = handle_unix_connection(db, &mut stream, &auth, connection_timeout);
-        if std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some() {
+        if std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some()
+            && super::workspace_changed_path_ready_proof(db).is_err()
+        {
+            std::thread::sleep(Duration::from_millis(10));
             if super::workspace_changed_path_ready_proof(db).is_err() {
-                std::thread::sleep(Duration::from_millis(10));
-                if super::workspace_changed_path_ready_proof(db).is_err() {
-                    return Err(Error::DaemonUnavailable(
-                        "workspace daemon observer health retirement requested".into(),
-                    ));
-                }
+                return Err(Error::DaemonUnavailable(
+                    "workspace daemon observer health retirement requested".into(),
+                ));
             }
         }
     }
@@ -704,7 +704,7 @@ fn is_http_header_name_char(ch: char) -> bool {
 }
 
 fn add_http_request_bytes(current: usize, added: usize) -> Result<usize> {
-    let total = current.checked_add(added).unwrap_or(usize::MAX);
+    let total = current.saturating_add(added);
     if total > MAX_HTTP_REQUEST_BYTES {
         return Err(http_request_size_error(total));
     }

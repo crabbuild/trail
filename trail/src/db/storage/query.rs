@@ -14,6 +14,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable lane-event row schema"
+    )]
     pub(crate) fn insert_lane_event_with_context(
         &self,
         lane_id: &str,
@@ -65,7 +69,7 @@ impl Trail {
     }
 
     fn ensure_lane_event_payload_limit(&self, event_type: &str, payload_json: &str) -> Result<()> {
-        let payload_bytes = payload_json.as_bytes().len() as u64;
+        let payload_bytes = payload_json.len() as u64;
         let max_event_payload_bytes = self.config.lane.max_event_payload_bytes;
         if max_event_payload_bytes > 0 && payload_bytes > max_event_payload_bytes {
             return Err(Error::InvalidInput(format!(
@@ -84,6 +88,10 @@ impl Trail {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable trace-span index row"
+    )]
     pub(crate) fn index_lane_trace_span_event(
         &self,
         event_id: &str,

@@ -90,6 +90,10 @@ pub(crate) fn render_diff(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the fixed diff rendering option contract"
+)]
 pub(crate) fn render_diff_with_title(
     summary: &DiffSummary,
     json: bool,

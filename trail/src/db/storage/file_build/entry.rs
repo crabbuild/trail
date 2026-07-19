@@ -1,6 +1,10 @@
 use super::*;
 
 impl Trail {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the fixed file-build identity state"
+    )]
     pub(crate) fn build_file_entry(
         &self,
         path: &str,
@@ -38,21 +42,10 @@ impl Trail {
                 FileContentRef::Binary(blob_id),
                 Vec::new(),
             )
-        } else if std::str::from_utf8(&bytes).is_err() {
-            let blob_id = self.put_blob(bytes.clone())?;
-            (
-                FileKind::OpaqueText,
-                FileContentRef::Opaque(blob_id),
-                Vec::new(),
-            )
-        } else if bytes.len() as u64 > self.config.text.opaque_text_max_bytes {
-            let blob_id = self.put_blob(bytes.clone())?;
-            (
-                FileKind::OpaqueText,
-                FileContentRef::Opaque(blob_id),
-                Vec::new(),
-            )
-        } else if max_line_len(&bytes) as u64 > self.config.text.max_line_bytes {
+        } else if std::str::from_utf8(&bytes).is_err()
+            || bytes.len() as u64 > self.config.text.opaque_text_max_bytes
+            || max_line_len(&bytes) as u64 > self.config.text.max_line_bytes
+        {
             let blob_id = self.put_blob(bytes.clone())?;
             (
                 FileKind::OpaqueText,

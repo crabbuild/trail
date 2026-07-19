@@ -84,17 +84,11 @@ pub(super) fn try_handle_auto_daemon_command(
         }
     }
     let workspace = daemon_start::workspace_from_context(ctx)?;
-    if workspace.join(".trail").is_dir() {
-        if let Some(ready) =
+    if workspace.join(".trail").is_dir()
+        && let Some(ready) =
             daemon_start::existing_workspace_daemon_ready(&workspace, daemon_token.as_deref())?
-        {
-            return try_handle_daemon_command(
-                ctx,
-                Some(ready.url),
-                Some(ready.auth_token),
-                command,
-            );
-        }
+    {
+        return try_handle_daemon_command(ctx, Some(ready.url), Some(ready.auth_token), command);
     }
     let Some(daemon_url) = discover_daemon_url(ctx)? else {
         return Ok(false);
@@ -210,34 +204,34 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::Approvals(_)
         | Command::Lease(_)
         | Command::Doctor => true,
-        Command::Lane(lane) => match &lane.command {
+        Command::Lane(lane) => matches!(
+            &lane.command,
             LaneSubcommand::Spawn(_)
-            | LaneSubcommand::List
-            | LaneSubcommand::Show(_)
-            | LaneSubcommand::Status(_)
-            | LaneSubcommand::Review(_)
-            | LaneSubcommand::Contribution(_)
-            | LaneSubcommand::Gates(_)
-            | LaneSubcommand::Readiness(_)
-            | LaneSubcommand::Merge(_)
-            | LaneSubcommand::MergeQueue(_)
-            | LaneSubcommand::RefreshPreview(_)
-            | LaneSubcommand::Handoff(_)
-            | LaneSubcommand::Claim(_)
-            | LaneSubcommand::Record(_)
-            | LaneSubcommand::Rewind(_)
-            | LaneSubcommand::Events(_)
-            | LaneSubcommand::Read(_)
-            | LaneSubcommand::Workdir(_)
-            | LaneSubcommand::SyncWorkdir(_)
-            | LaneSubcommand::ApplyPatch(_)
-            | LaneSubcommand::Diff(_)
-            | LaneSubcommand::Timeline(_) => true,
-            LaneSubcommand::RepairInitialization(_) => true,
-            LaneSubcommand::Turn(_) => true,
-            LaneSubcommand::Trace(_) => true,
-            _ => false,
-        },
+                | LaneSubcommand::List
+                | LaneSubcommand::Show(_)
+                | LaneSubcommand::Status(_)
+                | LaneSubcommand::Review(_)
+                | LaneSubcommand::Contribution(_)
+                | LaneSubcommand::Gates(_)
+                | LaneSubcommand::Readiness(_)
+                | LaneSubcommand::Merge(_)
+                | LaneSubcommand::MergeQueue(_)
+                | LaneSubcommand::RefreshPreview(_)
+                | LaneSubcommand::Handoff(_)
+                | LaneSubcommand::Claim(_)
+                | LaneSubcommand::Record(_)
+                | LaneSubcommand::Rewind(_)
+                | LaneSubcommand::Events(_)
+                | LaneSubcommand::Read(_)
+                | LaneSubcommand::Workdir(_)
+                | LaneSubcommand::SyncWorkdir(_)
+                | LaneSubcommand::ApplyPatch(_)
+                | LaneSubcommand::Diff(_)
+                | LaneSubcommand::Timeline(_)
+                | LaneSubcommand::RepairInitialization(_)
+                | LaneSubcommand::Turn(_)
+                | LaneSubcommand::Trace(_)
+        ),
         _ => false,
     }
 }

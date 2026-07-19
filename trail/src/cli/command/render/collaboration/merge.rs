@@ -235,13 +235,13 @@ pub(crate) fn render_lane_merge_queue_explain(
     if !checks.is_empty() {
         document = document.block(UiBlock::Checklist(checks));
     }
-    if let Some(dry_run) = &report.dry_run {
-        if !dry_run.changed_paths.is_empty() {
-            document = document.block(UiBlock::section(
-                "Dry-run changes:",
-                vec![UiBlock::Changes(change_list(&dry_run.changed_paths))],
-            ));
-        }
+    if let Some(dry_run) = &report.dry_run
+        && !dry_run.changed_paths.is_empty()
+    {
+        document = document.block(UiBlock::section(
+            "Dry-run changes:",
+            vec![UiBlock::Changes(change_list(&dry_run.changed_paths))],
+        ));
     }
     document = append_next_steps(document, &report.next_steps);
     render_document(&document, options)

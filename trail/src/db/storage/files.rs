@@ -176,13 +176,13 @@ impl Trail {
         }
         for path in additions {
             let folded = case_insensitive_path_key(path);
-            if let Some(previous) = after.get(&folded).and_then(Option::as_deref) {
-                if previous != path {
-                    return Err(Error::InvalidPath {
-                        path: path.clone(),
-                        reason: format!("case-insensitive path collision with `{previous}`"),
-                    });
-                }
+            if let Some(previous) = after.get(&folded).and_then(Option::as_deref)
+                && previous != path
+            {
+                return Err(Error::InvalidPath {
+                    path: path.clone(),
+                    reason: format!("case-insensitive path collision with `{previous}`"),
+                });
             }
             after.insert(folded, Some(path.clone()));
         }
@@ -254,9 +254,7 @@ impl Trail {
         let mut mutations = Vec::new();
         let mut expected_final_present_paths = BTreeSet::new();
         let mut collision = None;
-        for ((folded, candidates), existing) in
-            candidates_by_folded.into_iter().zip(existing.into_iter())
-        {
+        for ((folded, candidates), existing) in candidates_by_folded.into_iter().zip(existing) {
             let previous = existing
                 .map(|value| validate_case_fold_index_value(&folded, value))
                 .transpose()?;
@@ -269,10 +267,10 @@ impl Trail {
                 .filter(|path| disk_manifest.contains_key(*path))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            if let Some(previous) = &previous {
-                if disk_manifest.contains_key(previous) || !candidates.contains(previous) {
-                    present.insert(previous.clone());
-                }
+            if let Some(previous) = &previous
+                && (disk_manifest.contains_key(previous) || !candidates.contains(previous))
+            {
+                present.insert(previous.clone());
             }
             if present.len() > 1 {
                 let mut paths = present.into_iter();
@@ -559,18 +557,15 @@ impl Trail {
                     // metadata before trusting the unchanged-file cache, while
                     // still avoiding a content read for a true cache hit.
                     let metadata = fresh_regular_file_metadata(&self.workspace_root, &path)?;
-                    if previous_entry.executable == executable_from_metadata(&metadata) {
-                        if let Some(cached_manifest) =
+                    if previous_entry.executable == executable_from_metadata(&metadata)
+                        && let Some(cached_manifest) =
                             self.cached_worktree_manifest_for_metadata(&path, &metadata)?
-                        {
-                            if cached_manifest.content_hash == previous_entry.content_hash
-                                && cached_manifest.executable == previous_entry.executable
-                                && cached_manifest.kind == previous_entry.kind
-                            {
-                                disk_manifest.insert(path.clone(), cached_manifest);
-                                continue;
-                            }
-                        }
+                        && cached_manifest.content_hash == previous_entry.content_hash
+                        && cached_manifest.executable == previous_entry.executable
+                        && cached_manifest.kind == previous_entry.kind
+                    {
+                        disk_manifest.insert(path.clone(), cached_manifest);
+                        continue;
                     }
                 }
                 read_paths.push(path);
@@ -586,20 +581,19 @@ impl Trail {
                     .get(&previous_tree, path.as_bytes())?
                     .map(|value| from_cbor::<FileEntry>(&value))
                     .transpose()?;
-                if let Some(previous_entry) = &previous_same_path {
-                    if previous_entry.content_hash == content_hash
-                        && previous_entry.executable == executable
-                    {
-                        disk_manifest.insert(
-                            path.clone(),
-                            DiskManifest {
-                                kind: previous_entry.kind.clone(),
-                                executable: previous_entry.executable,
-                                content_hash: previous_entry.content_hash.clone(),
-                            },
-                        );
-                        continue;
-                    }
+                if let Some(previous_entry) = &previous_same_path
+                    && previous_entry.content_hash == content_hash
+                    && previous_entry.executable == executable
+                {
+                    disk_manifest.insert(
+                        path.clone(),
+                        DiskManifest {
+                            kind: previous_entry.kind.clone(),
+                            executable: previous_entry.executable,
+                            content_hash: previous_entry.content_hash.clone(),
+                        },
+                    );
+                    continue;
                 }
                 let previous_entry = previous_same_path.as_ref().or_else(|| {
                     previous_by_hash
@@ -696,21 +690,20 @@ impl Trail {
         for disk_file in disk_files {
             let content_hash = sha256_hex(&disk_file.bytes);
             let previous_entry = previous.and_then(|entries| entries.get(&disk_file.path));
-            if let Some(previous_entry) = previous_entry {
-                if previous_entry.content_hash == content_hash
-                    && previous_entry.executable == disk_file.executable
-                {
-                    disk_manifest.insert(
-                        disk_file.path.clone(),
-                        DiskManifest {
-                            kind: previous_entry.kind.clone(),
-                            executable: previous_entry.executable,
-                            content_hash: previous_entry.content_hash.clone(),
-                        },
-                    );
-                    files.insert(disk_file.path.clone(), previous_entry.clone());
-                    continue;
-                }
+            if let Some(previous_entry) = previous_entry
+                && previous_entry.content_hash == content_hash
+                && previous_entry.executable == disk_file.executable
+            {
+                disk_manifest.insert(
+                    disk_file.path.clone(),
+                    DiskManifest {
+                        kind: previous_entry.kind.clone(),
+                        executable: previous_entry.executable,
+                        content_hash: previous_entry.content_hash.clone(),
+                    },
+                );
+                files.insert(disk_file.path.clone(), previous_entry.clone());
+                continue;
             }
             let previous_entry = if previous_entry.is_none() {
                 previous_by_hash
@@ -756,6 +749,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the authenticated selected-record inputs"
+    )]
     pub(crate) fn build_root_for_selected_record_incremental_with_selection_set(
         &self,
         previous_root_id: &ObjectId,
@@ -769,14 +766,14 @@ impl Trail {
         let selected_disk_files = self.selected_record_disk_files_with_selection_set(
             disk_files,
             selected_paths,
-            &selections,
+            selections,
             allow_ignored,
         )?;
         self.build_root_for_selected_disk_files_incremental_with_selected_inputs(
             previous_root_id,
             previous,
             selected_disk_files,
-            &selections,
+            selections,
             change_id,
         )
     }
@@ -832,6 +829,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the authenticated record preflight inputs"
+    )]
     pub(crate) fn build_root_for_selected_disk_files_incremental_with_record_preflight(
         &self,
         worktree_root: &Path,
@@ -1290,13 +1291,13 @@ fn validate_case_fold_index_value(folded: &str, value: Vec<u8>) -> Result<String
 
 fn insert_case_fold_mapping(mappings: &mut BTreeMap<String, String>, path: &str) -> Result<()> {
     let folded = case_insensitive_path_key(path);
-    if let Some(previous) = mappings.insert(folded, path.to_string()) {
-        if previous != path {
-            return Err(Error::InvalidPath {
-                path: path.to_string(),
-                reason: format!("case-insensitive path collision with `{previous}`"),
-            });
-        }
+    if let Some(previous) = mappings.insert(folded, path.to_string())
+        && previous != path
+    {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: format!("case-insensitive path collision with `{previous}`"),
+        });
     }
     Ok(())
 }

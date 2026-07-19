@@ -53,26 +53,26 @@ impl Trail {
         let output_root = workdir
             .map(|path| self.resolve_checkout_workdir_path(path))
             .transpose()?;
-        if target.root_id == current.root_id {
-            if let Some(output_root) = &output_root {
-                // TRAIL_FS_PRODUCER: alternate_checkout_destination exempt_alternate_output exempt
-                let written_files = if dry_run {
-                    0
-                } else {
-                    prepare_checkout_workdir(output_root)?;
-                    self.materialize_root_files_at_streaming(&target.root_id, output_root, true)?
-                        .file_count
-                };
-                return Ok(CheckoutReport {
-                    change_id: target.change_id,
-                    root_id: target.root_id,
-                    written_files,
-                    dry_run,
-                    recorded_dirty,
-                    output_root: Some(output_root.to_string_lossy().to_string()),
-                    changed_paths: Vec::new(),
-                });
-            }
+        if target.root_id == current.root_id
+            && let Some(output_root) = &output_root
+        {
+            // TRAIL_FS_PRODUCER: alternate_checkout_destination exempt_alternate_output exempt
+            let written_files = if dry_run {
+                0
+            } else {
+                prepare_checkout_workdir(output_root)?;
+                self.materialize_root_files_at_streaming(&target.root_id, output_root, true)?
+                    .file_count
+            };
+            return Ok(CheckoutReport {
+                change_id: target.change_id,
+                root_id: target.root_id,
+                written_files,
+                dry_run,
+                recorded_dirty,
+                output_root: Some(output_root.to_string_lossy().to_string()),
+                changed_paths: Vec::new(),
+            });
         }
         let current_files = self.load_root_files(&current.root_id)?;
         let target_files = self.load_root_files(&target.root_id)?;

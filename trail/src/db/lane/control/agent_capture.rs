@@ -362,10 +362,10 @@ impl Trail {
                  WHERE workspace_id = ?1 AND status = 'active' AND expires_at <= ?2
                  ORDER BY capture_run_id",
             )?;
-            let rows = statement
+
+            statement
                 .query_map(params![self.config.workspace.id.0, now], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<String>, _>>()?;
-            rows
+                .collect::<std::result::Result<Vec<String>, _>>()?
         };
         if !expired_run_ids.is_empty() {
             let _lock = self.acquire_write_lock()?;
@@ -385,10 +385,10 @@ impl Trail {
                    AND s.status IN ('active', 'finalizing')
                  ORDER BY s.mapping_id",
             )?;
-            let rows = statement
+
+            statement
                 .query_map(params![self.config.workspace.id.0], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<String>, _>>()?;
-            rows
+                .collect::<std::result::Result<Vec<String>, _>>()?
         };
         let mut interrupted_mapping_ids = Vec::new();
         let mut interrupted_turn_ids = Vec::new();
@@ -2007,22 +2007,21 @@ impl Trail {
                             &mapping.trail_session_id,
                             Some(envelope.to_metadata_value()),
                         )?;
-                        if *synthetic {
-                            if let Some(turn_id) =
+                        if *synthetic
+                            && let Some(turn_id) =
                                 self.open_turn_for_agent_session(&mapping.trail_session_id)?
-                            {
-                                self.add_lane_turn_event(
-                                    &turn_id,
-                                    "diagnostic",
-                                    Some(serde_json::json!({
-                                        "code": "synthetic_turn_start",
-                                        "native_turn_id": event.native.turn_id,
-                                        "capture_run_id": event.capture_run_id,
-                                    })),
-                                    None,
-                                    None,
-                                )?;
-                            }
+                        {
+                            self.add_lane_turn_event(
+                                &turn_id,
+                                "diagnostic",
+                                Some(serde_json::json!({
+                                    "code": "synthetic_turn_start",
+                                    "native_turn_id": event.native.turn_id,
+                                    "capture_run_id": event.capture_run_id,
+                                })),
+                                None,
+                                None,
+                            )?;
                         }
                     }
                 }
@@ -2640,16 +2639,16 @@ impl Trail {
             ),
             _ => return Ok(()),
         };
-        if let Some(text) = payload_string_value(&event.payload, keys) {
-            if !text.is_empty() {
-                let duplicate = self
-                    .show_lane_turn(turn_id)?
-                    .messages
-                    .iter()
-                    .any(|message| message.role == role && message.body == text);
-                if !duplicate {
-                    self.add_lane_turn_message(turn_id, role, text)?;
-                }
+        if let Some(text) = payload_string_value(&event.payload, keys)
+            && !text.is_empty()
+        {
+            let duplicate = self
+                .show_lane_turn(turn_id)?
+                .messages
+                .iter()
+                .any(|message| message.role == role && message.body == text);
+            if !duplicate {
+                self.add_lane_turn_message(turn_id, role, text)?;
             }
         }
         Ok(())
@@ -3724,9 +3723,9 @@ mod tests {
             mapping.mapping_id
         );
 
-        crate::db::prepare_workspace_daemon(&mut db, false).unwrap();
+        crate::db::prepare_workspace_daemon(&db, false).unwrap();
         std::fs::write(temp.path().join("README.md"), "after\n").unwrap();
-        crate::db::workspace_daemon_fence(&mut db, None, None).unwrap();
+        crate::db::workspace_daemon_fence(&db, None, None).unwrap();
         let workspace_scope_before_lane: (String, i64, String, i64) = db
             .conn
             .query_row(

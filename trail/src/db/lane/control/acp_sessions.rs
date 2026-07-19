@@ -1,6 +1,10 @@
 use super::*;
 
 impl Trail {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable ACP session row schema"
+    )]
     pub fn upsert_lane_acp_session(
         &mut self,
         acp_session_id: &str,

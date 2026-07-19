@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use super::*;
 use trail::model::{AcpDoctorCheck, AcpDoctorReport, AcpProviderProfile};
 
+type AcpRelayCommand = (Option<String>, Vec<String>, BTreeMap<String, String>);
+
 pub(super) fn handle_acp_command(ctx: &RuntimeContext, acp: AcpCommand) -> Result<()> {
     match acp.command {
         AcpSubcommand::Relay(args) => handle_acp_relay(ctx, args),
@@ -243,10 +245,8 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
     let db = open_acp_relay_db(ctx)?;
     let materialize = if args.no_materialize {
         false
-    } else if let Some(materialize) = args.materialize {
-        materialize
     } else {
-        true
+        args.materialize.unwrap_or(true)
     };
 
     let (provider, upstream_command, upstream_env) =
@@ -288,7 +288,7 @@ fn open_acp_relay_db(ctx: &RuntimeContext) -> Result<trail::Trail> {
 fn resolve_acp_relay_command(
     args: &AcpRelayArgs,
     cache_dir: Option<&std::path::Path>,
-) -> Result<(Option<String>, Vec<String>, BTreeMap<String, String>)> {
+) -> Result<AcpRelayCommand> {
     if args.command.is_empty() {
         let agent = args.agent.as_deref().or(args.provider.as_deref()).ok_or_else(|| {
             Error::InvalidInput(

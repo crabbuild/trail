@@ -97,14 +97,13 @@ impl Trail {
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         let preserved_view = self.lane_workspace_view(lane)?;
-        if let Some(view) = &preserved_view {
-            if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-                if process_matches_start_token(pid, token) {
-                    return Err(Error::InvalidInput(format!(
+        if let Some(view) = &preserved_view
+            && let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                         "lane `{lane}` has an active workspace writer in process {pid}; unmount or stop it before removal"
                     )));
-                }
-            }
         }
         let preserved_space = preserved_view
             .as_ref()

@@ -613,12 +613,12 @@ fn mutating_open_options_call_offsets(code: &str) -> Vec<(usize, &'static str)> 
                 (&statement[..open], start)
             } else {
                 let (_, function_range) = enclosing_rust_function_range(code, start).unwrap();
-                let declaration_start = [b';', b'{', b'}']
-                    .into_iter()
+                let declaration_start = b";{}"
+                    .iter()
                     .filter_map(|delimiter| {
                         code.as_bytes()[function_range.start..start]
                             .iter()
-                            .rposition(|byte| *byte == delimiter)
+                            .rposition(|byte| byte == delimiter)
                     })
                     .max()
                     .map(|relative| function_range.start + relative + 1)

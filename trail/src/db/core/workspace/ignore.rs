@@ -89,15 +89,11 @@ impl WorkspaceIgnorePolicySnapshot {
                 ..OperationMetricsDelta::default()
             });
         }
-        if trailignore_exists {
-            if let Some(err) = builder.add(trailignore) {
-                return Err(err.to_string());
-            }
+        if trailignore_exists && let Some(err) = builder.add(trailignore) {
+            return Err(err.to_string());
         }
-        if gitignore_exists {
-            if let Some(err) = builder.add(gitignore) {
-                return Err(err.to_string());
-            }
+        if gitignore_exists && let Some(err) = builder.add(gitignore) {
+            return Err(err.to_string());
         }
         builder.build().map_err(|err| err.to_string())
     }

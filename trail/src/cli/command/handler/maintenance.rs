@@ -108,24 +108,22 @@ pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> R
         if let Err(err) = cache_warmup
             .run()
             .and_then(|_| endpoint_writer.write_if_alive())
+            && !quiet
         {
-            if !quiet {
-                let diagnostic = UiDiagnostic {
-                    code: err.code().to_string(),
-                    summary: "Trail daemon cache warmup failed".to_string(),
-                    cause: Some(err.to_string()),
-                    consequence: Some(
-                        "Requests may rebuild workspace cache entries before responding."
-                            .to_string(),
-                    ),
-                    recovery: None,
-                    alternatives: Vec::new(),
-                };
-                let _ = render_error_document(
-                    &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
-                    &error_options,
-                );
-            }
+            let diagnostic = UiDiagnostic {
+                code: err.code().to_string(),
+                summary: "Trail daemon cache warmup failed".to_string(),
+                cause: Some(err.to_string()),
+                consequence: Some(
+                    "Requests may rebuild workspace cache entries before responding.".to_string(),
+                ),
+                recovery: None,
+                alternatives: Vec::new(),
+            };
+            let _ = render_error_document(
+                &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
+                &error_options,
+            );
         }
     });
     if args.no_auth {

@@ -227,10 +227,10 @@ pub(super) fn push_workspace_views_check(db: &Trail, checks: &mut Vec<DoctorChec
             if matches!(status.as_str(), "failed" | "unhealthy" | "corrupt") {
                 errors.push(format!("{view_id}: status is {status}"));
             }
-            if let (Some(pid), Some(token)) = (*owner_pid, owner_token.as_deref()) {
-                if !process_matches_start_token(pid, token) {
-                    stale_leases.push(format!("{view_id}:{pid}"));
-                }
+            if let (Some(pid), Some(token)) = (*owner_pid, owner_token.as_deref())
+                && !process_matches_start_token(pid, token)
+            {
+                stale_leases.push(format!("{view_id}:{pid}"));
             }
             let backend_available = match backend.as_str() {
                 "fuse" if cfg!(target_os = "linux") => Path::new("/dev/fuse").exists(),

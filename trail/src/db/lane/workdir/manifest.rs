@@ -609,14 +609,13 @@ impl Trail {
         root_id: &ObjectId,
         entries: BTreeMap<String, CleanWorkdirManifestEntry>,
     ) -> Result<()> {
-        if let Some(workdir) = workdir_root_for_manifest_path(path) {
-            if crate::db::change_ledger::command_authority_enabled()
-                && self
-                    .registered_materialized_lane_for_root(workdir)?
-                    .is_some()
-            {
-                return self.invalidate_materialized_lane_marker(workdir);
-            }
+        if let Some(workdir) = workdir_root_for_manifest_path(path)
+            && crate::db::change_ledger::command_authority_enabled()
+            && self
+                .registered_materialized_lane_for_root(workdir)?
+                .is_some()
+        {
+            return self.invalidate_materialized_lane_marker(workdir);
         }
         let parent = path.parent().ok_or_else(|| Error::InvalidPath {
             path: path.to_string_lossy().to_string(),
@@ -628,7 +627,7 @@ impl Trail {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, true)?;
+        write_file_atomic(path, &serde_json::to_vec(&manifest)?, true)?;
         Ok(())
     }
 
@@ -691,14 +690,13 @@ impl Trail {
         &self,
         path: &Path,
     ) -> Result<Option<CleanWorkdirManifest>> {
-        if let Some(workdir) = workdir_root_for_manifest_path(path) {
-            if crate::db::change_ledger::command_authority_enabled()
-                && self
-                    .registered_materialized_lane_for_root(workdir)?
-                    .is_some()
-            {
-                return Ok(None);
-            }
+        if let Some(workdir) = workdir_root_for_manifest_path(path)
+            && crate::db::change_ledger::command_authority_enabled()
+            && self
+                .registered_materialized_lane_for_root(workdir)?
+                .is_some()
+        {
+            return Ok(None);
         }
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -774,7 +772,7 @@ impl Trail {
         if !crate::db::change_ledger::command_authority_enabled() {
             return Ok(None);
         }
-        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        let normalized = normalize_workdir_path(root)?;
         let persisted = self
             .conn
             .query_row(
@@ -887,7 +885,7 @@ impl Trail {
     }
 
     fn registered_materialized_lane_for_root(&self, root: &Path) -> Result<Option<String>> {
-        let normalized = normalize_workdir_path(&root.to_path_buf())?;
+        let normalized = normalize_workdir_path(root)?;
         self.conn
             .query_row(
                 "SELECT lane.name FROM lanes lane JOIN lane_branches branch USING(lane_id)

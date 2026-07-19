@@ -10,7 +10,16 @@ pub(crate) fn register_sqlite_vec_extension() -> Result<()> {
     let result = *SQLITE_VEC_REGISTRATION.get_or_init(|| {
         // sqlite-vec exposes a C extension entrypoint. Register it once before
         // opening connections that may read vec0 virtual tables.
-        unsafe { sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ()))) }
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *const i8,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> i32,
+            >(sqlite3_vec_init as *const ())))
+        }
     });
     if result == SQLITE_OK {
         Ok(())

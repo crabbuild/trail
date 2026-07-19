@@ -1134,13 +1134,12 @@ fn resolve_recipe_component(
     for edge in edges {
         if let Some(previous) =
             typed_edge_components.insert(edge.component.clone(), edge.edge_type.clone())
+            && previous != edge.edge_type
         {
-            if previous != edge.edge_type {
-                return Err(Error::InvalidInput(format!(
+            return Err(Error::InvalidInput(format!(
                     "environment component `{}` declares conflicting edge types `{previous}` and `{}` for `{}`",
                     definition.id, edge.edge_type, edge.component
                 )));
-            }
         }
     }
     let edges = typed_edge_components
@@ -1373,10 +1372,10 @@ fn recipe_target_overlap<'a>(
             prefix.push('/');
         }
         prefix.push_str(segment);
-        if segments.peek().is_some() {
-            if let Some((stored, owner)) = targets.get_key_value(&prefix) {
-                return Some((stored, owner));
-            }
+        if segments.peek().is_some()
+            && let Some((stored, owner)) = targets.get_key_value(&prefix)
+        {
+            return Some((stored, owner));
         }
     }
     targets
@@ -1402,13 +1401,12 @@ mod tests {
     fn ordered_recipe_target_overlap_finds_ancestors_and_descendants() {
         let descendants = BTreeMap::from([("generated/nested".to_string(), "child".to_string())]);
         assert_eq!(
-            recipe_target_overlap(&descendants, "generated").map(|(path, owner)| (path, owner)),
+            recipe_target_overlap(&descendants, "generated"),
             Some(("generated/nested", "child"))
         );
         let ancestors = BTreeMap::from([("generated".to_string(), "parent".to_string())]);
         assert_eq!(
-            recipe_target_overlap(&ancestors, "generated/nested")
-                .map(|(path, owner)| (path, owner)),
+            recipe_target_overlap(&ancestors, "generated/nested"),
             Some(("generated", "parent"))
         );
         assert!(recipe_target_overlap(&ancestors, "generated-sibling").is_none());
@@ -1819,9 +1817,11 @@ command = ["cp", "input.txt", "out-configuration/value.txt"]
         let mut specification = String::from("schema = \"trail.environment/v1\"\n");
         for index in (0..count).rev() {
             let component_id = format!("component-{index:04}");
-            let dependency = (index > 0)
-                .then(|| format!("depends_on = [\"component-{:04}\"]\n", index - 1))
-                .unwrap_or_default();
+            let dependency = if index > 0 {
+                format!("depends_on = [\"component-{:04}\"]\n", index - 1)
+            } else {
+                Default::default()
+            };
             specification.push_str(&format!(
                 r#"
 [[component]]

@@ -196,6 +196,10 @@ impl Trail {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the replace-line patch operation schema"
+    )]
     fn apply_replace_line_edit(
         &self,
         files: &mut BTreeMap<String, FileEntry>,
@@ -292,7 +296,7 @@ mod tests {
         };
 
         let err = db
-            .preflight_replace_line_batch(&[edit.clone()], &files)
+            .preflight_replace_line_batch(std::slice::from_ref(&edit), &files)
             .unwrap_err();
         assert!(
             matches!(err, Error::PatchRejected(ref message) if message.contains("requires expected_text")),

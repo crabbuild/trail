@@ -290,6 +290,10 @@ impl Trail {
         }))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "compares the fixed base/target/source conflict views"
+    )]
     fn explain_conflict_path(
         &self,
         path: &str,
@@ -672,6 +676,10 @@ fn line_preview(line: &LineEntry) -> String {
     value
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "classifies the fixed base/target/source conflict views"
+)]
 fn conflict_class_for_path(
     path: &str,
     base_entry: Option<&FileEntry>,

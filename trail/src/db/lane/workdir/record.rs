@@ -545,7 +545,7 @@ impl Trail {
                         record_scan_root,
                         &head.root_id,
                         &previous_files,
-                        &disk_files,
+                        disk_files,
                         &selected_paths,
                         &change_id,
                         record_preflight,
@@ -554,7 +554,7 @@ impl Trail {
                     self.build_root_for_selected_disk_files_incremental(
                         &head.root_id,
                         &previous_files,
-                        &disk_files,
+                        disk_files,
                         &selected_paths,
                         &change_id,
                     )?
@@ -1311,10 +1311,10 @@ fn lane_workdir_ignore_matcher(root: &Path) -> Result<ignore::gitignore::Gitigno
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     for filename in [".trailignore", ".gitignore"] {
         let path = root.join(filename);
-        if path.exists() {
-            if let Some(err) = builder.add(path) {
-                return Err(Error::InvalidInput(err.to_string()));
-            }
+        if path.exists()
+            && let Some(err) = builder.add(path)
+        {
+            return Err(Error::InvalidInput(err.to_string()));
         }
     }
     builder

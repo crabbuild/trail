@@ -2263,6 +2263,10 @@ fn cursor_coverage_roots(coverage: &CoveragePlan) -> Vec<CursorCoverageRoot> {
         .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "carries the fixed FSEvents startup and callback contract"
+)]
 fn run_stream(
     authority: HistoryAuthority,
     watched_roots: Vec<String>,
@@ -4292,11 +4296,13 @@ pub(crate) fn run_paused_callback_fence() -> std::result::Result<(), String> {
         let paused_gate = Arc::clone(&paused);
         let callback_thread = thread::spawn(move || {
             paused_gate.wait();
-            paused_sender.send(DurabilityCommand::Record {
-                path: LedgerPath::parse("post-sentinel-paused").expect("valid test path"),
-                flags: EvidenceFlags::CONTENT,
-                provider_event_id: 20,
-            })
+            paused_sender
+                .send(DurabilityCommand::Record {
+                    path: LedgerPath::parse("post-sentinel-paused").expect("valid test path"),
+                    flags: EvidenceFlags::CONTENT,
+                    provider_event_id: 20,
+                })
+                .map_err(|_| ())
         });
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         commands

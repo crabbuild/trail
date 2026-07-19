@@ -2415,15 +2415,15 @@ fn discover_git_dependencies(
         .map(PathBuf::from)
         .map(|path| resolve_git_cwd_path(&cwd, path))
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
-    if let Some(selected) = git_environment_value(context, "GIT_CONFIG") {
-        if !selected.is_empty() {
-            insert_git_dependency_path(
-                &mut paths,
-                context.case_sensitive,
-                resolve_git_cwd_path(&cwd, PathBuf::from(selected)),
-                PolicyDependencyKind::GitConfig,
-            );
-        }
+    if let Some(selected) = git_environment_value(context, "GIT_CONFIG")
+        && !selected.is_empty()
+    {
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
+            resolve_git_cwd_path(&cwd, PathBuf::from(selected)),
+            PolicyDependencyKind::GitConfig,
+        );
     }
     if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
         if !global.is_empty() {
@@ -2511,15 +2511,15 @@ fn discover_git_dependencies(
                     PolicyDependencyKind::GitConfig,
                 );
             }
-        } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile") {
-            if let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref()) {
-                insert_git_dependency_path(
-                    &mut paths,
-                    context.case_sensitive,
-                    path,
-                    PolicyDependencyKind::GitExcludesFile,
-                );
-            }
+        } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile")
+            && let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref())
+        {
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
+                path,
+                PolicyDependencyKind::GitExcludesFile,
+            );
         }
     }
 
@@ -2557,20 +2557,21 @@ fn discover_git_dependencies(
                         PolicyDependencyKind::GitConfig,
                         normalized_path_key(&included, context.case_sensitive),
                     );
-                    if !paths.contains_key(&included_key) {
-                        paths.insert(included_key, included.clone());
+                    if let std::collections::btree_map::Entry::Vacant(e) = paths.entry(included_key)
+                    {
+                        e.insert(included.clone());
                         pending.push(included);
                     }
                 }
-            } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile") {
-                if let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref()) {
-                    insert_git_dependency_path(
-                        &mut paths,
-                        context.case_sensitive,
-                        path,
-                        PolicyDependencyKind::GitExcludesFile,
-                    );
-                }
+            } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile")
+                && let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref())
+            {
+                insert_git_dependency_path(
+                    &mut paths,
+                    context.case_sensitive,
+                    path,
+                    PolicyDependencyKind::GitExcludesFile,
+                );
             }
         }
     }
@@ -3285,7 +3286,7 @@ impl NoFollowFileState {
 fn read_file_state_no_follow(path: &Path) -> Result<NoFollowFileState> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return read_file_state_openat(path);
+        read_file_state_openat(path)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

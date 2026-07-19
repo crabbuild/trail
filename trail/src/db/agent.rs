@@ -2734,6 +2734,10 @@ impl Trail {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preserves the public agent diff query contract"
+    )]
     pub fn agent_diff(
         &self,
         selector: &str,
@@ -3964,15 +3968,15 @@ impl Trail {
         let canonical_change_id = ChangeId::from_checkpoint_alias(change_id)
             .map(|change| change.0)
             .unwrap_or_else(|| change_id.to_string());
-        if let Some(transcript) = &view.transcript {
-            if let Some(turn) = transcript.turns.iter().find(|turn| {
+        if let Some(transcript) = &view.transcript
+            && let Some(turn) = transcript.turns.iter().find(|turn| {
                 turn.checkpoint
                     .as_ref()
                     .or(turn.turn.after_change.as_ref())
                     .is_some_and(|checkpoint| checkpoint.0 == canonical_change_id)
-            }) {
-                return self.agent_diff_target_from_turn(turn, "checkpoint", change_id.to_string());
-            }
+            })
+        {
+            return self.agent_diff_target_from_turn(turn, "checkpoint", change_id.to_string());
         }
         self.agent_diff_target_for_operation(view, &canonical_change_id, "checkpoint")
     }
@@ -4091,10 +4095,10 @@ impl Trail {
         }
         let candidate = Path::new(path);
         if candidate.is_absolute() {
-            if let Some(workdir) = &view.task.workdir {
-                if let Ok(relative) = candidate.strip_prefix(Path::new(workdir)) {
-                    return normalize_relative_path(&relative.to_string_lossy());
-                }
+            if let Some(workdir) = &view.task.workdir
+                && let Ok(relative) = candidate.strip_prefix(Path::new(workdir))
+            {
+                return normalize_relative_path(&relative.to_string_lossy());
             }
             if let Ok(relative) = candidate.strip_prefix(&self.workspace_root) {
                 return normalize_relative_path(&relative.to_string_lossy());
@@ -4206,10 +4210,10 @@ fn turn_operation_ids(turn: &TranscriptTurn) -> Vec<ChangeId> {
             ids.push(change_id.clone());
         }
     }
-    if let Some(checkpoint) = turn.checkpoint.as_ref().or(turn.turn.after_change.as_ref()) {
-        if !ids.iter().any(|existing| existing == checkpoint) {
-            ids.push(checkpoint.clone());
-        }
+    if let Some(checkpoint) = turn.checkpoint.as_ref().or(turn.turn.after_change.as_ref())
+        && !ids.iter().any(|existing| existing == checkpoint)
+    {
+        ids.push(checkpoint.clone());
     }
     ids
 }
@@ -4714,8 +4718,8 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
             patch: true,
         });
     }
-    if let Some(path) = path.clone() {
-        if lowered.contains("which prompt")
+    if let Some(path) = path.clone()
+        && (lowered.contains("which prompt")
             || lowered.contains("what prompt")
             || lowered.contains("which turn")
             || lowered.contains("what turn")
@@ -4734,10 +4738,9 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
             || agent_ask_has_any(
                 &lowered_tokens,
                 &["touched", "caused", "introduced", "origin"],
-            )
-        {
-            return Ok(AgentAskRoute::Why(path));
-        }
+            ))
+    {
+        return Ok(AgentAskRoute::Why(path));
     }
     if wants_prompt_change {
         return Ok(AgentAskRoute::Delta {
@@ -4745,13 +4748,13 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
             patch: wants_patch,
         });
     }
-    if agent_ask_has_any(&lowered_tokens, &["inspect", "file", "path"]) {
-        if let Some(path) = path.clone() {
-            return Ok(AgentAskRoute::File {
-                path,
-                patch: wants_patch,
-            });
-        }
+    if agent_ask_has_any(&lowered_tokens, &["inspect", "file", "path"])
+        && let Some(path) = path.clone()
+    {
+        return Ok(AgentAskRoute::File {
+            path,
+            patch: wants_patch,
+        });
     }
     if asks_file_risk {
         return Ok(AgentAskRoute::ChangesByFile);
@@ -4782,17 +4785,16 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     {
         return Ok(AgentAskRoute::Files);
     }
-    if let Some(path) = path.clone() {
-        if lowered.contains("what changed")
+    if let Some(path) = path.clone()
+        && (lowered.contains("what changed")
             || lowered.contains("changed")
             || lowered.contains("diff")
-            || lowered.contains("patch")
-        {
-            return Ok(AgentAskRoute::File {
-                path,
-                patch: wants_patch,
-            });
-        }
+            || lowered.contains("patch"))
+    {
+        return Ok(AgentAskRoute::File {
+            path,
+            patch: wants_patch,
+        });
     }
     if lowered.contains("apply order")
         || lowered.contains("apply first")
@@ -5327,13 +5329,11 @@ fn agent_ask_path(tokens: &[String], lowered_tokens: &[String]) -> Option<String
         if matches!(
             token.as_str(),
             "why" | "explain" | "inspect" | "file" | "path"
-        ) {
-            if let Some(path) = tokens
-                .get(idx + 1)
-                .and_then(|value| agent_ask_clean_path(value))
-            {
-                return Some(path);
-            }
+        ) && let Some(path) = tokens
+            .get(idx + 1)
+            .and_then(|value| agent_ask_clean_path(value))
+        {
+            return Some(path);
         }
     }
     tokens.iter().find_map(|token| agent_ask_clean_path(token))
@@ -5733,19 +5733,19 @@ fn agent_stack_next(
     items: &[AgentStackItem],
     shared_paths: &[AgentStackSharedPath],
 ) -> StatusSuggestion {
-    if let Some(shared) = shared_paths.first() {
-        if shared.lanes.len() >= 2 {
-            return StatusSuggestion {
-                command: format!(
-                    "trail agent compare {} {}",
-                    shared.lanes[0], shared.lanes[1]
-                ),
-                reason: format!(
-                    "review overlap on `{}` before applying either task",
-                    shared.path
-                ),
-            };
-        }
+    if let Some(shared) = shared_paths.first()
+        && shared.lanes.len() >= 2
+    {
+        return StatusSuggestion {
+            command: format!(
+                "trail agent compare {} {}",
+                shared.lanes[0], shared.lanes[1]
+            ),
+            reason: format!(
+                "review overlap on `{}` before applying either task",
+                shared.path
+            ),
+        };
     }
     if let Some(item) = items.iter().find(|item| item.status == "blocked") {
         return item.next.clone();
@@ -7712,13 +7712,12 @@ fn agent_receipt_validation(review: &LaneReviewPacketReport) -> Vec<LaneTestSumm
     if let Some(test) = &review.latest_test {
         validation.push(test.clone());
     }
-    if let Some(eval) = &review.latest_eval {
-        if !validation
+    if let Some(eval) = &review.latest_eval
+        && !validation
             .iter()
             .any(|gate: &LaneTestSummary| gate.event_id == eval.event_id)
-        {
-            validation.push(eval.clone());
-        }
+    {
+        validation.push(eval.clone());
     }
     for gate in &review.recent_gates {
         if validation
@@ -8093,9 +8092,7 @@ fn agent_review_action_mcp_arguments(
 }
 
 fn agent_review_action_gate_args(command: &str, lane: &str) -> Option<serde_json::Value> {
-    let marker = if command.contains(" agent test ") {
-        " -- "
-    } else if command.contains(" agent eval ") {
+    let marker = if command.contains(" agent test ") || command.contains(" agent eval ") {
         " -- "
     } else {
         return None;
@@ -8899,13 +8896,12 @@ fn agent_review_next(
     if matches!(
         risk.level,
         AgentRiskLevel::Blocking | AgentRiskLevel::High | AgentRiskLevel::Medium
-    ) {
-        if let Some(priority) = priorities.first() {
-            return StatusSuggestion {
-                command: priority.why_command.clone(),
-                reason: "start review with the highest-priority changed file".to_string(),
-            };
-        }
+    ) && let Some(priority) = priorities.first()
+    {
+        return StatusSuggestion {
+            command: priority.why_command.clone(),
+            reason: "start review with the highest-priority changed file".to_string(),
+        };
     }
     if view.task.status == AgentTaskStatus::Ready {
         return StatusSuggestion {
@@ -9935,13 +9931,13 @@ fn agent_delta_next(
             reason: "inspect any recorded task-level changes".to_string(),
         };
     }
-    if let Some(path) = file_filter {
-        if !matched {
-            return StatusSuggestion {
-                command: format!("trail agent file {lane} {}", agent_shell_arg(path)),
-                reason: "inspect the full task history for this file".to_string(),
-            };
-        }
+    if let Some(path) = file_filter
+        && !matched
+    {
+        return StatusSuggestion {
+            command: format!("trail agent file {lane} {}", agent_shell_arg(path)),
+            reason: "inspect the full task history for this file".to_string(),
+        };
     }
     if !patches {
         let mode_flag = if mode == "operation" {
@@ -9960,6 +9956,10 @@ fn agent_delta_next(
     fallback.clone()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "assembles the fixed agent delta report contract"
+)]
 fn agent_delta_suggestions(
     lane: &str,
     mode: &str,
@@ -10089,19 +10089,19 @@ fn agent_new_summary(
     changed_paths: &[FileDiffSummary],
     patches: bool,
 ) -> String {
-    if let Some(path) = file_filter {
-        if !matched {
-            return match reviewed {
-                Some(marker) => format!(
-                    "No new changes touched `{path}` since reviewed checkpoint `{}`.",
-                    marker.checkpoint.checkpoint_alias()
-                ),
-                None => format!(
-                    "`{path}` has no recorded changes in {}.",
-                    agent_task_label(task)
-                ),
-            };
-        }
+    if let Some(path) = file_filter
+        && !matched
+    {
+        return match reviewed {
+            Some(marker) => format!(
+                "No new changes touched `{path}` since reviewed checkpoint `{}`.",
+                marker.checkpoint.checkpoint_alias()
+            ),
+            None => format!(
+                "`{path}` has no recorded changes in {}.",
+                agent_task_label(task)
+            ),
+        };
     }
     let changed_lines = changed_paths
         .iter()
@@ -10169,7 +10169,7 @@ fn agent_new_next(
     }
     match status {
         "up_to_date" => StatusSuggestion {
-            command: format!("trail agent status"),
+            command: "trail agent status".to_string(),
             reason: "return to the latest task status".to_string(),
         },
         "new_changes" | "unreviewed" if !patches => {
@@ -10278,7 +10278,7 @@ fn agent_mark_reviewed_suggestions(lane: &str) -> Vec<StatusSuggestion> {
             reason: "confirm there are no new unreviewed changes".to_string(),
         },
         StatusSuggestion {
-            command: format!("trail agent status"),
+            command: "trail agent status".to_string(),
             reason: "return to the latest task status and next action".to_string(),
         },
     ]

@@ -23,8 +23,7 @@ pub(crate) fn fail_next_view_journal_sync_for_current_thread() {
 #[cfg(debug_assertions)]
 fn fail_view_journal_sync_if_requested() -> Result<()> {
     if FAIL_NEXT_VIEW_JOURNAL_SYNC.with(|fail| fail.replace(false)) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(Error::Io(std::io::Error::other(
             "injected workspace view journal sync failure",
         )));
     }

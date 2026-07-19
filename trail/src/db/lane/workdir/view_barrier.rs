@@ -90,7 +90,7 @@ impl ViewMutationBarrier {
         self.validate()?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.set_len(0)?;
-        write!(self.file, "{sequence} {generation}\n")?;
+        writeln!(self.file, "{sequence} {generation}")?;
         self.file.sync_data()?;
         self.validate()?;
         self.checkpoint_sequence = sequence;

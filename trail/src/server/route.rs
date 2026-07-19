@@ -26,12 +26,12 @@ pub(crate) fn route_request(
         .then(|| db.operation_metrics_generation())
         .flatten();
     let mut response = route_request_inner(db, request, auth);
-    if let Some(generation) = metrics_generation {
-        if let Some(report) = db.operation_metrics_json_after(generation) {
-            response
-                .extra_headers
-                .push(("X-Trail-Operation-Metrics", report));
-        }
+    if let Some(generation) = metrics_generation
+        && let Some(report) = db.operation_metrics_json_after(generation)
+    {
+        response
+            .extra_headers
+            .push(("X-Trail-Operation-Metrics", report));
     }
     response
 }

@@ -726,14 +726,13 @@ impl Trail {
             }
             if let Err(err) = self.reconcile_claimed_runtime_allocation(provider, allocation) {
                 let mut reason = err.to_string();
-                if let Ok(Some(observation)) = provider.inspect_container(allocation) {
-                    if validate_runtime_container_ownership(allocation, &observation).is_ok() {
-                        if let Err(stop_err) = provider.stop_container(allocation) {
-                            reason = format!(
+                if let Ok(Some(observation)) = provider.inspect_container(allocation)
+                    && validate_runtime_container_ownership(allocation, &observation).is_ok()
+                    && let Err(stop_err) = provider.stop_container(allocation)
+                {
+                    reason = format!(
                                 "{reason}; additionally failed to stop the unhealthy owned container: {stop_err}"
                             );
-                        }
-                    }
                 }
                 self.finish_runtime_allocation(
                     allocation,
@@ -1271,9 +1270,9 @@ fn wait_for_tcp_health(host_port: u16, timeout_ms: u64) -> Result<()> {
 
 fn validate_runtime_secret_file(path: &std::path::Path) -> Result<()> {
     if !path.is_absolute()
-        || path.to_str().map_or(true, |path| {
-            path.contains(',') || path.chars().any(char::is_control)
-        })
+        || path
+            .to_str()
+            .is_none_or(|path| path.contains(',') || path.chars().any(char::is_control))
     {
         return Err(Error::InvalidInput(
             "secret provider file handle must be an absolute UTF-8 path without control characters or commas"
@@ -1427,10 +1426,10 @@ mod tests {
                     ),
                 ])
             };
-            if !self.foreign_labels {
-                if let Some(digest) = state.secret_binding_digest.as_ref() {
-                    labels.insert(TRAIL_SECRET_BINDINGS_LABEL.to_string(), digest.clone());
-                }
+            if !self.foreign_labels
+                && let Some(digest) = state.secret_binding_digest.as_ref()
+            {
+                labels.insert(TRAIL_SECRET_BINDINGS_LABEL.to_string(), digest.clone());
             }
             Ok(Some(RuntimeContainerObservation {
                 provider_resource_id: "fake-container-id".to_string(),

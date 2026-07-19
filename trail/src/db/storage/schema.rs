@@ -7,6 +7,9 @@ mod changed_path_ledger;
 mod ddl;
 mod version;
 
+type ProllySqliteIndexStructure = (String, Vec<String>);
+type ProllySqliteTableStructure = (String, Vec<String>, Vec<ProllySqliteIndexStructure>);
+
 const PROLLY_SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS prolly_nodes (
     cid  BLOB PRIMARY KEY NOT NULL,
@@ -216,9 +219,7 @@ pub(crate) fn validate_prolly_sqlite_schema_v18(conn: &Connection) -> Result<()>
     Ok(())
 }
 
-fn prolly_sqlite_structure(
-    conn: &Connection,
-) -> Result<Vec<(String, Vec<String>, Vec<(String, Vec<String>)>)>> {
+fn prolly_sqlite_structure(conn: &Connection) -> Result<Vec<ProllySqliteTableStructure>> {
     let mut structure = Vec::new();
     for table in ["prolly_hints", "prolly_nodes", "prolly_roots"] {
         let columns = conn

@@ -234,16 +234,16 @@ impl CaptureIngress {
         {
             eprintln!("trail acp capture warning: durable finish journal failed: {error}");
         }
-        if let Some(tx) = &self.tx {
-            if let Err(error) = tx.try_send(CaptureCommand::Finish(reason)) {
-                let reason = match error {
-                    mpsc::TrySendError::Full(CaptureCommand::Finish(reason))
-                    | mpsc::TrySendError::Disconnected(CaptureCommand::Finish(reason)) => reason,
-                    _ => return,
-                };
-                if let Ok(mut pending) = self.pending_finish.lock() {
-                    *pending = Some(reason);
-                }
+        if let Some(tx) = &self.tx
+            && let Err(error) = tx.try_send(CaptureCommand::Finish(reason))
+        {
+            let reason = match error {
+                mpsc::TrySendError::Full(CaptureCommand::Finish(reason))
+                | mpsc::TrySendError::Disconnected(CaptureCommand::Finish(reason)) => reason,
+                _ => return,
+            };
+            if let Ok(mut pending) = self.pending_finish.lock() {
+                *pending = Some(reason);
             }
         }
     }
@@ -275,10 +275,9 @@ impl CaptureIngress {
             .done_rx
             .get_mut()
             .is_ok_and(|done_rx| done_rx.recv_timeout(timeout).is_ok())
+            && let Some(worker) = self.worker.take()
         {
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            let _ = worker.join();
         }
         self.report()
     }
@@ -303,10 +302,9 @@ impl Drop for CaptureIngress {
             .done_rx
             .get_mut()
             .is_ok_and(|done_rx| done_rx.recv_timeout(CAPTURE_SHUTDOWN_TIMEOUT).is_ok())
+            && let Some(worker) = self.worker.take()
         {
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            let _ = worker.join();
         }
     }
 }
@@ -1110,11 +1108,10 @@ fn redact_callback_secrets(message: &mut Value) {
                 return;
             };
             for variable in env {
-                if let Some(variable) = variable.as_object_mut() {
-                    if variable.contains_key("value") {
-                        variable
-                            .insert("value".to_string(), Value::String("[REDACTED]".to_string()));
-                    }
+                if let Some(variable) = variable.as_object_mut()
+                    && variable.contains_key("value")
+                {
+                    variable.insert("value".to_string(), Value::String("[REDACTED]".to_string()));
                 }
             }
         }

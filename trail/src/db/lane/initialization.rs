@@ -559,7 +559,13 @@ pub(crate) fn transition_lane_initialization(
     let error_code = update.last_error.map(Error::code);
     let error_message = update.last_error.map(|error| {
         let mut message = error.to_string();
-        message.truncate(message.floor_char_boundary(4096));
+        if message.len() > 4096 {
+            let mut boundary = 4096;
+            while !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
+        }
         message
     });
     let changed = tx.execute(
@@ -1158,13 +1164,13 @@ fn backfilled_lane_failed_invariant(
             "lane ref does not match the active branch head".into(),
         ));
     }
-    if workdir.is_some() {
+    if let Some(workdir) = workdir {
         if metadata.materialization.is_none() {
             return Ok(Some(
                 "materialized lane metadata is missing or incomplete".into(),
             ));
         }
-        if !authenticated_legacy_observer_evidence(tx, lane_id, workdir.unwrap(), now)? {
+        if !authenticated_legacy_observer_evidence(tx, lane_id, workdir, now)? {
             return Ok(Some(
                 "materialized lane authenticated observer/filesystem/policy evidence is missing or inconsistent".into(),
             ));

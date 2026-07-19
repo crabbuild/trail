@@ -287,10 +287,12 @@ enum DeletionSubstitutionPoint {
 }
 
 #[cfg(debug_assertions)]
+type DeletionSubstitutionHook = (DeletionSubstitutionPoint, Box<dyn FnOnce()>);
+
+#[cfg(debug_assertions)]
 thread_local! {
-    static DELETION_SUBSTITUTION_HOOK: std::cell::RefCell<
-        Option<(DeletionSubstitutionPoint, Box<dyn FnOnce()>)>
-    > = const { std::cell::RefCell::new(None) };
+    static DELETION_SUBSTITUTION_HOOK: std::cell::RefCell<Option<DeletionSubstitutionHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(debug_assertions)]
@@ -310,10 +312,8 @@ fn run_deletion_substitution_hook(point: DeletionSubstitutionPoint) {
             .borrow()
             .as_ref()
             .is_some_and(|(installed, _)| *installed == point);
-        if should_run {
-            if let Some((_, hook)) = slot.borrow_mut().take() {
-                hook();
-            }
+        if should_run && let Some((_, hook)) = slot.borrow_mut().take() {
+            hook();
         }
     });
 }
@@ -657,7 +657,8 @@ pub(crate) fn retire_deletion_scopes(
              WHERE scope_kind IN ('materialized_lane','workspace_view')
              ORDER BY scope_id",
         )?;
-        let rows = statement
+
+        statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -674,8 +675,7 @@ pub(crate) fn retire_deletion_scopes(
                     || ref_names.contains(&ref_name.as_str()))
                 .then_some(scope_id)
             })
-            .collect::<Vec<_>>();
-        rows
+            .collect::<Vec<_>>()
     };
     let mut retired_paths = Vec::new();
     for scope_id in scope_ids {

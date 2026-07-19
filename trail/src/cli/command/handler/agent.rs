@@ -359,15 +359,13 @@ fn handle_agent_hooks_setup(ctx: &RuntimeContext, args: AgentHooksSetupArgs) -> 
     })?;
     let dry_run = !args.yes || args.print_only;
     let report = apply_agent_hook_install_plan(&plan, dry_run)?;
-    if !dry_run {
-        if let Err(error) = db.record_agent_hook_installation(&plan, args.lane.as_deref()) {
-            rollback_agent_hook_install_plan(&plan).map_err(|rollback| {
-                Error::Conflict(format!(
-                    "failed to record hook installation ({error}); rollback also failed: {rollback}"
-                ))
-            })?;
-            return Err(error);
-        }
+    if !dry_run && let Err(error) = db.record_agent_hook_installation(&plan, args.lane.as_deref()) {
+        rollback_agent_hook_install_plan(&plan).map_err(|rollback| {
+            Error::Conflict(format!(
+                "failed to record hook installation ({error}); rollback also failed: {rollback}"
+            ))
+        })?;
+        return Err(error);
     }
     render_agent_hooks_value(
         ctx,
@@ -758,11 +756,11 @@ fn agent_hook_spool_pressure(db_dir: &std::path::Path) -> AgentHookSpoolPressure
     let mut pressure = AgentHookSpoolPressure::default();
     if let Ok(entries) = std::fs::read_dir(directory) {
         for entry in entries.flatten().take(10_000) {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    pressure.files += 1;
-                    pressure.bytes = pressure.bytes.saturating_add(metadata.len());
-                }
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file()
+            {
+                pressure.files += 1;
+                pressure.bytes = pressure.bytes.saturating_add(metadata.len());
             }
         }
     }
@@ -987,14 +985,14 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
     };
     let capture_result = open_db(ctx).and_then(|mut db| {
         let ingested = db.persist_agent_hook_receipt(input.clone())?;
-        if ingested.receipt.status != "processed" {
-            if let Err(error) = db.replay_agent_hook_receipt(&ingested.receipt.receipt_id) {
-                render_native_receipt_diagnostic(
-                    ctx,
-                    "Native receipt replay is deferred",
-                    error.to_string(),
-                );
-            }
+        if ingested.receipt.status != "processed"
+            && let Err(error) = db.replay_agent_hook_receipt(&ingested.receipt.receipt_id)
+        {
+            render_native_receipt_diagnostic(
+                ctx,
+                "Native receipt replay is deferred",
+                error.to_string(),
+            );
         }
         Ok(())
     });
@@ -1037,20 +1035,21 @@ fn enrich_kiro_hook_payload(
     let Some(root) = payload.as_object_mut() else {
         return payload;
     };
-    if native_event.eq_ignore_ascii_case("UserPromptSubmit") && !root.contains_key("prompt") {
-        if let Ok(prompt) = std::env::var("USER_PROMPT") {
-            if !prompt.is_empty() && prompt.len() <= trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES {
-                root.insert("prompt".to_string(), serde_json::Value::String(prompt));
-            }
-        }
+    if native_event.eq_ignore_ascii_case("UserPromptSubmit")
+        && !root.contains_key("prompt")
+        && let Ok(prompt) = std::env::var("USER_PROMPT")
+        && !prompt.is_empty()
+        && prompt.len() <= trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+    {
+        root.insert("prompt".to_string(), serde_json::Value::String(prompt));
     }
-    if !root.contains_key("cwd") {
-        if let Ok(cwd) = std::env::current_dir() {
-            root.insert(
-                "cwd".to_string(),
-                serde_json::Value::String(cwd.to_string_lossy().into_owned()),
-            );
-        }
+    if !root.contains_key("cwd")
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        root.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(cwd.to_string_lossy().into_owned()),
+        );
     }
     payload
 }
@@ -1538,11 +1537,9 @@ fn run_terminal_agent_task(
     } else {
         command
     };
-    if command_is_default {
-        if let Some(settings) = project_hook_settings {
-            command.push("--settings".to_string());
-            command.push(settings.to_string_lossy().into_owned());
-        }
+    if command_is_default && let Some(settings) = project_hook_settings {
+        command.push("--settings".to_string());
+        command.push(settings.to_string_lossy().into_owned());
     }
     if !ctx.json {
         render_document(
@@ -2082,8 +2079,8 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
             patch: true,
         });
     }
-    if let Some(path) = path.clone() {
-        if lowered.contains("which prompt")
+    if let Some(path) = path.clone()
+        && (lowered.contains("which prompt")
             || lowered.contains("what prompt")
             || lowered.contains("which turn")
             || lowered.contains("what turn")
@@ -2102,10 +2099,9 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
             || agent_ask_has_any(
                 &lowered_tokens,
                 &["touched", "caused", "introduced", "origin"],
-            )
-        {
-            return Ok(AgentAskIntent::Why(path));
-        }
+            ))
+    {
+        return Ok(AgentAskIntent::Why(path));
     }
     if wants_prompt_change {
         return Ok(AgentAskIntent::Delta {
@@ -2113,13 +2109,13 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
             patch: wants_patch,
         });
     }
-    if agent_ask_has_any(&lowered_tokens, &["inspect", "file", "path"]) {
-        if let Some(path) = path.clone() {
-            return Ok(AgentAskIntent::File {
-                path,
-                patch: wants_patch,
-            });
-        }
+    if agent_ask_has_any(&lowered_tokens, &["inspect", "file", "path"])
+        && let Some(path) = path.clone()
+    {
+        return Ok(AgentAskIntent::File {
+            path,
+            patch: wants_patch,
+        });
     }
     if asks_file_risk {
         return Ok(AgentAskIntent::ChangesByFile);
@@ -2150,17 +2146,16 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
     {
         return Ok(AgentAskIntent::Files);
     }
-    if let Some(path) = path.clone() {
-        if lowered.contains("what changed")
+    if let Some(path) = path.clone()
+        && (lowered.contains("what changed")
             || lowered.contains("changed")
             || lowered.contains("diff")
-            || lowered.contains("patch")
-        {
-            return Ok(AgentAskIntent::File {
-                path,
-                patch: wants_patch,
-            });
-        }
+            || lowered.contains("patch"))
+    {
+        return Ok(AgentAskIntent::File {
+            path,
+            patch: wants_patch,
+        });
     }
     if lowered.contains("apply order")
         || lowered.contains("apply first")
@@ -2582,13 +2577,11 @@ fn agent_ask_path(tokens: &[String], lowered_tokens: &[String]) -> Option<String
         if matches!(
             token.as_str(),
             "why" | "explain" | "inspect" | "file" | "path"
-        ) {
-            if let Some(path) = tokens
-                .get(idx + 1)
-                .and_then(|value| agent_ask_clean_path(value))
-            {
-                return Some(path);
-            }
+        ) && let Some(path) = tokens
+            .get(idx + 1)
+            .and_then(|value| agent_ask_clean_path(value))
+        {
+            return Some(path);
         }
     }
     tokens.iter().find_map(|token| agent_ask_clean_path(token))

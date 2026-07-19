@@ -36,7 +36,7 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
                 return Some(format!("ps:{value}"));
             }
         }
-        return None;
+        None
     }
     #[cfg(target_os = "windows")]
     {
@@ -117,7 +117,7 @@ pub(crate) fn process_matches_start_token(pid: u32, token: &str) -> bool {
     if !process_is_alive(pid) {
         return false;
     }
-    process_start_token(pid).map_or(true, |actual| actual == token)
+    process_start_token(pid).is_none_or(|actual| actual == token)
 }
 
 /// Internal helper entry point used by the CLI's hidden process-watchdog mode.

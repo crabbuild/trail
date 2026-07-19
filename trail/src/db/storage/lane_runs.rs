@@ -38,6 +38,10 @@ impl Trail {
         Ok((resolved_session_id, turn_id.map(str::to_string)))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable lane-run row schema"
+    )]
     pub(crate) fn insert_lane_run_state(
         &self,
         lane_id: &str,

@@ -477,7 +477,7 @@ pub(crate) fn run_tracked_ignored_candidate_flow() -> std::result::Result<(), St
     fs::write(temp.path().join("tree/untracked.txt"), b"ignored\n")
         .map_err(|error| error.to_string())?;
 
-    super::prepare_workspace_daemon(&mut db, false).map_err(|error| error.to_string())?;
+    super::prepare_workspace_daemon(&db, false).map_err(|error| error.to_string())?;
     set_command_authority_override(true);
     let _reset = OverrideReset;
     let (scope_id, provider_id): (String, String) = db
@@ -884,7 +884,7 @@ fn run_command_flow_inner(long_record_lock: bool) -> std::result::Result<(), Str
     let mut db = Trail::open(temp.path()).map_err(|error| error.to_string())?;
     db.record(None, Some("baseline".into()), Actor::human(), false)
         .map_err(|error| error.to_string())?;
-    super::prepare_workspace_daemon(&mut db, false).map_err(|error| error.to_string())?;
+    super::prepare_workspace_daemon(&db, false).map_err(|error| error.to_string())?;
     set_command_authority_override(true);
     let _reset = OverrideReset;
 
@@ -1613,22 +1613,21 @@ impl crate::Trail {
         // Materialized-lane runtime repair is wrapper-owned so a committed
         // observed operation has exactly one post-commit transition. Workspace
         // observed recording has no wrapper repair closure and remains local.
-        if lane_id.is_none() {
-            if let Some(runtime) = self
+        if lane_id.is_none()
+            && let Some(runtime) = self
                 .changed_path_daemon_registry
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .workspace
                 .as_mut()
-            {
-                runtime
-                    .accept_observed_baseline(&observed.expected, &target)
-                    .map_err(|error| crate::Error::OperationCommittedRepairRequired {
-                        operation: operation_id.0.clone(),
-                        repair: "workspace observer runtime".into(),
-                        reason: error.to_string(),
-                    })?;
-            }
+        {
+            runtime
+                .accept_observed_baseline(&observed.expected, &target)
+                .map_err(|error| crate::Error::OperationCommittedRepairRequired {
+                    operation: operation_id.0.clone(),
+                    repair: "workspace observer runtime".into(),
+                    reason: error.to_string(),
+                })?;
         }
         Ok(operation_id)
     }

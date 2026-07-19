@@ -175,12 +175,12 @@ impl AgentProviderRegistry {
                 .chain(manifest.aliases.iter().map(String::as_str))
             {
                 validate_provider_name(alias)?;
-                if let Some(existing) = aliases.insert(alias.to_string(), provider.clone()) {
-                    if existing != provider {
-                        return Err(Error::InvalidInput(format!(
+                if let Some(existing) = aliases.insert(alias.to_string(), provider.clone())
+                    && existing != provider
+                {
+                    return Err(Error::InvalidInput(format!(
                             "agent provider alias `{alias}` belongs to both `{existing}` and `{provider}`"
                         )));
-                    }
                 }
             }
         }
@@ -378,6 +378,10 @@ fn capabilities(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the fixed provider manifest schema"
+)]
 fn manifest(
     provider: &str,
     display_name: &str,

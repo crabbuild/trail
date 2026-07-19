@@ -1,6 +1,10 @@
 use super::*;
 
 impl Trail {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the durable lane pause event schema"
+    )]
     pub fn pause_lane_run(
         &mut self,
         lane: &str,

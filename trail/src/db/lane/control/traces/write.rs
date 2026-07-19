@@ -29,16 +29,15 @@ impl Trail {
         let parent = parent_span_id
             .map(|span_id| self.show_lane_trace_span(span_id))
             .transpose()?;
-        if let Some(parent) = &parent {
-            if parent.lane_id != turn.lane_id
+        if let Some(parent) = &parent
+            && (parent.lane_id != turn.lane_id
                 || parent.turn_id.as_deref() != Some(turn_id)
-                || parent.session_id != turn.session_id
-            {
-                return Err(Error::InvalidInput(format!(
-                    "parent span `{}` does not belong to turn `{turn_id}`",
-                    parent.span_id
-                )));
-            }
+                || parent.session_id != turn.session_id)
+        {
+            return Err(Error::InvalidInput(format!(
+                "parent span `{}` does not belong to turn `{turn_id}`",
+                parent.span_id
+            )));
         }
 
         let trace_id = match (trace_id.map(str::trim), parent.as_ref()) {

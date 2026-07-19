@@ -12,28 +12,27 @@ impl Trail {
         {
             std::thread::sleep(std::time::Duration::from_millis(milliseconds));
         }
-        if let Some(lane_handle) = input.lane_id.clone() {
-            if let Some((lane_id, ref_name)) = self.external_mutation_lane_identity(&lane_handle)? {
-                input.lane_id = Some(lane_id);
-                if input.target_ref.is_none() {
-                    input.target_ref = Some(ref_name);
-                }
+        if let Some(lane_handle) = input.lane_id.clone()
+            && let Some((lane_id, ref_name)) = self.external_mutation_lane_identity(&lane_handle)?
+        {
+            input.lane_id = Some(lane_id);
+            if input.target_ref.is_none() {
+                input.target_ref = Some(ref_name);
             }
         }
-        if input.lane_id.is_none() || input.target_ref.is_none() {
-            if let Some((lane_id, ref_name)) = input
+        if (input.lane_id.is_none() || input.target_ref.is_none())
+            && let Some((lane_id, ref_name)) = input
                 .turn_id
                 .as_deref()
                 .map(|turn_id| self.external_mutation_turn_identity(turn_id))
                 .transpose()?
                 .flatten()
-            {
-                if input.lane_id.is_none() {
-                    input.lane_id = Some(lane_id);
-                }
-                if input.target_ref.is_none() {
-                    input.target_ref = Some(ref_name);
-                }
+        {
+            if input.lane_id.is_none() {
+                input.lane_id = Some(lane_id);
+            }
+            if input.target_ref.is_none() {
+                input.target_ref = Some(ref_name);
             }
         }
         let seed = format!(

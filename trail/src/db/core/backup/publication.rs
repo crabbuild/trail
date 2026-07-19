@@ -76,28 +76,6 @@ fn publish_staged_tree_with_exchange(
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_exchange_refuses_before_moving_the_live_tree() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("live");
-        let stage = root.path().join("stage");
-        fs::create_dir(&target).unwrap();
-        fs::create_dir(&stage).unwrap();
-        fs::write(target.join("marker"), b"old").unwrap();
-        fs::write(stage.join("marker"), b"new").unwrap();
-
-        let result = publish_staged_tree_with_exchange(&stage, &target, |_, _| Ok(false));
-
-        assert!(result.is_err());
-        assert_eq!(fs::read(target.join("marker")).unwrap(), b"old");
-        assert_eq!(fs::read(stage.join("marker")).unwrap(), b"new");
-    }
-}
-
 pub(super) fn remove_retained_tree(path: Option<PathBuf>, parent: &Path) -> Result<()> {
     if let Some(path) = path {
         remove_any(&path)?;
@@ -162,6 +140,28 @@ pub(super) fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
         } else {
             Err(error.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_exchange_refuses_before_moving_the_live_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("live");
+        let stage = root.path().join("stage");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&stage).unwrap();
+        fs::write(target.join("marker"), b"old").unwrap();
+        fs::write(stage.join("marker"), b"new").unwrap();
+
+        let result = publish_staged_tree_with_exchange(&stage, &target, |_, _| Ok(false));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(target.join("marker")).unwrap(), b"old");
+        assert_eq!(fs::read(stage.join("marker")).unwrap(), b"new");
     }
 }
 

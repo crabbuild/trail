@@ -638,10 +638,10 @@ pub(crate) fn preflight_existing_schema(
             }
         }
         entry.changed.notify_all();
-        if let Some((failed_round, message)) = &state.failed {
-            if *failed_round == round {
-                return Err(schema_reinitialize_error(message.clone()));
-            }
+        if let Some((failed_round, message)) = &state.failed
+            && *failed_round == round
+        {
+            return Err(schema_reinitialize_error(message.clone()));
         }
         let (parent_authority, main_authority) = open_schema_main_authority(db_path, &generation)?;
         state.active_handoffs = state.active_handoffs.saturating_add(1);
@@ -760,10 +760,10 @@ fn schema_validation_runtime_namespace(db_path: &Path) -> Result<Option<(PathBuf
     let runtime_dir = PathBuf::from(format!("/tmp/trail-sv-{uid}"));
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
-    if let Err(error) = builder.create(&runtime_dir) {
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Ok(None);
-        }
+    if let Err(error) = builder.create(&runtime_dir)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Ok(None);
     }
     let metadata = match fs::symlink_metadata(&runtime_dir) {
         Ok(metadata) => metadata,
@@ -974,7 +974,7 @@ fn schema_validation_peer_identity(
         if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        return Ok((pid as u32, uid));
+        Ok((pid as u32, uid))
     }
 }
 
@@ -1499,23 +1499,21 @@ fn coordinate_schema_snapshot_validation(
                 let generation_key = schema_generation_key(generation);
                 let mut validation =
                     validate_schema_snapshot_generation(db_path, backend, generation);
-                let outcome = if validation.is_ok() {
-                    match schema_wal_digest(db_path, generation) {
+                let outcome = match &validation {
+                    Ok(()) => match schema_wal_digest(db_path, generation) {
                         Ok(digest) => {
                             *authenticated_wal_digest = Some(digest.clone());
                             CrossProcessSchemaValidationOutcome::Success(digest)
                         }
                         Err(error) => {
+                            let message = schema_failure_message(&error);
                             validation = Err(error);
-                            CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(
-                                validation.as_ref().unwrap_err(),
-                            ))
+                            CrossProcessSchemaValidationOutcome::Failure(message)
                         }
+                    },
+                    Err(error) => {
+                        CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(error))
                     }
-                } else {
-                    CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(
-                        validation.as_ref().unwrap_err(),
-                    ))
                 };
                 #[cfg(test)]
                 let (start_delay, shutdown_delay) =
@@ -1714,17 +1712,16 @@ fn schema_validation_process_test_probe() -> Result<()> {
             .create_new(true)
             .open(started_path);
     }
-    if let Some(crash_path) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_CRASH_ONCE") {
-        if let Ok(mut crash) = OpenOptions::new()
+    if let Some(crash_path) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_CRASH_ONCE")
+        && let Ok(mut crash) = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(crash_path)
-        {
-            writeln!(crash, "{}", std::process::id())?;
-            crash.sync_all()?;
-            loop {
-                std::thread::park();
-            }
+    {
+        writeln!(crash, "{}", std::process::id())?;
+        crash.sync_all()?;
+        loop {
+            std::thread::park();
         }
     }
     if let Some(delay) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS") {
@@ -1908,14 +1905,26 @@ fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 length: metadata.len(),
-                modified_seconds: (suffix != "-shm").then_some(metadata.mtime()).unwrap_or(0),
-                modified_nanoseconds: (suffix != "-shm")
-                    .then_some(metadata.mtime_nsec())
-                    .unwrap_or(0),
-                changed_seconds: (suffix != "-shm").then_some(metadata.ctime()).unwrap_or(0),
-                changed_nanoseconds: (suffix != "-shm")
-                    .then_some(metadata.ctime_nsec())
-                    .unwrap_or(0),
+                modified_seconds: if suffix != "-shm" {
+                    metadata.mtime()
+                } else {
+                    0
+                },
+                modified_nanoseconds: if suffix != "-shm" {
+                    metadata.mtime_nsec()
+                } else {
+                    0
+                },
+                changed_seconds: if suffix != "-shm" {
+                    metadata.ctime()
+                } else {
+                    0
+                },
+                changed_nanoseconds: if suffix != "-shm" {
+                    metadata.ctime_nsec()
+                } else {
+                    0
+                },
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 files.push(SchemaFileGeneration {
@@ -3444,6 +3453,7 @@ pub(crate) fn acquire_workspace_lock_with_admission(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(exclusion_path)
     {
         Ok(file) => file,
@@ -3791,10 +3801,7 @@ impl WorkspaceLockOwner {
     fn current(purpose: WorkspaceLockPurpose, operation_id: Option<&str>) -> std::io::Result<Self> {
         let mut nonce = [0_u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to generate workspace-lock nonce: {error}"),
-            )
+            std::io::Error::other(format!("failed to generate workspace-lock nonce: {error}"))
         })?;
         Ok(Self {
             version: 2,
@@ -4182,10 +4189,10 @@ fn cleanup_owned_workspace_lock(
     owner_record: &str,
     owner_file: &File,
 ) {
-    if let Some(candidate) = candidate_residue {
-        if rollback_workspace_lock_publication(lock_path, candidate, owner_record, owner_file) {
-            return;
-        }
+    if let Some(candidate) = candidate_residue
+        && rollback_workspace_lock_publication(lock_path, candidate, owner_record, owner_file)
+    {
+        return;
     }
     remove_owned_workspace_lock(lock_path, owner_record, owner_file);
 }
@@ -4499,8 +4506,7 @@ fn cleanup_abandoned_workspace_lock_candidates(db_dir: &Path) -> std::io::Result
     let entries = fs::read_dir(db_dir)?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_DIRECTORY_ENTRIES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "workspace lock directory exceeds the bounded cleanup scan; remove unexpected entries and retry",
             ));
         }
@@ -5987,11 +5993,11 @@ mod tests {
                 .wrapping_add(3037000493);
             parts.push(atoms[(state as usize) % atoms.len()]);
         }
-        let mut path = parts.join(if seed % 7 == 0 { "\\" } else { "/" });
-        if seed % 11 == 0 {
+        let mut path = parts.join(if seed.is_multiple_of(7) { "\\" } else { "/" });
+        if seed.is_multiple_of(11) {
             path.insert(0, '/');
         }
-        if seed % 13 == 0 {
+        if seed.is_multiple_of(13) {
             path.push('\0');
         }
         path
@@ -6013,17 +6019,17 @@ mod tests {
                 "op": op,
                 "path": path,
                 "content": format!("seed-{seed}\n"),
-                "extra": (seed % 3 == 0).then_some(true)
+                "extra": seed.is_multiple_of(3).then_some(true)
             }),
             "write_bytes" => serde_json::json!({
                 "op": op,
                 "path": path,
-                "bytes_hex": if seed % 2 == 0 { "00ff" } else { "not-hex" }
+                "bytes_hex": if seed.is_multiple_of(2) { "00ff" } else { "not-hex" }
             }),
             "replace_line" => serde_json::json!({
                 "op": op,
                 "path": path,
-                "line_id": if seed % 2 == 0 {
+                "line_id": if seed.is_multiple_of(2) {
                     serde_json::json!("line_abc:1")
                 } else {
                     serde_json::json!(1)
@@ -6047,7 +6053,7 @@ mod tests {
         };
         serde_json::json!({
             "message": format!("generated patch {seed}"),
-            "allow_stale": seed % 2 == 0,
+            "allow_stale": seed.is_multiple_of(2),
             "edits": [edit]
         })
     }

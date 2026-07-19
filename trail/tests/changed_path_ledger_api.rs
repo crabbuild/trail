@@ -19,13 +19,12 @@ struct AutoDaemonGuard(PathBuf);
 impl Drop for AutoDaemonGuard {
     fn drop(&mut self) {
         let endpoint = self.0.join(".trail/index/change-ledger/daemon.json");
-        if let Ok(bytes) = fs::read(endpoint) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(pid) = value["pid"].as_i64() {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                }
+        if let Ok(bytes) = fs::read(endpoint)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(pid) = value["pid"].as_i64()
+        {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
             }
         }
     }

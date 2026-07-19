@@ -1085,15 +1085,15 @@ impl Trail {
         if let Some(session_id) = session_id {
             self.lane_session(session_id)?;
         }
-        if let Some(status) = status {
-            if !matches!(
+        if let Some(status) = status
+            && !matches!(
                 status,
                 "proposed" | "accepted" | "rejected" | "expired" | "superseded"
-            ) {
-                return Err(Error::InvalidInput(format!(
-                    "unknown learning status `{status}`"
-                )));
-            }
+            )
+        {
+            return Err(Error::InvalidInput(format!(
+                "unknown learning status `{status}`"
+            )));
         }
         let mut statement = self.conn.prepare(
             "SELECT learning_id, lane_id, session_id, turn_id, scope, body, status,

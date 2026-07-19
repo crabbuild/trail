@@ -13,12 +13,12 @@ pub(crate) fn normalize_lane_gate_options(
         }
         options.suite = Some(suite.to_string());
     }
-    if let Some(score) = options.score {
-        if !score.is_finite() {
-            return Err(Error::InvalidInput(format!(
-                "lane {kind} score must be a finite number"
-            )));
-        }
+    if let Some(score) = options.score
+        && !score.is_finite()
+    {
+        return Err(Error::InvalidInput(format!(
+            "lane {kind} score must be a finite number"
+        )));
     }
     if let Some(threshold) = options.threshold {
         if !threshold.is_finite() {

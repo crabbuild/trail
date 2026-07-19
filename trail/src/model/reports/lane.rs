@@ -677,17 +677,14 @@ pub struct WorkspaceCheckpointReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PhysicalSharing {
     Verified,
     NotShared,
+    #[default]
     Unknown,
 }
 
-impl Default for PhysicalSharing {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSpaceReport {

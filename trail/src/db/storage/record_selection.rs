@@ -24,10 +24,10 @@ impl Trail {
         allow_ignored: bool,
         policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<Vec<DiskFile>> {
-        if allow_ignored {
-            if let Some(path) = selected_paths.iter().find(|path| is_internal_path(path)) {
-                return Err(Error::IgnoredPath(path.clone()));
-            }
+        if allow_ignored
+            && let Some(path) = selected_paths.iter().find(|path| is_internal_path(path))
+        {
+            return Err(Error::IgnoredPath(path.clone()));
         }
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),
@@ -118,10 +118,10 @@ impl Trail {
         selections: &SelectionSet,
         allow_ignored: bool,
     ) -> Result<Vec<DiskFile>> {
-        if allow_ignored {
-            if let Some(path) = explicit_paths.iter().find(|path| is_internal_path(path)) {
-                return Err(Error::IgnoredPath(path.clone()));
-            }
+        if allow_ignored
+            && let Some(path) = explicit_paths.iter().find(|path| is_internal_path(path))
+        {
+            return Err(Error::IgnoredPath(path.clone()));
         }
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),

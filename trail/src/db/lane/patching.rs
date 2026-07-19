@@ -210,14 +210,12 @@ impl Trail {
                 .changes
                 .iter_mut()
                 .find(|change| change.path == path && change.file_id.as_ref() == Some(&file_id))
-            {
-                if !change
+                && !change
                     .line_changes
                     .iter()
                     .any(|existing| existing.line_id == line.line_id)
-                {
-                    change.line_changes.push(line);
-                }
+            {
+                change.line_changes.push(line);
             }
         }
         if diff.changes.is_empty() && !empty_patch {
@@ -445,6 +443,10 @@ impl Trail {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the fixed lane projection publication state"
+    )]
     fn apply_lane_patch_workdir_projection(
         &self,
         lane_row: &LaneBranch,

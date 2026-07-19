@@ -720,10 +720,10 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     )?;
     unpublished_socket.armed = false;
     #[cfg(debug_assertions)]
-    if let Ok(delay) = std::env::var("TRAIL_TEST_WORKSPACE_DAEMON_DELAY_AFTER_INTENT_MS") {
-        if let Ok(delay) = delay.parse::<u64>() {
-            std::thread::sleep(Duration::from_millis(delay));
-        }
+    if let Ok(delay) = std::env::var("TRAIL_TEST_WORKSPACE_DAEMON_DELAY_AFTER_INTENT_MS")
+        && let Ok(delay) = delay.parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(delay));
     }
 
     let ledger_ready = trail::server::prepare_workspace_changed_path_daemon(&mut db)?;
@@ -1078,12 +1078,11 @@ fn acquire_or_observe_published_daemon(
         match flock(lock, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => return Ok(None),
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                if let Some(endpoint) = read_secure_endpoint(authority)? {
-                    if let EndpointState::Ready(ready) =
+                if let Some(endpoint) = read_secure_endpoint(authority)?
+                    && let EndpointState::Ready(ready) =
                         classify_endpoint(workspace, authority, &endpoint, requested_token)?
-                    {
-                        return Ok(Some(ready));
-                    }
+                {
+                    return Ok(Some(ready));
                 }
                 if Instant::now() >= deadline {
                     return Err(Error::DaemonUnavailable(
@@ -1658,10 +1657,10 @@ fn process_start_identity(pid: u32) -> Option<String> {
         if read != expected || info.pbi_pid != pid {
             return None;
         }
-        return Some(format!(
+        Some(format!(
             "macos:{}:{}:{}",
             info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
-        ));
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1684,10 +1683,10 @@ fn required_env(name: &str) -> Result<String> {
 
 fn ready_timeout() -> Duration {
     #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var("TRAIL_TEST_WORKSPACE_DAEMON_READY_TIMEOUT_MS") {
-        if let Ok(milliseconds) = value.parse::<u64>() {
-            return Duration::from_millis(milliseconds.max(1));
-        }
+    if let Ok(value) = std::env::var("TRAIL_TEST_WORKSPACE_DAEMON_READY_TIMEOUT_MS")
+        && let Ok(milliseconds) = value.parse::<u64>()
+    {
+        return Duration::from_millis(milliseconds.max(1));
     }
     Duration::from_secs(60)
 }

@@ -231,14 +231,13 @@ fn decode_newline(code: u8) -> Result<NewlineKind> {
 }
 
 fn write_change_id(out: &mut Vec<u8>, change_id: &ChangeId) {
-    if let Some(hex_id) = change_id.0.strip_prefix(crate::ids::CHANGE_ID_PREFIX) {
-        if hex_id.len() == 64 {
-            if let Ok(bytes) = hex::decode(hex_id) {
-                out.push(0);
-                out.extend_from_slice(&bytes);
-                return;
-            }
-        }
+    if let Some(hex_id) = change_id.0.strip_prefix(crate::ids::CHANGE_ID_PREFIX)
+        && hex_id.len() == 64
+        && let Ok(bytes) = hex::decode(hex_id)
+    {
+        out.push(0);
+        out.extend_from_slice(&bytes);
+        return;
     }
     out.push(1);
     write_bytes(out, change_id.0.as_bytes());
@@ -364,11 +363,11 @@ pub(crate) fn inserted_line_groups(
             continue;
         }
         let gap = line_gap_at(lines, idx, base_keys);
-        if let Some((last_gap, last_lines)) = groups.last_mut() {
-            if *last_gap == gap {
-                last_lines.push(line.clone());
-                continue;
-            }
+        if let Some((last_gap, last_lines)) = groups.last_mut()
+            && *last_gap == gap
+        {
+            last_lines.push(line.clone());
+            continue;
         }
         groups.push((gap, vec![line.clone()]));
     }
@@ -417,7 +416,7 @@ pub(crate) fn insert_lines_at_gap(
     gap: &LineGap,
     inserted: Vec<LineEntry>,
 ) {
-    let mut idx = if let Some(next) = &gap.next {
+    let idx = if let Some(next) = &gap.next {
         lines
             .iter()
             .position(|line| line.line_id_key() == *next)
@@ -431,9 +430,8 @@ pub(crate) fn insert_lines_at_gap(
     } else {
         lines.len()
     };
-    for line in inserted {
-        lines.insert(idx, line);
-        idx += 1;
+    for (offset, line) in inserted.into_iter().enumerate() {
+        lines.insert(idx + offset, line);
     }
 }
 

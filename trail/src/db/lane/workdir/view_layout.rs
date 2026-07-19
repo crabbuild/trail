@@ -86,15 +86,15 @@ pub(crate) struct ViewUpperLayout {
 
 impl ViewUpperLayout {
     pub(crate) fn from_source_upper(source_upper: PathBuf) -> Self {
-        if source_upper.file_name().and_then(|name| name.to_str()) == Some("source-upper") {
-            if let Some(view_dir) = source_upper.parent() {
-                return Self {
-                    source_upper: source_upper.clone(),
-                    generated_upper: view_dir.join("generated-upper"),
-                    scratch_upper: view_dir.join("scratch-upper"),
-                    meta_dir: view_dir.join("meta"),
-                };
-            }
+        if source_upper.file_name().and_then(|name| name.to_str()) == Some("source-upper")
+            && let Some(view_dir) = source_upper.parent()
+        {
+            return Self {
+                source_upper: source_upper.clone(),
+                generated_upper: view_dir.join("generated-upper"),
+                scratch_upper: view_dir.join("scratch-upper"),
+                meta_dir: view_dir.join("meta"),
+            };
         }
         let meta_dir = source_upper.join(".trail");
         Self {

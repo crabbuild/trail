@@ -148,13 +148,13 @@ impl Trail {
                 "workspace view for lane {lane} changed while acquiring its mutation barrier"
             )));
         }
-        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
-            if process_matches_start_token(pid, token) {
-                return Err(Error::InvalidInput(format!(
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
                     "workspace view {} has an active writer in process {pid}; unmount before updating its base",
                     view.view_id
                 )));
-            }
         }
         let lane_head = self.get_ref(&lane_branch.ref_name)?;
         self.ensure_lane_workdir_clean(&lane_branch, &lane_head)?;

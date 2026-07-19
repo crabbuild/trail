@@ -16,6 +16,33 @@ use tempfile::TempDir;
 use trail::{InitImportMode, Trail};
 
 const DAEMON_PROTOCOL_VERSION: u16 = 2;
+type TransitionScope = (
+    i64,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+);
+type TransitionOwner = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<i64>,
+);
+type RecoveredAuthority = (String, String, String, String, [i64; 7]);
 
 #[derive(Clone, Debug, Deserialize)]
 struct Endpoint {
@@ -118,10 +145,10 @@ impl Fixture {
     fn endpoint(&self) -> Endpoint {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok(bytes) = fs::read(self.endpoint_path()) {
-                if let Ok(endpoint) = serde_json::from_slice(&bytes) {
-                    return endpoint;
-                }
+            if let Ok(bytes) = fs::read(self.endpoint_path())
+                && let Ok(endpoint) = serde_json::from_slice(&bytes)
+            {
+                return endpoint;
             }
             assert!(
                 Instant::now() < deadline,
@@ -264,32 +291,8 @@ fn spawn_status_waiting_after_stale_verification(
 
 #[derive(Debug, PartialEq)]
 struct TransitionAuthoritySnapshot {
-    scope: (
-        i64,
-        i64,
-        String,
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        i64,
-    ),
-    owner: (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<Vec<u8>>,
-        i64,
-        i64,
-        i64,
-        Option<String>,
-        Option<i64>,
-    ),
+    scope: TransitionScope,
+    owner: TransitionOwner,
     limits: (i64, i64, i64, i64, i64, i64, i64),
 }
 
@@ -392,7 +395,7 @@ fn process_command_line(pid: u32) -> String {
             .args(["-o", "command=", "-p", &pid.to_string()])
             .output()
             .unwrap();
-        return String::from_utf8_lossy(&output.stdout).into_owned();
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     String::new()
@@ -400,11 +403,11 @@ fn process_command_line(pid: u32) -> String {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Ok(bytes) = fs::read(self.endpoint_path()) {
-            if let Ok(endpoint) = serde_json::from_slice::<Endpoint>(&bytes) {
-                unsafe {
-                    libc::kill(endpoint.pid as i32, libc::SIGTERM);
-                }
+        if let Ok(bytes) = fs::read(self.endpoint_path())
+            && let Ok(endpoint) = serde_json::from_slice::<Endpoint>(&bytes)
+        {
+            unsafe {
+                libc::kill(endpoint.pid as i32, libc::SIGTERM);
             }
         }
     }
@@ -782,9 +785,9 @@ fn live_daemon_rejects_tampered_endpoint_and_token_identity() {
     fs::remove_file(fixture.token_path()).unwrap();
     write_owner_file(&fixture.token_path(), &token_bytes);
 
-    fs::set_permissions(&fixture.socket_path(), fs::Permissions::from_mode(0o666)).unwrap();
+    fs::set_permissions(fixture.socket_path(), fs::Permissions::from_mode(0o666)).unwrap();
     assert_status_failed_for(&fixture.status(), "unsafe socket mode");
-    fs::set_permissions(&fixture.socket_path(), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(fixture.socket_path(), fs::Permissions::from_mode(0o600)).unwrap();
 
     let starting = serde_json::json!({
         "protocol_version": endpoint["protocol_version"],
@@ -1395,8 +1398,7 @@ fn populate_socket_tombstones(fixture: &Fixture, count: usize) {
 fn is_exact_private_socket_leaf(name: &str) -> bool {
     name.len() == 14
         && name.starts_with(".s")
-        && name[2..]
-            .as_bytes()
+        && name.as_bytes()[2..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
@@ -2098,12 +2100,8 @@ fn verified_stale_persisted_identity_drift_rotates_epoch_and_reconciles() {
 
         let conn =
             rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
-        let (stored_epoch, trust_state, recovered_authority): (
-            i64,
-            String,
-            (String, String, String, String, [i64; 7]),
-        ) = conn
-            .query_row(
+        let (stored_epoch, trust_state, recovered_authority): (i64, String, RecoveredAuthority) =
+            conn.query_row(
                 "SELECT epoch,trust_state,
                         filesystem_identity,scope_root_identity,
                         provider_identity,provider_id,

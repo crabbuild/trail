@@ -342,10 +342,10 @@ pub(crate) fn render_map_key(key: &MapKeyInspect) -> String {
 }
 
 pub(crate) fn render_map_value_summary(value: &MapValueInspect) -> Result<String> {
-    if let Some(text) = &value.text {
-        if value.summary == serde_json::json!({ "bytes": value.bytes }) {
-            return Ok(format!("{text:?}"));
-        }
+    if let Some(text) = &value.text
+        && value.summary == serde_json::json!({ "bytes": value.bytes })
+    {
+        return Ok(format!("{text:?}"));
     }
     let summary = serde_json::to_string(&value.summary)?;
     if value.truncated {

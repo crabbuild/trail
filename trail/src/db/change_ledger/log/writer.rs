@@ -13,10 +13,12 @@ use super::*;
 use crate::db::util::{apply_sqlite_runtime_pragmas, now_ts};
 
 #[cfg(test)]
+type AppendFlushBoundaryHook = Box<dyn FnOnce(&Path, &Path)>;
+
+#[cfg(test)]
 thread_local! {
-    static APPEND_FLUSH_BOUNDARY_HOOK: std::cell::RefCell<
-        Option<Box<dyn FnOnce(&Path, &Path)>>,
-    > = const { std::cell::RefCell::new(None) };
+    static APPEND_FLUSH_BOUNDARY_HOOK: std::cell::RefCell<Option<AppendFlushBoundaryHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

@@ -74,15 +74,15 @@ pub fn validate_acp_path_mapping(workspace_root: &std::path::Path) -> Result<()>
             reason: "ACP workspace root was not recognized as isolated".to_string(),
         });
     }
-    if let Some(external_root) = workspace_root.parent() {
-        if external_root != workspace_root {
-            let external = mapper.map(external_root)?;
-            if external.isolated || external.effective != external.original {
-                return Err(Error::InvalidPath {
-                    path: external_root.display().to_string(),
-                    reason: "ACP external root was not preserved".to_string(),
-                });
-            }
+    if let Some(external_root) = workspace_root.parent()
+        && external_root != workspace_root
+    {
+        let external = mapper.map(external_root)?;
+        if external.isolated || external.effective != external.original {
+            return Err(Error::InvalidPath {
+                path: external_root.display().to_string(),
+                reason: "ACP external root was not preserved".to_string(),
+            });
         }
     }
     Ok(())
@@ -503,17 +503,16 @@ impl FrameObserver for CaptureObserver {
                 .pointer("/result/protocolVersion")
                 .and_then(Value::as_u64)
                 == Some(1)
+            && let Ok(mut coordinator) = self.coordinator.lock()
         {
-            if let Ok(mut coordinator) = self.coordinator.lock() {
-                coordinator.remember_initialize_selection(frame.value());
-            }
+            coordinator.remember_initialize_selection(frame.value());
         }
         if !outcome.capture_v1() {
-            if frame.direction() == Direction::ClientToAgent && frame.method() == Some("initialize")
+            if frame.direction() == Direction::ClientToAgent
+                && frame.method() == Some("initialize")
+                && let Ok(mut coordinator) = self.coordinator.lock()
             {
-                if let Ok(mut coordinator) = self.coordinator.lock() {
-                    coordinator.remember_initialize_request(frame.value());
-                }
+                coordinator.remember_initialize_request(frame.value());
             }
             let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
             self.ingress.append(capture_frame(
@@ -570,15 +569,13 @@ impl FrameObserver for CaptureObserver {
             if (inline_session_request || inline_client_callback)
                 && captured
                 && candidate != *frame.value()
-            {
-                if let Err(error) = self
+                && let Err(error) = self
                     .pipeline
                     .lock()
                     .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
                     .commit_candidate(frame, candidate)
-                {
-                    eprintln!("trail acp relay transformation warning: {error}");
-                }
+            {
+                eprintln!("trail acp relay transformation warning: {error}");
             }
         }
         let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
@@ -2441,10 +2438,10 @@ impl CaptureCoordinator {
             self.flush_turn_events(active)?;
             self.capture_structured_diff_updates(active, update);
         }
-        if matches!(status, "completed" | "failed" | "cancelled") {
-            if let Some(span_id) = active.tool_spans.remove(&tool_call_id) {
-                active.push_span_ended(&span_id, status, Some(Value::Object(update.clone())));
-            }
+        if matches!(status, "completed" | "failed" | "cancelled")
+            && let Some(span_id) = active.tool_spans.remove(&tool_call_id)
+        {
+            active.push_span_ended(&span_id, status, Some(Value::Object(update.clone())));
         }
         Ok(())
     }
@@ -2589,15 +2586,13 @@ impl CaptureCoordinator {
                     "error"
                 };
                 result_summary = serde_json::json!({"decision": decision});
-                if has_outcome {
-                    if let Some(approval_id) = permission.approval_id.as_deref() {
-                        self.open_db()?.decide_lane_approval(
-                            approval_id,
-                            decision,
-                            Some("acp-editor".to_string()),
-                            Some("mirrored from ACP permission response".to_string()),
-                        )?;
-                    }
+                if has_outcome && let Some(approval_id) = permission.approval_id.as_deref() {
+                    self.open_db()?.decide_lane_approval(
+                        approval_id,
+                        decision,
+                        Some("acp-editor".to_string()),
+                        Some("mirrored from ACP permission response".to_string()),
+                    )?;
                 }
                 self.capture_callback_event(
                     &acp_session_id,
@@ -2688,15 +2683,12 @@ impl CaptureCoordinator {
                     .unwrap_or_default();
                 let redacted = crate::db::redact_sensitive_text(output);
                 let exit_status = message.pointer("/result/exitStatus").cloned();
-                if success {
-                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
-                        terminal.state =
-                            if exit_status.as_ref().is_some_and(|value| !value.is_null()) {
-                                "exited".to_string()
-                            } else {
-                                "running".to_string()
-                            };
-                    }
+                if success && let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                    terminal.state = if exit_status.as_ref().is_some_and(|value| !value.is_null()) {
+                        "exited".to_string()
+                    } else {
+                        "running".to_string()
+                    };
                 }
                 result_summary = serde_json::json!({
                     "terminal_id": terminal_id,
@@ -2707,10 +2699,8 @@ impl CaptureCoordinator {
                 });
             }
             ClientCallbackOperation::TerminalWait { terminal_id, .. } => {
-                if success {
-                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
-                        terminal.state = "exited".to_string();
-                    }
+                if success && let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                    terminal.state = "exited".to_string();
                 }
                 result_summary = serde_json::json!({
                     "terminal_id": terminal_id,
@@ -2720,10 +2710,8 @@ impl CaptureCoordinator {
                 });
             }
             ClientCallbackOperation::TerminalKill { terminal_id, .. } => {
-                if success {
-                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
-                        terminal.state = "killed".to_string();
-                    }
+                if success && let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                    terminal.state = "killed".to_string();
                 }
                 result_summary = serde_json::json!({
                     "terminal_id": terminal_id,
@@ -3991,17 +3979,15 @@ fn bound_binary_content(value: &mut Value, parent_type: Option<&str>) {
             for key in ["data", "blob"] {
                 let is_binary =
                     key == "blob" || matches!(content_type.as_deref(), Some("image" | "audio"));
-                if is_binary {
-                    if let Some(encoded) = object.get(key).and_then(Value::as_str) {
-                        object.insert(
-                            key.to_string(),
-                            serde_json::json!({
-                                "encoding": "base64",
-                                "encoded_bytes": encoded.len(),
-                                "sha256": hex::encode(Sha256::digest(encoded.as_bytes()))
-                            }),
-                        );
-                    }
+                if is_binary && let Some(encoded) = object.get(key).and_then(Value::as_str) {
+                    object.insert(
+                        key.to_string(),
+                        serde_json::json!({
+                            "encoding": "base64",
+                            "encoded_bytes": encoded.len(),
+                            "sha256": hex::encode(Sha256::digest(encoded.as_bytes()))
+                        }),
+                    );
                 }
             }
             for child in object.values_mut() {
@@ -4085,10 +4071,9 @@ fn collect_structured_diff_edits(
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|kind| kind == "diff")
+                && let Some(edit) = structured_diff_edit(object, cwd, seen)
             {
-                if let Some(edit) = structured_diff_edit(object, cwd, seen) {
-                    edits.push(edit);
-                }
+                edits.push(edit);
             }
             for key in ["content", "updates", "items"] {
                 collect_structured_diff_edits(object.get(key), cwd, seen, edits);
@@ -4270,10 +4255,8 @@ fn session_update_projection(
 ) -> Value {
     let mut structured = bounded_prompt_content(Some(&Value::Object(update.clone())));
     let thought_content_excluded = variant == AcpV1SessionUpdateKind::AgentThoughtChunk;
-    if thought_content_excluded {
-        if let Some(object) = structured.as_object_mut() {
-            object.remove("content");
-        }
+    if thought_content_excluded && let Some(object) = structured.as_object_mut() {
+        object.remove("content");
     }
     serde_json::json!({
         "protocol": "acp",

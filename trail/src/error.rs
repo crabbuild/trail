@@ -33,8 +33,8 @@ pub enum Error {
     CommittedRepairRequired {
         lane: String,
         initialization_id: String,
-        request_fingerprint: String,
-        operation_id: String,
+        request_fingerprint: Box<String>,
+        operation_id: Box<String>,
         phase: crate::model::LaneInitializationPhase,
         committed: bool,
         repair: String,

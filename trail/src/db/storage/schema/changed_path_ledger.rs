@@ -2,6 +2,8 @@ use super::*;
 
 const CHANGED_PATH_LEDGER_SCHEMA_VERSION: i64 = 1;
 const CHANGED_PATH_OBSERVER_LOG_FORMAT_VERSION: i64 = 1;
+type ForeignKeyShape<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+type TableForeignKeys<'a> = (&'a str, &'a [ForeignKeyShape<'a>]);
 
 pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
         "CREATE TABLE changed_path_scopes (
@@ -1159,7 +1161,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         return Ok(false);
     }
 
-    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 14] = [
+    let expected_foreign_keys: [TableForeignKeys<'_>; 14] = [
         ("changed_path_scopes", &[]),
         (
             "changed_path_entries",
@@ -1601,7 +1603,7 @@ fn policy_dependency_identity_is_canonical(identity: &str, kind: &str) -> bool {
 
 fn canonical_nonempty_hex(value: &str) -> bool {
     !value.is_empty()
-        && value.len() % 2 == 0
+        && value.len().is_multiple_of(2)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))

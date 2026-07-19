@@ -163,10 +163,10 @@ fn workspace_daemon_process_start_identity(pid: u32) -> Option<String> {
         if read != expected || info.pbi_pid != pid {
             return None;
         }
-        return Some(format!(
+        Some(format!(
             "macos:{}:{}:{}",
             info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
-        ));
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

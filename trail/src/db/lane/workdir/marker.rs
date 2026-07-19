@@ -373,7 +373,7 @@ pub(crate) fn materialized_lane_root_identity(workdir: &Path) -> Result<Vec<u8>>
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(workdir)?;
         let metadata = file.metadata()?;
-        return Ok(format!(
+        Ok(format!(
             "root-v1:dev={};ino={};mode={};uid={};gid={}",
             metadata.dev(),
             metadata.ino(),
@@ -381,7 +381,7 @@ pub(crate) fn materialized_lane_root_identity(workdir: &Path) -> Result<Vec<u8>>
             metadata.uid(),
             metadata.gid()
         )
-        .into_bytes());
+        .into_bytes())
     }
     #[cfg(not(unix))]
     {

@@ -199,13 +199,13 @@ where
     let mut seen = HashMap::new();
     for path in paths {
         let folded = case_insensitive_path_key(path);
-        if let Some(previous) = seen.insert(folded, path.clone()) {
-            if previous != *path {
-                return Err(Error::InvalidPath {
-                    path: path.clone(),
-                    reason: format!("case-insensitive path collision with `{previous}`"),
-                });
-            }
+        if let Some(previous) = seen.insert(folded, path.clone())
+            && previous != *path
+        {
+            return Err(Error::InvalidPath {
+                path: path.clone(),
+                reason: format!("case-insensitive path collision with `{previous}`"),
+            });
         }
     }
     Ok(())
