@@ -1774,21 +1774,23 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     #[cfg(test)]
     schema_validation_process_test_probe()?;
     #[cfg(test)]
-    let failure_hook = {
-        let failures = SCHEMA_VALIDATION_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-        failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(db_path)
-    };
-    if let Some(hook) = failure_hook {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Some(hook) = hook {
-            hook(db_path);
+    {
+        let failure_hook = {
+            let failures = SCHEMA_VALIDATION_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+            failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(db_path)
+        };
+        if let Some(hook) = failure_hook {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(hook) = hook {
+                hook(db_path);
+            }
+            return Err(schema_reinitialize_error(
+                "injected schema validation leader failure",
+            ));
         }
-        return Err(schema_reinitialize_error(
-            "injected schema validation leader failure",
-        ));
     }
     let snapshot = tempfile::Builder::new()
         .prefix("trail-schema-preflight-")
