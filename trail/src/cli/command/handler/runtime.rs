@@ -39,15 +39,31 @@ pub(super) fn open_db(ctx: &RuntimeContext) -> Result<Trail> {
     loop {
         match open_db_once(ctx) {
             Ok(db) => return Ok(db),
-            Err(Error::SchemaReinitializeRequired { ref found, .. })
-                if found == "schema main/WAL/SHM generation changed during mutable handoff"
-                    && std::time::Instant::now() < deadline =>
+            Err(error)
+                if retryable_open_db_handoff(&error) && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(std::time::Duration::from_millis(50));
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn retryable_open_db_handoff(error: &Error) -> bool {
+    match error {
+        Error::SchemaReinitializeRequired { found, .. } => {
+            found == "schema main/WAL/SHM generation changed during mutable handoff"
+        }
+        // Under a large cross-process CLI burst, preflight can exhaust its
+        // deliberately short in-process WAL snapshot retry budget while
+        // another process is still opening a verified connection. This is the
+        // same transient handoff as the generation result above; retry only
+        // this exact bounded diagnostic, never a generic workspace lock.
+        Error::WorkspaceLocked(message) => {
+            message == "SQLite WAL remained active throughout bounded schema snapshot validation; retry the command"
+        }
+        _ => false,
     }
 }
 

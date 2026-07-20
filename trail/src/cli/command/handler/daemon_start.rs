@@ -177,9 +177,20 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
     let Some(endpoint) = read_secure_endpoint(&authority)? else {
         return Ok(());
     };
-    match classify_endpoint(&workspace, &authority, &endpoint, None)? {
-        EndpointState::Stale(_) => return Ok(()),
-        EndpointState::Ready(_) => {}
+    match classify_endpoint(&workspace, &authority, &endpoint, None) {
+        Ok(EndpointState::Stale(_)) => return Ok(()),
+        Ok(EndpointState::Ready(_)) => {}
+        // Another local materializer may have withdrawn exactly this daemon's
+        // endpoint, token, and socket after our initial authenticated read.
+        // If the endpoint is now absent, retirement is already complete. Do
+        // not mask a remaining inconsistent publication.
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            if read_secure_endpoint(&authority)?.is_none() {
+                return Ok(());
+            }
+            return Err(Error::Io(error));
+        }
+        Err(error) => return Err(error),
     }
     let actual_start = process_start_identity(endpoint.pid).ok_or_else(|| {
         Error::DaemonUnavailable(
