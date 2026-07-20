@@ -1032,6 +1032,48 @@ fn external_materialized_spawn_retires_daemon_and_reconcile_starts_one_fresh_own
 }
 
 #[test]
+fn concurrent_external_lane_spawns_fall_back_after_daemon_retirement() {
+    const LANES: usize = 16;
+
+    let fixture = Arc::new(Fixture::new());
+    assert!(fixture.status().status.success());
+    let barrier = Arc::new(Barrier::new(LANES));
+    let callers = (0..LANES)
+        .map(|index| {
+            let fixture = Arc::clone(&fixture);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let lane = format!("concurrent-materialized-{index}");
+                barrier.wait();
+                let output =
+                    fixture.run(&["lane", "spawn", &lane, "--from", "main", "--materialize"]);
+                (lane, output)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (lane, output) in callers.into_iter().map(|caller| caller.join().unwrap()) {
+        assert!(
+            output.status.success(),
+            "concurrent materialized spawn {lane} failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let conn =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let lanes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM lanes WHERE name LIKE 'concurrent-materialized-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lanes, LANES as i64);
+}
+
+#[test]
 fn external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback() {
     let fixture = Fixture::new();
     let started = fixture.status_with_env(&[

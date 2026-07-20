@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use getrandom::getrandom;
@@ -225,7 +226,7 @@ fn classify_endpoint(
     requested_token: Option<&str>,
 ) -> Result<EndpointState> {
     let expected_workspace = workspace_identity(workspace)?;
-    let expected_executable = executable_identity(&std::env::current_exe()?)?;
+    let expected_executable = current_executable_identity()?;
     let expected_socket = workspace.join(".trail").join("changed-path.sock");
     authority.verify_trail_identity(&workspace.join(".trail"))?;
     if endpoint.socket_path != expected_socket
@@ -703,7 +704,7 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         process_start_identity: process_start_identity(std::process::id()).ok_or_else(|| {
             Error::DaemonUnavailable("workspace daemon process identity is unavailable".into())
         })?,
-        executable_identity: executable_identity(&std::env::current_exe()?)?,
+        executable_identity: current_executable_identity()?,
         workspace_identity: workspace_identity(&workspace)?,
         owner_nonce: owner_nonce.clone(),
         socket_path: socket_path.clone(),
@@ -1612,6 +1613,20 @@ fn executable_identity(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+fn current_executable_identity() -> Result<String> {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity.clone());
+    }
+    let identity = executable_identity(&std::env::current_exe()?)?;
+    let _ = IDENTITY.set(identity);
+    Ok(IDENTITY
+        .get()
+        .expect("current executable identity is initialized")
+        .clone())
 }
 
 fn process_is_alive(pid: u32) -> bool {

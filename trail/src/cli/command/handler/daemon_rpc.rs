@@ -94,7 +94,16 @@ pub(super) fn try_handle_auto_daemon_command(
         && let Some(ready) =
             daemon_start::existing_workspace_daemon_ready(&workspace, daemon_token.as_deref())?
     {
-        return try_handle_daemon_command(ctx, Some(ready.url), Some(ready.auth_token), command);
+        return match try_handle_daemon_command(
+            ctx,
+            Some(ready.url),
+            Some(ready.auth_token),
+            command,
+        ) {
+            Ok(handled) => Ok(handled),
+            Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
+            Err(err) => Err(err),
+        };
     }
     let Some(daemon_url) = discover_daemon_url(ctx)? else {
         return Ok(false);
