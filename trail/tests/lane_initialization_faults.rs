@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -286,7 +286,6 @@ fn initialization_child(workspace: &Path) -> Command {
         .arg("lane_initialization_crash_child")
         .arg("--nocapture")
         .env(CHILD_WORKSPACE, workspace)
-        .env(CHILD_LEDGER_AUTHORITY, "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     child
@@ -359,6 +358,143 @@ fn lane_initialization_creates_no_filesystem_coordination_artifacts() {
         before
     );
     assert_eq!(active_owner_rows(&trail_root.join("index/trail.sqlite")), 0);
+}
+
+struct MaterializationRelease {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for MaterializationRelease {
+    fn drop(&mut self) {
+        let (released, changed) = &*self.state;
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        changed.notify_all();
+    }
+}
+
+#[test]
+fn authority_off_distinct_materializations_overlap_without_workspace_lock() {
+    const WORKERS: usize = 2;
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let workspace = Arc::new(temp.path().to_path_buf());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let start = Arc::new(Barrier::new(WORKERS + 1));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let release_state = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = MaterializationRelease {
+        state: Arc::clone(&release_state),
+    };
+    let handles = (0..WORKERS)
+        .map(|index| {
+            let workspace = Arc::clone(&workspace);
+            let start = Arc::clone(&start);
+            let entered = entered_tx.clone();
+            let release_state = Arc::clone(&release_state);
+            thread::spawn(move || {
+                trail::test_support::set_changed_path_authority_override(false);
+                let mut db = Trail::open(&*workspace).unwrap();
+                trail::test_support::set_lane_initialization_materialization_barrier_for_current_thread(
+                    Some((entered, release_state)),
+                );
+                start.wait();
+                let lane = format!("authority-off-overlap-{index}");
+                let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    &lane,
+                    Some("main"),
+                    LaneWorkdirMode::PortableCopy,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                );
+                trail::test_support::set_lane_initialization_materialization_barrier_for_current_thread(None);
+                (lane, result)
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(entered_tx);
+    start.wait();
+
+    for _ in 0..WORKERS {
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("distinct materializations did not overlap at the deterministic barrier");
+    }
+    assert!(
+        !temp.path().join(".trail/lock").exists(),
+        "lane coordination created or held the workspace lock during materialization"
+    );
+    drop(release);
+
+    for handle in handles {
+        let (lane, result) = handle.join().unwrap();
+        let report = result.unwrap_or_else(|error| panic!("{lane} failed: {error:?}"));
+        assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+        assert!(report
+            .workdir
+            .as_ref()
+            .is_some_and(|path| Path::new(path).is_dir()));
+        assert_eq!(owners_for_lane(&sqlite, &lane), 0);
+    }
+    assert_eq!(active_owner_rows(&sqlite), 0);
+    assert!(!temp.path().join(".trail/lock").exists());
+}
+
+#[test]
+fn authority_on_claim_reaches_materialization_before_workspace_lock() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let workspace = temp.path().to_path_buf();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let release_state = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = MaterializationRelease {
+        state: Arc::clone(&release_state),
+    };
+    let worker = thread::spawn(move || {
+        trail::test_support::set_changed_path_authority_override(true);
+        let _authority = AuthorityOverride;
+        let mut db = Trail::open(&workspace).unwrap();
+        trail::test_support::set_lane_initialization_materialization_barrier_for_current_thread(
+            Some((entered_tx, release_state)),
+        );
+        let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "authority-on-claim",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        );
+        trail::test_support::set_lane_initialization_materialization_barrier_for_current_thread(
+            None,
+        );
+        result
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("authority-on claim did not reach the pre-materialization barrier");
+    assert!(
+        !temp.path().join(".trail/lock").exists(),
+        "owner claim acquired the workspace lock before materialization"
+    );
+    drop(release);
+    assert_eq!(
+        worker.join().unwrap().unwrap().phase,
+        LaneInitializationPhase::ObserverReady
+    );
+    assert!(!temp.path().join(".trail/lock").exists());
 }
 
 fn crash_and_resume(boundary: &str) {
@@ -1505,6 +1641,10 @@ fn concurrent_identical_processes_replay_one_committed_result() {
         .unwrap();
     assert_eq!(phase, "observer_ready");
     assert!(lane_initialization_filesystem_artifacts(&temp.path().join(".trail")).is_empty());
+    assert!(
+        !temp.path().join(".trail/lock").exists(),
+        "authority-off SQLite contention created or retained the workspace lock"
+    );
 }
 
 #[test]

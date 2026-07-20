@@ -4890,6 +4890,7 @@ pub(crate) use lane::{
     run_changed_path_view_flow, schema_v19_backfill_times_remaining,
     set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
+    set_lane_initialization_materialization_barrier_for_current_thread,
     set_lane_record_postcommit_failure_for_current_thread,
     set_sparse_selection_write_failure_for_current_thread,
 };

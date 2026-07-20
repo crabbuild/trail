@@ -150,6 +150,19 @@ pub mod test_support {
         crate::db::set_lane_initialization_io_failure_for_current_thread(boundary, disk_full);
     }
 
+    pub type LaneInitializationMaterializationRelease =
+        std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    pub type LaneInitializationMaterializationBarrier = (
+        std::sync::mpsc::Sender<()>,
+        LaneInitializationMaterializationRelease,
+    );
+
+    pub fn set_lane_initialization_materialization_barrier_for_current_thread(
+        barrier: Option<LaneInitializationMaterializationBarrier>,
+    ) {
+        crate::db::set_lane_initialization_materialization_barrier_for_current_thread(barrier);
+    }
+
     pub fn set_lane_association_failure_for_current_thread(boundary: Option<&'static str>) {
         crate::db::set_lane_association_failure_for_current_thread(boundary);
     }

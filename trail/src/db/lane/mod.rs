@@ -48,6 +48,7 @@ mod workspace_view;
 pub(crate) use lifecycle::{
     set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
+    set_lane_initialization_materialization_barrier_for_current_thread,
     set_sparse_selection_write_failure_for_current_thread,
 };
 pub(crate) use workdir::ViewMutationBarrier;

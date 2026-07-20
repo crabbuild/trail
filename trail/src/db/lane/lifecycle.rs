@@ -10,10 +10,49 @@ use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
 
 #[cfg(debug_assertions)]
+type LaneInitializationMaterializationRelease =
+    std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+#[cfg(debug_assertions)]
+type LaneInitializationMaterializationBarrier = (
+    std::sync::mpsc::Sender<()>,
+    LaneInitializationMaterializationRelease,
+);
+
+#[cfg(debug_assertions)]
 std::thread_local! {
     static FAIL_SPARSE_SELECTION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_LANE_ASSOCIATION_BOUNDARY: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
     static FAIL_LANE_INITIALIZATION_IO: std::cell::RefCell<Option<(&'static str, bool)>> = const { std::cell::RefCell::new(None) };
+    static LANE_INITIALIZATION_MATERIALIZATION_BARRIER: std::cell::RefCell<Option<LaneInitializationMaterializationBarrier>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_lane_initialization_materialization_barrier_for_current_thread(
+    barrier: Option<LaneInitializationMaterializationBarrier>,
+) {
+    LANE_INITIALIZATION_MATERIALIZATION_BARRIER.with(|installed| {
+        *installed.borrow_mut() = barrier;
+    });
+}
+
+#[cfg(debug_assertions)]
+fn wait_at_lane_initialization_materialization_barrier() -> Result<()> {
+    let barrier = LANE_INITIALIZATION_MATERIALIZATION_BARRIER
+        .with(|installed| installed.borrow().as_ref().cloned());
+    let Some((entered, release)) = barrier else {
+        return Ok(());
+    };
+    entered.send(()).map_err(|_| {
+        Error::InvalidInput("lane materialization test barrier receiver was dropped".into())
+    })?;
+    let (released, changed) = &*release;
+    let released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+    drop(
+        changed
+            .wait_while(released, |released| !*released)
+            .unwrap_or_else(|poison| poison.into_inner()),
+    );
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -836,28 +875,12 @@ impl Trail {
             )
         );
         request.lane_id.clone_from(&lane_id);
-        let _lock = if ledger_authority {
-            None
-        } else {
-            Some(self.acquire_write_lock()?)
-        };
         let repair_command = format!("trail lane repair-initialization {name}");
         let deadline = std::time::Instant::now() + lane_initialization_wait_timeout();
         let waiter_salt = new_lane_initialization_waiter_salt()?;
         let mut wait_attempt = 0_u32;
         let (initialization, fence, resumed) = loop {
-            let reservation_lock = if ledger_authority {
-                Some(crate::db::acquire_workspace_lock_for_lane_association(
-                    &self.db_dir,
-                    &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
-                    &request.initialization_id,
-                    &repair_command,
-                )?)
-            } else {
-                None
-            };
             let claim = claim_lane_initialization_owner(self, &request)?;
-            drop(reservation_lock);
             match claim {
                 LaneInitializationClaim::Owned {
                     record,
@@ -898,7 +921,6 @@ impl Trail {
                 initialization.phase,
                 LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
             ) {
-                drop(_lock);
                 return self.repair_lane_initialization_owned(&initialization, &fence);
             }
             heartbeat_lane_initialization_owner(
@@ -937,6 +959,8 @@ impl Trail {
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned())
                 } else if let Some(dir) = &request.workdir {
+                    #[cfg(debug_assertions)]
+                    wait_at_lane_initialization_materialization_barrier()?;
                     match &request.requested_workdir_mode {
                         LaneWorkdirMode::FuseCow => {
                             self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
