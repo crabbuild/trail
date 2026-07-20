@@ -30,19 +30,19 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let end = stat.rfind(')')?;
         let fields = stat.get(end + 2..)?.split_whitespace().collect::<Vec<_>>();
-        return fields.get(19).map(|value| format!("linux:{value}"));
+        fields.get(19).map(|value| format!("linux:{value}"))
     }
     #[cfg(target_os = "macos")]
     {
-        return macos_process_start_token(pid);
+        macos_process_start_token(pid)
     }
     #[cfg(target_os = "freebsd")]
     {
-        return freebsd_process_start_token(pid);
+        freebsd_process_start_token(pid)
     }
     #[cfg(target_os = "windows")]
     {
-        return windows_process_start_token(pid);
+        windows_process_start_token(pid)
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -473,15 +473,15 @@ fn unix_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch
 fn process_start_token_is_comparable(token: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return token.strip_prefix("linux:").is_some_and(canonical_decimal);
+        token.strip_prefix("linux:").is_some_and(canonical_decimal)
     }
     #[cfg(target_os = "macos")]
     {
-        return canonical_bsd_start_token(token, "macos");
+        canonical_bsd_start_token(token, "macos")
     }
     #[cfg(target_os = "freebsd")]
     {
-        return canonical_bsd_start_token(token, "freebsd");
+        canonical_bsd_start_token(token, "freebsd")
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     {
