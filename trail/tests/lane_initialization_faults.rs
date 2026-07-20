@@ -57,6 +57,25 @@ fn spawn_events_for_lane(sqlite: &Path, lane: &str) -> i64 {
     )
 }
 
+fn reject_lane_initialization_phases(sqlite: &Path, phases: &[&str]) {
+    let phases = phases
+        .iter()
+        .map(|phase| format!("'{phase}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Connection::open(sqlite)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_lane_initialization_phase
+             BEFORE UPDATE OF phase ON lane_initializations
+             WHEN NEW.phase IN ({phases})
+             BEGIN
+               SELECT RAISE(FAIL, 'injected lane initialization phase persistence failure');
+             END;"
+        ))
+        .unwrap();
+}
+
 #[test]
 fn lane_initialization_crash_child() {
     let Ok(workspace) = std::env::var(CHILD_WORKSPACE) else {
@@ -233,6 +252,146 @@ fn post_association_failure_is_durable_committed_repair_and_repairs_once() {
         ),
         1
     );
+}
+
+#[test]
+fn repair_state_persistence_failure_preserves_committed_outcome_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    reject_lane_initialization_phases(&sqlite, &["repair_required"]);
+    trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_event"));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "repair-write-failure",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+
+    assert!(
+        matches!(
+            error,
+            trail::Error::CommittedRepairRequired {
+                committed: true,
+                ..
+            }
+        ),
+        "post-commit failure escaped as {error:?}"
+    );
+    assert_eq!(
+        db.lane_initialization("repair-write-failure")
+            .unwrap()
+            .unwrap()
+            .phase,
+        LaneInitializationPhase::Associated
+    );
+}
+
+#[test]
+fn observer_ready_and_repair_persistence_failures_preserve_committed_outcome_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    reject_lane_initialization_phases(&sqlite, &["observer_ready", "repair_required"]);
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "observer-write-failure",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            trail::Error::CommittedRepairRequired {
+                committed: true,
+                ..
+            }
+        ),
+        "post-commit failure escaped as {error:?}"
+    );
+    assert_eq!(
+        db.lane_initialization("observer-write-failure")
+            .unwrap()
+            .unwrap()
+            .phase,
+        LaneInitializationPhase::Associated
+    );
+    assert_eq!(spawn_events_for_lane(&sqlite, "observer-write-failure"), 1);
+}
+
+#[test]
+fn concurrent_identical_spawn_requests_replay_one_committed_result() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    const CALLERS: usize = 16;
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let workspace = Arc::new(temp.path().to_path_buf());
+    let start = Arc::new(Barrier::new(CALLERS + 1));
+    let handles = (0..CALLERS)
+        .map(|_| {
+            let workspace = Arc::clone(&workspace);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                trail::test_support::set_changed_path_authority_override(true);
+                let _authority = AuthorityOverride;
+                let mut db = Trail::open(&*workspace).unwrap();
+                start.wait();
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    "duplicate-delivery",
+                    Some("main"),
+                    LaneWorkdirMode::Virtual,
+                    Some("codex".into()),
+                    Some("gpt-5".into()),
+                    None,
+                    &[],
+                    false,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+
+    let reports = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(reports
+        .iter()
+        .all(|report| report.phase == LaneInitializationPhase::ObserverReady));
+    assert!(reports
+        .iter()
+        .all(|report| report.initialization_id == reports[0].initialization_id));
+    assert!(reports
+        .iter()
+        .all(|report| report.lane_id == reports[0].lane_id));
+
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    assert_eq!(rows_for_lane(&sqlite, "duplicate-delivery"), 1);
+    assert_eq!(refs_for_lane(&sqlite, "duplicate-delivery"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "duplicate-delivery"), 1);
 }
 
 #[test]

@@ -322,13 +322,13 @@ mapping table.
 ## Reproducible Prolly Qualification
 
 Trail is qualified against the full prolly revision
-`b68fcf4c57ce477292440da00bfc8aeed816c63a`. The configured submodule remote is
+`b4aaee54b77aa5e61bdc6254425b143bd2c7f811`. The configured submodule remote is
 `https://github.com/crabbuild/prolly.git`; release qualification must prove the
 full object remains fetchable rather than relying on an abbreviated hash or a
 developer's existing submodule object database:
 
 ```sh
-prolly_revision=b68fcf4c57ce477292440da00bfc8aeed816c63a
+prolly_revision=b4aaee54b77aa5e61bdc6254425b143bd2c7f811
 test "$(git -C prolly rev-parse HEAD)" = "$prolly_revision"
 git -C prolly fetch --dry-run origin "$prolly_revision"
 git diff --submodule=log -- prolly Cargo.lock

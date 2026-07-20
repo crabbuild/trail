@@ -168,14 +168,18 @@ impl Trail {
             self.record_git_plumbing_command();
         }
         let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
-        let mapping = self.insert_git_mapping_for_state(
-            "export",
-            &branch,
-            &right_ref.change_id,
-            &right_ref.root_id,
-            Some(commit.clone()),
-            git_state.dirty,
-        )?;
+        let mapping = if verified_range_delta {
+            None
+        } else {
+            self.insert_git_mapping_for_state(
+                "export",
+                &branch,
+                &right_ref.change_id,
+                &right_ref.root_id,
+                Some(commit.clone()),
+                git_state.dirty,
+            )?
+        };
         Ok(GitExportReport {
             range: range.to_string(),
             branch,
@@ -399,6 +403,7 @@ mod tests {
         let report = db.git_export_commit_mapped(&range, "mapped", None).unwrap();
 
         assert_eq!(report.performance.export_mode, "mapped_delta");
+        assert!(report.mapping.is_some());
     }
 
     #[test]
@@ -488,5 +493,12 @@ mod tests {
                 .next(),
             Some("120000")
         );
+        assert!(
+            report.mapping.is_none(),
+            "a range-only proof must not publish a full-root mapping"
+        );
+        assert!(!db
+            .git_clean_head_matches_root_mapping(&report.commit, &report.root_id)
+            .unwrap());
     }
 }

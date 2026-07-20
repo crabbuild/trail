@@ -5,6 +5,151 @@ use super::initialization::{
 use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
 
+struct LaneInitializationSingleflight {
+    file: fs::File,
+}
+
+impl LaneInitializationSingleflight {
+    fn acquire(db_dir: &Path, initialization_id: &str) -> Result<Self> {
+        let shard = initialization_id
+            .strip_prefix("init_")
+            .and_then(|digest| digest.get(..3))
+            .filter(|shard| shard.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| Error::Corrupt("invalid lane initialization identity".into()))?;
+        let directory = db_dir.join("lane-initialization-locks");
+        fs::create_dir_all(&directory)?;
+        let metadata = fs::symlink_metadata(&directory)?;
+        if !metadata.file_type().is_dir() {
+            return Err(Error::InvalidPath {
+                path: directory.display().to_string(),
+                reason: "lane initialization lock authority is not a directory".into(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let path = directory.join(format!("{shard}.lock"));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::InvalidPath {
+                path: path.display().to_string(),
+                reason: "lane initialization lock is not a regular file".into(),
+            });
+        }
+        lock_lane_initialization_file(&file)?;
+        validate_lane_initialization_lock_identity(&path, &file)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for LaneInitializationSingleflight {
+    fn drop(&mut self) {
+        let _ = unlock_lane_initialization_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn lock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive).map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn unlock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock).map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn validate_lane_initialization_lock_identity(path: &Path, file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let published = fs::symlink_metadata(path)?;
+    let held = file.metadata()?;
+    if !published.file_type().is_file()
+        || held.dev() != published.dev()
+        || held.ino() != published.ino()
+        || held.nlink() != 1
+    {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "lane initialization lock identity changed while acquiring it".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::fileapi::LockFileEx;
+    use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, OVERLAPPED};
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked == FALSE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::fileapi::UnlockFileEx;
+    use winapi::um::minwinbase::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+    let unlocked = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle().cast(),
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if unlocked == FALSE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn validate_lane_initialization_lock_identity(path: &Path, _file: &fs::File) -> Result<()> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "lane initialization lock pathname changed while acquiring it".into(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(debug_assertions)]
 std::thread_local! {
     static FAIL_SPARSE_SELECTION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -125,35 +270,49 @@ fn lane_initialization_crash_cut(_boundary: &str) -> Result<()> {
 }
 
 impl Trail {
+    fn committed_lane_initialization_error(
+        &mut self,
+        initialization: &LaneInitializationRecord,
+        error: Error,
+    ) -> Error {
+        let mut reason = error.to_string();
+        let record = match self
+            .mark_lane_initialization_repair_required(&initialization.initialization_id, &error)
+        {
+            Ok(record) => Some(record),
+            Err(persistence_error) => {
+                reason.push_str("; repair-state persistence failed: ");
+                reason.push_str(&persistence_error.to_string());
+                lane_initialization_record(&self.conn, &initialization.initialization_id)
+                    .ok()
+                    .flatten()
+            }
+        };
+        let record = record.as_ref().unwrap_or(initialization);
+        let repair = record.repair_command.clone().unwrap_or_else(|| {
+            format!(
+                "trail lane repair-initialization {}",
+                initialization.lane_name
+            )
+        });
+        Error::CommittedRepairRequired {
+            lane: record.lane_name.clone(),
+            initialization_id: record.initialization_id.clone(),
+            request_fingerprint: Box::new(record.request_fingerprint.clone()),
+            operation_id: Box::new(record.operation_id.clone()),
+            phase: LaneInitializationPhase::RepairRequired,
+            committed: true,
+            repair,
+            reason,
+        }
+    }
+
     fn committed_lane_initialization_step<T>(
         &mut self,
         initialization: &LaneInitializationRecord,
         result: Result<T>,
     ) -> Result<T> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                let repaired = self.mark_lane_initialization_repair_required(
-                    &initialization.initialization_id,
-                    &error,
-                )?;
-                Err(Error::CommittedRepairRequired {
-                    lane: repaired.lane_name,
-                    initialization_id: repaired.initialization_id,
-                    request_fingerprint: Box::new(repaired.request_fingerprint),
-                    operation_id: Box::new(repaired.operation_id),
-                    phase: LaneInitializationPhase::RepairRequired,
-                    committed: true,
-                    repair: repaired.repair_command.unwrap_or_else(|| {
-                        format!(
-                            "trail lane repair-initialization {}",
-                            initialization.lane_name
-                        )
-                    }),
-                    reason: error.to_string(),
-                })
-            }
-        }
+        result.map_err(|error| self.committed_lane_initialization_error(initialization, error))
     }
 
     fn lane_spawn_report_for_initialization(
@@ -411,11 +570,6 @@ impl Trail {
     ) -> Result<LaneSpawnReport> {
         // TRAIL_FS_PRODUCER: lane_spawn_materialize Materialize controlled
         let ledger_authority = crate::db::change_ledger::command_authority_enabled();
-        let _lock = if ledger_authority {
-            None
-        } else {
-            Some(self.acquire_write_lock()?)
-        };
         validate_ref_segment(name)?;
         validate_lane_workdir_mode_request(&workdir_mode, workdir.is_some(), sparse_paths)?;
         let sparse_paths = normalize_record_paths(sparse_paths)?;
@@ -463,6 +617,13 @@ impl Trail {
             )
         );
         request.lane_id.clone_from(&lane_id);
+        let _singleflight =
+            LaneInitializationSingleflight::acquire(&self.db_dir, &request.initialization_id)?;
+        let _lock = if ledger_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         let repair_command = format!("trail lane repair-initialization {name}");
         let reservation_lock = if ledger_authority {
             Some(crate::db::acquire_workspace_lock_for_lane_association(
@@ -859,7 +1020,8 @@ impl Trail {
         })();
         self.committed_lane_initialization_step(&initialization, spawn_event)?;
         lane_initialization_crash_cut("after_spawn_event")?;
-        self.mark_lane_initialization_observer_ready(&request)?;
+        let observer_ready = self.mark_lane_initialization_observer_ready(&request);
+        self.committed_lane_initialization_step(&initialization, observer_ready)?;
         Ok(LaneSpawnReport {
             initialization_id: request.initialization_id,
             request_fingerprint: request.request_fingerprint,
@@ -1048,27 +1210,7 @@ impl Trail {
         let result = self.repair_lane_initialization_once(&initialization);
         match result {
             Ok(report) => Ok(report),
-            Err(error) => {
-                let repaired = self.mark_lane_initialization_repair_required(
-                    &initialization.initialization_id,
-                    &error,
-                )?;
-                Err(Error::CommittedRepairRequired {
-                    lane: repaired.lane_name,
-                    initialization_id: repaired.initialization_id,
-                    request_fingerprint: Box::new(repaired.request_fingerprint),
-                    operation_id: Box::new(repaired.operation_id),
-                    phase: LaneInitializationPhase::RepairRequired,
-                    committed: true,
-                    repair: repaired.repair_command.unwrap_or_else(|| {
-                        format!(
-                            "trail lane repair-initialization {}",
-                            initialization.lane_name
-                        )
-                    }),
-                    reason: error.to_string(),
-                })
-            }
+            Err(error) => Err(self.committed_lane_initialization_error(&initialization, error)),
         }
     }
 
