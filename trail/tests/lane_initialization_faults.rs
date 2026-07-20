@@ -204,6 +204,46 @@ fn ownerless_associated_fixture(lane: &str) -> (tempfile::TempDir, Trail) {
     (temp, db)
 }
 
+fn ownerless_materialized_repair_fixture(lane: &str) -> (tempfile::TempDir, Trail, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some(
+        "spawn_journal_completion",
+    ));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(matches!(
+        error,
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase: LaneInitializationPhase::RepairRequired,
+            ..
+        }
+    ));
+    let initialization = db.lane_initialization(lane).unwrap().unwrap();
+    let journal = temp
+        .path()
+        .join(".trail/materialization-operations")
+        .join(format!("{}.json", initialization.operation_id));
+    assert!(journal.is_file());
+    assert_eq!(owners_for_lane(&sqlite, lane), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, lane), 0);
+    (temp, db, journal)
+}
+
 #[test]
 fn lane_initialization_crash_child() {
     let Ok(workspace) = std::env::var(CHILD_WORKSPACE) else {
@@ -769,7 +809,7 @@ fn live_owner_blocks_manual_repair_before_side_effects() {
 #[test]
 fn concurrent_ownerless_repair_publishes_one_event_and_replays_idempotently() {
     const REPAIRERS: usize = 8;
-    let (temp, db) = ownerless_associated_fixture("ownerless-repair");
+    let (temp, db, journal) = ownerless_materialized_repair_fixture("ownerless-repair");
     drop(db);
     let sqlite = temp.path().join(".trail/index/trail.sqlite");
     let workspace = Arc::new(temp.path().to_path_buf());
@@ -796,6 +836,107 @@ fn concurrent_ownerless_repair_publishes_one_event_and_replays_idempotently() {
     assert_eq!(replay.phase, LaneInitializationPhase::ObserverReady);
     assert_eq!(spawn_events_for_lane(&sqlite, "ownerless-repair"), 1);
     assert_eq!(owners_for_lane(&sqlite, "ownerless-repair"), 0);
+    assert_eq!(
+        db.lane_initialization("ownerless-repair")
+            .unwrap()
+            .unwrap()
+            .phase,
+        LaneInitializationPhase::ObserverReady
+    );
+    assert!(!journal.exists());
+}
+
+#[test]
+fn associated_ownerless_repair_completes_observer_ready() {
+    let (temp, mut db) = ownerless_associated_fixture("associated-ownerless-repair");
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let report = db
+        .repair_lane_initialization("associated-ownerless-repair")
+        .unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(
+        spawn_events_for_lane(&sqlite, "associated-ownerless-repair"),
+        1
+    );
+    assert_eq!(owners_for_lane(&sqlite, "associated-ownerless-repair"), 0);
+}
+
+#[test]
+fn failed_claimed_repair_persists_error_and_releases_exact_owner() {
+    let (temp, mut db, _journal) = ownerless_materialized_repair_fixture("failed-repair-owner");
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let workdir = db
+        .lane_details("failed-repair-owner")
+        .unwrap()
+        .branch
+        .workdir
+        .unwrap();
+    fs::remove_dir_all(workdir).unwrap();
+
+    let error = db
+        .repair_lane_initialization("failed-repair-owner")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase: LaneInitializationPhase::RepairRequired,
+            ..
+        }
+    ));
+    assert_eq!(owners_for_lane(&sqlite, "failed-repair-owner"), 0);
+    let (phase, code): (String, Option<String>) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT phase,last_error_code FROM lane_initializations WHERE lane_name=?1",
+            ["failed-repair-owner"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(phase, "repair_required");
+    assert!(code.is_some());
+}
+
+#[test]
+fn deferred_materialized_spawn_releases_owner_before_resume() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    trail::test_support::set_changed_path_authority_override(true);
+    let _authority = AuthorityOverride;
+    let mut db = Trail::open(temp.path()).unwrap();
+    let deferred = db
+        .spawn_lane_with_deferred_initial_ledger(
+            "deferred-owner-release",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(deferred.phase, LaneInitializationPhase::Associated);
+    assert!(!deferred.completed_deferred_initialization);
+    assert_eq!(owners_for_lane(&sqlite, "deferred-owner-release"), 0);
+    drop(db);
+
+    let mut reopened = Trail::open(temp.path()).unwrap();
+    let completed = reopened
+        .resume_deferred_initial_lane_ledger("deferred-owner-release")
+        .unwrap();
+    assert_eq!(completed.phase, LaneInitializationPhase::ObserverReady);
+    assert!(completed.completed_deferred_initialization);
+    assert_eq!(owners_for_lane(&sqlite, "deferred-owner-release"), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, "deferred-owner-release"), 1);
 }
 
 #[test]

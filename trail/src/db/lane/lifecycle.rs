@@ -2,8 +2,9 @@ use super::initialization::{
     lane_initialization_record, LaneInitializationRecord, ResolvedLaneSpawnRequest,
 };
 use super::initialization_owner::{
-    claim_lane_initialization_owner, owner_fence_matches, release_lane_initialization_owner,
-    LaneInitializationClaim, LaneInitializationFence,
+    claim_lane_initialization_owner, claim_lane_initialization_repair,
+    heartbeat_lane_initialization_owner, owner_fence_matches, release_lane_initialization_owner,
+    LaneInitializationClaim, LaneInitializationFence, LaneInitializationRepairClaim,
 };
 use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
@@ -1124,6 +1125,22 @@ pub(crate) fn committed_lane_step<T>(
 }
 
 const LARGE_LANE_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
+const LANE_INITIALIZATION_REPAIR_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+fn lane_initialization_repair_wait_delay(
+    initialization_id: &str,
+    attempt: u32,
+) -> std::time::Duration {
+    let base = 10_u64.saturating_mul(1_u64 << attempt.min(5)).min(250);
+    let salt = initialization_id
+        .bytes()
+        .fold(u64::from(attempt) + 1, |value, byte| {
+            value.wrapping_mul(33).wrapping_add(u64::from(byte))
+        });
+    let jitter = salt % (base.saturating_div(4) + 1);
+    std::time::Duration::from_millis((base + jitter).min(250))
+}
 
 #[cfg(debug_assertions)]
 fn lane_initialization_crash_cut(boundary: &str) -> Result<()> {
@@ -1217,6 +1234,19 @@ impl Trail {
         result.map_err(|error| {
             self.committed_lane_initialization_error(initialization, Some(fence), error)
         })
+    }
+
+    fn release_lane_initialization_fence(
+        &mut self,
+        initialization_id: &str,
+        fence: &LaneInitializationFence,
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let released = release_lane_initialization_owner(&tx, initialization_id, fence)?;
+        tx.commit()?;
+        Ok(released)
     }
 
     fn publish_owned_lane_spawn_event(
@@ -1336,6 +1366,103 @@ impl Trail {
             if changed != 1 {
                 return Err(Error::Corrupt(format!(
                     "lane initialization `{initialization_id}` could not complete repair"
+                )));
+            }
+            lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` disappeared during completion"
+                ))
+            })
+        })();
+        match completion {
+            Ok(record) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(record)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    fn complete_owned_lane_initialization_repair_with_event(
+        &mut self,
+        initialization_id: &str,
+        fence: &LaneInitializationFence,
+        lane_id: &str,
+        change_id: &ChangeId,
+        payload: &serde_json::Value,
+    ) -> Result<LaneInitializationRecord> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let completion = (|| -> Result<LaneInitializationRecord> {
+            let record =
+                lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "lane initialization `{initialization_id}` disappeared during repair"
+                    ))
+                })?;
+            if record.phase == LaneInitializationPhase::ObserverReady {
+                let has_owner: bool = self.conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM lane_initialization_owners
+                         WHERE initialization_id=?1)",
+                    [initialization_id],
+                    |row| row.get(0),
+                )?;
+                if has_owner {
+                    return Err(Error::Corrupt(format!(
+                        "lane initialization `{initialization_id}` retained an owner after completion"
+                    )));
+                }
+                return Ok(record);
+            }
+            if record.phase != LaneInitializationPhase::RepairRequired {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` is {:?}, expected repair_required",
+                    record.phase
+                )));
+            }
+            if !owner_fence_matches(&self.conn, initialization_id, fence)? {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` owner fence no longer matches"
+                )));
+            }
+            let event_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM lane_events
+                     WHERE lane_id=?1 AND event_type='lane_spawned')",
+                [lane_id],
+                |row| row.get(0),
+            )?;
+            if !event_exists {
+                self.insert_lane_event(lane_id, "lane_spawned", Some(change_id), None, payload)?;
+            }
+            let changed = self.conn.execute(
+                "UPDATE lane_initializations
+                 SET phase='observer_ready',last_error_code=NULL,last_error_message=NULL,
+                     repair_command=NULL,updated_at=?1
+                 WHERE initialization_id=?2 AND phase='repair_required'
+                   AND EXISTS(
+                     SELECT 1 FROM lane_initialization_owners owner
+                     WHERE owner.initialization_id=lane_initializations.initialization_id
+                       AND owner.owner_token=?3 AND owner.owner_generation=?4)",
+                params![
+                    now_ts(),
+                    initialization_id,
+                    fence.owner_token,
+                    fence.owner_generation,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` could not complete fenced repair"
+                )));
+            }
+            let released = release_lane_initialization_owner(&self.conn, initialization_id, fence)?;
+            if !released {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` owner fence no longer matches"
                 )));
             }
             lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
@@ -1947,11 +2074,7 @@ impl Trail {
             Ok(()) => self.conn.execute_batch("COMMIT;")?,
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
-                let release_tx = self
-                    .conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                release_lane_initialization_owner(&release_tx, &request.initialization_id, &fence)?;
-                release_tx.commit()?;
+                self.release_lane_initialization_fence(&request.initialization_id, &fence)?;
                 return Err(error);
             }
         }
@@ -2005,6 +2128,19 @@ impl Trail {
             };
             let validation = singleflight.validate();
             self.committed_lane_initialization_step(&initialization, &fence, validation)?;
+            let release = self
+                .release_lane_initialization_fence(&initialization.initialization_id, &fence)
+                .and_then(|released| {
+                    if released {
+                        Ok(())
+                    } else {
+                        Err(Error::Corrupt(format!(
+                            "lane initialization `{}` owner fence no longer matches",
+                            initialization.initialization_id
+                        )))
+                    }
+                });
+            self.committed_lane_initialization_step(&initialization, &fence, release)?;
             return Ok(report);
         }
         if ledger_authority
@@ -2138,17 +2274,14 @@ impl Trail {
 
     #[doc(hidden)]
     pub fn resume_deferred_initial_lane_ledger(&mut self, lane: &str) -> Result<LaneSpawnReport> {
-        let initialization = self.prepare_unowned_lane_initialization_repair(lane)?;
-        if initialization.phase == LaneInitializationPhase::ObserverReady {
-            return self.lane_spawn_report_for_initialization(&initialization, true);
-        }
-        self.resume_deferred_initial_lane_ledger_inner(lane, None)
+        self.repair_lane_initialization_with_claim(lane)
     }
 
     fn resume_deferred_initial_lane_ledger_inner(
         &mut self,
         lane: &str,
         fence: Option<&LaneInitializationFence>,
+        repair_replay: bool,
     ) -> Result<LaneSpawnReport> {
         let details = self.lane_details(lane)?;
         let initialization = lane_initialization_record(&self.conn, lane)?
@@ -2199,6 +2332,13 @@ impl Trail {
             .unwrap_or(false);
 
         if details.branch.workdir.is_some() && !workdir_mode.is_transparent_cow() {
+            if let Some(fence) = fence {
+                heartbeat_lane_initialization_owner(
+                    &self.conn,
+                    &initialization.initialization_id,
+                    fence,
+                )?;
+            }
             let expected =
                 crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
                     self,
@@ -2249,6 +2389,13 @@ impl Trail {
                 },
                 |db| db.publish_lane_marker_if_materialized(&details.branch.lane_id),
             )?;
+            if let Some(fence) = fence {
+                heartbeat_lane_initialization_owner(
+                    &self.conn,
+                    &initialization.initialization_id,
+                    fence,
+                )?;
+            }
         }
 
         let spawn_payload = serde_json::json!({
@@ -2263,8 +2410,15 @@ impl Trail {
             "include_neighbors": include_neighbors,
             "transparent_cow_available": transparent_cow_available,
         });
-        let initialization = match fence {
-            Some(fence) => {
+        let initialization = match (fence, repair_replay) {
+            (Some(fence), true) => self.complete_owned_lane_initialization_repair_with_event(
+                &initialization.initialization_id,
+                fence,
+                &details.branch.lane_id,
+                &details.branch.base_change,
+                &spawn_payload,
+            )?,
+            (Some(fence), false) => {
                 self.publish_owned_lane_spawn_event(
                     &initialization.initialization_id,
                     fence,
@@ -2274,7 +2428,7 @@ impl Trail {
                 )?;
                 self.complete_deferred_lane_initialization_owned(&details.branch.lane_id, fence)?
             }
-            None => self.complete_unowned_lane_initialization_repair_with_event(
+            (None, _) => self.complete_unowned_lane_initialization_repair_with_event(
                 &initialization.initialization_id,
                 &details.branch.lane_id,
                 &details.branch.base_change,
@@ -2317,15 +2471,45 @@ impl Trail {
                 existing.phase
             )));
         }
-        let initialization = self.prepare_unowned_lane_initialization_repair(lane)?;
-        if initialization.phase == LaneInitializationPhase::ObserverReady {
-            return self.lane_spawn_report_for_initialization(&initialization, true);
-        }
-        let result = self.repair_lane_initialization_once(&initialization, None);
-        match result {
-            Ok(report) => Ok(report),
-            Err(error) => {
-                Err(self.committed_lane_initialization_error(&initialization, None, error))
+        self.repair_lane_initialization_with_claim(lane)
+    }
+
+    fn repair_lane_initialization_with_claim(&mut self, lane: &str) -> Result<LaneSpawnReport> {
+        let deadline = std::time::Instant::now() + LANE_INITIALIZATION_REPAIR_WAIT_TIMEOUT;
+        let mut attempt = 0_u32;
+        loop {
+            match claim_lane_initialization_repair(self, lane)? {
+                LaneInitializationRepairClaim::Terminal(record) => {
+                    return self.lane_spawn_report_for_initialization(&record, true);
+                }
+                LaneInitializationRepairClaim::Owned { record, fence } => {
+                    let result = self.repair_lane_initialization_once(&record, Some(&fence), true);
+                    return result.map_err(|error| {
+                        self.committed_lane_initialization_error(&record, Some(&fence), error)
+                    });
+                }
+                LaneInitializationRepairClaim::Contended { record, owner_pid } => {
+                    if record.phase == LaneInitializationPhase::Associated {
+                        return Err(Error::Corrupt(format!(
+                            "lane initialization `{}` is actively owned and cannot be repaired",
+                            record.initialization_id
+                        )));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::LaneInitializationInProgress {
+                            lane: record.lane_name,
+                            initialization_id: record.initialization_id,
+                            owner_pid,
+                            phase: record.phase,
+                            retry_command: format!("trail lane repair-initialization {}", lane),
+                        });
+                    }
+                    std::thread::sleep(lane_initialization_repair_wait_delay(
+                        &record.initialization_id,
+                        attempt,
+                    ));
+                    attempt = attempt.saturating_add(1);
+                }
             }
         }
     }
@@ -2335,7 +2519,7 @@ impl Trail {
         initialization: &LaneInitializationRecord,
         fence: &LaneInitializationFence,
     ) -> Result<LaneSpawnReport> {
-        let result = self.repair_lane_initialization_once(initialization, Some(fence));
+        let result = self.repair_lane_initialization_once(initialization, Some(fence), false);
         result.map_err(|error| {
             self.committed_lane_initialization_error(initialization, Some(fence), error)
         })
@@ -2345,7 +2529,15 @@ impl Trail {
         &mut self,
         initialization: &LaneInitializationRecord,
         fence: Option<&LaneInitializationFence>,
+        repair_replay: bool,
     ) -> Result<LaneSpawnReport> {
+        if let Some(fence) = fence {
+            heartbeat_lane_initialization_owner(
+                &self.conn,
+                &initialization.initialization_id,
+                fence,
+            )?;
+        }
         let expected_id = {
             let mut digest = sha2::Sha256::new();
             use sha2::Digest;
@@ -2402,16 +2594,38 @@ impl Trail {
             &head.root_id,
             &head.operation_id,
         )?;
+        if let Some(fence) = fence {
+            heartbeat_lane_initialization_owner(
+                &self.conn,
+                &initialization.initialization_id,
+                fence,
+            )?;
+        }
         if initialization.materialization_json.is_some() {
             let journal = self
                 .db_dir
                 .join("materialization-operations")
                 .join(format!("{}.json", initialization.operation_id));
-            if journal.exists() {
+            if repair_replay {
+                self.complete_materialization_operation_for_ownerless_repair(
+                    &initialization.operation_id,
+                )?;
+            } else if journal.exists() {
                 self.complete_materialization_operation(&initialization.operation_id)?;
             }
         }
-        self.resume_deferred_initial_lane_ledger_inner(&initialization.lane_name, fence)
+        if let Some(fence) = fence {
+            heartbeat_lane_initialization_owner(
+                &self.conn,
+                &initialization.initialization_id,
+                fence,
+            )?;
+        }
+        self.resume_deferred_initial_lane_ledger_inner(
+            &initialization.lane_name,
+            fence,
+            repair_replay,
+        )
     }
 
     pub fn ensure_lane_workdir_materialized(

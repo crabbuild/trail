@@ -48,6 +48,16 @@ pub enum Error {
         existing_fingerprint: String,
         requested_fingerprint: String,
     },
+    #[error(
+        "lane `{lane}` initialization {initialization_id} is still owned by live process {owner_pid} in phase {phase:?}; retry with `{retry_command}`"
+    )]
+    LaneInitializationInProgress {
+        lane: String,
+        initialization_id: String,
+        owner_pid: u32,
+        phase: crate::model::LaneInitializationPhase,
+        retry_command: String,
+    },
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -137,6 +147,7 @@ impl Error {
             Error::CommittedRepairRequired { .. }
             | Error::OperationCommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
             Error::LaneInitializationConflict { .. } => "LANE_INITIALIZATION_CONFLICT",
+            Error::LaneInitializationInProgress { .. } => "LANE_INITIALIZATION_IN_PROGRESS",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -195,7 +206,8 @@ impl Error {
             Error::ChangeLedgerReconcileRequired { .. } => 16,
             Error::CommittedRepairRequired { .. }
             | Error::OperationCommittedRepairRequired { .. } => 16,
-            Error::LaneInitializationConflict { .. } => 2,
+            Error::LaneInitializationConflict { .. }
+            | Error::LaneInitializationInProgress { .. } => 2,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
             | Error::CloneUnsupported
@@ -254,6 +266,20 @@ mod tests {
 
         assert_eq!(error.code(), "PATH_INDEX_REQUIRED");
         assert_eq!(error.exit_code(), 9);
+    }
+
+    #[test]
+    fn lane_initialization_in_progress_has_stable_code_and_exit_status() {
+        let error = Error::LaneInitializationInProgress {
+            lane: "agent-1".into(),
+            initialization_id: "init_123".into(),
+            owner_pid: 42,
+            phase: crate::model::LaneInitializationPhase::RepairRequired,
+            retry_command: "trail lane repair-initialization agent-1".into(),
+        };
+
+        assert_eq!(error.code(), "LANE_INITIALIZATION_IN_PROGRESS");
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

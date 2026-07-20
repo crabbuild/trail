@@ -265,6 +265,21 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::LaneInitializationInProgress { retry_command, .. } => {
+            let mut diagnostic = UiDiagnostic::new(
+                err.code(),
+                "Lane initialization is still owned by another live process",
+            );
+            diagnostic.consequence = Some(
+                "Trail preserved the active owner and stopped without taking over its work."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: retry_command.clone(),
+                reason: "Retry after the current lane initialization finishes.".to_string(),
+            });
+            diagnostic
+        }
         Error::InvalidInput(_) | Error::InvalidPath { .. } => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail cannot use the supplied input");

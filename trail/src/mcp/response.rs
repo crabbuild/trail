@@ -126,4 +126,27 @@ mod tests {
             "sha256:requested"
         );
     }
+
+    #[test]
+    fn lane_initialization_in_progress_tool_error_uses_shared_conflict_contract() {
+        let error = Error::LaneInitializationInProgress {
+            lane: "agent-1".into(),
+            initialization_id: "init_123".into(),
+            owner_pid: 42,
+            phase: crate::model::LaneInitializationPhase::RepairRequired,
+            retry_command: "trail lane repair-initialization agent-1".into(),
+        };
+        let value = tool_error_result(&error);
+
+        assert_eq!(value["isError"], true);
+        assert_eq!(
+            value["structuredContent"]["error"]["code"],
+            "LANE_INITIALIZATION_IN_PROGRESS"
+        );
+        assert_eq!(value["structuredContent"]["error"]["status"], 409);
+        assert_eq!(
+            value["structuredContent"]["error"]["details"]["owner_pid"],
+            42
+        );
+    }
 }

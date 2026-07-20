@@ -132,6 +132,20 @@ fn ref_operation(sqlite_path: &Path, name: &str) -> String {
         .unwrap()
 }
 
+fn initialization_owner_count(sqlite_path: &Path, lane: &str) -> i64 {
+    Connection::open(sqlite_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM lane_initialization_owners owner
+             JOIN lane_initializations initialization
+               ON initialization.initialization_id=owner.initialization_id
+             WHERE initialization.lane_name=?1",
+            [lane],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn spawn_virtual(
     fixture: &mut LaneInitializationFixture,
     name: &str,
@@ -221,6 +235,39 @@ fn http_duplicate_spawn_conflict_returns_shared_identity_details() {
     assert_ne!(
         conflict["error"]["details"]["requested_fingerprint"],
         first["request_fingerprint"]
+    );
+}
+
+#[test]
+fn http_deferred_materialized_spawn_completes_without_owner() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    let mut fixture = LaneInitializationFixture::new();
+    trail::test_support::set_changed_path_authority_override(true);
+    let _authority = AuthorityOverride;
+    let response = trail::server::handle_http_request(
+        fixture.db_mut(),
+        &api_request(
+            "POST",
+            "/v1/lanes",
+            serde_json::json!({
+                "name": "http-deferred-materialized",
+                "from": "main",
+                "workdir_mode": "portable-copy"
+            }),
+        ),
+    );
+    assert_eq!(response.status, 201);
+    let body: serde_json::Value = response.body_json().unwrap();
+    assert_eq!(body["phase"], "observer_ready");
+    assert_eq!(
+        initialization_owner_count(&fixture.sqlite_path(), "http-deferred-materialized"),
+        0
     );
 }
 
@@ -334,6 +381,9 @@ fn long_lived_handle_reads_sparse_lanes_created_by_cli_processes() {
             "spawn failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["phase"], "observer_ready");
+        assert_eq!(initialization_owner_count(&fixture.sqlite_path(), &name), 0);
         #[cfg(unix)]
         {
             let wal = PathBuf::from(format!("{}-wal", fixture.sqlite_path().display()));

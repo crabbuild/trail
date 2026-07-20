@@ -28,6 +28,19 @@ pub(crate) enum LaneInitializationClaim {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum LaneInitializationRepairClaim {
+    Owned {
+        record: LaneInitializationRecord,
+        fence: LaneInitializationFence,
+    },
+    Contended {
+        record: LaneInitializationRecord,
+        owner_pid: u32,
+    },
+    Terminal(LaneInitializationRecord),
+}
+
+#[derive(Clone, Debug)]
 struct LaneInitializationOwner {
     fence: LaneInitializationFence,
     owner_pid: u32,
@@ -286,6 +299,168 @@ pub(crate) fn claim_lane_initialization_owner(
     }
 }
 
+pub(crate) fn claim_lane_initialization_repair(
+    db: &mut Trail,
+    lane: &str,
+) -> Result<LaneInitializationRepairClaim> {
+    loop {
+        let record = lane_initialization_record(&db.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
+        if record.phase == LaneInitializationPhase::ObserverReady {
+            return Ok(LaneInitializationRepairClaim::Terminal(record));
+        }
+        if !matches!(
+            record.phase,
+            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+        ) {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` is {:?}, expected associated or repair_required",
+                record.initialization_id, record.phase
+            )));
+        }
+
+        let existing_owner = lane_initialization_owner(&db.conn, &record.initialization_id)?;
+        if let Some(owner) = existing_owner {
+            let owner_match =
+                owner_process_match(owner.owner_pid, &owner.owner_process_start_identity);
+            if owner_match != ProcessIdentityMatch::DeadOrMismatch
+                || record.phase == LaneInitializationPhase::Associated
+            {
+                return Ok(LaneInitializationRepairClaim::Contended {
+                    record,
+                    owner_pid: owner.owner_pid,
+                });
+            }
+
+            let owner_token = new_owner_token()?;
+            let owner_pid = std::process::id();
+            let owner_process_start_identity = current_process_start_token();
+            let now = now_ts();
+            let tx = db
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(current) = lane_initialization_record(&tx, lane)? else {
+                tx.commit()?;
+                continue;
+            };
+            if current.phase == LaneInitializationPhase::ObserverReady {
+                tx.commit()?;
+                return Ok(LaneInitializationRepairClaim::Terminal(current));
+            }
+            if current.phase != LaneInitializationPhase::RepairRequired {
+                tx.commit()?;
+                continue;
+            }
+            let changed = tx.execute(
+                "UPDATE lane_initialization_owners
+                 SET owner_token=?1, owner_generation=owner_generation+1,
+                     owner_pid=?2, owner_process_start_identity=?3,
+                     acquired_at=?4, heartbeat_at=?4
+                 WHERE initialization_id=?5
+                   AND owner_token=?6 AND owner_generation=?7
+                   AND owner_pid=?8 AND owner_process_start_identity=?9",
+                params![
+                    owner_token,
+                    owner_pid,
+                    owner_process_start_identity,
+                    now,
+                    current.initialization_id,
+                    owner.fence.owner_token,
+                    owner.fence.owner_generation,
+                    owner.owner_pid,
+                    owner.owner_process_start_identity,
+                ],
+            )?;
+            tx.commit()?;
+            if changed == 0 {
+                continue;
+            }
+            return Ok(LaneInitializationRepairClaim::Owned {
+                record: current,
+                fence: LaneInitializationFence {
+                    owner_token,
+                    owner_generation: owner.fence.owner_generation + 1,
+                },
+            });
+        }
+
+        let owner_token = new_owner_token()?;
+        let owner_pid = std::process::id();
+        let owner_process_start_identity = current_process_start_token();
+        let now = now_ts();
+        let tx = db
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(current) = lane_initialization_record(&tx, lane)? else {
+            tx.commit()?;
+            continue;
+        };
+        if current.phase == LaneInitializationPhase::ObserverReady {
+            tx.commit()?;
+            return Ok(LaneInitializationRepairClaim::Terminal(current));
+        }
+        if !matches!(
+            current.phase,
+            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+        ) {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` changed to {:?} during repair claim",
+                current.initialization_id, current.phase
+            )));
+        }
+        if current.phase == LaneInitializationPhase::Associated {
+            let changed = tx.execute(
+                "UPDATE lane_initializations
+                 SET phase='repair_required',
+                     repair_command='trail lane repair-initialization ' || lane_name,
+                     updated_at=?1
+                 WHERE initialization_id=?2 AND phase='associated'
+                   AND NOT EXISTS(
+                     SELECT 1 FROM lane_initialization_owners owner
+                     WHERE owner.initialization_id=lane_initializations.initialization_id)",
+                params![now, current.initialization_id],
+            )?;
+            if changed == 0 {
+                tx.commit()?;
+                continue;
+            }
+        }
+        let inserted = tx.execute(
+            "INSERT INTO lane_initialization_owners(
+                 initialization_id,owner_token,owner_generation,owner_pid,
+                 owner_process_start_identity,acquired_at,heartbeat_at)
+             VALUES(?1,?2,1,?3,?4,?5,?5)
+             ON CONFLICT(initialization_id) DO NOTHING",
+            params![
+                current.initialization_id,
+                owner_token,
+                owner_pid,
+                owner_process_start_identity,
+                now,
+            ],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            continue;
+        }
+        let claimed =
+            lane_initialization_record(&tx, &current.initialization_id)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "lane initialization `{}` disappeared during repair claim",
+                    current.initialization_id
+                ))
+            })?;
+        tx.commit()?;
+        return Ok(LaneInitializationRepairClaim::Owned {
+            record: claimed,
+            fence: LaneInitializationFence {
+                owner_token,
+                owner_generation: 1,
+            },
+        });
+    }
+}
+
 pub(crate) fn heartbeat_lane_initialization_owner(
     conn: &Connection,
     initialization_id: &str,
@@ -456,6 +631,30 @@ mod tests {
                 )
                 .unwrap();
             install_process_liveness_override(pid, start_identity, false);
+        }
+
+        fn install_repair_owner(&self, pid: u32, start_identity: &str, heartbeat_at: i64) {
+            self.insert_initialization("repair_required");
+            self.db
+                .conn
+                .execute(
+                    "INSERT INTO lane_initialization_owners(
+                         initialization_id,owner_token,owner_generation,owner_pid,
+                         owner_process_start_identity,acquired_at,heartbeat_at)
+                     VALUES(?1,?2,1,?3,?4,1,?5)",
+                    params![
+                        self.request.initialization_id,
+                        hex::encode([0x22_u8; 32]),
+                        pid,
+                        start_identity,
+                        heartbeat_at,
+                    ],
+                )
+                .unwrap();
+        }
+
+        fn claim_repair(&mut self) -> LaneInitializationRepairClaim {
+            claim_lane_initialization_repair(&mut self.db, &self.request.lane_name).unwrap()
         }
 
         fn install_terminal(&self, lane: &str, phase: LaneInitializationPhase) {
@@ -663,5 +862,41 @@ mod tests {
         )
         .unwrap());
         assert!(!fixture.owner_fence_matches("lane-a", &fence));
+    }
+
+    #[test]
+    fn dead_repair_owner_takeover_is_cas_fenced_and_increments_generation() {
+        let mut fixture = OwnerFixture::new();
+        fixture.install_repair_owner(u32::MAX, "dead-repair-owner", i64::MIN / 2);
+        install_process_liveness_override(u32::MAX, "dead-repair-owner", false);
+
+        let LaneInitializationRepairClaim::Owned { record, fence } = fixture.claim_repair() else {
+            panic!("expected repair ownership takeover")
+        };
+        assert_eq!(record.phase, LaneInitializationPhase::RepairRequired);
+        assert_eq!(fence.owner_generation, 2);
+        assert_eq!(fixture.stored_fence("lane-a"), fence);
+    }
+
+    #[test]
+    fn live_and_unknown_repair_owners_are_never_stolen_by_heartbeat_age() {
+        for (start_identity, unknown) in
+            [("live-repair-owner", false), ("unknown-repair-owner", true)]
+        {
+            let mut fixture = OwnerFixture::new();
+            fixture.install_repair_owner(std::process::id(), start_identity, i64::MIN / 2);
+            if unknown {
+                install_process_liveness_unknown_override(std::process::id(), start_identity);
+            } else {
+                install_process_liveness_override(std::process::id(), start_identity, true);
+            }
+            let before = fixture.stored_fence("lane-a");
+            let LaneInitializationRepairClaim::Contended { owner_pid, .. } = fixture.claim_repair()
+            else {
+                panic!("expected live repair-owner contention")
+            };
+            assert_eq!(owner_pid, std::process::id());
+            assert_eq!(fixture.stored_fence("lane-a"), before);
+        }
     }
 }

@@ -602,12 +602,35 @@ impl Trail {
     }
 
     pub(crate) fn complete_materialization_operation(&self, operation_id: &str) -> Result<()> {
+        self.complete_materialization_operation_with_missing_policy(operation_id, false)
+    }
+
+    pub(crate) fn complete_materialization_operation_for_ownerless_repair(
+        &self,
+        operation_id: &str,
+    ) -> Result<()> {
+        self.complete_materialization_operation_with_missing_policy(operation_id, true)
+    }
+
+    fn complete_materialization_operation_with_missing_policy(
+        &self,
+        operation_id: &str,
+        missing_is_complete: bool,
+    ) -> Result<()> {
         let journal_dir = self.db_dir.join("materialization-operations");
         let journal = SecureDirectory::open_absolute(&journal_dir)?;
         let name = format!("{operation_id}.json");
-        let bytes = journal
+        let bytes = match journal
             .read_regular_optional_bounded(&name, MAX_MATERIALIZATION_OPERATION_BYTES)?
-            .ok_or_else(|| Error::Corrupt("materialization operation record disappeared".into()))?;
+        {
+            Some(bytes) => bytes,
+            None if missing_is_complete => return Ok(()),
+            None => {
+                return Err(Error::Corrupt(
+                    "materialization operation record disappeared".into(),
+                ));
+            }
+        };
         let record: MaterializationOperationRecord = serde_json::from_slice(&bytes)?;
         let associated = self.materialization_record_has_lane_association(&record)?;
         if !associated {

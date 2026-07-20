@@ -146,7 +146,8 @@ impl StructuredErrorEnvelope {
             | crate::Error::SchemaReinitializeRequired { .. }
             | crate::Error::ChangeLedgerReconcileRequired { .. }
             | crate::Error::CommittedRepairRequired { .. }
-            | crate::Error::LaneInitializationConflict { .. } => 409,
+            | crate::Error::LaneInitializationConflict { .. }
+            | crate::Error::LaneInitializationInProgress { .. } => 409,
             crate::Error::InvalidInput(_)
             | crate::Error::InvalidPath { .. }
             | crate::Error::IgnoredPath(_)
@@ -188,6 +189,19 @@ impl StructuredErrorEnvelope {
                 "lane": lane,
                 "existing_fingerprint": existing_fingerprint,
                 "requested_fingerprint": requested_fingerprint,
+            })),
+            crate::Error::LaneInitializationInProgress {
+                lane,
+                initialization_id,
+                owner_pid,
+                phase,
+                retry_command,
+            } => Some(serde_json::json!({
+                "lane": lane,
+                "initialization_id": initialization_id,
+                "owner_pid": owner_pid,
+                "phase": phase,
+                "retry_command": retry_command,
             })),
             crate::Error::CommittedRepairRequired {
                 lane,
