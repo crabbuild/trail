@@ -167,6 +167,43 @@ fn reject_lane_initialization_owner_deletes(sqlite: &Path) {
         .unwrap();
 }
 
+fn ownerless_associated_fixture(lane: &str) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    reject_lane_initialization_phases(&sqlite, &["repair_required"]);
+    trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_event"));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(matches!(
+        error,
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase: LaneInitializationPhase::Associated,
+            ..
+        }
+    ));
+    Connection::open(&sqlite)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_lane_initialization_phase;")
+        .unwrap();
+    assert_eq!(owners_for_lane(&sqlite, lane), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, lane), 0);
+    (temp, db)
+}
+
 #[test]
 fn lane_initialization_crash_child() {
     let Ok(workspace) = std::env::var(CHILD_WORKSPACE) else {
@@ -577,6 +614,191 @@ fn stale_owner_cannot_transition_after_generation_takeover() {
 }
 
 #[test]
+fn pre_association_rollback_retains_materialized_state_and_releases_exact_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_after_ref"));
+    let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "retained-materialized",
+        Some("main"),
+        LaneWorkdirMode::PortableCopy,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    );
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(result.is_err());
+
+    let initialization = db
+        .lane_initialization("retained-materialized")
+        .unwrap()
+        .unwrap();
+    assert_eq!(initialization.phase, LaneInitializationPhase::Materialized);
+    assert_eq!(owners_for_lane(&sqlite, "retained-materialized"), 0);
+    assert_eq!(refs_for_lane(&sqlite, "retained-materialized"), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, "retained-materialized"), 0);
+    assert!(
+        initialization
+            .workdir
+            .as_ref()
+            .is_some_and(|workdir| Path::new(workdir).is_dir()),
+        "materialized rollback must retain its reusable workdir"
+    );
+}
+
+#[test]
+fn stale_owner_cannot_publish_lane_spawn_event_after_takeover() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let handshake = temp.path().join("stale-event-owner.handshake");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("lane_initialization_crash_child")
+        .arg("--nocapture")
+        .env(CHILD_WORKSPACE, temp.path())
+        .env(CRASH_AFTER, "after_association")
+        .env(HANDSHAKE, &handshake)
+        .env(CHILD_LEDGER_AUTHORITY, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !handshake.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        handshake.exists(),
+        "child did not publish association handshake"
+    );
+    let (initialization_id, stale_token, stale_generation): (String, String, i64) =
+        Connection::open(&sqlite)
+            .unwrap()
+            .query_row(
+                "SELECT initialization.initialization_id,owner.owner_token,owner.owner_generation
+                 FROM lane_initializations initialization
+                 JOIN lane_initialization_owners owner
+                   ON owner.initialization_id=initialization.initialization_id
+                 WHERE initialization.lane_name='crash-lane'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "UPDATE lane_initialization_owners
+             SET owner_token=?1,owner_generation=owner_generation+1,
+                 owner_pid=?2,owner_process_start_identity='replacement-event-owner'
+             WHERE initialization_id=?3 AND owner_token=?4 AND owner_generation=?5",
+            rusqlite::params![
+                "33".repeat(32),
+                std::process::id(),
+                initialization_id,
+                stale_token,
+                stale_generation,
+            ],
+        )
+        .unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let error = db
+        .debug_publish_lane_spawn_event_with_fence("crash-lane", &stale_token, stale_generation)
+        .unwrap_err();
+    assert!(error.to_string().contains("owner fence no longer matches"));
+    assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 0);
+}
+
+#[test]
+fn live_owner_blocks_manual_repair_before_side_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let handshake = temp.path().join("live-repair-owner.handshake");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("lane_initialization_crash_child")
+        .arg("--nocapture")
+        .env(CHILD_WORKSPACE, temp.path())
+        .env(CRASH_AFTER, "after_association")
+        .env(HANDSHAKE, &handshake)
+        .env(CHILD_LEDGER_AUTHORITY, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !handshake.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        handshake.exists(),
+        "child did not publish live-owner handshake"
+    );
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_ref_repair"));
+    let error = db.repair_lane_initialization("crash-lane").unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(error.to_string().contains("actively owned"));
+    assert!(!error
+        .to_string()
+        .contains("injected lane association failure"));
+    assert_eq!(
+        db.lane_initialization("crash-lane").unwrap().unwrap().phase,
+        LaneInitializationPhase::Associated
+    );
+    assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 0);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn concurrent_ownerless_repair_publishes_one_event_and_replays_idempotently() {
+    const REPAIRERS: usize = 8;
+    let (temp, db) = ownerless_associated_fixture("ownerless-repair");
+    drop(db);
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let workspace = Arc::new(temp.path().to_path_buf());
+    let start = Arc::new(Barrier::new(REPAIRERS + 1));
+    let handles = (0..REPAIRERS)
+        .map(|_| {
+            let workspace = Arc::clone(&workspace);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let mut db = Trail::open(workspace.as_ref()).unwrap();
+                start.wait();
+                db.repair_lane_initialization("ownerless-repair")
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+    for handle in handles {
+        let report = handle.join().unwrap().unwrap();
+        assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    }
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let replay = db.repair_lane_initialization("ownerless-repair").unwrap();
+    assert_eq!(replay.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(spawn_events_for_lane(&sqlite, "ownerless-repair"), 1);
+    assert_eq!(owners_for_lane(&sqlite, "ownerless-repair"), 0);
+}
+
+#[test]
 fn io_failures_never_advance_past_or_delete_the_durable_artifact() {
     for (boundary, disk_full) in [
         ("workdir_write", true),
@@ -609,13 +831,20 @@ fn io_failures_never_advance_past_or_delete_the_durable_artifact() {
         assert_eq!(refs_for_lane(&sqlite, "io-lane"), 0, "{boundary}");
         assert_eq!(spawn_events_for_lane(&sqlite, "io-lane"), 0, "{boundary}");
         let initialization = db.lane_initialization("io-lane").unwrap();
-        assert!(
-            initialization
-                .as_ref()
-                .is_none_or(|record| record.phase == LaneInitializationPhase::Reserved),
-            "boundary {boundary}: {initialization:?}"
-        );
-        assert!(!temp.path().join(".trail/worktrees/io-lane").exists());
+        if boundary == "association_sqlite_commit" {
+            let initialization = initialization.unwrap();
+            assert_eq!(initialization.phase, LaneInitializationPhase::Materialized);
+            assert_eq!(owners_for_lane(&sqlite, "io-lane"), 0);
+            assert!(temp.path().join(".trail/worktrees/io-lane").is_dir());
+        } else {
+            assert!(
+                initialization
+                    .as_ref()
+                    .is_none_or(|record| record.phase == LaneInitializationPhase::Reserved),
+                "boundary {boundary}: {initialization:?}"
+            );
+            assert!(!temp.path().join(".trail/worktrees/io-lane").exists());
+        }
     }
 }
 

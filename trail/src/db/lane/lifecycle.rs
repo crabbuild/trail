@@ -1219,6 +1219,143 @@ impl Trail {
         })
     }
 
+    fn publish_owned_lane_spawn_event(
+        &mut self,
+        initialization_id: &str,
+        fence: &LaneInitializationFence,
+        lane_id: &str,
+        change_id: &ChangeId,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let publication = (|| -> Result<()> {
+            if !owner_fence_matches(&self.conn, initialization_id, fence)? {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` owner fence no longer matches"
+                )));
+            }
+            let event_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM lane_events
+                     WHERE lane_id=?1 AND event_type='lane_spawned')",
+                [lane_id],
+                |row| row.get(0),
+            )?;
+            if !event_exists {
+                self.insert_lane_event(lane_id, "lane_spawned", Some(change_id), None, payload)?;
+            }
+            Ok(())
+        })();
+        match publication {
+            Ok(()) => self.conn.execute_batch("COMMIT;").map_err(Into::into),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_publish_lane_spawn_event_with_fence(
+        &mut self,
+        lane: &str,
+        owner_token: &str,
+        owner_generation: i64,
+    ) -> Result<()> {
+        let initialization = lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
+        let details = self.lane_details(&initialization.lane_id)?;
+        self.publish_owned_lane_spawn_event(
+            &initialization.initialization_id,
+            &LaneInitializationFence {
+                owner_token: owner_token.to_string(),
+                owner_generation,
+            },
+            &details.branch.lane_id,
+            &details.branch.base_change,
+            &serde_json::json!({"test": "stale-owner-event-publication"}),
+        )
+    }
+
+    fn complete_unowned_lane_initialization_repair_with_event(
+        &mut self,
+        initialization_id: &str,
+        lane_id: &str,
+        change_id: &ChangeId,
+        payload: &serde_json::Value,
+    ) -> Result<LaneInitializationRecord> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let completion = (|| -> Result<LaneInitializationRecord> {
+            let record =
+                lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "lane initialization `{initialization_id}` disappeared during repair"
+                    ))
+                })?;
+            let has_owner: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM lane_initialization_owners WHERE initialization_id=?1)",
+                [initialization_id],
+                |row| row.get(0),
+            )?;
+            if has_owner {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` became actively owned during repair"
+                )));
+            }
+            if record.phase == LaneInitializationPhase::ObserverReady {
+                return Ok(record);
+            }
+            if record.phase != LaneInitializationPhase::RepairRequired {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` is {:?}, expected repair_required",
+                    record.phase
+                )));
+            }
+            let event_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM lane_events
+                     WHERE lane_id=?1 AND event_type='lane_spawned')",
+                [lane_id],
+                |row| row.get(0),
+            )?;
+            if !event_exists {
+                self.insert_lane_event(lane_id, "lane_spawned", Some(change_id), None, payload)?;
+            }
+            let changed = self.conn.execute(
+                "UPDATE lane_initializations
+                 SET phase='observer_ready',last_error_code=NULL,last_error_message=NULL,
+                     repair_command=NULL,updated_at=?1
+                 WHERE initialization_id=?2 AND phase='repair_required'
+                   AND NOT EXISTS(
+                     SELECT 1 FROM lane_initialization_owners owner
+                     WHERE owner.initialization_id=lane_initializations.initialization_id)",
+                params![now_ts(), initialization_id],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` could not complete repair"
+                )));
+            }
+            lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "lane initialization `{initialization_id}` disappeared during completion"
+                ))
+            })
+        })();
+        match completion {
+            Ok(record) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(record)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
     fn lane_spawn_report_for_initialization(
         &self,
         initialization: &LaneInitializationRecord,
@@ -1810,24 +1947,11 @@ impl Trail {
             Ok(()) => self.conn.execute_batch("COMMIT;")?,
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
-                self.conn.execute(
-                    "DELETE FROM lane_initializations
-                     WHERE initialization_id=?1 AND phase='materialized'
-                       AND NOT EXISTS(SELECT 1 FROM refs WHERE name=?2)
-                       AND EXISTS(
-                         SELECT 1 FROM lane_initialization_owners owner
-                         WHERE owner.initialization_id=lane_initializations.initialization_id
-                           AND owner.owner_token=?3 AND owner.owner_generation=?4)",
-                    params![
-                        request.initialization_id,
-                        ref_name,
-                        fence.owner_token,
-                        fence.owner_generation,
-                    ],
-                )?;
-                if let Some(operation_id) = materialization_operation_id.as_deref() {
-                    self.abort_materialization_operation(operation_id)?;
-                }
+                let release_tx = self
+                    .conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                release_lane_initialization_owner(&release_tx, &request.initialization_id, &fence)?;
+                release_tx.commit()?;
                 return Err(error);
             }
         }
@@ -1963,25 +2087,26 @@ impl Trail {
                 })(),
             )?;
         }
+        let spawn_payload = serde_json::json!({
+            "ref_name": ref_name.clone(),
+            "base_root": request.source_root.0.clone(),
+            "workdir": materialized_workdir.clone(),
+            "requested_workdir_mode": requested_workdir_mode.as_str(),
+            "workdir_mode": resolved_workdir_mode.as_str(),
+            "workdir_backend": workdir_backend.as_str(),
+            "materialization": materialization_report,
+            "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
+            "include_neighbors": request.include_neighbors,
+            "transparent_cow_available": transparent_cow_available
+        });
         let spawn_event = (|| {
             fail_lane_association_if_requested("spawn_event")?;
-            self.insert_lane_event(
+            self.publish_owned_lane_spawn_event(
+                &request.initialization_id,
+                &fence,
                 &lane_id,
-                "lane_spawned",
-                Some(&request.source_change),
-                None,
-                &serde_json::json!({
-                    "ref_name": ref_name.clone(),
-                    "base_root": request.source_root.0.clone(),
-                    "workdir": materialized_workdir.clone(),
-                    "requested_workdir_mode": requested_workdir_mode.as_str(),
-                    "workdir_mode": resolved_workdir_mode.as_str(),
-                    "workdir_backend": workdir_backend.as_str(),
-                    "materialization": materialization_report,
-                    "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
-                    "include_neighbors": request.include_neighbors,
-                    "transparent_cow_available": transparent_cow_available
-                }),
+                &request.source_change,
+                &spawn_payload,
             )
         })();
         self.committed_lane_initialization_step(&initialization, &fence, spawn_event)?;
@@ -2013,6 +2138,10 @@ impl Trail {
 
     #[doc(hidden)]
     pub fn resume_deferred_initial_lane_ledger(&mut self, lane: &str) -> Result<LaneSpawnReport> {
+        let initialization = self.prepare_unowned_lane_initialization_repair(lane)?;
+        if initialization.phase == LaneInitializationPhase::ObserverReady {
+            return self.lane_spawn_report_for_initialization(&initialization, true);
+        }
         self.resume_deferred_initial_lane_ledger_inner(lane, None)
     }
 
@@ -2022,6 +2151,8 @@ impl Trail {
         fence: Option<&LaneInitializationFence>,
     ) -> Result<LaneSpawnReport> {
         let details = self.lane_details(lane)?;
+        let initialization = lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
         let metadata = details.record.metadata_json.as_deref().ok_or_else(|| {
             Error::Corrupt(format!(
                 "lane `{}` is missing its spawn metadata",
@@ -2120,37 +2251,35 @@ impl Trail {
             )?;
         }
 
-        let event_exists = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM lane_events WHERE lane_id=?1 AND event_type='lane_spawned')",
-            [&details.branch.lane_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !event_exists {
-            self.insert_lane_event(
-                &details.branch.lane_id,
-                "lane_spawned",
-                Some(&details.branch.base_change),
-                None,
-                &serde_json::json!({
-                    "ref_name": details.branch.ref_name,
-                    "base_root": details.branch.base_root.0,
-                    "workdir": details.branch.workdir,
-                    "requested_workdir_mode": requested_workdir_mode.as_str(),
-                    "workdir_mode": workdir_mode.as_str(),
-                    "workdir_backend": workdir_backend.as_str(),
-                    "materialization": materialization,
-                    "sparse_paths": sparse_paths,
-                    "include_neighbors": include_neighbors,
-                    "transparent_cow_available": transparent_cow_available,
-                }),
-            )?;
-        }
-
+        let spawn_payload = serde_json::json!({
+            "ref_name": details.branch.ref_name,
+            "base_root": details.branch.base_root.0,
+            "workdir": details.branch.workdir,
+            "requested_workdir_mode": requested_workdir_mode.as_str(),
+            "workdir_mode": workdir_mode.as_str(),
+            "workdir_backend": workdir_backend.as_str(),
+            "materialization": materialization,
+            "sparse_paths": sparse_paths,
+            "include_neighbors": include_neighbors,
+            "transparent_cow_available": transparent_cow_available,
+        });
         let initialization = match fence {
             Some(fence) => {
+                self.publish_owned_lane_spawn_event(
+                    &initialization.initialization_id,
+                    fence,
+                    &details.branch.lane_id,
+                    &details.branch.base_change,
+                    &spawn_payload,
+                )?;
                 self.complete_deferred_lane_initialization_owned(&details.branch.lane_id, fence)?
             }
-            None => self.complete_unowned_lane_initialization_repair(&details.branch.lane_id)?,
+            None => self.complete_unowned_lane_initialization_repair_with_event(
+                &initialization.initialization_id,
+                &details.branch.lane_id,
+                &details.branch.base_change,
+                &spawn_payload,
+            )?,
         };
         Ok(LaneSpawnReport {
             initialization_id: initialization.initialization_id,
@@ -2175,19 +2304,22 @@ impl Trail {
     /// Validate and idempotently finish a durably associated lane initialization.
     pub fn repair_lane_initialization(&mut self, lane: &str) -> Result<LaneSpawnReport> {
         validate_ref_segment(lane)?;
-        let initialization = lane_initialization_record(&self.conn, lane)?
+        let existing = lane_initialization_record(&self.conn, lane)?
             .ok_or_else(|| Error::InvalidInput(format!("lane `{lane}` has no initialization")))?;
-        if initialization.phase == LaneInitializationPhase::ObserverReady {
-            return self.lane_spawn_report_for_initialization(&initialization, true);
-        }
         if !matches!(
-            initialization.phase,
-            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+            existing.phase,
+            LaneInitializationPhase::Associated
+                | LaneInitializationPhase::RepairRequired
+                | LaneInitializationPhase::ObserverReady
         ) {
             return Err(Error::InvalidInput(format!(
                 "lane `{lane}` initialization is {:?}; repeat the identical spawn command",
-                initialization.phase
+                existing.phase
             )));
+        }
+        let initialization = self.prepare_unowned_lane_initialization_repair(lane)?;
+        if initialization.phase == LaneInitializationPhase::ObserverReady {
+            return self.lane_spawn_report_for_initialization(&initialization, true);
         }
         let result = self.repair_lane_initialization_once(&initialization, None);
         match result {

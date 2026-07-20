@@ -861,24 +861,15 @@ impl Trail {
             .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` initialization disappeared")))
     }
 
-    pub(crate) fn complete_unowned_lane_initialization_repair(
+    pub(crate) fn prepare_unowned_lane_initialization_repair(
         &mut self,
         lane: &str,
     ) -> Result<LaneInitializationRecord> {
-        let record = lane_initialization_record(&self.conn, lane)?
-            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
-        if record.phase == LaneInitializationPhase::ObserverReady {
-            return Ok(record);
-        }
-        if record.phase != LaneInitializationPhase::RepairRequired {
-            return Err(Error::Corrupt(format!(
-                "lane initialization `{}` is {:?}, expected repair_required",
-                record.initialization_id, record.phase
-            )));
-        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let record = lane_initialization_record(&tx, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
         let has_owner: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM lane_initialization_owners WHERE initialization_id=?1)",
             [&record.initialization_id],
@@ -886,29 +877,47 @@ impl Trail {
         )?;
         if has_owner {
             return Err(Error::Corrupt(format!(
-                "terminal lane initialization `{}` unexpectedly retains an owner",
+                "lane initialization `{}` is actively owned and cannot be repaired",
                 record.initialization_id
+            )));
+        }
+        if record.phase == LaneInitializationPhase::ObserverReady
+            || record.phase == LaneInitializationPhase::RepairRequired
+        {
+            tx.commit()?;
+            return Ok(record);
+        }
+        if record.phase != LaneInitializationPhase::Associated {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` is {:?}, expected associated or repair_required",
+                record.initialization_id, record.phase
             )));
         }
         let changed = tx.execute(
             "UPDATE lane_initializations
-             SET phase='observer_ready',last_error_code=NULL,last_error_message=NULL,
-                 repair_command=NULL,updated_at=?1
-             WHERE initialization_id=?2 AND phase='repair_required'
+             SET phase='repair_required',
+                 repair_command='trail lane repair-initialization ' || lane_name,
+                 updated_at=?1
+             WHERE initialization_id=?2 AND phase='associated'
                AND NOT EXISTS(
                  SELECT 1 FROM lane_initialization_owners owner
                  WHERE owner.initialization_id=lane_initializations.initialization_id)",
             params![now_ts(), record.initialization_id],
         )?;
         if changed != 1 {
-            return Err(Error::Corrupt(format!(
-                "lane initialization `{}` could not complete repair",
-                record.initialization_id
-            )));
+            return Err(lane_initialization_ownership_lost(
+                &record.initialization_id,
+            ));
         }
+        let prepared =
+            lane_initialization_record(&tx, &record.initialization_id)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "lane initialization `{}` disappeared during repair preparation",
+                    record.initialization_id
+                ))
+            })?;
         tx.commit()?;
-        lane_initialization_record(&self.conn, lane)?
-            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` initialization disappeared")))
+        Ok(prepared)
     }
 }
 
