@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use trail::{Actor, InitImportMode, LaneInitializationPhase, LaneWorkdirMode, Trail};
 
 const CHILD_WORKSPACE: &str = "TRAIL_TEST_INITIALIZATION_CHILD_WORKSPACE";
+const CHILD_LEDGER_AUTHORITY: &str = "TRAIL_TEST_INITIALIZATION_CHILD_LEDGER_AUTHORITY";
 const CRASH_AFTER: &str = "TRAIL_TEST_LANE_INITIALIZATION_CRASH_AFTER";
 const HANDSHAKE: &str = "TRAIL_TEST_LANE_INITIALIZATION_HANDSHAKE";
 
@@ -57,6 +58,33 @@ fn spawn_events_for_lane(sqlite: &Path, lane: &str) -> i64 {
     )
 }
 
+fn runtime_lock_paths(root: &Path) -> Vec<String> {
+    fn visit(root: &Path, current: &Path, paths: &mut Vec<String>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.ends_with(".lock") || name == "lock" || name.starts_with("lock.") {
+                paths.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, paths);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(root, root, &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn reject_lane_initialization_phases(sqlite: &Path, phases: &[&str]) {
     let phases = phases
         .iter()
@@ -81,6 +109,9 @@ fn lane_initialization_crash_child() {
     let Ok(workspace) = std::env::var(CHILD_WORKSPACE) else {
         return;
     };
+    if std::env::var_os(CHILD_LEDGER_AUTHORITY).is_some() {
+        trail::test_support::set_changed_path_authority_override(true);
+    }
     let mut db = Trail::open(workspace).unwrap();
     let _ = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "crash-lane",
@@ -276,23 +307,20 @@ fn repair_state_persistence_failure_preserves_committed_outcome_contract() {
         .unwrap_err();
     trail::test_support::set_lane_association_failure_for_current_thread(None);
 
-    assert!(
-        matches!(
-            error,
-            trail::Error::CommittedRepairRequired {
-                committed: true,
-                ..
-            }
-        ),
-        "post-commit failure escaped as {error:?}"
-    );
-    assert_eq!(
-        db.lane_initialization("repair-write-failure")
-            .unwrap()
-            .unwrap()
-            .phase,
-        LaneInitializationPhase::Associated
-    );
+    let durable_phase = db
+        .lane_initialization("repair-write-failure")
+        .unwrap()
+        .unwrap()
+        .phase;
+    match error {
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase,
+            ..
+        } => assert_eq!(phase, durable_phase),
+        other => panic!("post-commit failure escaped as {other:?}"),
+    }
+    assert_eq!(durable_phase, LaneInitializationPhase::Associated);
 }
 
 #[test]
@@ -315,24 +343,124 @@ fn observer_ready_and_repair_persistence_failures_preserve_committed_outcome_con
         )
         .unwrap_err();
 
-    assert!(
-        matches!(
-            error,
-            trail::Error::CommittedRepairRequired {
-                committed: true,
-                ..
-            }
-        ),
-        "post-commit failure escaped as {error:?}"
-    );
-    assert_eq!(
-        db.lane_initialization("observer-write-failure")
-            .unwrap()
-            .unwrap()
-            .phase,
-        LaneInitializationPhase::Associated
-    );
+    let durable_phase = db
+        .lane_initialization("observer-write-failure")
+        .unwrap()
+        .unwrap()
+        .phase;
+    match error {
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase,
+            ..
+        } => assert_eq!(phase, durable_phase),
+        other => panic!("post-commit failure escaped as {other:?}"),
+    }
+    assert_eq!(durable_phase, LaneInitializationPhase::Associated);
     assert_eq!(spawn_events_for_lane(&sqlite, "observer-write-failure"), 1);
+}
+
+#[test]
+fn persistent_singleflight_anchors_are_not_runtime_lock_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let trail_root = temp.path().join(".trail");
+    let before = runtime_lock_paths(&trail_root);
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "inventory-anchor",
+        Some("main"),
+        LaneWorkdirMode::Virtual,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(runtime_lock_paths(&trail_root), before);
+    assert_eq!(
+        fs::read_dir(trail_root.join("lane-initialization-locks"))
+            .unwrap()
+            .count(),
+        1
+    );
+    fs::write(trail_root.join("genuine-runtime.lock"), b"leaked\n").unwrap();
+    assert_ne!(runtime_lock_paths(&trail_root), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_singleflight_leaf_or_parent_never_creates_a_second_authority() {
+    struct AuthorityOverride;
+    impl Drop for AuthorityOverride {
+        fn drop(&mut self) {
+            trail::test_support::set_changed_path_authority_override(false);
+        }
+    }
+
+    for replace_parent in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_workspace(temp.path());
+        trail::test_support::set_changed_path_authority_override(true);
+        let _authority = AuthorityOverride;
+        let mut contender = Trail::open(temp.path()).unwrap();
+        let handshake = temp.path().join("singleflight.handshake");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("lane_initialization_crash_child")
+            .arg("--nocapture")
+            .env(CHILD_WORKSPACE, temp.path())
+            .env(CRASH_AFTER, "after_reservation")
+            .env(HANDSHAKE, &handshake)
+            .env(CHILD_LEDGER_AUTHORITY, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !handshake.exists() && Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handshake.exists(), "child did not acquire singleflight");
+
+        let lock_dir = temp.path().join(".trail/lane-initialization-locks");
+        let lock_path = fs::read_dir(&lock_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        if replace_parent {
+            fs::rename(&lock_dir, temp.path().join(".trail/held-locks")).unwrap();
+            fs::create_dir(&lock_dir).unwrap();
+        } else {
+            fs::rename(&lock_path, lock_path.with_extension("held")).unwrap();
+            fs::write(&lock_path, b"replacement\n").unwrap();
+        }
+
+        let result = contender.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "crash-lane",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            Some("codex".into()),
+            Some("gpt-5".into()),
+            None,
+            &[],
+            false,
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert!(
+            result.is_err(),
+            "replacement parent={replace_parent} acquired a second authority"
+        );
+    }
 }
 
 #[test]

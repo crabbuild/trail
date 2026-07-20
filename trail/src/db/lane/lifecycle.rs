@@ -7,6 +7,15 @@ use super::*;
 
 struct LaneInitializationSingleflight {
     file: fs::File,
+    path: PathBuf,
+    identity_path: PathBuf,
+    expected_identity: String,
+    #[cfg(unix)]
+    db_authority: fs::File,
+    #[cfg(unix)]
+    directory_authority: fs::File,
+    #[cfg(unix)]
+    directory: PathBuf,
 }
 
 impl LaneInitializationSingleflight {
@@ -18,45 +27,313 @@ impl LaneInitializationSingleflight {
             .ok_or_else(|| Error::Corrupt("invalid lane initialization identity".into()))?;
         let directory = db_dir.join("lane-initialization-locks");
         fs::create_dir_all(&directory)?;
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.file_type().is_dir() {
-            return Err(Error::InvalidPath {
-                path: directory.display().to_string(),
-                reason: "lane initialization lock authority is not a directory".into(),
-            });
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         }
-        let path = directory.join(format!("{shard}.lock"));
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
+        let path = directory.join(format!("{shard}.anchor"));
+        let identity_path = db_dir.join(format!("lane-initialization-{shard}.identity"));
+
+        #[cfg(unix)]
+        let db_authority = open_lane_initialization_directory(db_dir)?;
+        #[cfg(unix)]
+        let directory_authority =
+            open_lane_initialization_child_directory(&db_authority, "lane-initialization-locks")?;
+        #[cfg(unix)]
+        validate_lane_initialization_directory_identity(db_dir, &db_authority)?;
+        #[cfg(unix)]
+        validate_lane_initialization_directory_identity(&directory, &directory_authority)?;
+        #[cfg(unix)]
+        lock_lane_initialization_file(&db_authority)?;
+
+        #[cfg(unix)]
+        let (mut file, created) = open_lane_initialization_regular_at(
+            &directory_authority,
+            &format!("{shard}.anchor"),
+            true,
+        )?;
+        #[cfg(windows)]
+        let (mut file, created) = open_lane_initialization_regular(&path)?;
+        let expected_identity = lane_initialization_file_identity(&file)?;
+        initialize_or_validate_lane_initialization_identity(
+            &mut file,
+            created,
+            &expected_identity,
+            &path,
+        )?;
+
+        #[cfg(unix)]
+        let (mut identity, identity_created) = open_lane_initialization_regular_at(
+            &db_authority,
+            &format!("lane-initialization-{shard}.identity"),
+            true,
+        )?;
+        #[cfg(windows)]
+        let (mut identity, identity_created) = open_lane_initialization_regular(&identity_path)?;
+        initialize_or_validate_lane_initialization_identity(
+            &mut identity,
+            identity_created,
+            &expected_identity,
+            &identity_path,
+        )?;
+        if created {
+            file.sync_all()?;
+            #[cfg(unix)]
+            directory_authority.sync_all()?;
+        }
+        if identity_created {
+            identity.sync_all()?;
+            #[cfg(unix)]
+            db_authority.sync_all()?;
+        }
+        #[cfg(unix)]
+        unlock_lane_initialization_file(&db_authority)?;
+        lock_lane_initialization_file(&file)?;
+
+        let guard = Self {
+            file,
+            path,
+            identity_path,
+            expected_identity,
+            #[cfg(unix)]
+            db_authority,
+            #[cfg(unix)]
+            directory_authority,
+            #[cfg(unix)]
+            directory,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    fn validate(&self) -> Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            validate_lane_initialization_directory_identity(
+                self.directory
+                    .parent()
+                    .ok_or_else(|| Error::Corrupt("singleflight directory has no parent".into()))?,
+                &self.db_authority,
+            )?;
+            validate_lane_initialization_directory_identity(
+                &self.directory,
+                &self.directory_authority,
+            )?;
         }
-        let file = options.open(&path)?;
-        if !file.metadata()?.is_file() {
-            return Err(Error::InvalidPath {
-                path: path.display().to_string(),
-                reason: "lane initialization lock is not a regular file".into(),
-            });
+        validate_lane_initialization_lock_identity(
+            &self.path,
+            &self.file,
+            &self.expected_identity,
+        )?;
+        let mut anchor = self.file.try_clone()?;
+        validate_lane_initialization_identity_contents(
+            &mut anchor,
+            &self.expected_identity,
+            &self.path,
+        )?;
+        #[cfg(unix)]
+        let mut identity = open_lane_initialization_regular_at(
+            &self.db_authority,
+            self.identity_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    Error::Corrupt("invalid lane initialization identity name".into())
+                })?,
+            false,
+        )?
+        .0;
+        #[cfg(windows)]
+        let mut identity = fs::OpenOptions::new()
+            .read(true)
+            .open(&self.identity_path)?;
+        validate_lane_initialization_identity_contents(
+            &mut identity,
+            &self.expected_identity,
+            &self.identity_path,
+        )?;
+        validate_lane_initialization_lock_identity(
+            &self.path,
+            &self.file,
+            &self.expected_identity,
+        )?;
+        #[cfg(unix)]
+        {
+            validate_lane_initialization_directory_identity(
+                self.directory
+                    .parent()
+                    .ok_or_else(|| Error::Corrupt("singleflight directory has no parent".into()))?,
+                &self.db_authority,
+            )?;
+            validate_lane_initialization_directory_identity(
+                &self.directory,
+                &self.directory_authority,
+            )?;
         }
-        lock_lane_initialization_file(&file)?;
-        validate_lane_initialization_lock_identity(&path, &file)?;
-        Ok(Self { file })
+        Ok(())
     }
 }
 
 impl Drop for LaneInitializationSingleflight {
     fn drop(&mut self) {
+        let _ = self.validate();
         let _ = unlock_lane_initialization_file(&self.file);
     }
+}
+
+fn initialize_or_validate_lane_initialization_identity(
+    file: &mut fs::File,
+    created: bool,
+    expected: &str,
+    path: &Path,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if created {
+        file.write_all(expected.as_bytes())?;
+        file.write_all(b"\n")?;
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut observed = String::new();
+    file.take(256).read_to_string(&mut observed)?;
+    if observed.trim_end() != expected {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "lane initialization authority identity does not match its inode".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_lane_initialization_identity_contents(
+    file: &mut fs::File,
+    expected: &str,
+    path: &Path,
+) -> Result<()> {
+    initialize_or_validate_lane_initialization_identity(file, false, expected, path)
+}
+
+#[cfg(unix)]
+fn open_lane_initialization_directory(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    validate_lane_initialization_directory_identity(path, &file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_lane_initialization_child_directory(authority: &fs::File, name: &str) -> Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = CString::new(name)
+        .map_err(|_| Error::Corrupt("invalid lane initialization authority name".into()))?;
+    let fd = unsafe {
+        libc::openat(
+            authority.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_dir() {
+        return Err(Error::Corrupt(
+            "lane initialization authority is not a directory".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_lane_initialization_regular_at(
+    authority: &fs::File,
+    name: &str,
+    create: bool,
+) -> Result<(fs::File, bool)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = CString::new(name)
+        .map_err(|_| Error::Corrupt("invalid lane initialization anchor name".into()))?;
+    let base_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let (fd, created) = if create {
+        let fd = unsafe {
+            libc::openat(
+                authority.as_raw_fd(),
+                name.as_ptr(),
+                base_flags | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            (fd, true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let fd = unsafe { libc::openat(authority.as_raw_fd(), name.as_ptr(), base_flags) };
+                (fd, false)
+            } else {
+                return Err(Error::Io(error));
+            }
+        }
+    } else {
+        (
+            unsafe { libc::openat(authority.as_raw_fd(), name.as_ptr(), base_flags) },
+            false,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+        return Err(Error::Corrupt(
+            "lane initialization anchor is not a private single-linked regular file".into(),
+        ));
+    }
+    Ok((file, created))
+}
+
+#[cfg(unix)]
+fn validate_lane_initialization_directory_identity(path: &Path, file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let published = fs::symlink_metadata(path)?;
+    let held = file.metadata()?;
+    if !published.file_type().is_dir()
+        || published.dev() != held.dev()
+        || published.ino() != held.ino()
+    {
+        return Err(Error::InvalidPath {
+            path: path.display().to_string(),
+            reason: "lane initialization authority directory was replaced".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lane_initialization_file_identity(file: &fs::File) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(Error::Corrupt(
+            "lane initialization anchor is not a single-linked regular file".into(),
+        ));
+    }
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(unix)]
@@ -70,7 +347,11 @@ fn unlock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_lane_initialization_lock_identity(path: &Path, file: &fs::File) -> Result<()> {
+fn validate_lane_initialization_lock_identity(
+    path: &Path,
+    file: &fs::File,
+    expected: &str,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let published = fs::symlink_metadata(path)?;
@@ -79,6 +360,7 @@ fn validate_lane_initialization_lock_identity(path: &Path, file: &fs::File) -> R
         || held.dev() != published.dev()
         || held.ino() != published.ino()
         || held.nlink() != 1
+        || lane_initialization_file_identity(file)? != expected
     {
         return Err(Error::InvalidPath {
             path: path.display().to_string(),
@@ -140,11 +422,82 @@ fn unlock_lane_initialization_file(file: &fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn validate_lane_initialization_lock_identity(path: &Path, _file: &fs::File) -> Result<()> {
-    if !fs::symlink_metadata(path)?.file_type().is_file() {
+fn open_lane_initialization_regular(path: &Path) -> Result<(fs::File, bool)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use winapi::um::winbase::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    let open = |create_new| {
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        if create_new {
+            options.create_new(true);
+        }
+        options.open(path)
+    };
+    let (file, created) = match open(true) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (open(false)?, false),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let metadata = file.metadata()?;
+    use std::os::windows::fs::MetadataExt;
+    if !metadata.is_file()
+        || metadata.file_attributes() & winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(Error::Corrupt(
+            "lane initialization anchor is not a real regular file".into(),
+        ));
+    }
+    lane_initialization_file_identity(&file)?;
+    Ok((file, created))
+}
+
+#[cfg(windows)]
+fn lane_initialization_file_identity(file: &fs::File) -> Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    if information.nNumberOfLinks != 1
+        || information.dwFileAttributes & winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(Error::Corrupt(
+            "lane initialization anchor is not a private single-linked regular file".into(),
+        ));
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(format!(
+        "{}:{}",
+        information.dwVolumeSerialNumber, file_index
+    ))
+}
+
+#[cfg(windows)]
+fn validate_lane_initialization_lock_identity(
+    path: &Path,
+    file: &fs::File,
+    expected: &str,
+) -> Result<()> {
+    let published = windows_file_identity(path)?;
+    if published.attributes & winapi::um::winnt::FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || published.number_of_links != 1
+        || format!(
+            "{}:{}",
+            published.volume_serial_number, published.file_index
+        ) != expected
+        || lane_initialization_file_identity(file)? != expected
+    {
         return Err(Error::InvalidPath {
             path: path.display().to_string(),
-            reason: "lane initialization lock pathname changed while acquiring it".into(),
+            reason: "lane initialization lock pathname changed while acquiring its authority"
+                .into(),
         });
     }
     Ok(())
@@ -300,7 +653,7 @@ impl Trail {
             initialization_id: record.initialization_id.clone(),
             request_fingerprint: Box::new(record.request_fingerprint.clone()),
             operation_id: Box::new(record.operation_id.clone()),
-            phase: LaneInitializationPhase::RepairRequired,
+            phase: record.phase,
             committed: true,
             repair,
             reason,
@@ -617,7 +970,7 @@ impl Trail {
             )
         );
         request.lane_id.clone_from(&lane_id);
-        let _singleflight =
+        let singleflight =
             LaneInitializationSingleflight::acquire(&self.db_dir, &request.initialization_id)?;
         let _lock = if ledger_authority {
             None
@@ -641,7 +994,10 @@ impl Trail {
             LaneInitializationReservation::Start(record) => (record, false),
             LaneInitializationReservation::Resume(record) => (record, true),
             LaneInitializationReservation::Ready(record) => {
-                return self.lane_spawn_report_for_initialization(&record, true);
+                let report = self.lane_spawn_report_for_initialization(&record, true)?;
+                let validation = singleflight.validate();
+                self.committed_lane_initialization_step(&record, validation)?;
+                return Ok(report);
             }
         };
         lane_initialization_crash_cut("after_reservation")?;
@@ -650,7 +1006,10 @@ impl Trail {
             LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
         ) {
             drop(_lock);
-            return self.repair_lane_initialization(&request.lane_name);
+            let report = self.repair_lane_initialization(&request.lane_name)?;
+            let validation = singleflight.validate();
+            self.committed_lane_initialization_step(&initialization, validation)?;
+            return Ok(report);
         }
         let transparent_cow_available = request.requested_workdir_mode.is_transparent_cow();
         let mut sparse_policy_paths = None;
@@ -898,9 +1257,9 @@ impl Trail {
             && materialized_workdir.is_some()
             && !request.requested_workdir_mode.is_transparent_cow()
         {
-            return Ok(LaneSpawnReport {
-                initialization_id: initialization.initialization_id,
-                request_fingerprint: initialization.request_fingerprint,
+            let report = LaneSpawnReport {
+                initialization_id: initialization.initialization_id.clone(),
+                request_fingerprint: initialization.request_fingerprint.clone(),
                 phase: LaneInitializationPhase::Associated,
                 committed: true,
                 resumed,
@@ -915,7 +1274,10 @@ impl Trail {
                 materialization: materialization_report,
                 sparse_paths: sparse_policy_paths.unwrap_or_default(),
                 transparent_cow_available,
-            });
+            };
+            let validation = singleflight.validate();
+            self.committed_lane_initialization_step(&initialization, validation)?;
+            return Ok(report);
         }
         if ledger_authority
             && materialized_workdir.is_some()
@@ -1022,7 +1384,7 @@ impl Trail {
         lane_initialization_crash_cut("after_spawn_event")?;
         let observer_ready = self.mark_lane_initialization_observer_ready(&request);
         self.committed_lane_initialization_step(&initialization, observer_ready)?;
-        Ok(LaneSpawnReport {
+        let report = LaneSpawnReport {
             initialization_id: request.initialization_id,
             request_fingerprint: request.request_fingerprint,
             phase: LaneInitializationPhase::ObserverReady,
@@ -1039,7 +1401,10 @@ impl Trail {
             materialization: materialization_report,
             sparse_paths: sparse_policy_paths.unwrap_or_default(),
             transparent_cow_available,
-        })
+        };
+        let validation = singleflight.validate();
+        self.committed_lane_initialization_step(&initialization, validation)?;
+        Ok(report)
     }
 
     #[doc(hidden)]
