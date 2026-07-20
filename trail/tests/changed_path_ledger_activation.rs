@@ -55,11 +55,11 @@ fn authority_requires_every_checked_gate_and_supported_platform() {
     );
     assert_eq!(
         complete["raw_mutation_inventory_sha256"],
-        "d754ce5e3dca7e9a55311d87ca1a98447f7757b7c96eb7bcbf65c688cf3469d6"
+        "fcd05a2e4a79571a7e61e09f190db73b021aa5741177bce51e40e1d95c95cafd"
     );
     assert_eq!(
         complete["activation_audit_sha256"],
-        "df35dd5cadbcb78f85f1bd80b391de2a07df6392c98dea3c5aa86e982c3de866"
+        "523350cb7a2dcc1404acb5703991d687bf92f4954b745cb043e9e6afc071f315"
     );
     assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
     assert!(!trail::test_support::changed_path_authority_enabled_for("freebsd").unwrap());

@@ -1,6 +1,8 @@
 use super::workdir::{ViewPathClass, ViewUpperLayout};
 use super::workspace_layer::make_tree_writable;
 use super::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::db::change_ledger::secure_fs::SecureDirectory;
 use std::ffi::OsString;
 use std::process::Stdio;
 use std::thread;
@@ -3079,44 +3081,14 @@ impl Trail {
     }
 
     pub(super) fn workspace_environment_staging_parent(&self) -> Result<PathBuf> {
-        let canonical_db_dir = fs::canonicalize(&self.db_dir)?;
-        if !canonical_db_dir.is_dir() {
-            return Err(Error::Corrupt(format!(
-                "Trail database path `{}` is not a directory",
-                self.db_dir.display()
-            )));
-        }
-
-        let cache_dir = self.db_dir.join("cache");
-        fs::create_dir_all(&cache_dir)?;
-        let canonical_cache_dir = fs::canonicalize(&cache_dir)?;
-        let expected_cache_dir = canonical_db_dir.join("cache");
-        if !canonical_cache_dir.is_dir()
-            || !canonical_cache_dir.starts_with(&canonical_db_dir)
-            || canonical_cache_dir != expected_cache_dir
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            return Err(Error::InvalidPath {
-                path: cache_dir.to_string_lossy().into_owned(),
-                reason: "workspace environment cache directory must remain inside Trail storage"
-                    .to_string(),
-            });
+            workspace_environment_staging_parent_secure(&self.db_dir)
         }
-
-        let staging_dir = cache_dir.join("staging");
-        fs::create_dir_all(&staging_dir)?;
-        let canonical_staging_dir = fs::canonicalize(&staging_dir)?;
-        let expected_staging_dir = canonical_db_dir.join("cache/staging");
-        if !canonical_staging_dir.is_dir()
-            || !canonical_staging_dir.starts_with(&canonical_db_dir)
-            || canonical_staging_dir != expected_staging_dir
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            return Err(Error::InvalidPath {
-                path: staging_dir.to_string_lossy().into_owned(),
-                reason: "workspace environment staging directory must remain inside Trail storage"
-                    .to_string(),
-            });
+            workspace_environment_staging_parent_path_fallback(&self.db_dir)
         }
-        Ok(canonical_staging_dir)
     }
 
     fn execute_writable_private_environment_plan(
@@ -5680,6 +5652,124 @@ fn restricted_recipe_sandbox_name() -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_or_create_private_workspace_environment_directory(
+    parent: &SecureDirectory,
+    name: &str,
+) -> Result<SecureDirectory> {
+    match parent.open_dir(name) {
+        Ok(directory) => {
+            directory.restrict_private()?;
+            Ok(directory)
+        }
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match parent.create_private_dir(name) {
+                Ok(directory) => Ok(directory),
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let directory = parent.open_dir(name)?;
+                    directory.restrict_private()?;
+                    Ok(directory)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn workspace_environment_staging_parent_secure(db_dir: &Path) -> Result<PathBuf> {
+    let canonical_db_dir = fs::canonicalize(db_dir)?;
+    if !canonical_db_dir.is_dir() {
+        return Err(Error::Corrupt(format!(
+            "Trail database path `{}` is not a directory",
+            db_dir.display()
+        )));
+    }
+    let database = SecureDirectory::open_absolute(&canonical_db_dir)?;
+    let cache_path = canonical_db_dir.join("cache");
+    if fs::symlink_metadata(&cache_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::InvalidPath {
+            path: cache_path.to_string_lossy().into_owned(),
+            reason: "workspace environment cache directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    let cache = open_or_create_private_workspace_environment_directory(&database, "cache")?;
+    let staging_path = cache_path.join("staging");
+    if fs::symlink_metadata(&staging_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::InvalidPath {
+            path: staging_path.to_string_lossy().into_owned(),
+            reason: "workspace environment staging directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    let _staging = open_or_create_private_workspace_environment_directory(&cache, "staging")?;
+    let canonical_staging_dir = fs::canonicalize(&staging_path)?;
+    let expected_staging_dir = canonical_db_dir.join("cache/staging");
+    if !canonical_staging_dir.is_dir() || canonical_staging_dir != expected_staging_dir {
+        return Err(Error::InvalidPath {
+            path: staging_path.to_string_lossy().into_owned(),
+            reason: "workspace environment staging directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    Ok(canonical_staging_dir)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn workspace_environment_staging_parent_path_fallback(db_dir: &Path) -> Result<PathBuf> {
+    let canonical_db_dir = fs::canonicalize(db_dir)?;
+    if !canonical_db_dir.is_dir() {
+        return Err(Error::Corrupt(format!(
+            "Trail database path `{}` is not a directory",
+            db_dir.display()
+        )));
+    }
+
+    // Non-POSIX targets, including Windows, do not yet have SecureDirectory's
+    // descriptor-relative APIs. Validate each pathname before descending and
+    // again after creation.
+    let cache_dir = db_dir.join("cache");
+    if fs::symlink_metadata(&cache_dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::InvalidPath {
+            path: cache_dir.to_string_lossy().into_owned(),
+            reason: "workspace environment cache directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    fs::create_dir_all(&cache_dir)?;
+    let canonical_cache_dir = fs::canonicalize(&cache_dir)?;
+    let expected_cache_dir = canonical_db_dir.join("cache");
+    if !canonical_cache_dir.is_dir() || canonical_cache_dir != expected_cache_dir {
+        return Err(Error::InvalidPath {
+            path: cache_dir.to_string_lossy().into_owned(),
+            reason: "workspace environment cache directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+
+    let staging_dir = cache_dir.join("staging");
+    if fs::symlink_metadata(&staging_dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::InvalidPath {
+            path: staging_dir.to_string_lossy().into_owned(),
+            reason: "workspace environment staging directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    fs::create_dir_all(&staging_dir)?;
+    let canonical_staging_dir = fs::canonicalize(&staging_dir)?;
+    let expected_staging_dir = canonical_db_dir.join("cache/staging");
+    if !canonical_staging_dir.is_dir() || canonical_staging_dir != expected_staging_dir {
+        return Err(Error::InvalidPath {
+            path: staging_dir.to_string_lossy().into_owned(),
+            reason: "workspace environment staging directory must remain inside Trail storage"
+                .to_string(),
+        });
+    }
+    Ok(canonical_staging_dir)
+}
+
 fn ensure_restricted_recipe_sandbox_available() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -5754,6 +5844,77 @@ mod tests {
         assert!(error
             .to_string()
             .contains("staging directory must remain inside Trail storage"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_environment_staging_parent_rejects_cache_symlink_without_external_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        symlink(external.path(), workspace.path().join(".trail/cache")).unwrap();
+
+        db.workspace_environment_staging_parent().unwrap_err();
+        assert!(
+            !external.path().join("staging").exists(),
+            "rejected cache substitution must not create external staging storage"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn workspace_environment_staging_parent_restricts_existing_owned_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let cache = workspace.path().join(".trail/cache");
+        let staging = cache.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+
+        db.workspace_environment_staging_parent().unwrap();
+
+        assert_eq!(
+            fs::metadata(cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(staging).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn workspace_environment_staging_parent_accepts_concurrent_creators() {
+        use std::sync::{Arc, Barrier};
+
+        const CREATORS: usize = 32;
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db_dir = workspace.path().join(".trail");
+        let expected = fs::canonicalize(&db_dir).unwrap().join("cache/staging");
+        let barrier = Arc::new(Barrier::new(CREATORS));
+        let creators = (0..CREATORS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let db_dir = db_dir.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    workspace_environment_staging_parent_secure(&db_dir)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for creator in creators {
+            assert_eq!(creator.join().unwrap().unwrap(), expected);
+        }
     }
 
     fn cache_test_plan(

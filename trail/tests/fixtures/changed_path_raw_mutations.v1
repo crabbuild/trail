@@ -49,7 +49,7 @@ reviewed|db/change_ledger/observer/linux.rs|run|fs::rename|2
 reviewed|db/change_ledger/observer/linux.rs|run|fs::write|10
 reviewed|db/change_ledger/observer/macos.rs|new|fs::create_dir|1
 reviewed|db/change_ledger/observer/macos.rs|run|fs::create_dir_all|3
-reviewed|db/change_ledger/observer/macos.rs|run|fs::create_dir|13
+reviewed|db/change_ledger/observer/macos.rs|run|fs::create_dir|14
 reviewed|db/change_ledger/observer/macos.rs|run|fs::remove_dir|3
 reviewed|db/change_ledger/observer/macos.rs|run|fs::remove_file|2
 reviewed|db/change_ledger/observer/macos.rs|run|fs::rename|13
@@ -261,6 +261,7 @@ reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_inpu
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_input|fs::create_dir_all|1
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_input|fs::set_permissions|1
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_input|OpenOptions::write|1
+reviewed|db/lane/workspace_environment.rs|workspace_environment_staging_parent_path_fallback|fs::create_dir_all|2
 reviewed|db/lane/workspace_environment.rs|run_mounted_workspace_environment_command|fs::copy|1
 reviewed|db/lane/workspace_environment.rs|run_mounted_workspace_environment_command|fs::create_dir_all|3
 reviewed|db/lane/workspace_environment.rs|run_mounted_workspace_environment_command|fs::set_permissions|1
