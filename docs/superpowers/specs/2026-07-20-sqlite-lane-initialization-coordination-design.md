@@ -115,7 +115,10 @@ The owner updates `heartbeat_at` during every durable transition and before and
 after each long phase. Heartbeat age is diagnostic only; it never permits
 takeover while the process identity is live.
 
-Terminal transitions atomically delete the owner row. A pre-association error
+Terminal transitions atomically delete the owner row. An explicit manual or
+deferred repair may subsequently attach one transient owner to a
+`repair_required` row while repair is actively running; every quiescent or
+returned terminal state has zero owners. A pre-association error
 conditionally deletes only the caller's exact owner row, leaving the durable
 phase resumable. A post-association failure atomically records
 `repair_required` when possible and deletes the owner. If the repair-state
@@ -127,6 +130,16 @@ Crash recovery needs no filesystem cleanup. The next caller observes the stale
 owner row, proves its process identity dead, increments the generation, and
 resumes from the durable phase. A stale worker cannot commit after takeover
 because its token/generation fence no longer matches.
+
+Explicit repair uses the same owner table through a repair-specific claim.
+Ownerless `associated` becomes `repair_required` and gains a generation-one
+owner atomically; ownerless `repair_required` gains an owner without changing
+phase. Live or indeterminate repair owners are contended, and only a
+liveness-proven dead or mismatched owner may be replaced with a full-tuple CAS.
+The winner alone performs repair side effects. Success publishes the event,
+transitions to `observer_ready`, and deletes the exact owner atomically;
+failure updates `repair_required` error details and deletes the exact owner.
+Repair contenders use the same bounded wait/replay policy as spawn contenders.
 
 ## Contender wait and replay
 

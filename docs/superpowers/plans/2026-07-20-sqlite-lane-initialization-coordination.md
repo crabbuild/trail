@@ -14,7 +14,7 @@
 - The owner fence is the exact pair `(owner_token, owner_generation)`; the token is 64 lowercase hexadecimal characters and the generation is positive.
 - Time or heartbeat age alone never permits takeover from a live or indeterminate owner.
 - No SQLite write transaction may span materialization, environment setup, or observer startup.
-- Terminal transitions leave zero owner rows.
+- Quiescent and returned terminal states have zero owner rows. Explicit active repair may transiently attach one exact owner to `repair_required` and must release it on success or handled failure.
 - Coordination creates no `.lock`, `.anchor`, `.identity`, or candidate files.
 - A quiescent workspace copy must remain usable without filesystem repair.
 - Schema v19-to-v20 migration is transactional; v18 opens must migrate through v19 and then v20.
@@ -409,6 +409,12 @@ git commit -m "fix: fence lane initialization publications"
 ### Task 4: Contender wait, crash takeover, and public errors
 
 **Files:** `trail/src/db/lane/initialization_owner.rs`, `trail/src/db/lane/lifecycle.rs`, `trail/src/error.rs`, `trail/src/model/reports/maintenance.rs`, `trail/src/mcp/response.rs`, `trail/tests/lane_initialization_faults.rs`, and `trail/tests/lane_initialization.rs`.
+
+**Pulled forward by Task 3 review fixes:** repair-specific SQLite claim/wait,
+stable in-progress error mapping, and transient repair-owner takeover already
+exist. Task 4 must reuse/generalize them for ordinary spawn contention and add
+real child-process repair crash plus injected-clock timeout coverage; do not
+create a second wait policy or error contract.
 
 - [ ] **Step 1: Implement wait, replay, and takeover lifecycle**
 
