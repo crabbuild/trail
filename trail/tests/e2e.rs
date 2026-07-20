@@ -2330,7 +2330,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 19
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 20
         }));
     }
 
@@ -2523,7 +2523,7 @@ fn trail_refuses_workspaces_with_newer_schema_versions() {
     assert!(matches!(
         err,
         Error::SchemaReinitializeRequired { ref found, .. }
-            if found.contains("found version 999; expected version 19")
+            if found.contains("found version 999; expected version 20")
     ));
 }
 
