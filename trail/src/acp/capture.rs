@@ -25,13 +25,29 @@ const CAPTURE_PROJECT_LOCK_WAIT: Duration = Duration::from_millis(250);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const CAPTURE_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const CAPTURE_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPTURE_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 // Test-only liveness cap for observing detached cleanup after the unchanged shutdown deadline.
 #[cfg(test)]
 const CAPTURE_TEST_WORKER_COMPLETION_LIVENESS_CAP: Duration = Duration::from_secs(10);
 static SPILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-static CAPTURE_WORKER_PAUSES: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> =
+struct CaptureWorkerPause {
+    paused: Arc<AtomicBool>,
+    reached: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static CAPTURE_WORKER_PAUSES: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, Arc<CaptureWorkerPause>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static CAPTURE_RECOVERY_PAUSES: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -40,8 +56,8 @@ static CAPTURE_PROJECTION_ATTEMPTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, A
 
 #[cfg(test)]
 struct CaptureSpillActivationPause {
-    reached: AtomicBool,
-    release: AtomicBool,
+    reached: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -53,12 +69,33 @@ static CAPTURE_SPILL_ACTIVATION_PAUSES: std::sync::OnceLock<
 fn pause_capture_worker_for_test(
     workspace_root: &Path,
 ) -> (
+    crate::test_support::scoped_state::ScopedTestState<PathBuf, Arc<CaptureWorkerPause>>,
+    Arc<CaptureWorkerPause>,
+) {
+    let key = fs::canonicalize(workspace_root).unwrap();
+    let pause = Arc::new(CaptureWorkerPause {
+        paused: Arc::new(AtomicBool::new(true)),
+        reached: Arc::new(AtomicBool::new(false)),
+    });
+    let pauses = CAPTURE_WORKER_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = crate::test_support::scoped_state::ScopedTestState::install(
+        pauses,
+        key,
+        Arc::clone(&pause),
+    );
+    (guard, pause)
+}
+
+#[cfg(test)]
+fn pause_capture_recovery_for_test(
+    workspace_root: &Path,
+) -> (
     crate::test_support::scoped_state::ScopedTestState<PathBuf, Arc<AtomicBool>>,
     Arc<AtomicBool>,
 ) {
     let key = fs::canonicalize(workspace_root).unwrap();
     let paused = Arc::new(AtomicBool::new(true));
-    let pauses = CAPTURE_WORKER_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let pauses = CAPTURE_RECOVERY_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = crate::test_support::scoped_state::ScopedTestState::install(
         pauses,
         key,
@@ -94,8 +131,8 @@ fn pause_capture_spill_activation_for_test(
 ) {
     let key = fs::canonicalize(spill_dir).unwrap();
     let pause = Arc::new(CaptureSpillActivationPause {
-        reached: AtomicBool::new(false),
-        release: AtomicBool::new(false),
+        reached: Arc::new(AtomicBool::new(false)),
+        release: Arc::new(AtomicBool::new(false)),
     });
     let pauses = CAPTURE_SPILL_ACTIVATION_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = crate::test_support::scoped_state::ScopedTestState::install(
@@ -144,10 +181,32 @@ fn record_capture_projection_attempt_for_test(coordinator: &Arc<Mutex<CaptureCoo
 }
 
 #[cfg(test)]
-fn wait_for_capture_worker_test_pause(workspace_root: &Path) {
+fn capture_worker_test_pause(workspace_root: &Path) -> Option<Arc<CaptureWorkerPause>> {
+    let key = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    CAPTURE_WORKER_PAUSES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+#[cfg(test)]
+fn wait_for_capture_worker_test_pause(pause: Option<Arc<CaptureWorkerPause>>) {
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.store(true, Ordering::Release);
+    while pause.paused.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+fn wait_for_capture_recovery_test_pause(workspace_root: &Path) {
     let key = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     loop {
-        let paused = CAPTURE_WORKER_PAUSES
+        let paused = CAPTURE_RECOVERY_PAUSES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -239,7 +298,7 @@ pub(crate) struct CaptureIngress {
 
 impl CaptureIngress {
     pub(crate) fn new(
-        _workspace_root: PathBuf,
+        workspace_root: PathBuf,
         db_dir: PathBuf,
         coordinator: Arc<Mutex<CaptureCoordinator>>,
         connection_id: String,
@@ -253,6 +312,7 @@ impl CaptureIngress {
         let pending_finish = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::sync_channel(ACP_CAPTURE_QUEUE_CAPACITY);
         let (done_tx, done_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
         let worker_health = Arc::clone(&health);
         let worker_spill = Arc::clone(&spill);
         let worker_spill_mode = Arc::clone(&spill_mode);
@@ -264,19 +324,19 @@ impl CaptureIngress {
             .name("trail-acp-capture".to_string())
             .spawn(move || {
                 #[cfg(test)]
-                wait_for_capture_worker_test_pause(&_workspace_root);
-                #[cfg(test)]
-                drop(_workspace_root);
+                wait_for_capture_recovery_test_pause(&workspace_root);
                 let panic_health = Arc::clone(&worker_health);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     capture_worker(
                         rx,
+                        workspace_root,
                         coordinator,
                         worker_health,
                         worker_spill,
                         worker_spill_mode,
                         worker_stopping,
                         worker_pending_finish,
+                        ready_tx,
                     );
                 }));
                 if outcome.is_err() {
@@ -291,7 +351,7 @@ impl CaptureIngress {
                 let _ = done_tx.send(());
             })
             .map_err(Error::Io)?;
-        Ok(Self {
+        let ingress = Self {
             tx: Some(tx),
             health,
             worker: Some(worker),
@@ -302,7 +362,23 @@ impl CaptureIngress {
             worker_completed,
             pending_finish,
             done_rx: Mutex::new(done_rx),
-        })
+        };
+        match ready_rx.recv_timeout(CAPTURE_STARTUP_READY_TIMEOUT) {
+            Ok(()) => Ok(ingress),
+            Err(error) => {
+                let detail = match error {
+                    mpsc::RecvTimeoutError::Timeout => format!(
+                        "ACP capture recovery did not settle before the {}ms startup deadline",
+                        CAPTURE_STARTUP_READY_TIMEOUT.as_millis()
+                    ),
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        "ACP capture worker stopped before recovery settled".to_string()
+                    }
+                };
+                ingress.shutdown(CAPTURE_STARTUP_CLEANUP_TIMEOUT);
+                Err(Error::InvalidInput(detail))
+            }
+        }
     }
 
     pub(crate) fn append(&self, frame: CapturedFrame) -> Result<()> {
@@ -830,24 +906,33 @@ fn try_lock_spill_owner(_file: &File) -> Result<bool> {
 #[allow(clippy::too_many_arguments)]
 fn capture_worker(
     rx: mpsc::Receiver<CaptureCommand>,
+    _workspace_root: PathBuf,
     coordinator: Arc<Mutex<CaptureCoordinator>>,
     health: Arc<CaptureHealth>,
     spill: Arc<SpillStore>,
     spill_mode: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     pending_finish: Arc<Mutex<Option<RelayFinishReason>>>,
+    ready_tx: mpsc::Sender<()>,
 ) {
+    let mut startup_recovery_pending = false;
     let mut pending = match recovery_frames(&coordinator, &spill) {
         Ok(frames) => frames.into_iter().map(|frame| (frame, false)).collect(),
         Err(error) => {
+            spill.release_claimed();
+            spill_mode.store(true, Ordering::Release);
+            startup_recovery_pending = true;
             if health.record_error(&error) {
                 eprintln!("trail acp capture warning: recovery failed: {error}");
             }
             VecDeque::new()
         }
     };
-    load_recovered_finish(&spill, &pending_finish);
+    if !startup_recovery_pending {
+        load_recovered_finish(&spill, &pending_finish);
+    }
     let mut deferred_barriers = Vec::new();
+    let mut startup_ready = Some(ready_tx);
     let mut merged_frames = false;
     for command in rx.try_iter() {
         match command {
@@ -963,7 +1048,26 @@ fn capture_worker(
             break;
         }
 
+        if startup_recovery_pending {
+            match recovery_frames(&coordinator, &spill) {
+                Ok(frames) => {
+                    pending.extend(frames.into_iter().map(|frame| (frame, false)));
+                    load_recovered_finish(&spill, &pending_finish);
+                    startup_recovery_pending = false;
+                }
+                Err(error) => {
+                    spill.release_claimed();
+                    if health.record_error(&error) {
+                        eprintln!("trail acp capture warning: recovery retry failed: {error}");
+                    }
+                    thread::sleep(CAPTURE_RETRY_INTERVAL);
+                    continue;
+                }
+            }
+        }
+
         let mut merged_frames = false;
+        let mut recovered_spill = false;
         if spill_mode.load(Ordering::Acquire) {
             for command in rx.try_iter() {
                 match command {
@@ -981,6 +1085,7 @@ fn capture_worker(
             }
             match spill.take_all() {
                 Ok(frames) => {
+                    recovered_spill = true;
                     merged_frames |= !frames.is_empty();
                     pending.extend(frames.into_iter().map(|frame| (frame, false)));
                     load_recovered_finish(&spill, &pending_finish);
@@ -990,6 +1095,16 @@ fn capture_worker(
                         eprintln!("trail acp capture warning: spill replay failed: {error}");
                     }
                 }
+            }
+        }
+        if recovered_spill && pending.is_empty() && !merged_frames {
+            match spill.complete_claimed_frames_and_handoff(&spill_mode) {
+                Err(error) => {
+                    if health.record_error(&error) {
+                        eprintln!("trail acp capture warning: spill handoff failed: {error}");
+                    }
+                }
+                Ok(()) => {}
             }
         }
         if merged_frames {
@@ -1052,6 +1167,20 @@ fn capture_worker(
             && settle_pending_finish(&coordinator, &health, &spill, &pending_finish)
         {
             acknowledge_barriers(&mut deferred_barriers);
+            if let Some(ready_tx) = startup_ready.take() {
+                #[cfg(test)]
+                let worker_pause = capture_worker_test_pause(&_workspace_root);
+                #[cfg(test)]
+                if let Some(pause) = &worker_pause {
+                    pause.reached.store(true, Ordering::Release);
+                }
+                if ready_tx.send(()).is_err() {
+                    stopping.store(true, Ordering::Release);
+                    continue;
+                }
+                #[cfg(test)]
+                wait_for_capture_worker_test_pause(worker_pause);
+            }
         }
 
         match rx.recv_timeout(CAPTURE_RETRY_INTERVAL) {
@@ -1379,6 +1508,23 @@ mod tests {
     use crate::acp::AcpRelayOptions;
     use crate::InitImportMode;
 
+    struct AtomicBoolOnDrop {
+        signal: Arc<AtomicBool>,
+        value: bool,
+    }
+
+    impl AtomicBoolOnDrop {
+        fn new(signal: Arc<AtomicBool>, value: bool) -> Self {
+            Self { signal, value }
+        }
+    }
+
+    impl Drop for AtomicBoolOnDrop {
+        fn drop(&mut self) {
+            self.signal.store(self.value, Ordering::Release);
+        }
+    }
+
     #[test]
     fn callback_receipts_replace_file_content_and_terminal_environment_values() {
         let write = bounded_redacted_message(&serde_json::json!({
@@ -1406,6 +1552,83 @@ mod tests {
         }));
         assert_eq!(terminal["params"]["env"][0]["value"], "[REDACTED]");
         assert!(!terminal.to_string().contains("opaque-secret"));
+    }
+
+    #[test]
+    fn constructor_waits_for_abandoned_recovery_to_settle() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "startup recovery fixture\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let options = AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: None,
+            from_ref: None,
+            provider: Some("fixture".to_string()),
+            model: None,
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["fixture".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+        let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
+        let spill_dir = temp.path().join(".trail/acp-ingress");
+        let prior = SpillStore::new(spill_dir.clone(), "abandoned-connection".to_string()).unwrap();
+        prior
+            .append(&capture_frame(
+                "abandoned-connection",
+                Direction::AgentToClient,
+                7,
+                &serde_json::json!({"jsonrpc":"2.0","method":"ext/recover-before-ready"}),
+                false,
+            ))
+            .unwrap();
+        prior.persist_finish(&RelayFinishReason::EditorEof).unwrap();
+        drop(prior);
+
+        let (_pause_guard, paused) = pause_capture_recovery_for_test(temp.path());
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&paused), false);
+            scope.spawn(|| {
+                result_tx
+                    .send(CaptureIngress::new(
+                        temp.path().to_path_buf(),
+                        temp.path().join(".trail"),
+                        coordinator,
+                        "new-connection".to_string(),
+                    ))
+                    .unwrap();
+            });
+            let early = result_rx.recv_timeout(Duration::from_millis(100));
+            assert!(
+                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+                "capture ingress was exposed before abandoned recovery settled"
+            );
+            paused.store(false, Ordering::Release);
+            let ingress = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capture ingress did not become ready after recovery resumed")
+                .expect("capture ingress failed after recovery resumed");
+            assert!(
+                !spill_dir.join("abandoned-connection.jsonl").exists(),
+                "abandoned frames remained after capture ingress became ready"
+            );
+            assert!(
+                !spill_dir.join("abandoned-connection.finish.json").exists(),
+                "abandoned finish remained after capture ingress became ready"
+            );
+            let receipts = Trail::open(temp.path())
+                .unwrap()
+                .list_agent_hook_receipts(Some("trail-acp"), None, 10)
+                .unwrap();
+            assert!(receipts.iter().any(|receipt| {
+                receipt.connection_id.as_deref() == Some("abandoned-connection")
+                    && receipt.connection_sequence == Some(7)
+            }));
+            ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
+        });
     }
 
     fn preserved_spill_state(dir: &Path) -> (HashSet<u64>, bool) {
@@ -1451,7 +1674,8 @@ mod tests {
         let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
         let (_projection_guard, projection_attempts) =
             count_capture_projection_attempts_for_test(temp.path());
-        let (_pause_guard, paused) = pause_capture_worker_for_test(temp.path());
+        let (_pause_guard, pause) = pause_capture_worker_for_test(temp.path());
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         let lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
@@ -1460,6 +1684,10 @@ mod tests {
             "overflow-connection".to_string(),
         )
         .unwrap();
+        assert!(
+            pause.reached.load(Ordering::Acquire),
+            "capture worker was not paused before ingress became visible"
+        );
         for sequence in 0..FRAME_COUNT {
             ingress
                 .append(capture_frame(
@@ -1488,7 +1716,7 @@ mod tests {
             CAPTURE_SHUTDOWN_TIMEOUT,
             "shutdown did not publish stopping state",
         );
-        paused.store(false, Ordering::Release);
+        pause.paused.store(false, Ordering::Release);
         let (shutdown_elapsed, report) = shutdown_thread.join().unwrap();
         assert!(shutdown_elapsed < CAPTURE_SHUTDOWN_TIMEOUT + Duration::from_millis(250));
         assert!(
@@ -1561,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_preserves_startup_replay_without_projection() {
+    fn startup_timeout_is_bounded_and_preserves_recovery_durably() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "recovery fixture\n").unwrap();
         Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -1590,43 +1818,69 @@ mod tests {
                 false,
             ))
             .unwrap();
+        prior.persist_finish(&RelayFinishReason::EditorEof).unwrap();
         drop(prior);
+        Trail::open(temp.path())
+            .unwrap()
+            .persist_agent_hook_receipt(AgentHookReceiptInput {
+                installation_id: None,
+                provider: "trail-acp".to_string(),
+                native_event: "acp/frame".to_string(),
+                native_session_id: None,
+                native_turn_id: None,
+                transport: AgentCaptureTransport::Acp,
+                connection_id: Some("malformed-receipt".to_string()),
+                direction: Some("agent_to_client".to_string()),
+                connection_sequence: Some(99),
+                dedupe_key: "malformed-startup-recovery".to_string(),
+                payload: serde_json::json!({"malformed": true}),
+                occurred_at: Some(now_millis()),
+            })
+            .unwrap();
 
         let (_projection_guard, projection_attempts) =
             count_capture_projection_attempts_for_test(temp.path());
-        let (_pause_guard, paused) = pause_capture_worker_for_test(temp.path());
-        let lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
-        let ingress = CaptureIngress::new(
+        let started = Instant::now();
+        let error = match CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
             coordinator,
             "recovery-connection".to_string(),
-        )
-        .unwrap();
-        let stopping = Arc::clone(&ingress.stopping);
-        let worker_completed = Arc::clone(&ingress.worker_completed);
-        let shutdown_thread = thread::spawn(move || ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT));
-        wait_for_capture_test_signal(
-            &stopping,
-            CAPTURE_SHUTDOWN_TIMEOUT,
-            "shutdown did not publish stopping state",
+        ) {
+            Ok(ingress) => {
+                ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
+                panic!("capture ingress became visible while recovery stayed blocked");
+            }
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            error.to_string().contains("startup deadline"),
+            "unexpected startup recovery error: {error}"
         );
-        paused.store(false, Ordering::Release);
-        shutdown_thread.join().unwrap();
-        drop(lock);
-        wait_for_capture_test_signal(
-            &worker_completed,
-            CAPTURE_TEST_WORKER_COMPLETION_LIVENESS_CAP,
-            "capture worker did not complete durable replay cleanup",
+        assert!(
+            elapsed >= CAPTURE_STARTUP_READY_TIMEOUT,
+            "startup failure returned before its recovery deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed
+                < CAPTURE_STARTUP_READY_TIMEOUT
+                    + CAPTURE_STARTUP_CLEANUP_TIMEOUT
+                    + Duration::from_millis(500),
+            "startup failure exceeded its bounded cleanup allowance: {elapsed:?}"
         );
 
         assert_eq!(
             projection_attempts.load(Ordering::Relaxed),
             0,
-            "shutdown projected a frame already held for durable replay"
+            "malformed recovery projected a frame before readiness"
         );
-        let (preserved, _finish_preserved) = preserved_spill_state(&spill_dir);
+        let (preserved, finish_preserved) = preserved_spill_state(&spill_dir);
         assert_eq!(preserved, HashSet::from([7]));
+        assert!(
+            finish_preserved,
+            "startup timeout lost the recovered finish marker"
+        );
     }
 
     fn test_ingress(temp: &Path, connection_id: &str) -> CaptureIngress {
@@ -1841,7 +2095,8 @@ mod tests {
             upstream_env: BTreeMap::new(),
         };
         let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
-        let (_worker_pause_guard, worker_paused) = pause_capture_worker_for_test(temp.path());
+        let (_worker_pause_guard, worker_pause) = pause_capture_worker_for_test(temp.path());
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&worker_pause.paused), false);
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
@@ -1865,6 +2120,8 @@ mod tests {
         let (_activation_guard, activation_pause) =
             pause_capture_spill_activation_for_test(&spill_dir);
         thread::scope(|scope| {
+            let _release_activation_on_drop =
+                AtomicBoolOnDrop::new(Arc::clone(&activation_pause.release), true);
             let overflow = scope.spawn(|| {
                 ingress
                     .append(capture_frame(
@@ -1890,14 +2147,20 @@ mod tests {
                     .unwrap();
                 completion_tx.send(()).unwrap();
             });
-            let _ = completion_rx.recv_timeout(Duration::from_millis(100));
+            assert!(
+                matches!(
+                    completion_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "spill completion overtook the atomic activation-and-append section"
+            );
             activation_pause.release.store(true, Ordering::Release);
             overflow.join().unwrap();
             completion.join().unwrap();
         });
         let stranded = ingress.spill.path_for("spill-activation").is_file()
             && !ingress.spill_mode.load(Ordering::Acquire);
-        worker_paused.store(false, Ordering::Release);
+        worker_pause.paused.store(false, Ordering::Release);
         ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
         assert!(
             !stranded,
@@ -1953,7 +2216,8 @@ mod tests {
             .before_agent_message(&mut load_response)
             .unwrap();
 
-        let (_pause_guard, paused) = pause_capture_worker_for_test(temp.path());
+        let (_pause_guard, pause) = pause_capture_worker_for_test(temp.path());
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
@@ -1961,6 +2225,10 @@ mod tests {
             "startup-ordering".to_string(),
         )
         .unwrap();
+        assert!(
+            pause.reached.load(Ordering::Acquire),
+            "capture worker was not paused before ingress became visible"
+        );
         for (sequence, update) in [
             serde_json::json!({
                 "sessionUpdate": "user_message_chunk",
@@ -1991,7 +2259,7 @@ mod tests {
                 .unwrap();
         }
         ingress.finish(RelayFinishReason::EditorEof);
-        paused.store(false, Ordering::Release);
+        pause.paused.store(false, Ordering::Release);
         assert!(
             ingress.flush(Duration::from_secs(2)),
             "capture worker did not settle queued frames and finish"
