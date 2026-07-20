@@ -104,10 +104,22 @@ pub(super) fn try_handle_auto_daemon_command(
             Err(err) if auto_daemon_should_fallback(&err) => {
                 // A verified stale publication must be recovered through the
                 // authenticated daemon-start path before any local fallback.
-                let ready = daemon_start::ensure_workspace_daemon_ready(
-                    &workspace,
-                    daemon_token.as_deref(),
-                )?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let ready = loop {
+                    match daemon_start::ensure_workspace_daemon_ready(
+                        &workspace,
+                        daemon_token.as_deref(),
+                    ) {
+                        Ok(ready) => break ready,
+                        Err(recovery)
+                            if auto_daemon_should_fallback(&recovery)
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(recovery) => return Err(recovery),
+                    }
+                };
                 return try_handle_auto_daemon_or_fallback(
                     ctx,
                     ready.url,
