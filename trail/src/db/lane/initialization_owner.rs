@@ -3,7 +3,9 @@ use crate::db::lane::initialization::{
     insert_lane_initialization_reservation, lane_initialization_record, LaneInitializationRecord,
     ResolvedLaneSpawnRequest,
 };
-use crate::db::util::{current_process_start_token, process_matches_start_token};
+use crate::db::util::{
+    current_process_start_token, process_start_token_match, ProcessIdentityMatch,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LaneInitializationFence {
@@ -86,7 +88,7 @@ fn validate_matching_request(
 #[cfg(test)]
 thread_local! {
     static PROCESS_LIVENESS_OVERRIDES: std::cell::RefCell<
-        std::collections::HashMap<(u32, String), bool>
+        std::collections::HashMap<(u32, String), ProcessIdentityMatch>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -97,24 +99,39 @@ fn clear_process_liveness_overrides() {
 
 #[cfg(test)]
 fn install_process_liveness_override(pid: u32, start_identity: &str, live: bool) {
+    let result = if live {
+        ProcessIdentityMatch::Match
+    } else {
+        ProcessIdentityMatch::DeadOrMismatch
+    };
     PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
         overrides
             .borrow_mut()
-            .insert((pid, start_identity.to_string()), live);
+            .insert((pid, start_identity.to_string()), result);
     });
 }
 
-fn owner_process_matches(pid: u32, start_identity: &str) -> bool {
+#[cfg(test)]
+fn install_process_liveness_unknown_override(pid: u32, start_identity: &str) {
+    PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
+        overrides.borrow_mut().insert(
+            (pid, start_identity.to_string()),
+            ProcessIdentityMatch::Unknown,
+        );
+    });
+}
+
+fn owner_process_match(pid: u32, start_identity: &str) -> ProcessIdentityMatch {
     #[cfg(test)]
-    if let Some(live) = PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
+    if let Some(result) = PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
         overrides
             .borrow()
             .get(&(pid, start_identity.to_string()))
             .copied()
     }) {
-        return live;
+        return result;
     }
-    process_matches_start_token(pid, start_identity)
+    process_start_token_match(pid, start_identity)
 }
 
 pub(crate) fn claim_lane_initialization_owner(
@@ -209,7 +226,9 @@ pub(crate) fn claim_lane_initialization_owner(
             });
         };
 
-        if owner_process_matches(owner.owner_pid, &owner.owner_process_start_identity) {
+        if owner_process_match(owner.owner_pid, &owner.owner_process_start_identity)
+            != ProcessIdentityMatch::DeadOrMismatch
+        {
             return Ok(LaneInitializationClaim::Contended {
                 record,
                 owner_pid: owner.owner_pid,
@@ -404,6 +423,21 @@ mod tests {
             install_process_liveness_override(pid, &start_identity, false);
         }
 
+        fn mark_owner_unknown(&self, lane: &str) {
+            assert_eq!(lane, self.request.lane_name);
+            let (pid, start_identity): (u32, String) = self
+                .db
+                .conn
+                .query_row(
+                    "SELECT owner_pid,owner_process_start_identity
+                     FROM lane_initialization_owners WHERE initialization_id=?1",
+                    [&self.request.initialization_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            install_process_liveness_unknown_override(pid, &start_identity);
+        }
+
         fn install_owner(&self, pid: u32, start_identity: &str) {
             self.insert_initialization("reserved");
             self.db
@@ -535,6 +569,19 @@ mod tests {
         };
         assert_eq!(record.lane_name, "lane-a");
         assert_eq!(owner_pid, std::process::id());
+        assert_eq!(fixture.stored_fence("lane-a"), first);
+    }
+
+    #[test]
+    fn unknown_owner_is_contended_even_when_heartbeat_is_expired() {
+        let mut fixture = OwnerFixture::new();
+        let first = fixture.claim("lane-a").owned_fence();
+        fixture.age_heartbeat("lane-a", i64::MIN / 2);
+        fixture.mark_owner_unknown("lane-a");
+        assert!(matches!(
+            fixture.claim("lane-a"),
+            LaneInitializationClaim::Contended { .. }
+        ));
         assert_eq!(fixture.stored_fence("lane-a"), first);
     }
 

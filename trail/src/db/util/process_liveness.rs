@@ -1,3 +1,10 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessIdentityMatch {
+    Match,
+    DeadOrMismatch,
+    Unknown,
+}
+
 pub(crate) fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -114,10 +121,29 @@ pub(crate) fn current_process_start_token() -> String {
 }
 
 pub(crate) fn process_matches_start_token(pid: u32, token: &str) -> bool {
-    if !process_is_alive(pid) {
-        return false;
+    process_identity_may_match(process_start_token_match(pid, token))
+}
+
+pub(crate) fn process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch {
+    #[cfg(unix)]
+    {
+        unix_process_start_token_match(pid, token)
     }
-    process_start_token(pid).is_none_or(|actual| actual == token)
+
+    #[cfg(target_os = "windows")]
+    {
+        windows_process_start_token_match(pid, token)
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = (pid, token);
+        ProcessIdentityMatch::Unknown
+    }
+}
+
+fn process_identity_may_match(result: ProcessIdentityMatch) -> bool {
+    result != ProcessIdentityMatch::DeadOrMismatch
 }
 
 /// Internal helper entry point used by the CLI's hidden process-watchdog mode.
@@ -241,6 +267,54 @@ fn windows_watch_parent_and_terminate_child(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch {
+    use winapi::shared::minwindef::{DWORD, FILETIME};
+    use winapi::shared::winerror::ERROR_INVALID_PARAMETER;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{GetExitCodeProcess, GetProcessTimes, OpenProcess};
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+
+    const STILL_ACTIVE: DWORD = 259;
+    // SAFETY: the handle is checked before use and closed on every path after opening.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                ProcessIdentityMatch::DeadOrMismatch
+            } else {
+                ProcessIdentityMatch::Unknown
+            };
+        }
+        let mut exit_code = 0;
+        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+            CloseHandle(handle);
+            return ProcessIdentityMatch::Unknown;
+        }
+        if exit_code != STILL_ACTIVE {
+            CloseHandle(handle);
+            return ProcessIdentityMatch::DeadOrMismatch;
+        }
+
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+            CloseHandle(handle);
+            return ProcessIdentityMatch::Unknown;
+        }
+        CloseHandle(handle);
+        let value = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        if format!("windows:{value}") == token {
+            ProcessIdentityMatch::Match
+        } else {
+            ProcessIdentityMatch::DeadOrMismatch
+        }
+    }
+}
+
 pub(crate) fn test_crash_point(name: &str) {
     #[cfg(test)]
     {
@@ -284,6 +358,27 @@ fn unix_process_is_alive(pid: u32) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn unix_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return ProcessIdentityMatch::DeadOrMismatch;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+        return ProcessIdentityMatch::DeadOrMismatch;
+    };
+
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => {}
+        Err(rustix::io::Errno::SRCH) => return ProcessIdentityMatch::DeadOrMismatch,
+        Err(_) => return ProcessIdentityMatch::Unknown,
+    }
+    match process_start_token(pid.as_raw_nonzero().get() as u32) {
+        Some(actual) if actual == token => ProcessIdentityMatch::Match,
+        Some(_) => ProcessIdentityMatch::DeadOrMismatch,
+        None => ProcessIdentityMatch::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +395,18 @@ mod tests {
         assert!(process_is_alive(std::process::id()));
         let token = current_process_start_token();
         assert!(process_matches_start_token(std::process::id(), &token));
+        assert_eq!(
+            process_start_token_match(std::process::id(), &token),
+            ProcessIdentityMatch::Match
+        );
+    }
+
+    #[test]
+    fn unknown_identity_probe_is_conservatively_live_for_boolean_callers() {
+        assert!(process_identity_may_match(ProcessIdentityMatch::Unknown));
+        assert!(process_identity_may_match(ProcessIdentityMatch::Match));
+        assert!(!process_identity_may_match(
+            ProcessIdentityMatch::DeadOrMismatch
+        ));
     }
 }
