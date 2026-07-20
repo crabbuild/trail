@@ -84,6 +84,15 @@ The common lifecycle is:
 5. Run tests or evals.
 6. Rewind, refresh, hand off, or remove the lane.
 
+### Copying or relocating a workspace
+
+Stop Trail commands, agents, mounts, and observers before copying or moving a
+workspace that includes `.trail/`. Lane-initialization authority records use a
+portable repository token and are valid after a quiescent filesystem copy or
+cross-volume move. Copying while an initialization is live is unsupported: the
+copy may capture an inconsistent publication boundary, so discard it and copy
+again after the source is quiescent.
+
 ## Command Families
 
 | Goal | Commands |

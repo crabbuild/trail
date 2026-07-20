@@ -4855,6 +4855,7 @@ mod lane;
 pub(crate) use lane::{
     clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,
     install_schema_v18_authenticated_lane_evidence, install_schema_v19_backfill_times,
+    lane_initialization_publication_lock_count, reset_lane_initialization_publication_lock_count,
     run_changed_path_view_flow, schema_v19_backfill_times_remaining,
     set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,

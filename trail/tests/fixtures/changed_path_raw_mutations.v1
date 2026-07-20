@@ -143,6 +143,13 @@ reviewed|db/core/workspace/ignore.rs|ignore_remove|fs::write|1
 reviewed|db/lane/initialization.rs|install_schema_v18_authenticated_lane_evidence|fs::set_permissions|1
 reviewed|db/lane/lifecycle.rs|lane_initialization_crash_cut|OpenOptions::create_new|1
 reviewed|db/lane/lifecycle.rs|lane_initialization_crash_cut|OpenOptions::write|1
+reviewed|db/lane/lifecycle.rs|lane_initialization_publication_crash_cut|OpenOptions::create_new|1
+reviewed|db/lane/lifecycle.rs|lane_initialization_publication_crash_cut|OpenOptions::write|1
+reviewed|db/lane/lifecycle.rs|open_lane_initialization_regular|OpenOptions::create_new|1
+reviewed|db/lane/lifecycle.rs|open_lane_initialization_regular|OpenOptions::write|1
+reviewed|db/lane/lifecycle.rs|open_lane_initialization_regular_existing|OpenOptions::write|1
+reviewed|db/lane/lifecycle.rs|open_or_create_lane_initialization_child_directory|fs::create_dir|1
+reviewed|db/lane/lifecycle.rs|remove_lane_initialization_regular|fs::remove_file|1
 reviewed|db/lane/lifecycle.rs|write_sparse_workdir_manifest|fs::create_dir_all|1
 pending_task12|db/lane/workdir/dokan.rs|flush_file_buffers|OpenOptions::write|1
 pending_task12|db/lane/workdir/dokan.rs|mount_dokan_cow_for_lane_with_view|fs::create_dir_all|1

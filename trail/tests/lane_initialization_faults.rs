@@ -13,6 +13,8 @@ const CHILD_WORKSPACE: &str = "TRAIL_TEST_INITIALIZATION_CHILD_WORKSPACE";
 const CHILD_LEDGER_AUTHORITY: &str = "TRAIL_TEST_INITIALIZATION_CHILD_LEDGER_AUTHORITY";
 const CRASH_AFTER: &str = "TRAIL_TEST_LANE_INITIALIZATION_CRASH_AFTER";
 const HANDSHAKE: &str = "TRAIL_TEST_LANE_INITIALIZATION_HANDSHAKE";
+const SINGLEFLIGHT_CRASH_AFTER: &str = "TRAIL_TEST_LANE_SINGLEFLIGHT_CRASH_AFTER";
+const SINGLEFLIGHT_FAIL_AT: &str = "TRAIL_TEST_LANE_SINGLEFLIGHT_FAIL_AT";
 
 fn initialize_workspace(path: &Path) {
     Trail::init(path, "main", InitImportMode::Empty, false).unwrap();
@@ -25,6 +27,20 @@ fn initialize_workspace(path: &Path) {
         false,
     )
     .unwrap();
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&source_path, &destination_path);
+        } else {
+            fs::copy(source_path, destination_path).unwrap();
+        }
+    }
 }
 
 fn count(sqlite: &Path, sql: &str, parameter: &str) -> i64 {
@@ -85,6 +101,29 @@ fn runtime_lock_paths(root: &Path) -> Vec<String> {
     paths
 }
 
+fn singleflight_candidate_paths(root: &Path) -> Vec<PathBuf> {
+    fn visit(current: &Path, paths: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lane-initialization-candidate-")
+            {
+                paths.push(path.clone());
+            }
+            if entry.file_type().unwrap().is_dir() {
+                visit(&path, paths);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(root, &mut paths);
+    paths
+}
+
 fn reject_lane_initialization_phases(sqlite: &Path, phases: &[&str]) {
     let phases = phases
         .iter()
@@ -113,7 +152,7 @@ fn lane_initialization_crash_child() {
         trail::test_support::set_changed_path_authority_override(true);
     }
     let mut db = Trail::open(workspace).unwrap();
-    let _ = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+    let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "crash-lane",
         Some("main"),
         LaneWorkdirMode::PortableCopy,
@@ -122,6 +161,241 @@ fn lane_initialization_crash_child() {
         None,
         &[],
         false,
+    );
+    if std::env::var_os(SINGLEFLIGHT_FAIL_AT).is_some() {
+        assert!(
+            result.is_err(),
+            "singleflight publication fault was ignored"
+        );
+    }
+}
+
+fn singleflight_child(workspace: &Path) -> Command {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("--exact")
+        .arg("lane_initialization_crash_child")
+        .arg("--nocapture")
+        .env(CHILD_WORKSPACE, workspace)
+        .env(CHILD_LEDGER_AUTHORITY, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    child
+}
+
+#[test]
+fn first_publication_crashes_at_every_boundary_recover_without_poisoning_the_shard() {
+    for boundary in [
+        "after_publication_lock",
+        "after_anchor_temp_sync",
+        "after_anchor_publish",
+        "after_identity_temp_sync",
+        "after_identity_publish",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_workspace(temp.path());
+        let handshake = temp
+            .path()
+            .join(format!("singleflight-{boundary}.handshake"));
+        let mut child = singleflight_child(temp.path())
+            .env(SINGLEFLIGHT_CRASH_AFTER, boundary)
+            .env(HANDSHAKE, &handshake)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !handshake.exists() && Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handshake.exists(),
+            "child did not publish the {boundary} first-publication handshake"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut db = Trail::open(temp.path()).unwrap();
+        let report = db
+            .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "crash-lane",
+                Some("main"),
+                LaneWorkdirMode::PortableCopy,
+                Some("codex".into()),
+                Some("gpt-5".into()),
+                None,
+                &[],
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{boundary} poisoned its shard: {error:?}"));
+        assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+        assert!(
+            singleflight_candidate_paths(&temp.path().join(".trail")).is_empty(),
+            "{boundary} left a publication candidate after recovery"
+        );
+    }
+}
+
+#[test]
+fn first_publication_write_failures_leave_the_shard_retryable() {
+    for boundary in ["anchor_write", "identity_write"] {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_workspace(temp.path());
+        let status = singleflight_child(temp.path())
+            .env(SINGLEFLIGHT_FAIL_AT, boundary)
+            .status()
+            .unwrap();
+        assert!(status.success(), "child did not observe {boundary} fault");
+
+        let mut db = Trail::open(temp.path()).unwrap();
+        let report = db
+            .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "crash-lane",
+                Some("main"),
+                LaneWorkdirMode::PortableCopy,
+                Some("codex".into()),
+                Some("gpt-5".into()),
+                None,
+                &[],
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{boundary} poisoned its shard: {error:?}"));
+        assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    }
+}
+
+#[test]
+fn quiescent_workspace_copy_reuses_portable_singleflight_authority() {
+    let source = tempfile::tempdir().unwrap();
+    initialize_workspace(source.path());
+    {
+        let mut db = Trail::open(source.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "relocated-lane",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let destination = tempfile::tempdir().unwrap();
+    let copied_workspace = destination.path().join("copied-workspace");
+    copy_directory(source.path(), &copied_workspace);
+    let mut copied = Trail::open(&copied_workspace).unwrap();
+    let report = copied
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "relocated-lane",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert!(report.resumed);
+    let trail_root = copied_workspace.join(".trail");
+    let anchor = fs::read_dir(trail_root.join("lane-initialization-locks"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let identity = fs::read_dir(&trail_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("lane-initialization-"))
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "identity")
+        })
+        .unwrap();
+    for authority in [anchor, identity] {
+        let record = fs::read_to_string(authority).unwrap();
+        assert!(record.starts_with("trail-lane-initialization-authority-v2\ntoken="));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unauthenticated_singleflight_directory_never_redirects_permission_changes() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let victim = temp.path().join("permission-victim");
+    fs::create_dir(&victim).unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+    let singleflight = temp.path().join(".trail/lane-initialization-locks");
+    symlink(&victim, &singleflight).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "symlink-authority",
+        Some("main"),
+        LaneWorkdirMode::Virtual,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn established_shard_skips_first_publication_coordination() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    trail::test_support::reset_lane_initialization_publication_lock_count();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "established-fast-path",
+        Some("main"),
+        LaneWorkdirMode::Virtual,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        trail::test_support::lane_initialization_publication_lock_count(),
+        1,
+        "first use must enter publication coordination"
+    );
+
+    trail::test_support::reset_lane_initialization_publication_lock_count();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "established-fast-path",
+        Some("main"),
+        LaneWorkdirMode::Virtual,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        trail::test_support::lane_initialization_publication_lock_count(),
+        0,
+        "established shards must stay on the per-shard fast path"
     );
 }
 
@@ -390,7 +664,7 @@ fn persistent_singleflight_anchors_are_not_runtime_lock_inventory() {
     assert_ne!(runtime_lock_paths(&trail_root), before);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn replacing_singleflight_leaf_or_parent_never_creates_a_second_authority() {
     struct AuthorityOverride;

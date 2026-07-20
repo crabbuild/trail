@@ -129,6 +129,14 @@ pub mod test_support {
         crate::db::set_lane_initialization_io_failure_for_current_thread(boundary, disk_full);
     }
 
+    pub fn reset_lane_initialization_publication_lock_count() {
+        crate::db::reset_lane_initialization_publication_lock_count();
+    }
+
+    pub fn lane_initialization_publication_lock_count() -> u64 {
+        crate::db::lane_initialization_publication_lock_count()
+    }
+
     pub fn set_lane_association_failure_for_current_thread(boundary: Option<&'static str>) {
         crate::db::set_lane_association_failure_for_current_thread(boundary);
     }
