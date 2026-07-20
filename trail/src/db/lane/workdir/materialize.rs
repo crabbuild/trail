@@ -7,6 +7,7 @@ const MAX_MATERIALIZATION_OPERATION_BYTES: u64 = 64 * 1024;
 // workspace-wide bound prevents a burst of lane spawns from saturating APFS
 // (or an equivalent POSIX filesystem) with clone and xattr operations.
 const MAX_CONCURRENT_NATIVE_MATERIALIZATIONS: usize = 16;
+const MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS: usize = 1;
 const NATIVE_MATERIALIZATION_ADMISSION_WAIT: std::time::Duration =
     std::time::Duration::from_secs(120);
 const MATERIALIZATION_COORDINATION_DIRECTORY: &str = "materialization-coordination";
@@ -147,10 +148,10 @@ impl NativeMaterializationAdmission {
     }
 }
 
-/// Holds one workspace-wide pre-open slot for a materializing CLI lane spawn.
+/// Holds the workspace-wide pre-open slot for a materializing CLI lane spawn.
 /// This deliberately uses a different slot namespace from the native-COW
-/// stage admission: it prevents a burst from overwhelming SQLite preflight,
-/// while the latter continues to bound filesystem clone work.
+/// stage admission: it serializes short SQLite preflight handoffs, while the
+/// latter continues to allow bounded concurrent filesystem clone work.
 pub(crate) struct PreOpenMaterializationAdmission {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     _slot: std::fs::File,
@@ -168,10 +169,11 @@ impl PreOpenMaterializationAdmission {
             let slots = materialization_coordination_directory(db_dir)?;
             let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
             let mut delay = std::time::Duration::from_millis(2);
-            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS;
             loop {
-                for offset in 0..MAX_CONCURRENT_NATIVE_MATERIALIZATIONS {
-                    let slot = (first_slot + offset) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+                for offset in 0..MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS {
+                    let slot =
+                        (first_slot + offset) % MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS;
                     let file =
                         slots.open_or_create_private_regular(&format!("spawn-slot-{slot:02}"))?;
                     match rustix::fs::flock(
