@@ -1097,15 +1097,13 @@ fn capture_worker(
                 }
             }
         }
-        if recovered_spill && pending.is_empty() && !merged_frames {
-            match spill.complete_claimed_frames_and_handoff(&spill_mode) {
-                Err(error) => {
-                    if health.record_error(&error) {
-                        eprintln!("trail acp capture warning: spill handoff failed: {error}");
-                    }
-                }
-                Ok(()) => {}
-            }
+        if recovered_spill
+            && pending.is_empty()
+            && !merged_frames
+            && let Err(error) = spill.complete_claimed_frames_and_handoff(&spill_mode)
+            && health.record_error(&error)
+        {
+            eprintln!("trail acp capture warning: spill handoff failed: {error}");
         }
         if merged_frames {
             sort_pending_frames(&mut pending);
@@ -1121,17 +1119,13 @@ fn capture_worker(
                     health
                         .last_projected_sequence
                         .store(frame.sequence, Ordering::Release);
-                    if pending.is_empty() {
-                        match spill.complete_claimed_frames_and_handoff(&spill_mode) {
-                            Err(error) => {
-                                if health.record_error(&error) {
-                                    eprintln!(
-                                        "trail acp capture warning: spill acknowledgement failed: {error}"
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
+                    if pending.is_empty()
+                        && let Err(error) = spill.complete_claimed_frames_and_handoff(&spill_mode)
+                        && health.record_error(&error)
+                    {
+                        eprintln!(
+                            "trail acp capture warning: spill acknowledgement failed: {error}"
+                        );
                     }
                 }
                 Err(error) => {
