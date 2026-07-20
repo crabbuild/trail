@@ -162,6 +162,20 @@ pub mod test_support {
         crate::db::set_lane_association_failure_for_current_thread(boundary);
     }
 
+    pub fn set_lane_initialization_wait_timeout_for_current_thread(
+        timeout: Option<std::time::Duration>,
+    ) {
+        crate::db::set_lane_initialization_wait_timeout_for_current_thread(timeout);
+    }
+
+    pub fn current_process_start_token() -> String {
+        crate::db::current_process_start_token_for_test()
+    }
+
+    pub fn steal_lane_initialization_owner_on_next_heartbeat_for_current_thread() {
+        crate::db::steal_lane_initialization_owner_on_next_heartbeat_for_current_thread();
+    }
+
     pub fn install_lane_record_after_c2_write_for_current_thread(
         path: std::path::PathBuf,
         bytes: Vec<u8>,

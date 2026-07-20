@@ -147,6 +147,16 @@ fn owner_process_match(pid: u32, start_identity: &str) -> ProcessIdentityMatch {
     process_start_token_match(pid, start_identity)
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static STEAL_OWNER_ON_NEXT_HEARTBEAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn steal_owner_on_next_heartbeat_for_current_thread() {
+    STEAL_OWNER_ON_NEXT_HEARTBEAT.with(|enabled| enabled.set(true));
+}
+
 pub(crate) fn claim_lane_initialization_owner(
     db: &mut Trail,
     request: &ResolvedLaneSpawnRequest,
@@ -466,6 +476,22 @@ pub(crate) fn heartbeat_lane_initialization_owner(
     initialization_id: &str,
     fence: &LaneInitializationFence,
 ) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if STEAL_OWNER_ON_NEXT_HEARTBEAT.with(|enabled| enabled.replace(false)) {
+        conn.execute(
+            "UPDATE lane_initialization_owners
+             SET owner_token=?1,owner_generation=owner_generation+1,
+                 owner_pid=?2,owner_process_start_identity='dead-test-owner'
+             WHERE initialization_id=?3 AND owner_token=?4 AND owner_generation=?5",
+            params![
+                "55".repeat(32),
+                u32::MAX,
+                initialization_id,
+                fence.owner_token,
+                fence.owner_generation,
+            ],
+        )?;
+    }
     let changed = conn.execute(
         "UPDATE lane_initialization_owners SET heartbeat_at=?1
          WHERE initialization_id=?2 AND owner_token=?3 AND owner_generation=?4",
@@ -479,9 +505,9 @@ pub(crate) fn heartbeat_lane_initialization_owner(
     if changed == 1 {
         return Ok(());
     }
-    Err(Error::Corrupt(format!(
-        "lane initialization `{initialization_id}` owner fence no longer matches"
-    )))
+    Err(Error::LaneInitializationOwnershipLost {
+        initialization_id: initialization_id.to_string(),
+    })
 }
 
 pub(crate) fn release_lane_initialization_owner(

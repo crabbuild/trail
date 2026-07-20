@@ -328,7 +328,7 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
-        Error::Corrupt(_) => {
+        Error::Corrupt(_) | Error::LaneInitializationOwnershipLost { .. } => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail detected damaged workspace data");
             diagnostic.consequence =

@@ -690,9 +690,9 @@ pub(crate) fn transition_lane_initialization(
 }
 
 fn lane_initialization_ownership_lost(initialization_id: &str) -> Error {
-    Error::Corrupt(format!(
-        "lane initialization `{initialization_id}` owner fence no longer matches"
-    ))
+    Error::LaneInitializationOwnershipLost {
+        initialization_id: initialization_id.to_string(),
+    }
 }
 
 impl Trail {

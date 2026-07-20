@@ -4856,6 +4856,23 @@ pub(crate) use change_ledger::{
 };
 mod core;
 mod lane;
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_lane_initialization_wait_timeout_for_current_thread(
+    timeout: Option<std::time::Duration>,
+) {
+    lane::set_lane_initialization_wait_timeout_for_current_thread(timeout);
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn current_process_start_token_for_test() -> String {
+    util::current_process_start_token()
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn steal_lane_initialization_owner_on_next_heartbeat_for_current_thread() {
+    lane::steal_owner_on_next_heartbeat_for_current_thread();
+}
 #[cfg(debug_assertions)]
 pub(crate) use lane::{
     clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,

@@ -58,6 +58,9 @@ pub enum Error {
         phase: crate::model::LaneInitializationPhase,
         retry_command: String,
     },
+    #[doc(hidden)]
+    #[error("lane initialization {initialization_id} owner fence no longer matches")]
+    LaneInitializationOwnershipLost { initialization_id: String },
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -148,6 +151,7 @@ impl Error {
             | Error::OperationCommittedRepairRequired { .. } => "COMMITTED_REPAIR_REQUIRED",
             Error::LaneInitializationConflict { .. } => "LANE_INITIALIZATION_CONFLICT",
             Error::LaneInitializationInProgress { .. } => "LANE_INITIALIZATION_IN_PROGRESS",
+            Error::LaneInitializationOwnershipLost { .. } => "LANE_INITIALIZATION_OWNERSHIP_LOST",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -208,6 +212,7 @@ impl Error {
             | Error::OperationCommittedRepairRequired { .. } => 16,
             Error::LaneInitializationConflict { .. }
             | Error::LaneInitializationInProgress { .. } => 2,
+            Error::LaneInitializationOwnershipLost { .. } => 1,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
             | Error::CloneUnsupported

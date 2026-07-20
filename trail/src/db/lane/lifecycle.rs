@@ -1125,13 +1125,31 @@ pub(crate) fn committed_lane_step<T>(
 }
 
 const LARGE_LANE_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
-const LANE_INITIALIZATION_REPAIR_WAIT_TIMEOUT: std::time::Duration =
+const LANE_INITIALIZATION_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
-fn lane_initialization_repair_wait_delay(
-    initialization_id: &str,
-    attempt: u32,
-) -> std::time::Duration {
+#[cfg(debug_assertions)]
+thread_local! {
+    static LANE_INITIALIZATION_WAIT_TIMEOUT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_lane_initialization_wait_timeout_for_current_thread(
+    timeout: Option<std::time::Duration>,
+) {
+    LANE_INITIALIZATION_WAIT_TIMEOUT_OVERRIDE.with(|selected| selected.set(timeout));
+}
+
+fn lane_initialization_wait_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(timeout) = LANE_INITIALIZATION_WAIT_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    LANE_INITIALIZATION_WAIT_TIMEOUT
+}
+
+fn lane_initialization_wait_delay(initialization_id: &str, attempt: u32) -> std::time::Duration {
     let base = 10_u64.saturating_mul(1_u64 << attempt.min(5)).min(250);
     let salt = initialization_id
         .bytes()
@@ -1231,9 +1249,23 @@ impl Trail {
         fence: &LaneInitializationFence,
         result: Result<T>,
     ) -> Result<T> {
-        result.map_err(|error| {
-            self.committed_lane_initialization_error(initialization, Some(fence), error)
+        result.map_err(|error| match error {
+            Error::LaneInitializationOwnershipLost { .. } => error,
+            _ => self.committed_lane_initialization_error(initialization, Some(fence), error),
         })
+    }
+
+    fn committed_lane_initialization_heartbeat(
+        &mut self,
+        initialization: &LaneInitializationRecord,
+        fence: &LaneInitializationFence,
+    ) -> Result<()> {
+        let heartbeat = heartbeat_lane_initialization_owner(
+            &self.conn,
+            &initialization.initialization_id,
+            fence,
+        );
+        self.committed_lane_initialization_step(initialization, fence, heartbeat)
     }
 
     fn release_lane_initialization_fence(
@@ -1260,9 +1292,9 @@ impl Trail {
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let publication = (|| -> Result<()> {
             if !owner_fence_matches(&self.conn, initialization_id, fence)? {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{initialization_id}` owner fence no longer matches"
-                )));
+                return Err(Error::LaneInitializationOwnershipLost {
+                    initialization_id: initialization_id.to_string(),
+                });
             }
             let event_exists: bool = self.conn.query_row(
                 "SELECT EXISTS(
@@ -1424,9 +1456,9 @@ impl Trail {
                 )));
             }
             if !owner_fence_matches(&self.conn, initialization_id, fence)? {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{initialization_id}` owner fence no longer matches"
-                )));
+                return Err(Error::LaneInitializationOwnershipLost {
+                    initialization_id: initialization_id.to_string(),
+                });
             }
             let event_exists: bool = self.conn.query_row(
                 "SELECT EXISTS(
@@ -1461,9 +1493,9 @@ impl Trail {
             }
             let released = release_lane_initialization_owner(&self.conn, initialization_id, fence)?;
             if !released {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{initialization_id}` owner fence no longer matches"
-                )));
+                return Err(Error::LaneInitializationOwnershipLost {
+                    initialization_id: initialization_id.to_string(),
+                });
             }
             lane_initialization_record(&self.conn, initialization_id)?.ok_or_else(|| {
                 Error::Corrupt(format!(
@@ -1736,6 +1768,37 @@ impl Trail {
         include_neighbors: bool,
         defer_initial_ledger: bool,
     ) -> Result<LaneSpawnReport> {
+        loop {
+            match self.spawn_lane_with_workdir_mode_paths_and_neighbors_once(
+                name,
+                from,
+                workdir_mode.clone(),
+                provider.clone(),
+                model.clone(),
+                workdir.clone(),
+                sparse_paths,
+                include_neighbors,
+                defer_initial_ledger,
+            ) {
+                Err(Error::LaneInitializationOwnershipLost { .. }) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_lane_with_workdir_mode_paths_and_neighbors_once(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        workdir_mode: LaneWorkdirMode,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+        defer_initial_ledger: bool,
+    ) -> Result<LaneSpawnReport> {
         // TRAIL_FS_PRODUCER: lane_spawn_materialize Materialize controlled
         let ledger_authority = crate::db::change_ledger::command_authority_enabled();
         validate_ref_segment(name)?;
@@ -1793,155 +1856,10 @@ impl Trail {
             Some(self.acquire_write_lock()?)
         };
         let repair_command = format!("trail lane repair-initialization {name}");
-        let reservation_lock = if ledger_authority {
-            Some(crate::db::acquire_workspace_lock_for_lane_association(
-                &self.db_dir,
-                &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
-                &request.initialization_id,
-                &repair_command,
-            )?)
-        } else {
-            None
-        };
-        let claim = claim_lane_initialization_owner(self, &request)?;
-        drop(reservation_lock);
-        let (initialization, fence, resumed) = match claim {
-            LaneInitializationClaim::Owned {
-                record,
-                fence,
-                resumed,
-            } => (record, fence, resumed),
-            LaneInitializationClaim::Terminal(record) => {
-                let report = self.lane_spawn_report_for_initialization(&record, true)?;
-                let validation = singleflight.validate();
-                if let Err(error) = validation {
-                    return Err(self.committed_lane_initialization_error(&record, None, error));
-                }
-                return Ok(report);
-            }
-            LaneInitializationClaim::Contended { record, owner_pid } => {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{}` for lane `{}` is owned by live process {owner_pid}",
-                    record.initialization_id, record.lane_name
-                )));
-            }
-        };
-        lane_initialization_crash_cut("after_reservation")?;
-        if matches!(
-            initialization.phase,
-            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
-        ) {
-            drop(_lock);
-            let report = self.repair_lane_initialization_owned(&initialization, &fence)?;
-            let validation = singleflight.validate();
-            self.committed_lane_initialization_step(&initialization, &fence, validation)?;
-            return Ok(report);
-        }
-        let transparent_cow_available = request.requested_workdir_mode.is_transparent_cow();
-        let mut sparse_policy_paths = None;
-        let mut resolved_workdir_mode = request.requested_workdir_mode.clone();
-        let mut workdir_backend = request
-            .requested_workdir_mode
-            .default_backend()
-            .unwrap_or(WorkdirBackend::Clone);
-        let mut materialization_report: Option<MaterializationReport> = initialization
-            .materialization_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?;
-        let mut materialization_operation_id = if initialization.phase
-            == LaneInitializationPhase::Materialized
-            && request.workdir.is_some()
-        {
-            Some(initialization.operation_id.clone())
-        } else {
-            None
-        };
-        if let Some(report) = &materialization_report {
-            workdir_backend = report.backend();
-        }
-        fail_lane_initialization_io_if_requested("workdir_write")?;
-        let materialized_workdir = if initialization.phase == LaneInitializationPhase::Materialized
-        {
-            initialization
-                .workdir
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned())
-        } else if let Some(dir) = &request.workdir {
-            match &request.requested_workdir_mode {
-                LaneWorkdirMode::FuseCow => {
-                    self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
-                }
-                LaneWorkdirMode::DokanCow => {
-                    #[cfg(target_os = "windows")]
-                    self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
-                    #[cfg(not(target_os = "windows"))]
-                    return Err(Error::InvalidInput(
-                        "dokan-cow workdirs are currently supported only on Windows".to_string(),
-                    ));
-                }
-                LaneWorkdirMode::NfsCow => {
-                    self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
-                }
-                LaneWorkdirMode::Sparse => {
-                    let (report, operation_id) = self
-                        .materialize_lane_workdir_at_paths_with_neighbors(
-                            &request.source_root,
-                            dir,
-                            workdir.is_some(),
-                            &request.sparse_paths,
-                            request.include_neighbors,
-                        )?;
-                    materialization_operation_id = operation_id;
-                    if let Some(report) = report {
-                        workdir_backend = report.backend();
-                        materialization_report = Some(report);
-                    }
-                    if !request.sparse_paths.is_empty() {
-                        sparse_policy_paths = self.sparse_workdir_paths(dir)?;
-                    }
-                }
-                LaneWorkdirMode::NativeCow
-                | LaneWorkdirMode::PortableCopy
-                | LaneWorkdirMode::Auto => {
-                    let policy = match request.requested_workdir_mode {
-                        LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
-                        LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
-                        LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
-                        _ => unreachable!(),
-                    };
-                    let outcome = self.materialize_lane_root_staged(
-                        &request.source_root,
-                        dir,
-                        workdir.is_some(),
-                        policy,
-                    )?;
-                    resolved_workdir_mode = outcome.resolved_mode;
-                    workdir_backend = outcome.backend;
-                    materialization_operation_id =
-                        Some(outcome.materialization_operation_id.clone());
-                    materialization_report = Some(outcome.report);
-                }
-                LaneWorkdirMode::Virtual => {}
-            }
-            Some(dir.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        let initialization_operation = materialization_operation_id
-            .as_ref()
-            .map(|operation_id| ObjectId(operation_id.clone()))
-            .unwrap_or_else(|| request.source_operation.clone());
-        for boundary in ["file_sync", "directory_sync"] {
-            if let Err(error) = fail_lane_initialization_io_if_requested(boundary) {
-                if let Some(operation_id) = materialization_operation_id.as_deref() {
-                    self.abort_materialization_operation(operation_id)?;
-                }
-                return Err(error);
-            }
-        }
-        if initialization.phase == LaneInitializationPhase::Reserved {
-            let materialization_lock = if ledger_authority {
+        let deadline = std::time::Instant::now() + lane_initialization_wait_timeout();
+        let mut wait_attempt = 0_u32;
+        let (initialization, fence, resumed) = loop {
+            let reservation_lock = if ledger_authority {
                 Some(crate::db::acquire_workspace_lock_for_lane_association(
                     &self.db_dir,
                     &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
@@ -1951,54 +1869,224 @@ impl Trail {
             } else {
                 None
             };
-            self.mark_lane_initialization_materialized(
-                &request,
-                &fence,
-                &initialization_operation,
-                materialization_report.as_ref(),
-            )?;
-            drop(materialization_lock);
-        }
-        lane_initialization_crash_cut("after_materialization")?;
-        let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
-        let requested_workdir_mode = request.requested_workdir_mode.clone();
-        let metadata_json = serde_json::to_string(&serde_json::json!({
-            "source_ref": request.source_ref,
-            "requested_workdir_mode": requested_workdir_mode.as_str(),
-            "workdir_mode": resolved_workdir_mode.as_str(),
-            "workdir_backend": workdir_backend.as_str(),
-            "materialization": materialization_report,
-            "sparse_paths": sparse_paths_for_report,
-            "include_neighbors": request.include_neighbors,
-            "transparent_cow_available": transparent_cow_available
-        }))?;
-        let now = now_ts();
-        let association_lock = if ledger_authority {
-            Some(crate::db::acquire_workspace_lock_for_lane_association(
-                &self.db_dir,
-                &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
-                &request.initialization_id,
-                &repair_command,
-            )?)
-        } else {
-            None
-        };
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let association = (|| -> Result<()> {
-            if !owner_fence_matches(&self.conn, &request.initialization_id, &fence)? {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{}` owner fence no longer matches",
-                    request.initialization_id
-                )));
+            let claim = claim_lane_initialization_owner(self, &request)?;
+            drop(reservation_lock);
+            match claim {
+                LaneInitializationClaim::Owned {
+                    record,
+                    fence,
+                    resumed,
+                } => break (record, fence, resumed),
+                LaneInitializationClaim::Terminal(record) => {
+                    let report = self.lane_spawn_report_for_initialization(&record, true)?;
+                    let validation = singleflight.validate();
+                    if let Err(error) = validation {
+                        return Err(self.committed_lane_initialization_error(&record, None, error));
+                    }
+                    return Ok(report);
+                }
+                LaneInitializationClaim::Contended { record, owner_pid } => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::LaneInitializationInProgress {
+                            lane: record.lane_name,
+                            initialization_id: record.initialization_id,
+                            owner_pid,
+                            phase: record.phase,
+                            retry_command: format!("trail lane spawn {name}"),
+                        });
+                    }
+                    std::thread::sleep(lane_initialization_wait_delay(
+                        &record.initialization_id,
+                        wait_attempt,
+                    ));
+                    wait_attempt = wait_attempt.saturating_add(1);
+                }
             }
-            self.insert_new_ref_database_only(
-                &ref_name,
-                &request.source_change,
-                &request.source_root,
-                &request.source_operation,
+        };
+        let owned_result = (|| -> Result<LaneSpawnReport> {
+            lane_initialization_crash_cut("after_reservation")?;
+            if matches!(
+                initialization.phase,
+                LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+            ) {
+                drop(_lock);
+                let report = self.repair_lane_initialization_owned(&initialization, &fence)?;
+                let validation = singleflight.validate();
+                self.committed_lane_initialization_step(&initialization, &fence, validation)?;
+                return Ok(report);
+            }
+            heartbeat_lane_initialization_owner(
+                &self.conn,
+                &initialization.initialization_id,
+                &fence,
             )?;
-            fail_lane_association_if_requested("spawn_after_ref")?;
-            self.conn.execute(
+            let transparent_cow_available = request.requested_workdir_mode.is_transparent_cow();
+            let mut sparse_policy_paths = None;
+            let mut resolved_workdir_mode = request.requested_workdir_mode.clone();
+            let mut workdir_backend = request
+                .requested_workdir_mode
+                .default_backend()
+                .unwrap_or(WorkdirBackend::Clone);
+            let mut materialization_report: Option<MaterializationReport> = initialization
+                .materialization_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?;
+            let mut materialization_operation_id = if initialization.phase
+                == LaneInitializationPhase::Materialized
+                && request.workdir.is_some()
+            {
+                Some(initialization.operation_id.clone())
+            } else {
+                None
+            };
+            if let Some(report) = &materialization_report {
+                workdir_backend = report.backend();
+            }
+            fail_lane_initialization_io_if_requested("workdir_write")?;
+            let materialized_workdir =
+                if initialization.phase == LaneInitializationPhase::Materialized {
+                    initialization
+                        .workdir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                } else if let Some(dir) = &request.workdir {
+                    match &request.requested_workdir_mode {
+                        LaneWorkdirMode::FuseCow => {
+                            self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
+                        }
+                        LaneWorkdirMode::DokanCow => {
+                            #[cfg(target_os = "windows")]
+                            self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
+                            #[cfg(not(target_os = "windows"))]
+                            return Err(Error::InvalidInput(
+                                "dokan-cow workdirs are currently supported only on Windows"
+                                    .to_string(),
+                            ));
+                        }
+                        LaneWorkdirMode::NfsCow => {
+                            self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
+                        }
+                        LaneWorkdirMode::Sparse => {
+                            let (report, operation_id) = self
+                                .materialize_lane_workdir_at_paths_with_neighbors(
+                                    &request.source_root,
+                                    dir,
+                                    workdir.is_some(),
+                                    &request.sparse_paths,
+                                    request.include_neighbors,
+                                )?;
+                            materialization_operation_id = operation_id;
+                            if let Some(report) = report {
+                                workdir_backend = report.backend();
+                                materialization_report = Some(report);
+                            }
+                            if !request.sparse_paths.is_empty() {
+                                sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+                            }
+                        }
+                        LaneWorkdirMode::NativeCow
+                        | LaneWorkdirMode::PortableCopy
+                        | LaneWorkdirMode::Auto => {
+                            let policy = match request.requested_workdir_mode {
+                                LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
+                                LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
+                                LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
+                                _ => unreachable!(),
+                            };
+                            let outcome = self.materialize_lane_root_staged(
+                                &request.source_root,
+                                dir,
+                                workdir.is_some(),
+                                policy,
+                            )?;
+                            resolved_workdir_mode = outcome.resolved_mode;
+                            workdir_backend = outcome.backend;
+                            materialization_operation_id =
+                                Some(outcome.materialization_operation_id.clone());
+                            materialization_report = Some(outcome.report);
+                        }
+                        LaneWorkdirMode::Virtual => {}
+                    }
+                    Some(dir.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+            let initialization_operation = materialization_operation_id
+                .as_ref()
+                .map(|operation_id| ObjectId(operation_id.clone()))
+                .unwrap_or_else(|| request.source_operation.clone());
+            for boundary in ["file_sync", "directory_sync"] {
+                if let Err(error) = fail_lane_initialization_io_if_requested(boundary) {
+                    if let Some(operation_id) = materialization_operation_id.as_deref() {
+                        self.abort_materialization_operation(operation_id)?;
+                    }
+                    return Err(error);
+                }
+            }
+            if initialization.phase == LaneInitializationPhase::Reserved {
+                let materialization_lock = if ledger_authority {
+                    Some(crate::db::acquire_workspace_lock_for_lane_association(
+                        &self.db_dir,
+                        &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                        &request.initialization_id,
+                        &repair_command,
+                    )?)
+                } else {
+                    None
+                };
+                self.mark_lane_initialization_materialized(
+                    &request,
+                    &fence,
+                    &initialization_operation,
+                    materialization_report.as_ref(),
+                )?;
+                drop(materialization_lock);
+            }
+            heartbeat_lane_initialization_owner(
+                &self.conn,
+                &initialization.initialization_id,
+                &fence,
+            )?;
+            lane_initialization_crash_cut("after_materialization")?;
+            let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
+            let requested_workdir_mode = request.requested_workdir_mode.clone();
+            let metadata_json = serde_json::to_string(&serde_json::json!({
+                "source_ref": request.source_ref,
+                "requested_workdir_mode": requested_workdir_mode.as_str(),
+                "workdir_mode": resolved_workdir_mode.as_str(),
+                "workdir_backend": workdir_backend.as_str(),
+                "materialization": materialization_report,
+                "sparse_paths": sparse_paths_for_report,
+                "include_neighbors": request.include_neighbors,
+                "transparent_cow_available": transparent_cow_available
+            }))?;
+            let now = now_ts();
+            let association_lock = if ledger_authority {
+                Some(crate::db::acquire_workspace_lock_for_lane_association(
+                    &self.db_dir,
+                    &self.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                    &request.initialization_id,
+                    &repair_command,
+                )?)
+            } else {
+                None
+            };
+            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let association = (|| -> Result<()> {
+                if !owner_fence_matches(&self.conn, &request.initialization_id, &fence)? {
+                    return Err(Error::LaneInitializationOwnershipLost {
+                        initialization_id: request.initialization_id.clone(),
+                    });
+                }
+                self.insert_new_ref_database_only(
+                    &ref_name,
+                    &request.source_change,
+                    &request.source_root,
+                    &request.source_operation,
+                )?;
+                fail_lane_association_if_requested("spawn_after_ref")?;
+                self.conn.execute(
                 "INSERT INTO lanes (lane_id, name, kind, provider, model, created_at, metadata_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -2011,8 +2099,8 @@ impl Trail {
                     metadata_json
                 ],
             )?;
-            fail_lane_association_if_requested("spawn_after_lane")?;
-            self.conn.execute(
+                fail_lane_association_if_requested("spawn_after_lane")?;
+                self.conn.execute(
                 "INSERT INTO lane_branches \
                  (lane_id, ref_name, base_change, head_change, base_root, head_root, session_id, workdir, status, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
@@ -2028,90 +2116,246 @@ impl Trail {
                     now
                 ],
             )?;
-            fail_lane_association_if_requested("spawn_after_branch")?;
-            fail_lane_initialization_io_if_requested("association_sqlite_commit")?;
-            let changed = self.conn.execute(
-                "UPDATE lane_initializations SET phase='associated',updated_at=?1
+                fail_lane_association_if_requested("spawn_after_branch")?;
+                fail_lane_initialization_io_if_requested("association_sqlite_commit")?;
+                let changed = self.conn.execute(
+                    "UPDATE lane_initializations SET phase='associated',updated_at=?1
                  WHERE initialization_id=?2 AND request_fingerprint=?3
                    AND phase='materialized'
                    AND EXISTS(
                      SELECT 1 FROM lane_initialization_owners owner
                      WHERE owner.initialization_id=lane_initializations.initialization_id
                        AND owner.owner_token=?4 AND owner.owner_generation=?5)",
-                params![
-                    now,
-                    request.initialization_id,
-                    request.request_fingerprint,
-                    fence.owner_token,
-                    fence.owner_generation,
-                ],
-            )?;
-            if changed != 1 {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{}` could not transition materialized -> associated",
-                    request.initialization_id
-                )));
-            }
-            let owner_changed = self.conn.execute(
-                "UPDATE lane_initialization_owners SET heartbeat_at=?1
+                    params![
+                        now,
+                        request.initialization_id,
+                        request.request_fingerprint,
+                        fence.owner_token,
+                        fence.owner_generation,
+                    ],
+                )?;
+                if changed != 1 {
+                    if !owner_fence_matches(&self.conn, &request.initialization_id, &fence)? {
+                        return Err(Error::LaneInitializationOwnershipLost {
+                            initialization_id: request.initialization_id.clone(),
+                        });
+                    }
+                    return Err(Error::Corrupt(format!(
+                        "lane initialization `{}` could not transition materialized -> associated",
+                        request.initialization_id
+                    )));
+                }
+                let owner_changed = self.conn.execute(
+                    "UPDATE lane_initialization_owners SET heartbeat_at=?1
                  WHERE initialization_id=?2 AND owner_token=?3 AND owner_generation=?4",
-                params![
-                    now,
-                    request.initialization_id,
-                    fence.owner_token,
-                    fence.owner_generation,
-                ],
-            )?;
-            if owner_changed != 1 {
-                return Err(Error::Corrupt(format!(
-                    "lane initialization `{}` owner fence no longer matches",
-                    request.initialization_id
-                )));
-            }
-            Ok(())
-        })();
-        match association {
-            Ok(()) => self.conn.execute_batch("COMMIT;")?,
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                self.release_lane_initialization_fence(&request.initialization_id, &fence)?;
-                return Err(error);
-            }
-        }
-        drop(association_lock);
-        lane_initialization_crash_cut("after_association")?;
-        let committed_operation = materialization_operation_id
-            .clone()
-            .unwrap_or_else(|| request.source_operation.0.clone());
-        let mirror = (|| {
-            fail_lane_association_if_requested("spawn_ref_repair")?;
-            self.repair_new_ref_mirror(
-                &ref_name,
-                &request.source_change,
-                &request.source_root,
-                &request.source_operation,
-            )
-        })();
-        self.committed_lane_initialization_step(&initialization, &fence, mirror)?;
-        lane_initialization_crash_cut("after_reconciliation")?;
-        if let Some(operation_id) = materialization_operation_id.as_deref() {
-            let journal = (|| {
-                fail_lane_association_if_requested("spawn_journal_completion")?;
-                self.complete_materialization_operation(operation_id)
+                    params![
+                        now,
+                        request.initialization_id,
+                        fence.owner_token,
+                        fence.owner_generation,
+                    ],
+                )?;
+                if owner_changed != 1 {
+                    return Err(Error::LaneInitializationOwnershipLost {
+                        initialization_id: request.initialization_id.clone(),
+                    });
+                }
+                Ok(())
             })();
-            self.committed_lane_initialization_step(&initialization, &fence, journal)?;
-        }
-        let reconciliation = fail_lane_association_if_requested("spawn_after_commit");
-        self.committed_lane_initialization_step(&initialization, &fence, reconciliation)?;
-        if defer_initial_ledger
-            && ledger_authority
-            && materialized_workdir.is_some()
-            && !request.requested_workdir_mode.is_transparent_cow()
-        {
+            match association {
+                Ok(()) => self.conn.execute_batch("COMMIT;")?,
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    self.release_lane_initialization_fence(&request.initialization_id, &fence)?;
+                    return Err(error);
+                }
+            }
+            drop(association_lock);
+            lane_initialization_crash_cut("after_association")?;
+            let committed_operation = materialization_operation_id
+                .clone()
+                .unwrap_or_else(|| request.source_operation.0.clone());
+            self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            let mirror = (|| {
+                fail_lane_association_if_requested("spawn_ref_repair")?;
+                self.repair_new_ref_mirror(
+                    &ref_name,
+                    &request.source_change,
+                    &request.source_root,
+                    &request.source_operation,
+                )
+            })();
+            self.committed_lane_initialization_step(&initialization, &fence, mirror)?;
+            self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            lane_initialization_crash_cut("after_reconciliation")?;
+            if let Some(operation_id) = materialization_operation_id.as_deref() {
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+                let journal = (|| {
+                    fail_lane_association_if_requested("spawn_journal_completion")?;
+                    self.complete_materialization_operation(operation_id)
+                })();
+                self.committed_lane_initialization_step(&initialization, &fence, journal)?;
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            }
+            let reconciliation = fail_lane_association_if_requested("spawn_after_commit");
+            self.committed_lane_initialization_step(&initialization, &fence, reconciliation)?;
+            if defer_initial_ledger
+                && ledger_authority
+                && materialized_workdir.is_some()
+                && !request.requested_workdir_mode.is_transparent_cow()
+            {
+                let report = LaneSpawnReport {
+                    initialization_id: initialization.initialization_id.clone(),
+                    request_fingerprint: initialization.request_fingerprint.clone(),
+                    phase: LaneInitializationPhase::Associated,
+                    committed: true,
+                    resumed,
+                    completed_deferred_initialization: false,
+                    lane_id,
+                    ref_name,
+                    base_change: request.source_change,
+                    workdir: materialized_workdir,
+                    requested_workdir_mode,
+                    workdir_mode: resolved_workdir_mode,
+                    workdir_backend: Some(workdir_backend),
+                    materialization: materialization_report,
+                    sparse_paths: sparse_policy_paths.unwrap_or_default(),
+                    transparent_cow_available,
+                };
+                let validation = singleflight.validate();
+                self.committed_lane_initialization_step(&initialization, &fence, validation)?;
+                let release = self
+                    .release_lane_initialization_fence(&initialization.initialization_id, &fence)
+                    .and_then(|released| {
+                        if released {
+                            Ok(())
+                        } else {
+                            Err(Error::LaneInitializationOwnershipLost {
+                                initialization_id: initialization.initialization_id.clone(),
+                            })
+                        }
+                    });
+                self.committed_lane_initialization_step(&initialization, &fence, release)?;
+                return Ok(report);
+            }
+            if ledger_authority
+                && materialized_workdir.is_some()
+                && !request.requested_workdir_mode.is_transparent_cow()
+            {
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+                let expected_result =
+                    crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
+                        self, &lane_id,
+                    );
+                let expected = self.committed_lane_initialization_step(
+                    &initialization,
+                    &fence,
+                    expected_result,
+                )?;
+                let evidence = crate::db::change_ledger::IntentEvidence {
+                    exact_paths: Vec::new(),
+                    complete_prefixes: Vec::new(),
+                };
+                let alignment = crate::db::change_ledger::run_projection_alignment(
+                    self,
+                    &expected,
+                    crate::db::change_ledger::IntentProducer::Materialize,
+                    &evidence,
+                    crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
+                    |db, intent| {
+                        crate::db::change_ledger::with_materialized_lane_controlled_interval(
+                            db,
+                            &lane_id,
+                            intent,
+                            &evidence,
+                            |_| Ok(()),
+                            |db, policy, candidates| {
+                                let comparison = db.compare_controlled_projection_target(
+                                policy,
+                                candidates,
+                                &request.source_root,
+                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
+                            )?;
+                                if comparison.summaries.is_empty() {
+                                    Ok(())
+                                } else {
+                                    Err(Error::ChangeLedgerReconcileRequired {
+                                    scope: expected.scope_id.to_text(),
+                                    state: "stale_baseline".into(),
+                                    reason: format!(
+                                        "initial lane materialization did not match its target root: {:?}",
+                                        comparison.summaries
+                                    ),
+                                    command: format!("trail lane status {lane_id}"),
+                                })
+                                }
+                            },
+                        )
+                    },
+                    |db| db.publish_lane_marker_if_materialized(&lane_id),
+                );
+                self.committed_lane_initialization_step(&initialization, &fence, alignment)?;
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            } else if materialized_workdir.is_some() {
+                let marker = (|| {
+                    fail_lane_association_if_requested("spawn_marker")?;
+                    self.publish_lane_marker_if_materialized(name)
+                })();
+                self.committed_lane_initialization_step(&initialization, &fence, marker)?;
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            }
+            lane_initialization_crash_cut("after_marker")?;
+            if request.requested_workdir_mode.is_transparent_cow() {
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+                committed_lane_step(
+                    &committed_operation,
+                    "initial lane workspace view publication",
+                    (|| {
+                        fail_lane_association_if_requested("spawn_workspace_view")?;
+                        let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
+                            Error::Corrupt("transparent COW lane has no mountpoint".to_string())
+                        })?;
+                        self.create_workspace_view(
+                            &lane_id,
+                            &request.source_change,
+                            &request.source_root,
+                            platform_workspace_backend(&request.requested_workdir_mode),
+                            Path::new(mountpoint),
+                        )
+                    })(),
+                )?;
+                self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
+            }
+            let spawn_payload = serde_json::json!({
+                "ref_name": ref_name.clone(),
+                "base_root": request.source_root.0.clone(),
+                "workdir": materialized_workdir.clone(),
+                "requested_workdir_mode": requested_workdir_mode.as_str(),
+                "workdir_mode": resolved_workdir_mode.as_str(),
+                "workdir_backend": workdir_backend.as_str(),
+                "materialization": materialization_report,
+                "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
+                "include_neighbors": request.include_neighbors,
+                "transparent_cow_available": transparent_cow_available
+            });
+            let spawn_event = (|| {
+                fail_lane_association_if_requested("spawn_event")?;
+                self.publish_owned_lane_spawn_event(
+                    &request.initialization_id,
+                    &fence,
+                    &lane_id,
+                    &request.source_change,
+                    &spawn_payload,
+                )
+            })();
+            self.committed_lane_initialization_step(&initialization, &fence, spawn_event)?;
+            lane_initialization_crash_cut("after_spawn_event")?;
+            let observer_ready = self.mark_lane_initialization_observer_ready(&request, &fence);
+            self.committed_lane_initialization_step(&initialization, &fence, observer_ready)?;
             let report = LaneSpawnReport {
-                initialization_id: initialization.initialization_id.clone(),
-                request_fingerprint: initialization.request_fingerprint.clone(),
-                phase: LaneInitializationPhase::Associated,
+                initialization_id: request.initialization_id,
+                request_fingerprint: request.request_fingerprint,
+                phase: LaneInitializationPhase::ObserverReady,
                 committed: true,
                 resumed,
                 completed_deferred_initialization: false,
@@ -2128,148 +2372,24 @@ impl Trail {
             };
             let validation = singleflight.validate();
             self.committed_lane_initialization_step(&initialization, &fence, validation)?;
-            let release = self
-                .release_lane_initialization_fence(&initialization.initialization_id, &fence)
-                .and_then(|released| {
-                    if released {
-                        Ok(())
-                    } else {
-                        Err(Error::Corrupt(format!(
-                            "lane initialization `{}` owner fence no longer matches",
-                            initialization.initialization_id
-                        )))
-                    }
-                });
-            self.committed_lane_initialization_step(&initialization, &fence, release)?;
-            return Ok(report);
-        }
-        if ledger_authority
-            && materialized_workdir.is_some()
-            && !request.requested_workdir_mode.is_transparent_cow()
-        {
-            let expected_result =
-                crate::db::change_ledger::prepare_materialized_lane_controlled_projection(
-                    self, &lane_id,
-                );
-            let expected =
-                self.committed_lane_initialization_step(&initialization, &fence, expected_result)?;
-            let evidence = crate::db::change_ledger::IntentEvidence {
-                exact_paths: Vec::new(),
-                complete_prefixes: Vec::new(),
-            };
-            let alignment = crate::db::change_ledger::run_projection_alignment(
-                self,
-                &expected,
-                crate::db::change_ledger::IntentProducer::Materialize,
-                &evidence,
-                crate::db::change_ledger::ProjectionAlignmentMode::Aligned,
-                |db, intent| {
-                    crate::db::change_ledger::with_materialized_lane_controlled_interval(
-                        db,
-                        &lane_id,
-                        intent,
-                        &evidence,
-                        |_| Ok(()),
-                        |db, policy, candidates| {
-                            let comparison = db.compare_controlled_projection_target(
-                                policy,
-                                candidates,
-                                &request.source_root,
-                                crate::db::change_ledger::CandidateMaterialization::ManifestOnly,
-                            )?;
-                            if comparison.summaries.is_empty() {
-                                Ok(())
-                            } else {
-                                Err(Error::ChangeLedgerReconcileRequired {
-                                    scope: expected.scope_id.to_text(),
-                                    state: "stale_baseline".into(),
-                                    reason: format!(
-                                        "initial lane materialization did not match its target root: {:?}",
-                                        comparison.summaries
-                                    ),
-                                    command: format!("trail lane status {lane_id}"),
-                                })
-                            }
-                        },
-                    )
-                },
-                |db| db.publish_lane_marker_if_materialized(&lane_id),
-            );
-            self.committed_lane_initialization_step(&initialization, &fence, alignment)?;
-        } else if materialized_workdir.is_some() {
-            let marker = (|| {
-                fail_lane_association_if_requested("spawn_marker")?;
-                self.publish_lane_marker_if_materialized(name)
-            })();
-            self.committed_lane_initialization_step(&initialization, &fence, marker)?;
-        }
-        lane_initialization_crash_cut("after_marker")?;
-        if request.requested_workdir_mode.is_transparent_cow() {
-            committed_lane_step(
-                &committed_operation,
-                "initial lane workspace view publication",
-                (|| {
-                    fail_lane_association_if_requested("spawn_workspace_view")?;
-                    let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
-                        Error::Corrupt("transparent COW lane has no mountpoint".to_string())
-                    })?;
-                    self.create_workspace_view(
-                        &lane_id,
-                        &request.source_change,
-                        &request.source_root,
-                        platform_workspace_backend(&request.requested_workdir_mode),
-                        Path::new(mountpoint),
-                    )
-                })(),
-            )?;
-        }
-        let spawn_payload = serde_json::json!({
-            "ref_name": ref_name.clone(),
-            "base_root": request.source_root.0.clone(),
-            "workdir": materialized_workdir.clone(),
-            "requested_workdir_mode": requested_workdir_mode.as_str(),
-            "workdir_mode": resolved_workdir_mode.as_str(),
-            "workdir_backend": workdir_backend.as_str(),
-            "materialization": materialization_report,
-            "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
-            "include_neighbors": request.include_neighbors,
-            "transparent_cow_available": transparent_cow_available
-        });
-        let spawn_event = (|| {
-            fail_lane_association_if_requested("spawn_event")?;
-            self.publish_owned_lane_spawn_event(
-                &request.initialization_id,
-                &fence,
-                &lane_id,
-                &request.source_change,
-                &spawn_payload,
-            )
+            Ok(report)
         })();
-        self.committed_lane_initialization_step(&initialization, &fence, spawn_event)?;
-        lane_initialization_crash_cut("after_spawn_event")?;
-        let observer_ready = self.mark_lane_initialization_observer_ready(&request, &fence);
-        self.committed_lane_initialization_step(&initialization, &fence, observer_ready)?;
-        let report = LaneSpawnReport {
-            initialization_id: request.initialization_id,
-            request_fingerprint: request.request_fingerprint,
-            phase: LaneInitializationPhase::ObserverReady,
-            committed: true,
-            resumed,
-            completed_deferred_initialization: false,
-            lane_id,
-            ref_name,
-            base_change: request.source_change,
-            workdir: materialized_workdir,
-            requested_workdir_mode,
-            workdir_mode: resolved_workdir_mode,
-            workdir_backend: Some(workdir_backend),
-            materialization: materialization_report,
-            sparse_paths: sparse_policy_paths.unwrap_or_default(),
-            transparent_cow_available,
-        };
-        let validation = singleflight.validate();
-        self.committed_lane_initialization_step(&initialization, &fence, validation)?;
-        Ok(report)
+        if owned_result.is_err() {
+            if let Ok(Some(current)) =
+                lane_initialization_record(&self.conn, &initialization.initialization_id)
+            {
+                if matches!(
+                    current.phase,
+                    LaneInitializationPhase::Reserved | LaneInitializationPhase::Materialized
+                ) {
+                    let _ = self.release_lane_initialization_fence(
+                        &initialization.initialization_id,
+                        &fence,
+                    );
+                }
+            }
+        }
+        owned_result
     }
 
     #[doc(hidden)]
@@ -2475,7 +2595,7 @@ impl Trail {
     }
 
     fn repair_lane_initialization_with_claim(&mut self, lane: &str) -> Result<LaneSpawnReport> {
-        let deadline = std::time::Instant::now() + LANE_INITIALIZATION_REPAIR_WAIT_TIMEOUT;
+        let deadline = std::time::Instant::now() + lane_initialization_wait_timeout();
         let mut attempt = 0_u32;
         loop {
             match claim_lane_initialization_repair(self, lane)? {
@@ -2484,9 +2604,17 @@ impl Trail {
                 }
                 LaneInitializationRepairClaim::Owned { record, fence } => {
                     let result = self.repair_lane_initialization_once(&record, Some(&fence), true);
-                    return result.map_err(|error| {
-                        self.committed_lane_initialization_error(&record, Some(&fence), error)
-                    });
+                    match result {
+                        Err(Error::LaneInitializationOwnershipLost { .. }) => continue,
+                        Err(error) => {
+                            return Err(self.committed_lane_initialization_error(
+                                &record,
+                                Some(&fence),
+                                error,
+                            ));
+                        }
+                        Ok(report) => return Ok(report),
+                    }
                 }
                 LaneInitializationRepairClaim::Contended { record, owner_pid } => {
                     if record.phase == LaneInitializationPhase::Associated {
@@ -2504,7 +2632,7 @@ impl Trail {
                             retry_command: format!("trail lane repair-initialization {}", lane),
                         });
                     }
-                    std::thread::sleep(lane_initialization_repair_wait_delay(
+                    std::thread::sleep(lane_initialization_wait_delay(
                         &record.initialization_id,
                         attempt,
                     ));
@@ -2520,8 +2648,9 @@ impl Trail {
         fence: &LaneInitializationFence,
     ) -> Result<LaneSpawnReport> {
         let result = self.repair_lane_initialization_once(initialization, Some(fence), false);
-        result.map_err(|error| {
-            self.committed_lane_initialization_error(initialization, Some(fence), error)
+        result.map_err(|error| match error {
+            Error::LaneInitializationOwnershipLost { .. } => error,
+            _ => self.committed_lane_initialization_error(initialization, Some(fence), error),
         })
     }
 
@@ -2594,6 +2723,7 @@ impl Trail {
             &head.root_id,
             &head.operation_id,
         )?;
+        lane_initialization_crash_cut("repair_after_ref_mirror")?;
         if let Some(fence) = fence {
             heartbeat_lane_initialization_owner(
                 &self.conn,
@@ -2614,6 +2744,7 @@ impl Trail {
                 self.complete_materialization_operation(&initialization.operation_id)?;
             }
         }
+        lane_initialization_crash_cut("repair_after_journal")?;
         if let Some(fence) = fence {
             heartbeat_lane_initialization_owner(
                 &self.conn,
@@ -2621,6 +2752,7 @@ impl Trail {
                 fence,
             )?;
         }
+        lane_initialization_crash_cut("repair_before_observer_ready")?;
         self.resume_deferred_initial_lane_ledger_inner(
             &initialization.lane_name,
             fence,

@@ -15,6 +15,10 @@ const CRASH_AFTER: &str = "TRAIL_TEST_LANE_INITIALIZATION_CRASH_AFTER";
 const HANDSHAKE: &str = "TRAIL_TEST_LANE_INITIALIZATION_HANDSHAKE";
 const SINGLEFLIGHT_CRASH_AFTER: &str = "TRAIL_TEST_LANE_SINGLEFLIGHT_CRASH_AFTER";
 const SINGLEFLIGHT_FAIL_AT: &str = "TRAIL_TEST_LANE_SINGLEFLIGHT_FAIL_AT";
+const CHILD_EXPECT_SUCCESS: &str = "TRAIL_TEST_LANE_INITIALIZATION_EXPECT_SUCCESS";
+const CHILD_REPAIR_LANE: &str = "TRAIL_TEST_LANE_INITIALIZATION_REPAIR_LANE";
+const CHILD_READY: &str = "TRAIL_TEST_LANE_INITIALIZATION_CHILD_READY";
+const CHILD_START: &str = "TRAIL_TEST_LANE_INITIALIZATION_CHILD_START";
 
 fn initialize_workspace(path: &Path) {
     Trail::init(path, "main", InitImportMode::Empty, false).unwrap();
@@ -253,21 +257,42 @@ fn lane_initialization_crash_child() {
         trail::test_support::set_changed_path_authority_override(true);
     }
     let mut db = Trail::open(workspace).unwrap();
-    let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
-        "crash-lane",
-        Some("main"),
-        LaneWorkdirMode::PortableCopy,
-        Some("codex".into()),
-        Some("gpt-5".into()),
-        None,
-        &[],
-        false,
-    );
+    if let (Some(ready), Some(start)) =
+        (std::env::var_os(CHILD_READY), std::env::var_os(CHILD_START))
+    {
+        fs::write(ready, b"ready\n").unwrap();
+        let start = PathBuf::from(start);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !start.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            start.exists(),
+            "process coordination start barrier timed out"
+        );
+    }
+    let result = if let Ok(lane) = std::env::var(CHILD_REPAIR_LANE) {
+        db.repair_lane_initialization(&lane)
+    } else {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "crash-lane",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            Some("codex".into()),
+            Some("gpt-5".into()),
+            None,
+            &[],
+            false,
+        )
+    };
     if std::env::var_os(SINGLEFLIGHT_FAIL_AT).is_some() {
         assert!(
             result.is_err(),
             "singleflight publication fault was ignored"
         );
+    }
+    if std::env::var_os(CHILD_EXPECT_SUCCESS).is_some() {
+        result.unwrap();
     }
 }
 
@@ -562,6 +587,166 @@ fn identical_spawn_resumes_at_every_durable_crash_cut() {
     ] {
         crash_and_resume(boundary);
     }
+}
+
+#[test]
+fn dead_process_owner_is_taken_over_and_replays_after_every_crash_cut() {
+    for boundary in [
+        "repair_after_ref_mirror",
+        "repair_after_journal",
+        "repair_before_observer_ready",
+    ] {
+        let lane = "repair-crash";
+        let (temp, db, _journal) = ownerless_materialized_repair_fixture(lane);
+        drop(db);
+        let sqlite = temp.path().join(".trail/index/trail.sqlite");
+        let handshake = temp.path().join(format!("{boundary}.handshake"));
+        let mut child = singleflight_child(temp.path())
+            .env(CHILD_REPAIR_LANE, lane)
+            .env(CRASH_AFTER, boundary)
+            .env(HANDSHAKE, &handshake)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handshake.exists() && Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handshake.exists(), "repair winner did not reach {boundary}");
+        let generation: i64 = Connection::open(&sqlite)
+            .unwrap()
+            .query_row(
+                "SELECT owner.owner_generation
+                 FROM lane_initialization_owners owner
+                 JOIN lane_initializations initialization
+                   ON initialization.initialization_id=owner.initialization_id
+                 WHERE initialization.lane_name=?1",
+                [lane],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let mut survivor = Trail::open(temp.path()).unwrap();
+        let report = survivor.repair_lane_initialization(lane).unwrap();
+        assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+        assert!(report.resumed);
+        assert_eq!(owners_for_lane(&sqlite, lane), 0);
+        assert_eq!(spawn_events_for_lane(&sqlite, lane), 1);
+        assert_eq!(refs_for_lane(&sqlite, lane), 1);
+    }
+}
+
+#[test]
+fn live_owner_timeout_is_stable_and_never_revokes() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let lane = "live-timeout";
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_after_ref"));
+    let failed = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        lane,
+        Some("main"),
+        LaneWorkdirMode::PortableCopy,
+        Some("codex".into()),
+        Some("gpt-5".into()),
+        None,
+        &[],
+        false,
+    );
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(failed.is_err());
+    assert_eq!(owners_for_lane(&sqlite, lane), 0);
+
+    let initialization_id: String = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT initialization_id FROM lane_initializations WHERE lane_name=?1",
+            [lane],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let owner_token = "44".repeat(32);
+    let owner_generation = 7_i64;
+    Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "INSERT INTO lane_initialization_owners(
+                 initialization_id,owner_token,owner_generation,owner_pid,
+                 owner_process_start_identity,acquired_at,heartbeat_at)
+             VALUES(?1,?2,?3,?4,?5,1,1)",
+            rusqlite::params![
+                initialization_id,
+                owner_token,
+                owner_generation,
+                std::process::id(),
+                trail::test_support::current_process_start_token(),
+            ],
+        )
+        .unwrap();
+
+    trail::test_support::set_lane_initialization_wait_timeout_for_current_thread(Some(
+        Duration::ZERO,
+    ));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            Some("codex".into()),
+            Some("gpt-5".into()),
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_initialization_wait_timeout_for_current_thread(None);
+    assert_eq!(error.code(), "LANE_INITIALIZATION_IN_PROGRESS");
+    assert_eq!(error.exit_code(), 2);
+    let stored: (String, i64, u32, i64) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner_token,owner_generation,owner_pid,heartbeat_at
+             FROM lane_initialization_owners WHERE initialization_id=?1",
+            [&initialization_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        (owner_token, owner_generation, std::process::id(), 1)
+    );
+}
+
+#[test]
+fn lost_owner_fence_restarts_claim_and_replay_internally() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::steal_lane_initialization_owner_on_next_heartbeat_for_current_thread();
+    let report = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "lost-fence-retry",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert!(report.resumed);
+    assert_eq!(owners_for_lane(&sqlite, "lost-fence-retry"), 0);
+    assert_eq!(refs_for_lane(&sqlite, "lost-fence-retry"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "lost-fence-retry"), 1);
 }
 
 #[test]
@@ -1338,6 +1523,65 @@ fn concurrent_identical_spawn_requests_replay_one_committed_result() {
     assert_eq!(rows_for_lane(&sqlite, "duplicate-delivery"), 1);
     assert_eq!(refs_for_lane(&sqlite, "duplicate-delivery"), 1);
     assert_eq!(spawn_events_for_lane(&sqlite, "duplicate-delivery"), 1);
+}
+
+#[test]
+fn concurrent_identical_processes_replay_one_committed_result() {
+    const CALLERS: usize = 16;
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let start = temp.path().join("processes.start");
+    let readiness = (0..CALLERS)
+        .map(|index| temp.path().join(format!("process-{index:02}.ready")))
+        .collect::<Vec<_>>();
+    let mut children = Vec::with_capacity(CALLERS);
+    for ready in &readiness {
+        let mut child = singleflight_child(temp.path())
+            .env(CHILD_EXPECT_SUCCESS, "1")
+            .env(CHILD_READY, ready)
+            .env(CHILD_START, &start)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited while opening Trail"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready.exists(),
+            "child did not open Trail before the deadline"
+        );
+        children.push(child);
+    }
+    fs::write(&start, b"start\n").unwrap();
+    for child in children.drain(..) {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "identical spawn child failed: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    assert_eq!(rows_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(refs_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(owners_for_lane(&sqlite, "crash-lane"), 0);
+    let phase: String = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT phase FROM lane_initializations WHERE lane_name='crash-lane'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "observer_ready");
 }
 
 #[test]
