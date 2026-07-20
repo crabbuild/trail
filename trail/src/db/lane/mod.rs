@@ -5,6 +5,7 @@ mod control;
 mod gates;
 mod identity;
 mod initialization;
+mod initialization_owner;
 pub(crate) use initialization::backfill_lane_initializations_v19;
 #[cfg(any(test, debug_assertions))]
 pub(crate) use initialization::{

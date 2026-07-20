@@ -521,6 +521,46 @@ pub(crate) fn lane_initialization_record(
     .transpose()
 }
 
+pub(crate) fn insert_lane_initialization_reservation(
+    conn: &Connection,
+    request: &ResolvedLaneSpawnRequest,
+) -> Result<LaneInitializationRecord> {
+    let lane_ref_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM refs WHERE name=?1)",
+        [lane_ref(&request.lane_name)],
+        |row| row.get(0),
+    )?;
+    if lane_ref_exists {
+        return Err(Error::InvalidInput(format!(
+            "lane `{}` already exists without initialization identity",
+            request.lane_name
+        )));
+    }
+
+    let now = now_ts();
+    conn.execute(
+        "INSERT INTO lane_initializations(
+             initialization_id,lane_name,lane_id,request_fingerprint,operation_id,
+             phase,workdir,materialization_json,last_error_code,last_error_message,
+             repair_command,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,'reserved',?6,NULL,NULL,NULL,NULL,?7,?7)",
+        params![
+            request.initialization_id,
+            request.lane_name,
+            request.lane_id,
+            request.request_fingerprint,
+            request.source_operation.0,
+            request
+                .workdir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            now,
+        ],
+    )?;
+    lane_initialization_record(conn, &request.lane_name)?
+        .ok_or_else(|| Error::Corrupt("lane initialization reservation disappeared".into()))
+}
+
 pub(crate) struct LaneInitializationUpdate<'a> {
     pub(crate) operation_id: Option<&'a str>,
     pub(crate) workdir: Option<&'a Path>,
@@ -639,40 +679,7 @@ impl Trail {
             });
         }
 
-        let lane_ref_exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM refs WHERE name=?1)",
-            [lane_ref(&request.lane_name)],
-            |row| row.get(0),
-        )?;
-        if lane_ref_exists {
-            return Err(Error::InvalidInput(format!(
-                "lane `{}` already exists without initialization identity",
-                request.lane_name
-            )));
-        }
-
-        let now = now_ts();
-        tx.execute(
-            "INSERT INTO lane_initializations(
-                 initialization_id,lane_name,lane_id,request_fingerprint,operation_id,
-                 phase,workdir,materialization_json,last_error_code,last_error_message,
-                 repair_command,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,'reserved',?6,NULL,NULL,NULL,NULL,?7,?7)",
-            params![
-                request.initialization_id,
-                request.lane_name,
-                request.lane_id,
-                request.request_fingerprint,
-                request.source_operation.0,
-                request
-                    .workdir
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                now,
-            ],
-        )?;
-        let record = lane_initialization_record(&tx, &request.lane_name)?
-            .ok_or_else(|| Error::Corrupt("lane initialization reservation disappeared".into()))?;
+        let record = insert_lane_initialization_reservation(&tx, request)?;
         tx.commit()?;
         Ok(LaneInitializationReservation::Start(record))
     }
