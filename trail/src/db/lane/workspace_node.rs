@@ -409,8 +409,14 @@ mod tests {
 
     #[test]
     fn two_lanes_with_identical_node_inputs_reuse_one_real_frozen_install() {
-        if Command::new("npm").arg("--version").output().is_err()
-            || Command::new("node").arg("--version").output().is_err()
+        if !Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
         {
             return;
         }

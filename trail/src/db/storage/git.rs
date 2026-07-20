@@ -2147,7 +2147,11 @@ mod tests {
             }
         }
 
-        if Command::new("git").arg("--version").output().is_err() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();

@@ -11605,8 +11605,14 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
 
 #[test]
 fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
-    if Command::new("npm").arg("--version").output().is_err()
-        || Command::new("node").arg("--version").output().is_err()
+    if !Command::new("npm")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+        || !Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
     {
         return;
     }
@@ -12010,8 +12016,14 @@ portability = "host"
 
 #[test]
 fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
-    if Command::new("npm").arg("--version").output().is_err()
-        || Command::new("node").arg("--version").output().is_err()
+    if !Command::new("npm")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+        || !Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
     {
         return;
     }

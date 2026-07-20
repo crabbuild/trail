@@ -6847,10 +6847,22 @@ mod tests {
         assert!(message.contains("trail/node@1"));
         assert!(message.contains("trail/cargo-target-seed@1"));
         if cargo_lock_ready
-            && Command::new("cargo").arg("--version").output().is_ok()
-            && Command::new("rustc").arg("--version").output().is_ok()
-            && Command::new("npm").arg("--version").output().is_ok()
-            && Command::new("node").arg("--version").output().is_ok()
+            && Command::new("cargo")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+            && Command::new("rustc")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+            && Command::new("npm")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+            && Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
         {
             let synchronized = db
                 .sync_all_workspace_environments("polyglot", None)

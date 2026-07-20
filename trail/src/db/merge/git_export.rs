@@ -342,7 +342,11 @@ mod tests {
 
     #[test]
     fn mapped_git_export_requires_preexisting_clean_mapping() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -369,7 +373,11 @@ mod tests {
 
     #[test]
     fn mapped_git_export_reports_mapped_delta_mode() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -395,7 +403,11 @@ mod tests {
 
     #[test]
     fn general_git_export_reports_full_snapshot_mode_without_mapping() {
-        if Command::new("git").arg("--version").output().is_err() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -424,7 +436,11 @@ mod tests {
     fn clean_git_export_uses_verified_range_delta_without_a_full_root_mapping() {
         use std::os::unix::fs::symlink;
 
-        if Command::new("git").arg("--version").output().is_err() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
