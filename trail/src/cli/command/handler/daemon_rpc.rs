@@ -90,25 +90,51 @@ pub(super) fn try_handle_auto_daemon_command(
         }
     }
     let workspace = daemon_start::workspace_from_context(ctx)?;
-    if workspace.join(".trail").is_dir()
-        && let Some(ready) =
-            daemon_start::existing_workspace_daemon_ready(&workspace, daemon_token.as_deref())?
-    {
-        return match try_handle_daemon_command(
-            ctx,
-            Some(ready.url),
-            Some(ready.auth_token),
-            command,
-        ) {
-            Ok(handled) => Ok(handled),
-            Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
-            Err(err) => Err(err),
-        };
+    if workspace.join(".trail").is_dir() {
+        match daemon_start::existing_workspace_daemon_ready(&workspace, daemon_token.as_deref()) {
+            Ok(Some(ready)) => {
+                return try_handle_auto_daemon_or_fallback(
+                    ctx,
+                    ready.url,
+                    ready.auth_token,
+                    command,
+                );
+            }
+            Ok(None) => {}
+            Err(err) if auto_daemon_should_fallback(&err) => {
+                // A verified stale publication must be recovered through the
+                // authenticated daemon-start path before any local fallback.
+                let ready = daemon_start::ensure_workspace_daemon_ready(
+                    &workspace,
+                    daemon_token.as_deref(),
+                )?;
+                return try_handle_auto_daemon_or_fallback(
+                    ctx,
+                    ready.url,
+                    ready.auth_token,
+                    command,
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
     let Some(daemon_url) = discover_daemon_url(ctx)? else {
         return Ok(false);
     };
     match try_handle_daemon_command(ctx, Some(daemon_url), daemon_token, command) {
+        Ok(handled) => Ok(handled),
+        Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn try_handle_auto_daemon_or_fallback(
+    ctx: &RuntimeContext,
+    daemon_url: String,
+    daemon_token: String,
+    command: &Command,
+) -> Result<bool> {
+    match try_handle_daemon_command(ctx, Some(daemon_url), Some(daemon_token), command) {
         Ok(handled) => Ok(handled),
         Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
         Err(err) => Err(err),

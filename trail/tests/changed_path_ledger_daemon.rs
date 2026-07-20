@@ -1032,6 +1032,40 @@ fn external_materialized_spawn_retires_daemon_and_reconcile_starts_one_fresh_own
 }
 
 #[test]
+fn verified_stale_daemon_recovers_before_external_lane_spawn() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let daemon = fixture.endpoint();
+    kill_and_wait(daemon.pid);
+
+    let spawned = fixture.run(&[
+        "lane",
+        "spawn",
+        "stale-daemon-materialized",
+        "--from",
+        "main",
+        "--materialize",
+    ]);
+    assert!(
+        spawned.status.success(),
+        "verified stale daemon did not recover before lane spawn:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&spawned.stdout),
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+
+    let conn =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let lanes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM lanes WHERE name='stale-daemon-materialized'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lanes, 1);
+}
+
+#[test]
 fn concurrent_external_lane_spawns_fall_back_after_daemon_retirement() {
     const LANES: usize = 16;
 
