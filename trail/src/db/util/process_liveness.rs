@@ -32,19 +32,13 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
         let fields = stat.get(end + 2..)?.split_whitespace().collect::<Vec<_>>();
         return fields.get(19).map(|value| format!("linux:{value}"));
     }
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !value.is_empty() {
-                return Some(format!("ps:{value}"));
-            }
-        }
-        None
+        return macos_process_start_token(pid);
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        return freebsd_process_start_token(pid);
     }
     #[cfg(target_os = "windows")]
     {
@@ -60,6 +54,68 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
         let _ = pid;
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start_token(pid: u32) -> Option<String> {
+    let raw_pid = i32::try_from(pid).ok()?;
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` points to a writable `proc_bsdinfo` allocation and the
+    // supplied byte count exactly matches that allocation.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            expected,
+        )
+    };
+    if read != expected || info.pbi_pid != pid || info.pbi_start_tvusec >= 1_000_000 {
+        return None;
+    }
+    Some(format!(
+        "macos:{}:{}:{}",
+        info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(target_os = "freebsd")]
+fn freebsd_process_start_token(pid: u32) -> Option<String> {
+    let raw_pid = i32::try_from(pid).ok()?;
+    let mut info = unsafe { std::mem::zeroed::<libc::kinfo_proc>() };
+    let mut info_len = std::mem::size_of::<libc::kinfo_proc>();
+    let mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        raw_pid,
+    ];
+    // SAFETY: the MIB contains the documented KERN_PROC_PID query, `info`
+    // points to a writable `kinfo_proc`, and `info_len` describes its size.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut info as *mut libc::kinfo_proc).cast(),
+            &mut info_len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if result != 0
+        || info_len != std::mem::size_of::<libc::kinfo_proc>()
+        || info.ki_pid != raw_pid
+        || info.ki_start.tv_sec < 0
+        || !(0..1_000_000).contains(&info.ki_start.tv_usec)
+    {
+        return None;
+    }
+    Some(format!(
+        "freebsd:{}:{}:{}",
+        info.ki_pid, info.ki_start.tv_sec, info.ki_start.tv_usec
+    ))
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -375,9 +431,64 @@ fn unix_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch
     }
     match process_start_token(pid.as_raw_nonzero().get() as u32) {
         Some(actual) if actual == token => ProcessIdentityMatch::Match,
-        Some(_) => ProcessIdentityMatch::DeadOrMismatch,
+        Some(_) if process_start_token_is_comparable(token) => ProcessIdentityMatch::DeadOrMismatch,
+        // A live process with a token from an older implementation or another
+        // operating system cannot be compared safely. In particular, Darwin's
+        // former locale- and timezone-sensitive `ps:` token must not authorize
+        // takeover merely because the representation changed.
+        Some(_) => ProcessIdentityMatch::Unknown,
         None => ProcessIdentityMatch::Unknown,
     }
+}
+
+#[cfg(unix)]
+fn process_start_token_is_comparable(token: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = token;
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return canonical_bsd_start_token(token, "macos");
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        return canonical_bsd_start_token(token, "freebsd");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        let _ = token;
+        false
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn canonical_bsd_start_token(token: &str, platform: &str) -> bool {
+    let mut fields = token.split(':');
+    let (Some(found_platform), Some(pid), Some(seconds), Some(microseconds), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    found_platform == platform
+        && canonical_decimal(pid)
+        && canonical_decimal(seconds)
+        && canonical_decimal(microseconds)
+        && microseconds
+            .parse::<u32>()
+            .is_ok_and(|value| value < 1_000_000)
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn canonical_decimal(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
 }
 
 #[cfg(test)]
@@ -409,5 +520,42 @@ mod tests {
         assert!(!process_identity_may_match(
             ProcessIdentityMatch::DeadOrMismatch
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_start_token_is_stable_across_ps_timezones() {
+        let pid = std::process::id();
+        let first = process_start_token(pid).expect("current process has a start token");
+        let ps_start = |timezone: &str| {
+            let output = std::process::Command::new("ps")
+                .env("TZ", timezone)
+                .args(["-o", "lstart=", "-p", &pid.to_string()])
+                .output()
+                .expect("query ps start time");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .expect("ps output is UTF-8")
+                .trim()
+                .to_string()
+        };
+        let utc_ps_start = ps_start("UTC");
+        let vancouver_ps_start = ps_start("America/Vancouver");
+        let second = process_start_token(pid).expect("current process still has a start token");
+
+        assert_ne!(utc_ps_start, vancouver_ps_start);
+        assert_eq!(first, second);
+        assert!(first.starts_with(&format!("macos:{pid}:")));
+        assert!(canonical_bsd_start_token(&first, "macos"));
+        assert!(!first.starts_with("ps:"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_process_with_legacy_ps_token_is_indeterminate() {
+        assert_eq!(
+            process_start_token_match(std::process::id(), "ps:Mon Jul 20 00:00:00 2026"),
+            ProcessIdentityMatch::Unknown
+        );
     }
 }
