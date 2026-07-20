@@ -1675,7 +1675,6 @@ mod tests {
         let (_projection_guard, projection_attempts) =
             count_capture_projection_attempts_for_test(temp.path());
         let (_pause_guard, pause) = pause_capture_worker_for_test(temp.path());
-        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         let lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
@@ -1684,6 +1683,7 @@ mod tests {
             "overflow-connection".to_string(),
         )
         .unwrap();
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         assert!(
             pause.reached.load(Ordering::Acquire),
             "capture worker was not paused before ingress became visible"
@@ -2096,7 +2096,6 @@ mod tests {
         };
         let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
         let (_worker_pause_guard, worker_pause) = pause_capture_worker_for_test(temp.path());
-        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&worker_pause.paused), false);
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
@@ -2104,6 +2103,7 @@ mod tests {
             "spill-activation".to_string(),
         )
         .unwrap();
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&worker_pause.paused), false);
         for sequence in 0..ACP_CAPTURE_QUEUE_CAPACITY {
             ingress
                 .append(capture_frame(
@@ -2217,7 +2217,6 @@ mod tests {
             .unwrap();
 
         let (_pause_guard, pause) = pause_capture_worker_for_test(temp.path());
-        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         let ingress = CaptureIngress::new(
             temp.path().to_path_buf(),
             temp.path().join(".trail"),
@@ -2225,6 +2224,7 @@ mod tests {
             "startup-ordering".to_string(),
         )
         .unwrap();
+        let _unpause_on_drop = AtomicBoolOnDrop::new(Arc::clone(&pause.paused), false);
         assert!(
             pause.reached.load(Ordering::Acquire),
             "capture worker was not paused before ingress became visible"
