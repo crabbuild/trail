@@ -3078,6 +3078,47 @@ impl Trail {
         Ok(true)
     }
 
+    pub(super) fn workspace_environment_staging_parent(&self) -> Result<PathBuf> {
+        let canonical_db_dir = fs::canonicalize(&self.db_dir)?;
+        if !canonical_db_dir.is_dir() {
+            return Err(Error::Corrupt(format!(
+                "Trail database path `{}` is not a directory",
+                self.db_dir.display()
+            )));
+        }
+
+        let cache_dir = self.db_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+        let canonical_cache_dir = fs::canonicalize(&cache_dir)?;
+        let expected_cache_dir = canonical_db_dir.join("cache");
+        if !canonical_cache_dir.is_dir()
+            || !canonical_cache_dir.starts_with(&canonical_db_dir)
+            || canonical_cache_dir != expected_cache_dir
+        {
+            return Err(Error::InvalidPath {
+                path: cache_dir.to_string_lossy().into_owned(),
+                reason: "workspace environment cache directory must remain inside Trail storage"
+                    .to_string(),
+            });
+        }
+
+        let staging_dir = cache_dir.join("staging");
+        fs::create_dir_all(&staging_dir)?;
+        let canonical_staging_dir = fs::canonicalize(&staging_dir)?;
+        let expected_staging_dir = canonical_db_dir.join("cache/staging");
+        if !canonical_staging_dir.is_dir()
+            || !canonical_staging_dir.starts_with(&canonical_db_dir)
+            || canonical_staging_dir != expected_staging_dir
+        {
+            return Err(Error::InvalidPath {
+                path: staging_dir.to_string_lossy().into_owned(),
+                reason: "workspace environment staging directory must remain inside Trail storage"
+                    .to_string(),
+            });
+        }
+        Ok(canonical_staging_dir)
+    }
+
     fn execute_writable_private_environment_plan(
         &self,
         plan: &WorkspaceEnvironmentPlan,
@@ -3090,7 +3131,7 @@ impl Trail {
         ) {
             ensure_restricted_recipe_sandbox_available()?;
         }
-        let staging_parent = workspace_environment_temporary_parent()?;
+        let staging_parent = self.workspace_environment_staging_parent()?;
         let staging = tempfile::Builder::new()
             .prefix("trail-private-environment-")
             .tempdir_in(&staging_parent)?;
@@ -3127,7 +3168,7 @@ impl Trail {
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         ) {
             ensure_restricted_recipe_sandbox_available()?;
-            let sandbox_parent = workspace_environment_temporary_parent()?;
+            let sandbox_parent = self.workspace_environment_staging_parent()?;
             let sandbox = tempfile::Builder::new()
                 .prefix("trail-environment-")
                 .tempdir_in(&sandbox_parent)?;
@@ -5671,28 +5712,6 @@ fn ensure_restricted_recipe_sandbox_available() -> Result<()> {
     }
 }
 
-pub(super) fn workspace_environment_temporary_parent() -> Result<PathBuf> {
-    let candidate = std::env::temp_dir();
-    validate_workspace_environment_temporary_parent(&candidate)
-}
-
-fn validate_workspace_environment_temporary_parent(candidate: &Path) -> Result<PathBuf> {
-    if !candidate.is_absolute() {
-        return Err(Error::InvalidInput(format!(
-            "workspace environment temporary directory `{}` is not absolute",
-            candidate.display()
-        )));
-    }
-    let canonical = fs::canonicalize(candidate)?;
-    if !canonical.is_dir() {
-        return Err(Error::InvalidInput(format!(
-            "workspace environment temporary path `{}` is not a directory",
-            candidate.display()
-        )));
-    }
-    Ok(canonical)
-}
-
 #[cfg(target_os = "macos")]
 pub(super) fn sandbox_profile_escape(path: &Path) -> String {
     path.to_string_lossy()
@@ -5705,25 +5724,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_environment_temporary_parent_honors_process_configuration() {
-        assert_eq!(
-            workspace_environment_temporary_parent().unwrap(),
-            fs::canonicalize(std::env::temp_dir()).unwrap()
-        );
+    fn workspace_environment_staging_parent_is_trail_owned() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let parent = db.workspace_environment_staging_parent().unwrap();
+        let trail_dir = fs::canonicalize(workspace.path().join(".trail")).unwrap();
+        let expected = trail_dir.join("cache/staging");
+
+        assert_eq!(parent, expected);
+        assert!(parent.starts_with(&trail_dir));
+        assert_ne!(parent, fs::canonicalize(std::env::temp_dir()).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn workspace_environment_temporary_parent_rejects_relative_paths() {
-        let error =
-            validate_workspace_environment_temporary_parent(Path::new("relative/tmp")).unwrap_err();
-        assert!(error.to_string().contains("is not absolute"));
-    }
+    fn workspace_environment_staging_parent_rejects_external_symlink_substitution() {
+        use std::os::unix::fs::symlink;
 
-    #[test]
-    fn workspace_environment_temporary_parent_rejects_files() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let error = validate_workspace_environment_temporary_parent(file.path()).unwrap_err();
-        assert!(error.to_string().contains("is not a directory"));
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let staging = workspace.path().join(".trail/cache/staging");
+        fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        symlink(external.path(), &staging).unwrap();
+
+        let error = db.workspace_environment_staging_parent().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("staging directory must remain inside Trail storage"));
     }
 
     fn cache_test_plan(

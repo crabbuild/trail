@@ -17,8 +17,7 @@ use trail_environment_adapter_sdk::{
 };
 
 use super::workspace_environment::{
-    workspace_environment_temporary_parent, WorkspaceEnvironmentCache,
-    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
+    WorkspaceEnvironmentCache, WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
     WorkspaceEnvironmentCommand, WorkspaceEnvironmentDependency, WorkspaceEnvironmentEdgeType,
     WorkspaceEnvironmentExternalArtifact, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
     WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
@@ -1125,7 +1124,7 @@ impl Trail {
         let mut request_bytes = Vec::new();
         write_frame(&mut request_bytes, request, MAX_FRAME_BYTES)
             .map_err(|error| Error::Serialization(error.to_string()))?;
-        let sandbox_parent = workspace_environment_temporary_parent()?;
+        let sandbox_parent = self.workspace_environment_staging_parent()?;
         let sandbox = tempfile::Builder::new()
             .prefix("trail-adapter-plugin-")
             .tempdir_in(&sandbox_parent)?;
