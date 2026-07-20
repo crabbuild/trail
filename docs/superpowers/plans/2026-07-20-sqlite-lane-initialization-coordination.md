@@ -621,8 +621,11 @@ LaneInitializationOwnershipLost {
 ```
 
 Codes are `LANE_INITIALIZATION_IN_PROGRESS` and
-`LANE_INITIALIZATION_OWNERSHIP_LOST`; CLI exit status is 2 and HTTP/MCP status
-is 409 with all fields in JSON details.
+`LANE_INITIALIZATION_OWNERSHIP_LOST`. Only `LANE_INITIALIZATION_IN_PROGRESS`
+is a public CLI/HTTP/MCP outcome (exit status 2, HTTP 409, all fields in JSON
+details). `LANE_INITIALIZATION_OWNERSHIP_LOST` is an internal fence signal:
+every spawn call site must catch it and restart claim/replay, so it never leaks
+as a user-visible ordinary failure.
 
 - [ ] **Step 5: Replace spawn singleflight with claim/wait/replay**
 
