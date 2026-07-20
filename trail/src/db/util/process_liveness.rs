@@ -56,6 +56,25 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn different_process_start_token_for_test(pid: u32) -> String {
+    let token = process_start_token(pid).expect("test process has a stable start token");
+    let (prefix, last_component) = token
+        .rsplit_once(':')
+        .expect("canonical process start token has a numeric component");
+    let value = last_component
+        .parse::<u64>()
+        .expect("canonical process start token ends in a number");
+    let different = if token.starts_with("macos:") || token.starts_with("freebsd:") {
+        (value + 1) % 1_000_000
+    } else {
+        value
+            .checked_add(1)
+            .unwrap_or_else(|| value.saturating_sub(1))
+    };
+    format!("{prefix}:{different}")
+}
+
 #[cfg(target_os = "macos")]
 fn macos_process_start_token(pid: u32) -> Option<String> {
     let raw_pid = i32::try_from(pid).ok()?;

@@ -796,7 +796,9 @@ mod macos {
                 &state,
                 serde_json::to_vec(&serde_json::json!({
                     "pid": std::process::id(),
-                    "process_start_token": "reused-pid",
+                    "process_start_token": different_process_start_token_for_test(
+                        std::process::id()
+                    ),
                     "port": 1,
                 }))
                 .unwrap(),

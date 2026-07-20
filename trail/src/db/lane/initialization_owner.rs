@@ -692,7 +692,6 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            install_process_liveness_override(pid, start_identity, false);
         }
 
         fn install_repair_owner(&self, pid: u32, start_identity: &str, heartbeat_at: i64) {
@@ -874,7 +873,10 @@ mod tests {
     #[test]
     fn pid_reuse_with_a_different_start_identity_is_takeover_not_contention() {
         let mut fixture = OwnerFixture::new();
-        fixture.install_owner(std::process::id(), "different-start-token");
+        fixture.install_owner(
+            std::process::id(),
+            &crate::db::util::different_process_start_token_for_test(std::process::id()),
+        );
         assert!(matches!(
             fixture.claim("lane-a"),
             LaneInitializationClaim::Owned { resumed: true, .. }

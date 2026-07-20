@@ -5224,7 +5224,10 @@ mod tests {
             )
             .unwrap();
             match replacement {
-                "process_start" => owner.process_start_identity = "reused-pid".into(),
+                "process_start" => {
+                    owner.process_start_identity =
+                        different_process_start_token_for_test(std::process::id())
+                }
                 "executable" => owner.executable_identity = "ff".repeat(32),
                 _ => unreachable!(),
             }
