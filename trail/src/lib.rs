@@ -176,6 +176,20 @@ pub mod test_support {
         crate::db::steal_lane_initialization_owner_on_next_heartbeat_for_current_thread();
     }
 
+    pub fn set_lane_initialization_owner_liveness_unknown_for_current_thread(
+        pid: u32,
+        start_identity: &str,
+    ) {
+        crate::db::set_lane_initialization_owner_liveness_unknown_for_current_thread(
+            pid,
+            start_identity,
+        );
+    }
+
+    pub fn clear_lane_initialization_owner_liveness_overrides_for_current_thread() {
+        crate::db::clear_lane_initialization_owner_liveness_overrides_for_current_thread();
+    }
+
     pub fn install_lane_record_after_c2_write_for_current_thread(
         path: std::path::PathBuf,
         bytes: Vec<u8>,

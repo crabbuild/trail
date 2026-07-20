@@ -98,15 +98,15 @@ fn validate_matching_request(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
     static PROCESS_LIVENESS_OVERRIDES: std::cell::RefCell<
         std::collections::HashMap<(u32, String), ProcessIdentityMatch>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-#[cfg(test)]
-fn clear_process_liveness_overrides() {
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn clear_process_liveness_overrides() {
     PROCESS_LIVENESS_OVERRIDES.with(|overrides| overrides.borrow_mut().clear());
 }
 
@@ -124,8 +124,8 @@ fn install_process_liveness_override(pid: u32, start_identity: &str, live: bool)
     });
 }
 
-#[cfg(test)]
-fn install_process_liveness_unknown_override(pid: u32, start_identity: &str) {
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn install_process_liveness_unknown_override(pid: u32, start_identity: &str) {
     PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
         overrides.borrow_mut().insert(
             (pid, start_identity.to_string()),
@@ -135,7 +135,7 @@ fn install_process_liveness_unknown_override(pid: u32, start_identity: &str) {
 }
 
 fn owner_process_match(pid: u32, start_identity: &str) -> ProcessIdentityMatch {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(result) = PROCESS_LIVENESS_OVERRIDES.with(|overrides| {
         overrides
             .borrow()
@@ -333,9 +333,7 @@ pub(crate) fn claim_lane_initialization_repair(
         if let Some(owner) = existing_owner {
             let owner_match =
                 owner_process_match(owner.owner_pid, &owner.owner_process_start_identity);
-            if owner_match != ProcessIdentityMatch::DeadOrMismatch
-                || record.phase == LaneInitializationPhase::Associated
-            {
+            if owner_match != ProcessIdentityMatch::DeadOrMismatch {
                 return Ok(LaneInitializationRepairClaim::Contended {
                     record,
                     owner_pid: owner.owner_pid,
@@ -357,9 +355,39 @@ pub(crate) fn claim_lane_initialization_repair(
                 tx.commit()?;
                 return Ok(LaneInitializationRepairClaim::Terminal(current));
             }
-            if current.phase != LaneInitializationPhase::RepairRequired {
+            if !matches!(
+                current.phase,
+                LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
+            ) {
                 tx.commit()?;
                 continue;
+            }
+            if current.phase == LaneInitializationPhase::Associated {
+                let transitioned = tx.execute(
+                    "UPDATE lane_initializations
+                     SET phase='repair_required',
+                         repair_command='trail lane repair-initialization ' || lane_name,
+                         updated_at=?1
+                     WHERE initialization_id=?2 AND phase='associated'
+                       AND EXISTS(
+                         SELECT 1 FROM lane_initialization_owners owner
+                         WHERE owner.initialization_id=lane_initializations.initialization_id
+                           AND owner.owner_token=?3 AND owner.owner_generation=?4
+                           AND owner.owner_pid=?5
+                           AND owner.owner_process_start_identity=?6)",
+                    params![
+                        now,
+                        current.initialization_id,
+                        owner.fence.owner_token,
+                        owner.fence.owner_generation,
+                        owner.owner_pid,
+                        owner.owner_process_start_identity,
+                    ],
+                )?;
+                if transitioned == 0 {
+                    drop(tx);
+                    continue;
+                }
             }
             let changed = tx.execute(
                 "UPDATE lane_initialization_owners
@@ -381,12 +409,20 @@ pub(crate) fn claim_lane_initialization_repair(
                     owner.owner_process_start_identity,
                 ],
             )?;
-            tx.commit()?;
             if changed == 0 {
+                drop(tx);
                 continue;
             }
+            let claimed =
+                lane_initialization_record(&tx, &current.initialization_id)?.ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "lane initialization `{}` disappeared during repair takeover",
+                        current.initialization_id
+                    ))
+                })?;
+            tx.commit()?;
             return Ok(LaneInitializationRepairClaim::Owned {
-                record: current,
+                record: claimed,
                 fence: LaneInitializationFence {
                     owner_token,
                     owner_generation: owner.fence.owner_generation + 1,
@@ -660,7 +696,21 @@ mod tests {
         }
 
         fn install_repair_owner(&self, pid: u32, start_identity: &str, heartbeat_at: i64) {
-            self.insert_initialization("repair_required");
+            self.install_active_owner("repair_required", pid, start_identity, heartbeat_at);
+        }
+
+        fn install_associated_owner(&self, pid: u32, start_identity: &str, heartbeat_at: i64) {
+            self.install_active_owner("associated", pid, start_identity, heartbeat_at);
+        }
+
+        fn install_active_owner(
+            &self,
+            phase: &str,
+            pid: u32,
+            start_identity: &str,
+            heartbeat_at: i64,
+        ) {
+            self.insert_initialization(phase);
             self.db
                 .conn
                 .execute(
@@ -905,12 +955,29 @@ mod tests {
     }
 
     #[test]
+    fn dead_associated_owner_takeover_transitions_repair_and_increments_generation() {
+        let mut fixture = OwnerFixture::new();
+        fixture.install_associated_owner(u32::MAX, "dead-associated-owner", i64::MIN / 2);
+        install_process_liveness_override(u32::MAX, "dead-associated-owner", false);
+
+        let LaneInitializationRepairClaim::Owned { record, fence } = fixture.claim_repair() else {
+            panic!("expected associated ownership takeover")
+        };
+        assert_eq!(record.phase, LaneInitializationPhase::RepairRequired);
+        assert_eq!(fence.owner_generation, 2);
+        assert_eq!(fixture.stored_fence("lane-a"), fence);
+    }
+
+    #[test]
     fn live_and_unknown_repair_owners_are_never_stolen_by_heartbeat_age() {
-        for (start_identity, unknown) in
-            [("live-repair-owner", false), ("unknown-repair-owner", true)]
-        {
+        for (phase, start_identity, unknown) in [
+            ("repair_required", "live-repair-owner", false),
+            ("repair_required", "unknown-repair-owner", true),
+            ("associated", "live-associated-owner", false),
+            ("associated", "unknown-associated-owner", true),
+        ] {
             let mut fixture = OwnerFixture::new();
-            fixture.install_repair_owner(std::process::id(), start_identity, i64::MIN / 2);
+            fixture.install_active_owner(phase, std::process::id(), start_identity, i64::MIN / 2);
             if unknown {
                 install_process_liveness_unknown_override(std::process::id(), start_identity);
             } else {

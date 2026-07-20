@@ -17,6 +17,10 @@ mod lifecycle;
 #[cfg(debug_assertions)]
 pub(crate) use initialization_owner::steal_owner_on_next_heartbeat_for_current_thread;
 #[cfg(debug_assertions)]
+pub(crate) use initialization_owner::{
+    clear_process_liveness_overrides, install_process_liveness_unknown_override,
+};
+#[cfg(debug_assertions)]
 pub(crate) use lifecycle::set_lane_initialization_wait_timeout_for_current_thread;
 mod patch_diff;
 mod patch_edits;

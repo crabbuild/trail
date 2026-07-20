@@ -642,6 +642,85 @@ fn dead_process_owner_is_taken_over_and_replays_after_every_crash_cut() {
 }
 
 #[test]
+fn dead_associated_owner_is_atomically_taken_over_for_repair() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let associated = temp.path().join("associated-owner.handshake");
+    let mut spawn_winner = singleflight_child(temp.path())
+        .env(CRASH_AFTER, "after_association")
+        .env(HANDSHAKE, &associated)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !associated.exists() && Instant::now() < deadline {
+        if spawn_winner.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        associated.exists(),
+        "spawn winner did not associate the lane"
+    );
+    let original: (String, i64) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner.owner_token,owner.owner_generation
+             FROM lane_initialization_owners owner
+             JOIN lane_initializations initialization
+               ON initialization.initialization_id=owner.initialization_id
+             WHERE initialization.lane_name='crash-lane'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(original.1, 1);
+    spawn_winner.kill().unwrap();
+    spawn_winner.wait().unwrap();
+
+    let repair_cut = temp.path().join("associated-repair-takeover.handshake");
+    let mut repair_winner = singleflight_child(temp.path())
+        .env(CHILD_REPAIR_LANE, "crash-lane")
+        .env(CRASH_AFTER, "repair_after_ref_mirror")
+        .env(HANDSHAKE, &repair_cut)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !repair_cut.exists() && Instant::now() < deadline {
+        if repair_winner.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(repair_cut.exists(), "repair winner did not take over");
+    let takeover: (String, i64, String) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner.owner_token,owner.owner_generation,initialization.phase
+             FROM lane_initialization_owners owner
+             JOIN lane_initializations initialization
+               ON initialization.initialization_id=owner.initialization_id
+             WHERE initialization.lane_name='crash-lane'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_ne!(takeover.0, original.0);
+    assert_eq!(takeover.1, original.1 + 1);
+    assert_eq!(takeover.2, "repair_required");
+    repair_winner.kill().unwrap();
+    repair_winner.wait().unwrap();
+
+    let mut survivor = Trail::open(temp.path()).unwrap();
+    let report = survivor.repair_lane_initialization("crash-lane").unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(owners_for_lane(&sqlite, "crash-lane"), 0);
+    assert_eq!(refs_for_lane(&sqlite, "crash-lane"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 1);
+}
+
+#[test]
 fn live_owner_timeout_is_stable_and_never_revokes() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -708,6 +787,10 @@ fn live_owner_timeout_is_stable_and_never_revokes() {
     trail::test_support::set_lane_initialization_wait_timeout_for_current_thread(None);
     assert_eq!(error.code(), "LANE_INITIALIZATION_IN_PROGRESS");
     assert_eq!(error.exit_code(), 2);
+    let trail::Error::LaneInitializationInProgress { retry_command, .. } = &error else {
+        panic!("expected stable in-progress error")
+    };
+    assert!(retry_command.contains("repeat the exact original"));
     let stored: (String, i64, u32, i64) = Connection::open(&sqlite)
         .unwrap()
         .query_row(
@@ -945,7 +1028,7 @@ fn stale_owner_cannot_publish_lane_spawn_event_after_takeover() {
 }
 
 #[test]
-fn live_owner_blocks_manual_repair_before_side_effects() {
+fn live_and_unknown_associated_owner_timeout_preserves_fence_and_side_effects() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
     let sqlite = temp.path().join(".trail/index/trail.sqlite");
@@ -974,19 +1057,78 @@ fn live_owner_blocks_manual_repair_before_side_effects() {
         "child did not publish live-owner handshake"
     );
 
+    let before: (String, i64, u32, String, i64) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner.owner_token,owner.owner_generation,owner.owner_pid,
+                    owner.owner_process_start_identity,owner.heartbeat_at
+             FROM lane_initialization_owners owner
+             JOIN lane_initializations initialization
+               ON initialization.initialization_id=owner.initialization_id
+             WHERE initialization.lane_name='crash-lane'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_initialization_wait_timeout_for_current_thread(Some(
+        Duration::ZERO,
+    ));
     trail::test_support::set_lane_association_failure_for_current_thread(Some("spawn_ref_repair"));
-    let error = db.repair_lane_initialization("crash-lane").unwrap_err();
+    for unknown in [false, true] {
+        if unknown {
+            trail::test_support::set_lane_initialization_owner_liveness_unknown_for_current_thread(
+                before.2, &before.3,
+            );
+        }
+        let error = db.repair_lane_initialization("crash-lane").unwrap_err();
+        assert_eq!(error.code(), "LANE_INITIALIZATION_IN_PROGRESS");
+        let trail::Error::LaneInitializationInProgress { retry_command, .. } = &error else {
+            panic!("expected stable repair contention")
+        };
+        assert_eq!(retry_command, "trail lane repair-initialization crash-lane");
+        assert!(!error
+            .to_string()
+            .contains("injected lane association failure"));
+    }
     trail::test_support::set_lane_association_failure_for_current_thread(None);
-    assert!(error.to_string().contains("actively owned"));
-    assert!(!error
-        .to_string()
-        .contains("injected lane association failure"));
+    trail::test_support::set_lane_initialization_wait_timeout_for_current_thread(None);
+    trail::test_support::clear_lane_initialization_owner_liveness_overrides_for_current_thread();
     assert_eq!(
         db.lane_initialization("crash-lane").unwrap().unwrap().phase,
         LaneInitializationPhase::Associated
     );
     assert_eq!(spawn_events_for_lane(&sqlite, "crash-lane"), 0);
+    let after: (String, i64, u32, String, i64) = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner.owner_token,owner.owner_generation,owner.owner_pid,
+                    owner.owner_process_start_identity,owner.heartbeat_at
+             FROM lane_initialization_owners owner
+             JOIN lane_initializations initialization
+               ON initialization.initialization_id=owner.initialization_id
+             WHERE initialization.lane_name='crash-lane'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -1080,6 +1222,53 @@ fn failed_claimed_repair_persists_error_and_releases_exact_owner() {
         .unwrap();
     assert_eq!(phase, "repair_required");
     assert!(code.is_some());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn transparent_cow_view_failure_persists_repair_and_replays_without_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let lane = "transparent-view-repair";
+    let mut db = Trail::open(temp.path()).unwrap();
+    trail::test_support::set_lane_association_failure_for_current_thread(Some(
+        "spawn_workspace_view",
+    ));
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::NfsCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    trail::test_support::set_lane_association_failure_for_current_thread(None);
+    assert!(matches!(
+        error,
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase: LaneInitializationPhase::RepairRequired,
+            ..
+        }
+    ));
+    assert_eq!(owners_for_lane(&sqlite, lane), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, lane), 0);
+    assert_eq!(
+        db.lane_initialization(lane).unwrap().unwrap().phase,
+        LaneInitializationPhase::RepairRequired
+    );
+    assert!(db.lane_workspace_view(lane).unwrap().is_none());
+
+    let repaired = db.repair_lane_initialization(lane).unwrap();
+    assert_eq!(repaired.phase, LaneInitializationPhase::ObserverReady);
+    assert!(db.lane_workspace_view(lane).unwrap().is_some());
+    assert_eq!(owners_for_lane(&sqlite, lane), 0);
+    assert_eq!(spawn_events_for_lane(&sqlite, lane), 1);
 }
 
 #[test]

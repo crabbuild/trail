@@ -4873,6 +4873,19 @@ pub(crate) fn current_process_start_token_for_test() -> String {
 pub(crate) fn steal_lane_initialization_owner_on_next_heartbeat_for_current_thread() {
     lane::steal_owner_on_next_heartbeat_for_current_thread();
 }
+
+#[cfg(debug_assertions)]
+pub(crate) fn set_lane_initialization_owner_liveness_unknown_for_current_thread(
+    pid: u32,
+    start_identity: &str,
+) {
+    lane::install_process_liveness_unknown_override(pid, start_identity);
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn clear_lane_initialization_owner_liveness_overrides_for_current_thread() {
+    lane::clear_process_liveness_overrides();
+}
 #[cfg(debug_assertions)]
 pub(crate) use lane::{
     clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,

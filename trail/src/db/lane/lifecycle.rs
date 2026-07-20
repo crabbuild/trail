@@ -1149,15 +1149,33 @@ fn lane_initialization_wait_timeout() -> std::time::Duration {
     LANE_INITIALIZATION_WAIT_TIMEOUT
 }
 
-fn lane_initialization_wait_delay(initialization_id: &str, attempt: u32) -> std::time::Duration {
-    let base = 10_u64.saturating_mul(1_u64 << attempt.min(5)).min(250);
-    let salt = initialization_id
+fn new_lane_initialization_waiter_salt() -> Result<u64> {
+    let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn lane_initialization_wait_delay(
+    initialization_id: &str,
+    attempt: u32,
+    waiter_salt: u64,
+) -> std::time::Duration {
+    let base = 10_u64.saturating_mul(1_u64 << attempt.min(5)).min(240);
+    let initialization_hash = initialization_id
         .bytes()
         .fold(u64::from(attempt) + 1, |value, byte| {
             value.wrapping_mul(33).wrapping_add(u64::from(byte))
         });
-    let jitter = salt % (base.saturating_div(4) + 1);
-    std::time::Duration::from_millis((base + jitter).min(250))
+    let mut salt = initialization_hash ^ waiter_salt ^ u64::from(attempt).rotate_left(32);
+    salt ^= salt >> 30;
+    salt = salt.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    salt ^= salt >> 27;
+    salt = salt.wrapping_mul(0x94d0_49bb_1331_11eb);
+    salt ^= salt >> 31;
+    let jitter_limit = base.saturating_div(4).min(250 - base);
+    let jitter = salt % (jitter_limit + 1);
+    std::time::Duration::from_millis(base + jitter)
 }
 
 #[cfg(debug_assertions)]
@@ -1857,6 +1875,7 @@ impl Trail {
         };
         let repair_command = format!("trail lane repair-initialization {name}");
         let deadline = std::time::Instant::now() + lane_initialization_wait_timeout();
+        let waiter_salt = new_lane_initialization_waiter_salt()?;
         let mut wait_attempt = 0_u32;
         let (initialization, fence, resumed) = loop {
             let reservation_lock = if ledger_authority {
@@ -1892,12 +1911,19 @@ impl Trail {
                             initialization_id: record.initialization_id,
                             owner_pid,
                             phase: record.phase,
-                            retry_command: format!("trail lane spawn {name}"),
+                            retry_command: if record.phase == LaneInitializationPhase::Associated {
+                                format!("trail lane repair-initialization {name}")
+                            } else {
+                                format!(
+                                    "repeat the exact original `trail lane spawn` request for lane `{name}`"
+                                )
+                            },
                         });
                     }
                     std::thread::sleep(lane_initialization_wait_delay(
                         &record.initialization_id,
                         wait_attempt,
+                        waiter_salt,
                     ));
                     wait_attempt = wait_attempt.saturating_add(1);
                 }
@@ -2171,10 +2197,8 @@ impl Trail {
                 }
             }
             drop(association_lock);
-            lane_initialization_crash_cut("after_association")?;
-            let committed_operation = materialization_operation_id
-                .clone()
-                .unwrap_or_else(|| request.source_operation.0.clone());
+            let crash_cut = lane_initialization_crash_cut("after_association");
+            self.committed_lane_initialization_step(&initialization, &fence, crash_cut)?;
             self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
             let mirror = (|| {
                 fail_lane_association_if_requested("spawn_ref_repair")?;
@@ -2187,7 +2211,8 @@ impl Trail {
             })();
             self.committed_lane_initialization_step(&initialization, &fence, mirror)?;
             self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
-            lane_initialization_crash_cut("after_reconciliation")?;
+            let crash_cut = lane_initialization_crash_cut("after_reconciliation");
+            self.committed_lane_initialization_step(&initialization, &fence, crash_cut)?;
             if let Some(operation_id) = materialization_operation_id.as_deref() {
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
                 let journal = (|| {
@@ -2304,26 +2329,24 @@ impl Trail {
                 self.committed_lane_initialization_step(&initialization, &fence, marker)?;
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
             }
-            lane_initialization_crash_cut("after_marker")?;
+            let crash_cut = lane_initialization_crash_cut("after_marker");
+            self.committed_lane_initialization_step(&initialization, &fence, crash_cut)?;
             if request.requested_workdir_mode.is_transparent_cow() {
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
-                committed_lane_step(
-                    &committed_operation,
-                    "initial lane workspace view publication",
-                    (|| {
-                        fail_lane_association_if_requested("spawn_workspace_view")?;
-                        let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
-                            Error::Corrupt("transparent COW lane has no mountpoint".to_string())
-                        })?;
-                        self.create_workspace_view(
-                            &lane_id,
-                            &request.source_change,
-                            &request.source_root,
-                            platform_workspace_backend(&request.requested_workdir_mode),
-                            Path::new(mountpoint),
-                        )
-                    })(),
-                )?;
+                let workspace_view = (|| {
+                    fail_lane_association_if_requested("spawn_workspace_view")?;
+                    let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
+                        Error::Corrupt("transparent COW lane has no mountpoint".to_string())
+                    })?;
+                    self.create_workspace_view(
+                        &lane_id,
+                        &request.source_change,
+                        &request.source_root,
+                        platform_workspace_backend(&request.requested_workdir_mode),
+                        Path::new(mountpoint),
+                    )
+                })();
+                self.committed_lane_initialization_step(&initialization, &fence, workspace_view)?;
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
             }
             let spawn_payload = serde_json::json!({
@@ -2349,7 +2372,8 @@ impl Trail {
                 )
             })();
             self.committed_lane_initialization_step(&initialization, &fence, spawn_event)?;
-            lane_initialization_crash_cut("after_spawn_event")?;
+            let crash_cut = lane_initialization_crash_cut("after_spawn_event");
+            self.committed_lane_initialization_step(&initialization, &fence, crash_cut)?;
             let observer_ready = self.mark_lane_initialization_observer_ready(&request, &fence);
             self.committed_lane_initialization_step(&initialization, &fence, observer_ready)?;
             let report = LaneSpawnReport {
@@ -2596,6 +2620,7 @@ impl Trail {
 
     fn repair_lane_initialization_with_claim(&mut self, lane: &str) -> Result<LaneSpawnReport> {
         let deadline = std::time::Instant::now() + lane_initialization_wait_timeout();
+        let waiter_salt = new_lane_initialization_waiter_salt()?;
         let mut attempt = 0_u32;
         loop {
             match claim_lane_initialization_repair(self, lane)? {
@@ -2617,12 +2642,6 @@ impl Trail {
                     }
                 }
                 LaneInitializationRepairClaim::Contended { record, owner_pid } => {
-                    if record.phase == LaneInitializationPhase::Associated {
-                        return Err(Error::Corrupt(format!(
-                            "lane initialization `{}` is actively owned and cannot be repaired",
-                            record.initialization_id
-                        )));
-                    }
                     if std::time::Instant::now() >= deadline {
                         return Err(Error::LaneInitializationInProgress {
                             lane: record.lane_name,
@@ -2635,6 +2654,7 @@ impl Trail {
                     std::thread::sleep(lane_initialization_wait_delay(
                         &record.initialization_id,
                         attempt,
+                        waiter_salt,
                     ));
                     attempt = attempt.saturating_add(1);
                 }
@@ -2696,6 +2716,7 @@ impl Trail {
             ));
         }
         let head = self.get_ref(&details.branch.ref_name)?;
+        let workdir_mode = self.lane_workdir_mode_for(&details.record, &details.branch)?;
         if head.change_id != details.branch.head_change || head.root_id != details.branch.head_root
         {
             return Err(Error::Corrupt(
@@ -2730,6 +2751,25 @@ impl Trail {
                 &initialization.initialization_id,
                 fence,
             )?;
+        }
+        if workdir_mode.is_transparent_cow() {
+            let mountpoint = details.branch.workdir.as_deref().ok_or_else(|| {
+                Error::Corrupt("transparent COW lane has no mountpoint".to_string())
+            })?;
+            self.create_workspace_view(
+                &details.branch.lane_id,
+                &details.branch.base_change,
+                &details.branch.base_root,
+                platform_workspace_backend(&workdir_mode),
+                Path::new(mountpoint),
+            )?;
+            if let Some(fence) = fence {
+                heartbeat_lane_initialization_owner(
+                    &self.conn,
+                    &initialization.initialization_id,
+                    fence,
+                )?;
+            }
         }
         if initialization.materialization_json.is_some() {
             let journal = self
@@ -3465,6 +3505,30 @@ mod hard_cutover_tests {
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let db = Trail::open(workspace.path()).unwrap();
         (workspace, db)
+    }
+
+    #[test]
+    fn lane_initialization_wait_jitter_varies_by_waiter_and_stays_bounded_at_cap() {
+        let initial = (0_u64..64)
+            .map(|salt| lane_initialization_wait_delay("init_wait", 0, salt))
+            .collect::<std::collections::BTreeSet<_>>();
+        let capped = (0_u64..64)
+            .map(|salt| lane_initialization_wait_delay("init_wait", u32::MAX, salt))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            initial.len() > 1,
+            "distinct waiters must not wake in lockstep"
+        );
+        assert!(capped.len() > 1, "capped waits must retain jitter");
+        assert!(initial.iter().all(|delay| {
+            *delay >= std::time::Duration::from_millis(10)
+                && *delay <= std::time::Duration::from_millis(12)
+        }));
+        assert!(capped.iter().all(|delay| {
+            *delay >= std::time::Duration::from_millis(240)
+                && *delay <= std::time::Duration::from_millis(250)
+        }));
     }
 
     fn assert_lane_association_absent(db: &Trail, name: &str) {
