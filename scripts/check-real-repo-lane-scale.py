@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 UNTRACKED_SCHEMA_VERSION = 1
 RESULT_COLUMNS = [
     "command_id", "phase", "lane", "wall_seconds", "peak_rss_bytes",
@@ -55,7 +55,7 @@ ROOT_FILES = {
     "metrics.json", "results.tsv", "evidence-manifest.sha256",
 }
 RESOURCE_KEYS = [
-    "lanes", "lane_branches", "lane_refs", "merge_queue", "initializations", "workspace_views", "leases",
+    "lanes", "lane_branches", "lane_refs", "merge_queue", "initializations", "initialization_owners", "workspace_views", "leases",
     "observer_owners", "lock_paths", "socket_paths", "mount_paths", "workdir_paths",
     "materialization_journals",
 ]
@@ -81,6 +81,7 @@ RESOURCE_ROW_KEYS = {
     "lane_refs": {"name", "change_id", "root_id", "operation_id", "generation"},
     "merge_queue": {"queue_id", "lane_id", "target_ref", "status"},
     "initializations": {"initialization_id", "lane_name", "lane_id", "request_fingerprint", "phase", "workdir", "materialization_json"},
+    "initialization_owners": {"initialization_id", "owner_generation", "owner_pid"},
     "workspace_views": {"view_id", "lane_id", "backend", "mountpoint", "source_upper", "generated_upper", "scratch_upper", "meta_dir", "journal_path", "status", "owner_pid"},
     "leases": {"lease_id", "lane_id", "ref_name", "path", "mode", "expires_at"},
     "observer_owners": {"scope_id", "lease_state", "daemon_pid"},
@@ -235,7 +236,7 @@ def read_resource_inventory(path: Path) -> dict[str, list[Any]]:
                 fail(f"{label} must be an object")
             exact_keys(row, keys, label)
             for field, value in row.items():
-                if field in {"generation", "expires_at", "owner_pid", "daemon_pid", "size_bytes"}:
+                if field in {"generation", "owner_generation", "expires_at", "owner_pid", "daemon_pid", "size_bytes"}:
                     if value is not None:
                         integer(value, f"{label}.{field}")
                 elif value is not None and (not isinstance(value, str) or not value):
@@ -699,7 +700,7 @@ def check(root: Path) -> dict[str, Any]:
     if any(row.get("name") in {f"refs/lanes/{lane}" for lane in lane_names}
            for row in final_resources["lane_refs"]):
         fail("final resource inventory retains run-owned lane refs")
-    stable_keys = ["lane_refs", "initializations", "workspace_views", "leases",
+    stable_keys = ["lane_refs", "initializations", "initialization_owners", "workspace_views", "leases",
                    "observer_owners", "lock_paths", "socket_paths", "mount_paths",
                    "workdir_paths", "materialization_journals"]
     differences = [key for key in stable_keys if final_resources[key] != runtime_resources[key]]
@@ -750,7 +751,7 @@ def check(root: Path) -> dict[str, Any]:
 
     correctness = metrics["correctness"]
     if not isinstance(correctness, dict): fail("correctness must be an object")
-    exact_keys(correctness, ["lane_count", "edit_count", "ambiguous_results", "false_deletions", "missing_lanes", "unintended_paths", "integrity_errors", "live_locks"], "correctness")
+    exact_keys(correctness, ["lane_count", "edit_count", "ambiguous_results", "false_deletions", "missing_lanes", "unintended_paths", "integrity_errors", "live_locks", "active_owner_rows"], "correctness")
     if integer(correctness["lane_count"], "correctness.lane_count") != lanes_expected: fail("correctness lane count mismatch")
     if integer(correctness["edit_count"], "correctness.edit_count") != expected_count: fail("correctness edit count mismatch")
     derived_correctness = {
@@ -764,6 +765,7 @@ def check(root: Path) -> dict[str, Any]:
                              + len(set(modified_changes) ^ set(expected_paths))),
         "integrity_errors": 0,
         "live_locks": resource_added_count(runtime_resources, final_resources, "lock_paths") + resource_added_count(runtime_resources, final_resources, "leases"),
+        "active_owner_rows": len(active_resources["initialization_owners"]),
     }
     for key, expected in derived_correctness.items():
         if integer(correctness[key], f"correctness.{key}") != expected: fail(f"correctness.{key} does not match raw evidence")
@@ -909,7 +911,7 @@ def check(root: Path) -> dict[str, Any]:
 
     cleanup = metrics["cleanup"]
     if not isinstance(cleanup, dict): fail("cleanup must be an object")
-    exact_keys(cleanup, ["stale_mounts", "stale_sockets", "stale_locks", "stale_initializations", "stale_materializations", "leaked_workdirs", "stale_queue_rows", "stale_lane_rows", "stale_lane_refs"], "cleanup")
+    exact_keys(cleanup, ["stale_mounts", "stale_sockets", "stale_locks", "stale_initializations", "stale_materializations", "leaked_workdirs", "stale_queue_rows", "stale_lane_rows", "stale_lane_refs", "active_owner_rows"], "cleanup")
     derived_cleanup = {
         "stale_mounts": resource_added_count(runtime_resources, final_resources, "mount_paths"),
         "stale_sockets": resource_added_count(runtime_resources, final_resources, "socket_paths"),
@@ -924,6 +926,7 @@ def check(root: Path) -> dict[str, Any]:
                                  if row.get("lane_id") in run_lane_ids and not str(row.get("name", "")).startswith("retired/")]),
         "stale_lane_refs": len([row for row in final_resources["lane_refs"]
                                  if row.get("name") in {f"refs/lanes/{lane}" for lane in lane_names}]),
+        "active_owner_rows": len(final_resources["initialization_owners"]),
     }
     for key, expected in derived_cleanup.items():
         if integer(cleanup[key], f"cleanup.{key}") != expected: fail(f"cleanup.{key} does not match resource inventory")

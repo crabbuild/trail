@@ -87,11 +87,11 @@ The common lifecycle is:
 ### Copying or relocating a workspace
 
 Stop Trail commands, agents, mounts, and observers before copying or moving a
-workspace that includes `.trail/`. Lane-initialization authority records use a
-portable repository token and are valid after a quiescent filesystem copy or
-cross-volume move. Copying while an initialization is live is unsupported: the
-copy may capture an inconsistent publication boundary, so discard it and copy
-again after the source is quiescent.
+workspace that includes `.trail/`. Lane-initialization state and ownership live
+in the Trail SQLite database, so a quiescent copy or cross-volume move needs no
+lock-file or authority-file repair. Copying while an initialization is live is
+unsupported. If that happens, discard the copy and copy again after the source
+is quiescent.
 
 ## Command Families
 
@@ -138,6 +138,21 @@ Compatibility flags:
 - `--materialize` creates a materialized workdir.
 - `--no-materialize` keeps the lane virtual.
 - `--paths <PATH>...` implies a sparse materialized workdir.
+
+### Concurrent initialization
+
+Concurrent identical `lane spawn` requests coordinate through a short-lived
+SQLite owner claim and replay one durable result. Trail does not create lane
+initialization lock, anchor, identity, or candidate files. Different lane
+initializations hold SQLite write authority only for brief claim and phase
+transactions; workdir materialization runs outside those transactions.
+
+Trail protects an owner whose process identity is live or cannot be checked
+safely. It takes over only after process liveness proves the recorded owner is
+dead or its process-start identity no longer matches. Heartbeat age and wall
+clock time never authorize takeover. A contender that still sees a protected
+owner after 30 minutes returns `LANE_INITIALIZATION_IN_PROGRESS` with the lane,
+durable phase, owner PID, and retry guidance; it does not revoke the owner.
 
 `fuse-cow` requires FUSE support when mounted by a runtime such as
 `trail agent start --workdir-mode fuse-cow`: macFUSE on macOS, or `/dev/fuse`

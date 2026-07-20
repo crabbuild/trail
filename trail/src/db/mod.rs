@@ -3689,10 +3689,7 @@ fn workspace_lock_admission_can_wait(
             | WorkspaceLockPurpose::ObserverStartup
             | WorkspaceLockPurpose::ObserverPublication,
         ) => true,
-        (WorkspaceLockPurpose::LaneAssociation, WorkspaceLockPurpose::LaneAssociation) => {
-            matches!((admission.operation_id, holder.operation_id.as_deref()),
-                (Some(requested), Some(held)) if requested != held)
-        }
+        (WorkspaceLockPurpose::LaneAssociation, WorkspaceLockPurpose::LaneAssociation) => true,
         (
             WorkspaceLockPurpose::ObserverPublication,
             WorkspaceLockPurpose::LaneAssociation | WorkspaceLockPurpose::ObserverStartup,
@@ -4890,7 +4887,6 @@ pub(crate) fn clear_lane_initialization_owner_liveness_overrides_for_current_thr
 pub(crate) use lane::{
     clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,
     install_schema_v18_authenticated_lane_evidence, install_schema_v19_backfill_times,
-    lane_initialization_publication_lock_count, reset_lane_initialization_publication_lock_count,
     run_changed_path_view_flow, schema_v19_backfill_times_remaining,
     set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
@@ -5169,6 +5165,43 @@ mod tests {
                     operation_id: Some("scope-b"),
                     deadline: Duration::from_secs(1),
                     retry_command: "retry observer startup",
+                },
+            )
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        drop(held);
+        let acquired = waiter.join().unwrap().unwrap();
+        drop(acquired);
+        assert!(!db_dir.join("lock").exists());
+    }
+
+    #[test]
+    fn workspace_lock_identical_lane_associations_wait_for_short_owner_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_dir = temp.path().to_path_buf();
+        let schema = db_dir.join("trail.sqlite");
+        let held = acquire_workspace_lock_with_admission(
+            &db_dir,
+            &schema,
+            WorkspaceLockAdmission {
+                purpose: WorkspaceLockPurpose::LaneAssociation,
+                operation_id: Some("init-identical"),
+                deadline: Duration::ZERO,
+                retry_command: "holder",
+            },
+        )
+        .unwrap();
+        let waiter_dir = db_dir.clone();
+        let waiter_schema = schema.clone();
+        let waiter = std::thread::spawn(move || {
+            acquire_workspace_lock_with_admission(
+                &waiter_dir,
+                &waiter_schema,
+                WorkspaceLockAdmission {
+                    purpose: WorkspaceLockPurpose::LaneAssociation,
+                    operation_id: Some("init-identical"),
+                    deadline: Duration::from_secs(1),
+                    retry_command: "retry identical lane association",
                 },
             )
         });

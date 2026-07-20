@@ -46,7 +46,6 @@ mod workspace_view;
 
 #[cfg(debug_assertions)]
 pub(crate) use lifecycle::{
-    lane_initialization_publication_lock_count, reset_lane_initialization_publication_lock_count,
     set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
     set_sparse_selection_write_failure_for_current_thread,

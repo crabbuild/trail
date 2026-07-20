@@ -194,7 +194,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
     empty_resources = {
         "schema_version": 1,
         "resources": {key: [] for key in (
-            "lanes", "lane_branches", "lane_refs", "merge_queue", "initializations", "workspace_views",
+            "lanes", "lane_branches", "lane_refs", "merge_queue", "initializations", "initialization_owners", "workspace_views",
             "leases", "observer_owners", "lock_paths", "socket_paths",
             "mount_paths", "workdir_paths", "materialization_journals",
         )},
@@ -302,7 +302,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         "correctness": {"lane_count": lanes, "edit_count": lanes * files,
                         "ambiguous_results": 0, "false_deletions": 0,
                         "missing_lanes": 0, "unintended_paths": 0,
-                        "integrity_errors": 0, "live_locks": 0},
+                        "integrity_errors": 0, "live_locks": 0, "active_owner_rows": 0},
         "performance": {"spawn": perf(lanes), "record": perf(lanes),
                         "queue_run": perf(1), "git_export": perf(1),
                         "latency_ceiling_enforced": lanes <= 64},
@@ -326,7 +326,7 @@ def fixture(root: Path, lanes: int = 2, files: int = 2, wall: float = 0.2) -> No
         "cleanup": {"stale_mounts": 0, "stale_sockets": 0, "stale_locks": 0,
                     "stale_initializations": 0, "stale_materializations": 0,
                     "leaked_workdirs": 0, "stale_queue_rows": 0, "stale_lane_rows": 0,
-                    "stale_lane_refs": 0},
+                    "stale_lane_refs": 0, "active_owner_rows": 0},
         "audit_history": {"retired_lane_rows": lanes, "removed_lane_branch_rows": lanes,
                           "terminal_queue_rows": lanes},
         "integrity": {"trail_doctor": True, "trail_fsck": True,
@@ -419,6 +419,36 @@ class CheckerContractTests(unittest.TestCase):
         metrics = json.loads((root / "metrics.json").read_text())
         metrics["cleanup"]["stale_locks"] = 1
         (root / "metrics.json").write_text(json.dumps(metrics) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "resource inventory"):
+            checker.check(root)
+
+    def test_active_lane_initialization_owner_is_rejected(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        active = json.loads((root / "active-resources.json").read_text())
+        active["resources"]["initialization_owners"] = [{
+            "initialization_id": "init-live", "owner_generation": 1, "owner_pid": 42,
+        }]
+        (root / "active-resources.json").write_text(json.dumps(active, sort_keys=True) + "\n")
+        metrics = json.loads((root / "metrics.json").read_text())
+        metrics["correctness"]["active_owner_rows"] = 1
+        (root / "metrics.json").write_text(json.dumps(metrics, sort_keys=True) + "\n")
+        refresh_manifest(root)
+        with self.assertRaisesRegex(checker.EvidenceError, "active_owner_rows"):
+            checker.check(root)
+
+    def test_zero_active_lane_initialization_owners_are_accepted(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        self.assertEqual(checker.check(root)["status"], "PASS")
+
+    def test_synthetic_runtime_lock_leak_is_rejected(self) -> None:
+        temp, root = self.artifact()
+        self.addCleanup(temp.cleanup)
+        final = json.loads((root / "final-resources.json").read_text())
+        final["resources"]["lock_paths"] = ["synthetic-runtime.lock"]
+        (root / "final-resources.json").write_text(json.dumps(final, sort_keys=True) + "\n")
         refresh_manifest(root)
         with self.assertRaisesRegex(checker.EvidenceError, "resource inventory"):
             checker.check(root)

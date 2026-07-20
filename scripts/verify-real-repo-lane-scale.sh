@@ -172,6 +172,7 @@ tables = {
     "lane_refs": ("refs", ["name", "change_id", "root_id", "operation_id", "generation"]),
     "merge_queue": ("lane_merge_queue", ["queue_id", "lane_id", "target_ref", "status"]),
     "initializations": ("lane_initializations", ["initialization_id", "lane_name", "lane_id", "request_fingerprint", "phase", "workdir", "materialization_json"]),
+    "initialization_owners": ("lane_initialization_owners", ["initialization_id", "owner_generation", "owner_pid"]),
     "workspace_views": ("workspace_views", ["view_id", "lane_id", "backend", "mountpoint", "source_upper", "generated_upper", "scratch_upper", "meta_dir", "journal_path", "status", "owner_pid"]),
     "leases": ("leases", ["lease_id", "lane_id", "ref_name", "path", "mode", "expires_at"]),
     "observer_owners": ("changed_path_observer_owners", ["scope_id", "lease_state", "daemon_pid"]),
@@ -1166,6 +1167,7 @@ cleanup={
  "stale_queue_rows":sum(row.get("lane_id") in run_lane_ids and row.get("status") not in {"merged","failed","cancelled"} for row in final_resources["merge_queue"]),
  "stale_lane_rows":sum(row.get("lane_id") in run_lane_ids and not str(row.get("name","")).startswith("retired/") for row in final_resources["lanes"]),
  "stale_lane_refs":sum(row.get("name") in {f"refs/lanes/{name}" for name in planned} for row in final_resources["lane_refs"]),
+ "active_owner_rows":len(final_resources["initialization_owners"]),
 }
 expected_paths=(root/"expected-paths.txt").read_text().splitlines()
 trail_paths=(root/"final-trail-paths.txt").read_text().splitlines()
@@ -1186,10 +1188,10 @@ integrity_commands={
  "git-fsck":git_fsck_wrapper["actual_exit_code"] == 0,
 }
 metrics={
- "schema_version":6,
+ "schema_version":7,
  "run":{"run_id":run_id,"lanes":lanes,"files_per_lane":files,"concurrency":int(concurrency),"fault_phase":fault_phase,"latency_ceiling_seconds":float(ceiling)},
  "baseline":{"trail_commit":trail_commit,"trail_source_commit":trail_source,"trail_ref":trail_ref,"trail_root":trail_root,"git_head":git_head,"git_branch":git_branch,"git_index_tree":git_index,"filesystem":filesystem,"repo_path":repo},
- "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline^set(expected_paths))+len(changed_paths^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases")},
+ "correctness":{"lane_count":lanes,"edit_count":lanes*files,"ambiguous_results":sum(r["initialization_id"]!=r["retry_initialization_id"] for r in lane_rows),"false_deletions":len(deleted_paths),"missing_lanes":len(planned-(active_names & active_lane_names_from_refs & active_lane_names_from_initializations)),"unintended_paths":len(set(trail_paths)^set(expected_paths))+len(set(git_paths)^set(expected_paths))+len(unexpected_changes)+len(modified_baseline^set(expected_paths))+len(changed_paths^set(expected_paths)),"integrity_errors":sum(not value for value in integrity_commands.values()),"live_locks":added_count("lock_paths")+added_count("leases"),"active_owner_rows":len(active_resources["initialization_owners"])},
  "performance":{"spawn":perf("spawn"),"record":perf("record"),"queue_run":perf("queue_run"),"git_export":perf("git_export"),"latency_ceiling_enforced":lanes<=64},
  "storage":{"db_bytes_before":int(db_before),"db_bytes_after":int(db_after),"db_wal_bytes_before":int(wal_before),"db_wal_bytes_after":int(wal_after),"db_shm_bytes_before":int(shm_before),"db_shm_bytes_after":int(shm_after),"repo_disk_bytes_before":int(repo_disk_before),"repo_disk_bytes_after":int(repo_disk_after),"trail_disk_bytes_before":int(trail_disk_before),"trail_disk_bytes_after":int(trail_disk_after),"output_disk_bytes_after":int(output_disk_after),"observer_log_bytes_before":int(log_before),"observer_log_bytes_after":int(log_after),"logical_lane_bytes":sum(int(r["logical_bytes"]) for r in lane_rows),"allocated_lane_bytes":sum(int(r["allocated_bytes"]) for r in lane_rows),"exclusive_lane_bytes":sum(int(r["exclusive_bytes"]) for r in lane_rows),"clone_count":sum(int(r["clone_count"]) for r in lane_rows),"shared_physical_bytes":sum(int(r["shared_physical_bytes"]) for r in lane_rows),"shared_extent_bytes":sum(int(r["shared_extent_bytes"] or 0) for r in lane_rows),"changed_bytes":sum(int(r["changed_bytes"]) for r in lane_rows)},
  "git_export":{"export_mode":export["performance"]["export_mode"],"changed_path_count":export["performance"]["changed_path_count"],"commit_count":int(commit_count),"commit":export_commit,"parent":export_parent,"dedicated_ref":dedicated_ref,"dedicated_ref_target":dedicated_target,"original_head_unchanged":True,"original_branch_unchanged":True,"original_index_unchanged":True,"dirty_refusal_code":dirty_code,"unexpected_path_count":len(set(git_paths)^set(expected_paths))},

@@ -49,6 +49,7 @@ const MAX_PENDING_RECORDS: usize = 8_192;
 const MAX_RETAINED_EVENTS: usize = 65_536;
 const MAX_DIRECT_POLICY_DEPENDENCIES: usize = 1_024;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CAPABILITY_VERSION: u16 = 4;
 const STREAM_FLAGS: u32 = fs_events::kFSEventStreamCreateFlagFileEvents
@@ -391,7 +392,7 @@ struct StartOptions {
 impl StartOptions {
     fn production() -> Self {
         Self {
-            timeout: FENCE_TIMEOUT,
+            timeout: STREAM_START_TIMEOUT,
             authority_override: None,
             post_start_database_uuid_override: None,
             delay_after_native_start: Duration::ZERO,

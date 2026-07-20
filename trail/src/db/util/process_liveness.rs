@@ -5,6 +5,7 @@ pub(crate) enum ProcessIdentityMatch {
     Unknown,
 }
 
+#[cfg(test)]
 pub(crate) fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -61,7 +62,7 @@ pub(crate) fn process_start_token(pid: u32) -> Option<String> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn windows_process_is_alive(pid: u32) -> bool {
     use winapi::shared::minwindef::DWORD;
     use winapi::um::handleapi::CloseHandle;
@@ -343,7 +344,7 @@ pub(crate) fn test_crash_point(name: &str) {
     let _ = name;
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn unix_process_is_alive(pid: u32) -> bool {
     let Ok(raw_pid) = i32::try_from(pid) else {
         return false;
