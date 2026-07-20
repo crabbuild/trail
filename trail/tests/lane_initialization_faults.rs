@@ -58,6 +58,17 @@ fn rows_for_lane(sqlite: &Path, lane: &str) -> i64 {
     )
 }
 
+fn owners_for_lane(sqlite: &Path, lane: &str) -> i64 {
+    count(
+        sqlite,
+        "SELECT COUNT(*) FROM lane_initialization_owners owner
+         JOIN lane_initializations initialization
+           ON initialization.initialization_id=owner.initialization_id
+         WHERE initialization.lane_name=?1",
+        lane,
+    )
+}
+
 fn refs_for_lane(sqlite: &Path, lane: &str) -> i64 {
     count(
         sqlite,
@@ -140,6 +151,19 @@ fn reject_lane_initialization_phases(sqlite: &Path, phases: &[&str]) {
                SELECT RAISE(FAIL, 'injected lane initialization phase persistence failure');
              END;"
         ))
+        .unwrap();
+}
+
+fn reject_lane_initialization_owner_deletes(sqlite: &Path) {
+    Connection::open(sqlite)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_lane_initialization_owner_delete
+             BEFORE DELETE ON lane_initialization_owners
+             BEGIN
+               SELECT RAISE(FAIL, 'injected lane initialization owner release failure');
+             END;",
+        )
         .unwrap();
 }
 
@@ -464,6 +488,95 @@ fn identical_spawn_resumes_at_every_durable_crash_cut() {
 }
 
 #[test]
+fn stale_owner_cannot_transition_after_generation_takeover() {
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let handshake = temp.path().join("stale-owner.handshake");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("lane_initialization_crash_child")
+        .arg("--nocapture")
+        .env(CHILD_WORKSPACE, temp.path())
+        .env(CRASH_AFTER, "after_reservation")
+        .env(HANDSHAKE, &handshake)
+        .env(CHILD_LEDGER_AUTHORITY, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !handshake.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handshake.exists(), "child did not publish owner handshake");
+
+    let (initialization_id, stale_token, stale_generation): (String, String, i64) =
+        Connection::open(&sqlite)
+            .unwrap()
+            .query_row(
+                "SELECT initialization.initialization_id,owner.owner_token,owner.owner_generation
+                 FROM lane_initializations initialization
+                 JOIN lane_initialization_owners owner
+                   ON owner.initialization_id=initialization.initialization_id
+                 WHERE initialization.lane_name='crash-lane'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let replacement_token = "22".repeat(32);
+    let changed = Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "UPDATE lane_initialization_owners
+             SET owner_token=?1,owner_generation=owner_generation+1,
+                 owner_pid=?2,owner_process_start_identity='replacement-owner'
+             WHERE initialization_id=?3 AND owner_token=?4 AND owner_generation=?5",
+            rusqlite::params![
+                replacement_token,
+                std::process::id(),
+                initialization_id,
+                stale_token,
+                stale_generation,
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let error = db
+        .debug_transition_lane_initialization_with_fence(
+            &initialization_id,
+            &stale_token,
+            stale_generation,
+            LaneInitializationPhase::Reserved,
+            LaneInitializationPhase::Materialized,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("owner fence no longer matches"));
+    assert_eq!(
+        db.lane_initialization("crash-lane").unwrap().unwrap().phase,
+        LaneInitializationPhase::Reserved
+    );
+    let stored_generation: i64 = Connection::open(&sqlite)
+        .unwrap()
+        .query_row(
+            "SELECT owner_generation FROM lane_initialization_owners
+             WHERE initialization_id=?1",
+            [&initialization_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_generation, stale_generation + 1);
+}
+
+#[test]
 fn io_failures_never_advance_past_or_delete_the_durable_artifact() {
     for (boundary, disk_full) in [
         ("workdir_write", true),
@@ -560,6 +673,64 @@ fn post_association_failure_is_durable_committed_repair_and_repairs_once() {
 }
 
 #[test]
+fn terminal_transition_and_owner_release_are_one_transaction() {
+    let successful = tempfile::tempdir().unwrap();
+    initialize_workspace(successful.path());
+    let successful_sqlite = successful.path().join(".trail/index/trail.sqlite");
+    let mut successful_db = Trail::open(successful.path()).unwrap();
+    let report = successful_db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "terminal-success",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(report.phase, LaneInitializationPhase::ObserverReady);
+    assert_eq!(owners_for_lane(&successful_sqlite, "terminal-success"), 0);
+
+    let temp = tempfile::tempdir().unwrap();
+    initialize_workspace(temp.path());
+    let sqlite = temp.path().join(".trail/index/trail.sqlite");
+    let mut db = Trail::open(temp.path()).unwrap();
+    reject_lane_initialization_owner_deletes(&sqlite);
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "terminal-release",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+    match error {
+        trail::Error::CommittedRepairRequired {
+            committed: true,
+            phase,
+            ..
+        } => assert_eq!(phase, LaneInitializationPhase::Associated),
+        other => panic!("terminal owner-release failure escaped as {other:?}"),
+    }
+    assert_eq!(
+        db.lane_initialization("terminal-release")
+            .unwrap()
+            .unwrap()
+            .phase,
+        LaneInitializationPhase::Associated
+    );
+    assert_eq!(owners_for_lane(&sqlite, "terminal-release"), 1);
+    assert_eq!(spawn_events_for_lane(&sqlite, "terminal-release"), 1);
+}
+
+#[test]
 fn repair_state_persistence_failure_preserves_committed_outcome_contract() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -595,6 +766,7 @@ fn repair_state_persistence_failure_preserves_committed_outcome_contract() {
         other => panic!("post-commit failure escaped as {other:?}"),
     }
     assert_eq!(durable_phase, LaneInitializationPhase::Associated);
+    assert_eq!(owners_for_lane(&sqlite, "repair-write-failure"), 0);
 }
 
 #[test]
@@ -604,6 +776,7 @@ fn observer_ready_and_repair_persistence_failures_preserve_committed_outcome_con
     let sqlite = temp.path().join(".trail/index/trail.sqlite");
     let mut db = Trail::open(temp.path()).unwrap();
     reject_lane_initialization_phases(&sqlite, &["observer_ready", "repair_required"]);
+    reject_lane_initialization_owner_deletes(&sqlite);
     let error = db
         .spawn_lane_with_workdir_mode_paths_and_neighbors(
             "observer-write-failure",
@@ -632,6 +805,7 @@ fn observer_ready_and_repair_persistence_failures_preserve_committed_outcome_con
     }
     assert_eq!(durable_phase, LaneInitializationPhase::Associated);
     assert_eq!(spawn_events_for_lane(&sqlite, "observer-write-failure"), 1);
+    assert_eq!(owners_for_lane(&sqlite, "observer-write-failure"), 1);
 }
 
 #[test]

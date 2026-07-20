@@ -1,3 +1,4 @@
+use super::initialization_owner::{owner_fence_matches, LaneInitializationFence};
 use super::*;
 #[cfg(any(test, debug_assertions))]
 use std::collections::VecDeque;
@@ -337,13 +338,6 @@ impl ResolvedLaneSpawnRequest {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum LaneInitializationReservation {
-    Start(LaneInitializationRecord),
-    Resume(LaneInitializationRecord),
-    Ready(LaneInitializationRecord),
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 struct CanonicalLegacyLaneMetadata {
     requested_workdir_mode: String,
@@ -592,6 +586,7 @@ fn phase_database_name(phase: LaneInitializationPhase) -> &'static str {
 pub(crate) fn transition_lane_initialization(
     tx: &rusqlite::Transaction<'_>,
     initialization_id: &str,
+    fence: &LaneInitializationFence,
     expected: LaneInitializationPhase,
     next: LaneInitializationPhase,
     update: LaneInitializationUpdate<'_>,
@@ -618,7 +613,11 @@ pub(crate) fn transition_lane_initialization(
              repair_command=CASE WHEN ?1='repair_required'
                THEN 'trail lane repair-initialization ' || lane_name ELSE NULL END,
              updated_at=?7
-         WHERE initialization_id=?8 AND phase=?9",
+         WHERE initialization_id=?8 AND phase=?9
+           AND EXISTS(
+             SELECT 1 FROM lane_initialization_owners owner
+             WHERE owner.initialization_id=lane_initializations.initialization_id
+               AND owner.owner_token=?10 AND owner.owner_generation=?11)",
         params![
             phase_database_name(next),
             update.operation_id,
@@ -631,9 +630,35 @@ pub(crate) fn transition_lane_initialization(
             now_ts(),
             initialization_id,
             phase_database_name(expected),
+            fence.owner_token,
+            fence.owner_generation,
         ],
     )?;
     if changed == 1 {
+        let owner_changed = if matches!(
+            next,
+            LaneInitializationPhase::ObserverReady | LaneInitializationPhase::RepairRequired
+        ) {
+            tx.execute(
+                "DELETE FROM lane_initialization_owners
+                 WHERE initialization_id=?1 AND owner_token=?2 AND owner_generation=?3",
+                params![initialization_id, fence.owner_token, fence.owner_generation],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE lane_initialization_owners SET heartbeat_at=?1
+                 WHERE initialization_id=?2 AND owner_token=?3 AND owner_generation=?4",
+                params![
+                    now_ts(),
+                    initialization_id,
+                    fence.owner_token,
+                    fence.owner_generation,
+                ],
+            )?
+        };
+        if owner_changed != 1 {
+            return Err(lane_initialization_ownership_lost(initialization_id));
+        }
         return Ok(());
     }
     let current = lane_initialization_record(tx, initialization_id)?.ok_or_else(|| {
@@ -641,8 +666,22 @@ pub(crate) fn transition_lane_initialization(
             "lane initialization `{initialization_id}` disappeared during transition"
         ))
     })?;
-    if current.phase == next {
+    let fence_matches = owner_fence_matches(tx, initialization_id, fence)?;
+    let any_owner: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM lane_initialization_owners WHERE initialization_id=?1)",
+        [initialization_id],
+        |row| row.get(0),
+    )?;
+    let terminal_without_owner = matches!(
+        next,
+        LaneInitializationPhase::ObserverReady | LaneInitializationPhase::RepairRequired
+    ) && !any_owner;
+    if current.phase == next && (fence_matches || terminal_without_owner) {
         return Ok(());
+    }
+    if !fence_matches {
+        return Err(lane_initialization_ownership_lost(initialization_id));
     }
     Err(Error::Corrupt(format!(
         "lane initialization `{initialization_id}` is {:?}, expected {:?} for transition to {:?}",
@@ -650,43 +689,21 @@ pub(crate) fn transition_lane_initialization(
     )))
 }
 
+fn lane_initialization_ownership_lost(initialization_id: &str) -> Error {
+    Error::Corrupt(format!(
+        "lane initialization `{initialization_id}` owner fence no longer matches"
+    ))
+}
+
 impl Trail {
     pub fn lane_initialization(&self, lane: &str) -> Result<Option<LaneInitializationReport>> {
         Ok(lane_initialization_record(&self.conn, lane)?.map(LaneInitializationRecord::report))
     }
 
-    pub(crate) fn reserve_lane_initialization(
-        &mut self,
-        request: &ResolvedLaneSpawnRequest,
-    ) -> Result<LaneInitializationReservation> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(existing) = lane_initialization_record(&tx, &request.lane_name)? {
-            if existing.request_fingerprint != request.request_fingerprint {
-                return Err(Error::LaneInitializationConflict {
-                    lane: request.lane_name.clone(),
-                    existing_fingerprint: existing.request_fingerprint,
-                    requested_fingerprint: request.request_fingerprint.clone(),
-                });
-            }
-            let ready = existing.phase == LaneInitializationPhase::ObserverReady;
-            tx.commit()?;
-            return Ok(if ready {
-                LaneInitializationReservation::Ready(existing)
-            } else {
-                LaneInitializationReservation::Resume(existing)
-            });
-        }
-
-        let record = insert_lane_initialization_reservation(&tx, request)?;
-        tx.commit()?;
-        Ok(LaneInitializationReservation::Start(record))
-    }
-
     pub(crate) fn mark_lane_initialization_materialized(
         &mut self,
         request: &ResolvedLaneSpawnRequest,
+        fence: &LaneInitializationFence,
         operation_id: &ObjectId,
         materialization: Option<&MaterializationReport>,
     ) -> Result<()> {
@@ -695,6 +712,7 @@ impl Trail {
         transition_lane_initialization(
             &tx,
             &request.initialization_id,
+            fence,
             LaneInitializationPhase::Reserved,
             LaneInitializationPhase::Materialized,
             LaneInitializationUpdate {
@@ -711,29 +729,27 @@ impl Trail {
     pub(crate) fn mark_lane_initialization_observer_ready(
         &mut self,
         request: &ResolvedLaneSpawnRequest,
+        fence: &LaneInitializationFence,
     ) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE lane_initializations SET phase='observer_ready',updated_at=?1
-             WHERE initialization_id=?2 AND request_fingerprint=?3
-               AND phase IN ('associated','repair_required')",
-            params![
-                now_ts(),
-                request.initialization_id,
-                request.request_fingerprint,
-            ],
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transition_lane_initialization(
+            &tx,
+            &request.initialization_id,
+            fence,
+            LaneInitializationPhase::Associated,
+            LaneInitializationPhase::ObserverReady,
+            LaneInitializationUpdate::none(),
         )?;
-        if changed != 1 {
-            return Err(Error::Corrupt(format!(
-                "lane initialization `{}` could not transition associated -> observer_ready",
-                request.initialization_id
-            )));
-        }
+        tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn mark_lane_initialization_repair_required(
         &mut self,
         initialization_id: &str,
+        fence: &LaneInitializationFence,
         error: &Error,
     ) -> Result<LaneInitializationRecord> {
         let current =
@@ -742,13 +758,22 @@ impl Trail {
                     "lane initialization `{initialization_id}` disappeared"
                 ))
             })?;
-        if current.phase == LaneInitializationPhase::ObserverReady {
+        if matches!(
+            current.phase,
+            LaneInitializationPhase::ObserverReady | LaneInitializationPhase::RepairRequired
+        ) {
+            let has_owner: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM lane_initialization_owners WHERE initialization_id=?1)",
+                [initialization_id],
+                |row| row.get(0),
+            )?;
+            if has_owner {
+                return Err(lane_initialization_ownership_lost(initialization_id));
+            }
             return Ok(current);
         }
-        if !matches!(
-            current.phase,
-            LaneInitializationPhase::Associated | LaneInitializationPhase::RepairRequired
-        ) {
+        if current.phase != LaneInitializationPhase::Associated {
             return Err(Error::Corrupt(format!(
                 "cannot require repair for unassociated lane initialization `{initialization_id}`"
             )));
@@ -757,6 +782,7 @@ impl Trail {
         transition_lane_initialization(
             &tx,
             initialization_id,
+            fence,
             current.phase,
             LaneInitializationPhase::RepairRequired,
             LaneInitializationUpdate {
@@ -772,9 +798,38 @@ impl Trail {
         })
     }
 
-    pub(crate) fn complete_deferred_lane_initialization(
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_transition_lane_initialization_with_fence(
+        &mut self,
+        initialization_id: &str,
+        owner_token: &str,
+        owner_generation: i64,
+        expected: LaneInitializationPhase,
+        next: LaneInitializationPhase,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transition_lane_initialization(
+            &tx,
+            initialization_id,
+            &LaneInitializationFence {
+                owner_token: owner_token.to_string(),
+                owner_generation,
+            },
+            expected,
+            next,
+            LaneInitializationUpdate::none(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_deferred_lane_initialization_owned(
         &mut self,
         lane: &str,
+        fence: &LaneInitializationFence,
     ) -> Result<LaneInitializationRecord> {
         let record = lane_initialization_record(&self.conn, lane)?
             .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
@@ -790,19 +845,68 @@ impl Trail {
                 record.initialization_id, record.phase
             )));
         }
-        let changed = self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transition_lane_initialization(
+            &tx,
+            &record.initialization_id,
+            fence,
+            record.phase,
+            LaneInitializationPhase::ObserverReady,
+            LaneInitializationUpdate::none(),
+        )?;
+        tx.commit()?;
+        lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` initialization disappeared")))
+    }
+
+    pub(crate) fn complete_unowned_lane_initialization_repair(
+        &mut self,
+        lane: &str,
+    ) -> Result<LaneInitializationRecord> {
+        let record = lane_initialization_record(&self.conn, lane)?
+            .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` has no initialization row")))?;
+        if record.phase == LaneInitializationPhase::ObserverReady {
+            return Ok(record);
+        }
+        if record.phase != LaneInitializationPhase::RepairRequired {
+            return Err(Error::Corrupt(format!(
+                "lane initialization `{}` is {:?}, expected repair_required",
+                record.initialization_id, record.phase
+            )));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_owner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lane_initialization_owners WHERE initialization_id=?1)",
+            [&record.initialization_id],
+            |row| row.get(0),
+        )?;
+        if has_owner {
+            return Err(Error::Corrupt(format!(
+                "terminal lane initialization `{}` unexpectedly retains an owner",
+                record.initialization_id
+            )));
+        }
+        let changed = tx.execute(
             "UPDATE lane_initializations
              SET phase='observer_ready',last_error_code=NULL,last_error_message=NULL,
                  repair_command=NULL,updated_at=?1
-             WHERE initialization_id=?2 AND phase IN ('associated','repair_required')",
+             WHERE initialization_id=?2 AND phase='repair_required'
+               AND NOT EXISTS(
+                 SELECT 1 FROM lane_initialization_owners owner
+                 WHERE owner.initialization_id=lane_initializations.initialization_id)",
             params![now_ts(), record.initialization_id],
         )?;
         if changed != 1 {
             return Err(Error::Corrupt(format!(
-                "lane initialization `{}` could not complete deferred observer readiness",
+                "lane initialization `{}` could not complete repair",
                 record.initialization_id
             )));
         }
+        tx.commit()?;
         lane_initialization_record(&self.conn, lane)?
             .ok_or_else(|| Error::Corrupt(format!("lane `{lane}` initialization disappeared")))
     }
