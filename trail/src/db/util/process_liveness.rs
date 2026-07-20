@@ -366,10 +366,19 @@ fn windows_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMa
         let value = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
         if format!("windows:{value}") == token {
             ProcessIdentityMatch::Match
-        } else {
+        } else if windows_process_start_token_is_comparable(token) {
             ProcessIdentityMatch::DeadOrMismatch
+        } else {
+            ProcessIdentityMatch::Unknown
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_start_token_is_comparable(token: &str) -> bool {
+    token
+        .strip_prefix("windows:")
+        .is_some_and(canonical_decimal)
 }
 
 pub(crate) fn test_crash_point(name: &str) {
@@ -445,8 +454,7 @@ fn unix_process_start_token_match(pid: u32, token: &str) -> ProcessIdentityMatch
 fn process_start_token_is_comparable(token: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let _ = token;
-        return true;
+        return token.strip_prefix("linux:").is_some_and(canonical_decimal);
     }
     #[cfg(target_os = "macos")]
     {
@@ -484,7 +492,12 @@ fn canonical_bsd_start_token(token: &str, platform: &str) -> bool {
             .is_ok_and(|value| value < 1_000_000)
 }
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 fn canonical_decimal(value: &str) -> bool {
     value
         .parse::<u64>()
@@ -520,6 +533,25 @@ mod tests {
         assert!(!process_identity_may_match(
             ProcessIdentityMatch::DeadOrMismatch
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn live_process_with_local_fallback_token_is_indeterminate() {
+        let pid = std::process::id();
+        assert_eq!(
+            process_start_token_match(pid, &format!("local:{pid}:1")),
+            ProcessIdentityMatch::Unknown
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn dead_process_with_local_fallback_token_is_reclaimable() {
+        assert_eq!(
+            process_start_token_match(0, "local:0:1"),
+            ProcessIdentityMatch::DeadOrMismatch
+        );
     }
 
     #[cfg(target_os = "macos")]
