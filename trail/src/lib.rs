@@ -73,6 +73,27 @@ pub mod test_support {
         crate::db::clear_schema_v19_migration_failure(db_path);
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SchemaV20MigrationBoundary {
+        AfterDdlBeforeUserVersion,
+    }
+
+    pub fn install_schema_v20_migration_failure(
+        db_path: &std::path::Path,
+        boundary: SchemaV20MigrationBoundary,
+    ) {
+        let boundary = match boundary {
+            SchemaV20MigrationBoundary::AfterDdlBeforeUserVersion => {
+                crate::db::SchemaV20MigrationBoundary::AfterDdlBeforeUserVersion
+            }
+        };
+        crate::db::install_schema_v20_migration_failure(db_path, boundary);
+    }
+
+    pub fn clear_schema_v20_migration_failure(db_path: &std::path::Path) {
+        crate::db::clear_schema_v20_migration_failure(db_path);
+    }
+
     pub fn install_schema_v19_backfill_times(times: Vec<i64>) {
         crate::db::install_schema_v19_backfill_times(times);
     }

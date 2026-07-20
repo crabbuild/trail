@@ -293,11 +293,11 @@ fn migrate_single_legacy_lane(metadata: &serde_json::Value) -> trail::LaneInitia
 }
 
 #[test]
-fn fresh_schema_19_has_the_exact_lane_initialization_contract() {
+fn fresh_schema_20_preserves_the_exact_lane_initialization_contract() {
     let temp = tempfile::tempdir().unwrap();
     Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
     let db_path = Schema18Fixture::db_path_for(temp.path());
-    assert_eq!(sqlite_user_version(&db_path), 19);
+    assert_eq!(sqlite_user_version(&db_path), 20);
     assert_eq!(
         table_columns(&db_path),
         EXPECTED_COLUMNS
@@ -334,7 +334,7 @@ fn fresh_schema_19_has_the_exact_lane_initialization_contract() {
 fn schema_18_migrates_once_and_backfills_every_existing_lane() {
     let fixture = Schema18Fixture::with_clean_and_inconsistent_lanes();
     let db = Trail::open(fixture.workspace()).unwrap();
-    assert_eq!(sqlite_user_version(fixture.db_path()), 19);
+    assert_eq!(sqlite_user_version(fixture.db_path()), 20);
     let conservative = db.lane_initialization("clean").unwrap().unwrap();
     assert_eq!(conservative.phase, LaneInitializationPhase::RepairRequired);
     assert!(conservative
@@ -359,7 +359,7 @@ fn schema_18_migrates_once_and_backfills_every_existing_lane() {
     );
     drop(db);
     drop(Trail::open(fixture.workspace()).unwrap());
-    assert_eq!(sqlite_user_version(fixture.db_path()), 19);
+    assert_eq!(sqlite_user_version(fixture.db_path()), 20);
     assert_eq!(
         Connection::open(fixture.db_path())
             .unwrap()
@@ -630,7 +630,7 @@ fn failed_schema_18_migration_is_byte_invariant_and_retriable() {
     assert_eq!(fixture.database_image_hashes(), before);
     trail::test_support::clear_schema_v19_migration_failure(fixture.db_path());
     drop(Trail::open(fixture.workspace()).unwrap());
-    assert_eq!(sqlite_user_version(fixture.db_path()), 19);
+    assert_eq!(sqlite_user_version(fixture.db_path()), 20);
 }
 
 #[test]
@@ -647,9 +647,9 @@ fn corrupt_predecessor_future_and_partial_current_shapes_are_refused_without_mut
 
     let future = Schema18Fixture::clean();
     let conn = Connection::open(future.db_path()).unwrap();
-    conn.pragma_update(None, "user_version", 20).unwrap();
+    conn.pragma_update(None, "user_version", 21).unwrap();
     conn.execute(
-        "UPDATE schema_meta SET value='20' WHERE key='schema.version'",
+        "UPDATE schema_meta SET value='21' WHERE key='schema.version'",
         [],
     )
     .unwrap();
@@ -657,7 +657,7 @@ fn corrupt_predecessor_future_and_partial_current_shapes_are_refused_without_mut
     let before = future.database_image_hashes();
     let error = open_error(future.workspace());
     assert_eq!(error.code(), "SCHEMA_REINITIALIZE_REQUIRED");
-    assert!(error.to_string().contains("found version 20"));
+    assert!(error.to_string().contains("found version 21"));
     assert_eq!(future.database_image_hashes(), before);
 
     let partial_v19 = Schema18Fixture::clean();
@@ -673,7 +673,7 @@ fn corrupt_predecessor_future_and_partial_current_shapes_are_refused_without_mut
 }
 
 #[test]
-fn schema_18_and_schema_19_backups_restore_through_schema_19() {
+fn schema_18_and_schema_20_backups_restore_through_schema_20() {
     let fixture = Schema18Fixture::clean();
     let archives = tempfile::tempdir().unwrap();
     let baseline = schema18_binary();
@@ -694,7 +694,7 @@ fn schema_18_and_schema_19_backups_restore_through_schema_19() {
     Trail::restore_backup(&restored_v18, &backup_v18, false).unwrap();
     assert_eq!(
         sqlite_user_version(&Schema18Fixture::db_path_for(&restored_v18)),
-        19
+        20
     );
 
     let db = Trail::open(fixture.workspace()).unwrap();
@@ -705,12 +705,12 @@ fn schema_18_and_schema_19_backups_restore_through_schema_19() {
     Trail::restore_backup(&restored_v19, &backup_v19, false).unwrap();
     assert_eq!(
         sqlite_user_version(&Schema18Fixture::db_path_for(&restored_v19)),
-        19
+        20
     );
 }
 
 #[test]
-fn schema_18_binary_refuses_a_migrated_schema_19_workspace() {
+fn schema_18_binary_refuses_a_migrated_schema_20_workspace() {
     let fixture = Schema18Fixture::clean();
     drop(Trail::open(fixture.workspace()).unwrap());
     let output = Command::new(schema18_binary())
@@ -728,7 +728,7 @@ fn schema_18_binary_refuses_a_migrated_schema_19_workspace() {
         rendered.contains("SCHEMA_REINITIALIZE_REQUIRED"),
         "{rendered}"
     );
-    assert!(rendered.contains("found version 19"), "{rendered}");
+    assert!(rendered.contains("found version 20"), "{rendered}");
 }
 
 fn schema18_binary() -> PathBuf {

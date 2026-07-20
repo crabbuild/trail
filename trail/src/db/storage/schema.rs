@@ -27,23 +27,36 @@ CREATE TABLE IF NOT EXISTS prolly_roots (
 ) WITHOUT ROWID;";
 
 impl Trail {
-    pub(crate) fn validate_schema_v19(conn: &Connection) -> Result<()> {
-        validate_schema_v19(conn)
+    pub(crate) fn validate_schema_v20(conn: &Connection) -> Result<()> {
+        validate_schema_v20(conn)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn schema_user_version_for_test(&self) -> i64 {
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("Trail connection must expose its schema user_version")
     }
 }
 
 pub(crate) fn validate_schema_v18_for_migration(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, SCHEMA_V18_VERSION, false)
+    validate_schema_version(conn, SCHEMA_V18_VERSION, false, false)
 }
 
-pub(crate) fn validate_schema_v19(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, TRAIL_SCHEMA_VERSION, true)
+pub(crate) fn validate_schema_v19_for_migration(conn: &Connection) -> Result<()> {
+    validate_schema_version(conn, SCHEMA_V19_VERSION, true, false)
+}
+
+pub(crate) fn validate_schema_v20(conn: &Connection) -> Result<()> {
+    validate_schema_version(conn, TRAIL_SCHEMA_VERSION, true, true)
 }
 
 fn validate_schema_version(
     conn: &Connection,
     expected_version: i64,
     require_lane_initializations: bool,
+    require_lane_initialization_owners: bool,
 ) -> Result<()> {
     let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if user_version != expected_version {
@@ -71,6 +84,13 @@ fn validate_schema_version(
             "schema v18 contains schema v19 lane initialization objects".into(),
         ));
     }
+    if require_lane_initialization_owners {
+        ddl::validate_lane_initialization_owners_v20_shape(conn)?;
+    } else if !ddl::lane_initialization_owner_objects_absent(conn)? {
+        return Err(Error::Corrupt(
+            "pre-v20 schema contains lane initialization owner objects".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -80,22 +100,38 @@ pub(crate) fn migrate_schema_v18_to_v19(conn: &mut Connection) -> Result<()> {
     tx.execute_batch(ddl::LANE_INITIALIZATIONS_V19)?;
     fail_schema_v19_migration_if_installed(&tx)?;
     crate::db::lane::backfill_lane_initializations_v19(&tx)?;
+    update_schema_version_metadata(&tx, SCHEMA_V19_VERSION)?;
+    tx.pragma_update(None, "user_version", SCHEMA_V19_VERSION)?;
+    validate_schema_v19_for_migration(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn migrate_schema_v19_to_v20(conn: &mut Connection) -> Result<()> {
+    validate_schema_v19_for_migration(conn)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(ddl::LANE_INITIALIZATION_OWNERS_V20)?;
+    fail_schema_v20_migration_if_installed(&tx)?;
+    update_schema_version_metadata(&tx, TRAIL_SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", TRAIL_SCHEMA_VERSION)?;
+    validate_schema_v20(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn update_schema_version_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    version: i64,
+) -> Result<()> {
     let now = now_ts();
     tx.execute(
         "UPDATE schema_meta SET value=?1,updated_at=?2 WHERE key=?3",
-        params![
-            TRAIL_SCHEMA_VERSION.to_string(),
-            now,
-            SCHEMA_META_VERSION_KEY
-        ],
+        params![version.to_string(), now, SCHEMA_META_VERSION_KEY],
     )?;
     tx.execute(
         "UPDATE schema_meta SET value=?1,updated_at=?2 WHERE key=?3",
         params![env!("CARGO_PKG_VERSION"), now, SCHEMA_META_APP_VERSION_KEY],
     )?;
-    tx.pragma_update(None, "user_version", TRAIL_SCHEMA_VERSION)?;
-    validate_schema_v19(&tx)?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -106,7 +142,17 @@ pub(crate) enum SchemaV19MigrationBoundary {
 }
 
 #[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchemaV20MigrationBoundary {
+    AfterDdlBeforeUserVersion,
+}
+
+#[cfg(any(test, debug_assertions))]
 static SCHEMA_V19_MIGRATION_FAILURES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    OnceLock::new();
+
+#[cfg(any(test, debug_assertions))]
+static SCHEMA_V20_MIGRATION_FAILURES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
     OnceLock::new();
 
 #[cfg(any(test, debug_assertions))]
@@ -124,6 +170,28 @@ pub(crate) fn install_schema_v19_migration_failure(
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn clear_schema_v19_migration_failure(db_path: &Path) {
     if let Some(failures) = SCHEMA_V19_MIGRATION_FAILURES.get() {
+        failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn install_schema_v20_migration_failure(
+    db_path: &Path,
+    _boundary: SchemaV20MigrationBoundary,
+) {
+    SCHEMA_V20_MIGRATION_FAILURES
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn clear_schema_v20_migration_failure(db_path: &Path) {
+    if let Some(failures) = SCHEMA_V20_MIGRATION_FAILURES.get() {
         failures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -149,6 +217,32 @@ fn fail_schema_v19_migration_if_installed(conn: &Connection) -> Result<()> {
         {
             return Err(Error::Corrupt(
                 "injected schema v19 migration failure after DDL".into(),
+            ));
+        }
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = conn;
+    Ok(())
+}
+
+fn fail_schema_v20_migration_if_installed(conn: &Connection) -> Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        let path: String = conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let path = PathBuf::from(path);
+        let path = canonicalize_lossless(&path).unwrap_or(path);
+        if SCHEMA_V20_MIGRATION_FAILURES
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&path)
+        {
+            return Err(Error::Corrupt(
+                "injected schema v20 migration failure after DDL".into(),
             ));
         }
     }

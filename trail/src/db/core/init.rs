@@ -673,7 +673,7 @@ impl Trail {
             operation_metrics,
         };
         if schema_mode == SchemaOpenMode::FreshCreate {
-            db.create_schema_v19()?;
+            db.create_schema_v20()?;
         }
         Ok(db)
     }
@@ -859,21 +859,26 @@ fn preflight_existing_schema_with_migration(
         Ok(validated) => return Ok(validated),
         Err(error) => error,
     };
-    if inspect_existing_schema_version(db_path, prolly_backend)? != SCHEMA_V18_VERSION {
+    let predecessor = inspect_existing_schema_version(db_path, prolly_backend)?;
+    if !matches!(predecessor, SCHEMA_V18_VERSION | SCHEMA_V19_VERSION) {
         return Err(original_error);
     }
 
-    migrate_existing_schema_v18(db_dir, db_path, prolly_backend)?;
+    migrate_existing_schema_to_v20(db_dir, db_path, prolly_backend)?;
     preflight_existing_schema(db_path, prolly_backend)
 }
 
-fn migrate_existing_schema_v18(db_dir: &Path, db_path: &Path, prolly_backend: &str) -> Result<()> {
+fn migrate_existing_schema_to_v20(
+    db_dir: &Path,
+    db_path: &Path,
+    prolly_backend: &str,
+) -> Result<()> {
     let _lock = acquire_workspace_lock_with_admission(
         db_dir,
         db_path,
         WorkspaceLockAdmission {
             purpose: WorkspaceLockPurpose::SchemaTransition,
-            operation_id: Some("schema-v18-to-v19"),
+            operation_id: Some("schema-to-v20"),
             deadline: Duration::ZERO,
             retry_command: "trail init --force",
         },
@@ -890,25 +895,35 @@ fn migrate_existing_schema_v18(db_dir: &Path, db_path: &Path, prolly_backend: &s
         .map_err(schema_reinitialize_error)?;
     match current {
         TRAIL_SCHEMA_VERSION => {
-            storage::validate_schema_v19(&conn).map_err(schema_reinitialize_error)
+            storage::validate_schema_v20(&conn).map_err(schema_reinitialize_error)
+        }
+        SCHEMA_V19_VERSION => {
+            storage::validate_schema_v19_for_migration(&conn).map_err(schema_reinitialize_error)?;
+            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
+            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)
         }
         SCHEMA_V18_VERSION => {
             storage::validate_schema_v18_for_migration(&conn).map_err(schema_reinitialize_error)?;
-            match prolly_backend {
-                "sqlite" => storage::validate_prolly_sqlite_schema_v18(&conn)
-                    .map_err(schema_reinitialize_error)?,
-                "slatedb" => storage::validate_no_prolly_sqlite_schema_v18(&conn)
-                    .map_err(schema_reinitialize_error)?,
-                other => {
-                    return Err(Error::InvalidInput(format!(
-                        "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-                    )))
-                }
-            }
-            storage::migrate_schema_v18_to_v19(&mut conn).map_err(schema_reinitialize_error)
+            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
+            storage::migrate_schema_v18_to_v19(&mut conn).map_err(schema_reinitialize_error)?;
+            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)
         }
         found => Err(schema_reinitialize_error(format!(
             "database corrupt: found version {found}; expected version {TRAIL_SCHEMA_VERSION}"
+        ))),
+    }
+}
+
+fn validate_predecessor_prolly_schema(conn: &Connection, prolly_backend: &str) -> Result<()> {
+    match prolly_backend {
+        "sqlite" => {
+            storage::validate_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
+        }
+        "slatedb" => {
+            storage::validate_no_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
+        }
+        other => Err(Error::InvalidInput(format!(
+            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
         ))),
     }
 }

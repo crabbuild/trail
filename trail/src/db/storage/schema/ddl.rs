@@ -1098,13 +1098,28 @@ CREATE INDEX lane_initializations_phase_updated_idx
     ON lane_initializations(phase, updated_at);
 "#;
 
+pub(super) const LANE_INITIALIZATION_OWNERS_V20: &str = r#"
+CREATE TABLE lane_initialization_owners (
+    initialization_id TEXT PRIMARY KEY
+        REFERENCES lane_initializations(initialization_id) ON DELETE CASCADE,
+    owner_token TEXT NOT NULL CHECK (
+        length(owner_token)=64 AND owner_token NOT GLOB '*[^0-9a-f]*'),
+    owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+    owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+    owner_process_start_identity TEXT NOT NULL
+        CHECK (length(owner_process_start_identity) > 0),
+    acquired_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL
+);
+"#;
+
 impl Trail {
-    pub(crate) fn create_schema_v19(&self) -> Result<()> {
-        create_schema_v19(&self.conn)
+    pub(crate) fn create_schema_v20(&self) -> Result<()> {
+        create_schema_v20(&self.conn)
     }
 }
 
-pub(crate) fn create_schema_v19(conn: &Connection) -> Result<()> {
+pub(crate) fn create_schema_v20(conn: &Connection) -> Result<()> {
     create_schema(conn, TRAIL_SCHEMA_VERSION, true)
 }
 
@@ -1126,6 +1141,9 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
         if lane_initializations {
             conn.execute_batch(LANE_INITIALIZATIONS_V19)?;
         }
+        if version == TRAIL_SCHEMA_VERSION {
+            conn.execute_batch(LANE_INITIALIZATION_OWNERS_V20)?;
+        }
         validate_schema_v18_shape(conn)?;
         let now = now_ts();
         for (key, value) in [
@@ -1143,8 +1161,10 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
             )?;
         }
         conn.pragma_update(None, "user_version", version)?;
-        if lane_initializations {
-            validate_schema_v19(conn)
+        if version == TRAIL_SCHEMA_VERSION {
+            validate_schema_v20(conn)
+        } else if lane_initializations {
+            validate_schema_v19_for_migration(conn)
         } else {
             validate_schema_v18_for_migration(conn)
         }
@@ -1171,6 +1191,45 @@ pub(super) fn validate_lane_initializations_v19_shape(conn: &Connection) -> Resu
         ));
     }
     Ok(())
+}
+
+pub(super) fn validate_lane_initialization_owners_v20_shape(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.pragma_update(None, "foreign_keys", true)?;
+    expected.execute_batch(LANE_INITIALIZATIONS_V19)?;
+    expected.execute_batch(LANE_INITIALIZATION_OWNERS_V20)?;
+    let actual = lane_initialization_owner_objects(conn)?;
+    let wanted = lane_initialization_owner_objects(&expected)?;
+    if actual != wanted {
+        return Err(Error::Corrupt(
+            "lane initialization owner schema v20 sqlite_master shape does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lane_initialization_owner_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
+         WHERE (name LIKE 'lane_initialization_owners%'
+                OR tbl_name='lane_initialization_owners')
+           AND name NOT LIKE 'sqlite_%'
+         ORDER BY type,name",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                normalize_sql(&row.get::<_, String>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn lane_initialization_owner_objects_absent(conn: &Connection) -> Result<bool> {
+    Ok(lane_initialization_owner_objects(conn)?.is_empty())
 }
 
 fn lane_initialization_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
@@ -1259,6 +1318,7 @@ fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
            AND name NOT LIKE 'prolly_%'
            AND name NOT LIKE 'changed_path_%'
            AND name NOT LIKE 'lane_initializations%'
+           AND name NOT LIKE 'lane_initialization_owners%'
          ORDER BY type, name",
     )?;
     let objects = statement
@@ -1309,7 +1369,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
 
-        assert!(create_schema_v19(&conn).is_err());
+        assert!(create_schema_v20(&conn).is_err());
 
         assert_eq!(master_objects(&conn), before);
         assert_eq!(

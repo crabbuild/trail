@@ -6,10 +6,10 @@ const APPROVED_PRODUCER_INVENTORY_SHA256: &str =
 const APPROVED_RAW_MUTATION_INVENTORY_SHA256: &str =
     "21f2de654b01a47669160b991f5c4fcaf2f0613c8a2a1c5b2aff3be971997698";
 const APPROVED_ACTIVATION_AUDIT_SHA256: &str =
-    "717bd5ca985bc0fd0636c0f1cefc3b2eaefcd11c78ae3b4f571c8a08c61d9f30";
+    "9c4e60f1741a981c1553ac5ed28cfea76ffc58cbd2a712beccbbc1e7ec3a269b";
 const ACTIVATION_AUDIT_MANIFEST: &str = concat!(
     "trail-changed-path-activation-v1\n",
-    "schema=19\n",
+    "schema=20\n",
     "producer=a13fa0330d89ad442a4f796a5fd37b55177ab4fdf7805354925b99fc18199d0e\n",
     "raw=21f2de654b01a47669160b991f5c4fcaf2f0613c8a2a1c5b2aff3be971997698\n",
     "linux_suite=changed_path_ledger_linux\n",
@@ -72,7 +72,7 @@ impl ActivationEvidence {
         let checked_activation_audit = activation_audit_sha256 == APPROVED_ACTIVATION_AUDIT_SHA256;
         Ok(Self {
             schema_hard_cutover: checked_activation_audit
-                && super::super::TRAIL_SCHEMA_VERSION == 19,
+                && super::super::TRAIL_SCHEMA_VERSION == 20,
             producer_inventory_complete: checked_activation_audit,
             // These fields declare the checked build contract. Exact-SHA
             // workflow dependencies, rather than this self-hash, authorize a
