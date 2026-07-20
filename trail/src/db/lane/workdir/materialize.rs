@@ -1,6 +1,5 @@
 use super::*;
 use crate::db::change_ledger::secure_fs::SecureDirectory;
-use rayon::prelude::*;
 
 const MAX_MATERIALIZATION_OPERATION_BYTES: u64 = 64 * 1024;
 
@@ -236,8 +235,14 @@ impl Trail {
 
             let mut stamps = BTreeMap::new();
             let mut report = MaterializationReport::default();
+            // Lane spawning is already parallel across CLI/daemon processes.
+            // A Rayon pool inside every materializing lane multiplies that
+            // parallelism (for example, 64 lane spawns each create a full
+            // worker pool) and overwhelms filesystem clone/xattr operations.
+            // Keep a lane's native-COW work ordered; the outer lane fan-out
+            // remains the concurrency boundary.
             let results = files
-                .par_iter()
+                .iter()
                 .map(|(path, entry)| {
                     let source_stamp =
                         source
@@ -954,7 +959,10 @@ where
     let inventory = native_materialization_durability_inventory(source, stage, paths)?;
     let mut files = inventory.source_files.into_iter().collect::<Vec<_>>();
     files.extend(inventory.destination_files);
-    files.par_iter().try_for_each(|path| -> Result<()> {
+    // This durability barrier follows the same process-level concurrency
+    // policy as native cloning above. Parallel fsync calls from every active
+    // lane amplify contention without changing the required durability cut.
+    files.iter().try_for_each(|path| -> Result<()> {
         let file = OpenOptions::new().read(true).open(path)?;
         // Rust's File::sync_all maps to F_FULLFSYNC on Apple platforms.
         // Use POSIX fsync for each inode, then one F_FULLFSYNC below.

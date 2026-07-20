@@ -1,5 +1,4 @@
 use super::*;
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 pub(crate) enum WorkspaceCowMaterializeStatus {
@@ -95,8 +94,11 @@ pub(crate) fn materialize_from_workspace_cow_report(
     }
 
     let remaining = iter.collect::<Vec<_>>();
+    // Callers can materialize many workdirs concurrently. Avoid adding a
+    // per-process Rayon pool beneath that fan-out: native clone operations
+    // contend on filesystem metadata and retain identical semantics in order.
     let results = remaining
-        .par_iter()
+        .iter()
         .map(|(path, entry)| {
             let status = if let Some(source_stamp) = source_stamps.get(*path) {
                 materialize_workspace_file_cow_status_if_stamp_matches(
