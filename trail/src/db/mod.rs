@@ -34,6 +34,8 @@ use crate::ids::{
 };
 use crate::model::*;
 
+pub use lane::LaneSpawnMaterializationAdmission;
+
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";

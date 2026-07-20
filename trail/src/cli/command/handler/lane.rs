@@ -8,6 +8,18 @@ mod work;
 pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Result<()> {
     match lane.command {
         LaneSubcommand::Spawn(args) => {
+            // Hold a workspace-wide pre-open slot for the complete mutable
+            // spawn. The native-COW limiter begins later, after `open_db`;
+            // without this companion gate, a large agent burst can saturate
+            // SQLite's schema preflight before it reaches that limiter.
+            let _materialization_admission = if !args.no_materialize
+                && args.materialize != Some(false)
+            {
+                let workspace = daemon_start::workspace_from_context(ctx)?;
+                Some(trail::LaneSpawnMaterializationAdmission::acquire_for_workspace(&workspace)?)
+            } else {
+                None
+            };
             let mut db = open_db(ctx)?;
             let workdir_mode = db.resolve_lane_spawn_workdir_mode(
                 args.from.as_deref(),

@@ -147,6 +147,66 @@ impl NativeMaterializationAdmission {
     }
 }
 
+/// Holds one workspace-wide pre-open slot for a materializing CLI lane spawn.
+/// This deliberately uses a different slot namespace from the native-COW
+/// stage admission: it prevents a burst from overwhelming SQLite preflight,
+/// while the latter continues to bound filesystem clone work.
+pub(crate) struct PreOpenMaterializationAdmission {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _slot: std::fs::File,
+}
+
+impl PreOpenMaterializationAdmission {
+    pub(crate) fn acquire_for_workspace(workspace: &Path) -> Result<Self> {
+        let workspace = workspace.canonicalize()?;
+        Self::acquire(&workspace.join(".trail/index"))
+    }
+
+    fn acquire(db_dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let slots = materialization_coordination_directory(db_dir)?;
+            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
+            let mut delay = std::time::Duration::from_millis(2);
+            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+            loop {
+                for offset in 0..MAX_CONCURRENT_NATIVE_MATERIALIZATIONS {
+                    let slot = (first_slot + offset) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+                    let file =
+                        slots.open_or_create_private_regular(&format!("spawn-slot-{slot:02}"))?;
+                    match rustix::fs::flock(
+                        &file,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    ) {
+                        Ok(()) => return Ok(Self { _slot: file }),
+                        Err(error) if error == rustix::io::Errno::AGAIN => {}
+                        Err(error) => return Err(Error::Io(error.into())),
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::WorkspaceLockTimeout {
+                        holder_purpose: "native_cow_spawn_admission".to_string(),
+                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        operation_id: None,
+                        retry_command: "repeat the lane spawn command".to_string(),
+                    });
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = db_dir;
+            Ok(Self {})
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializationPolicy {
     StrictNative,

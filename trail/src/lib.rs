@@ -15,7 +15,7 @@ pub mod mcp;
 pub mod model;
 pub mod server;
 
-pub use db::{InitImportMode, Trail};
+pub use db::{InitImportMode, LaneSpawnMaterializationAdmission, Trail};
 pub use error::{Error, Result};
 pub use ids::{AnchorId, ChangeId, FileId, LineId, MessageId, ObjectId, WorkspaceId};
 pub use model::*;
