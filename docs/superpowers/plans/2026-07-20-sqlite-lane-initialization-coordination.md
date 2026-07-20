@@ -20,7 +20,7 @@
 - Schema v19-to-v20 migration is transactional; v18 opens must migrate through v19 and then v20.
 - `COMMITTED_REPAIR_REQUIRED` must report the actual durable phase even when repair-state persistence fails.
 - A contender may wait from 10 ms up to 250 ms with bounded jitter; after 30 minutes it returns `LANE_INITIALIZATION_IN_PROGRESS` without revoking the owner.
-- Use red-green TDD for every production behavior change.
+- Execution override (2026-07-20): for Tasks 3-6, implement the scoped production change first, then add or update focused regression coverage and run verification. Do not use a red/green TDD cycle.
 - Preserve the dirty `prolly` submodule and all unrelated untracked documentation.
 - Do not merge, rebase, push, reset, clean, switch branches, or modify the primary worktree during implementation.
 
@@ -379,107 +379,21 @@ git commit -m "feat: coordinate lane initialization in sqlite"
 
 ### Task 3: Fence durable phases and association
 
-**Files:**
-- Modify: `trail/src/db/lane/initialization.rs`
-- Modify: `trail/src/db/lane/lifecycle.rs`
-- Modify: `trail/tests/lane_initialization_faults.rs`
+**Files:** `trail/src/db/lane/initialization.rs`, `trail/src/db/lane/lifecycle.rs`, and focused additions to `trail/tests/lane_initialization_faults.rs`.
 
-**Interfaces:**
-- Consumes Task 2's fence.
-- Produces owner-fenced materialized, associated, observer-ready, repair-required, and release transactions.
+- [ ] **Step 1: Implement exact-fence phase transitions**
 
-- [ ] **Step 1: Write RED stale-owner and atomic-release tests**
+Require `LaneInitializationFence` in every phase API. Add exact token/generation owner predicates to materialized, associated, observer-ready, and repair-required mutations. When a transition is terminal, delete the exact owner in the same transaction and require one deletion. Reread initialization and owner rows to distinguish idempotent replay from ownership loss.
 
-```rust
-#[test]
-fn stale_owner_cannot_transition_after_generation_takeover() {
-    let fixture = LaneInitializationFixture::new();
-    let stale = fixture.claim_owner("fenced-lane");
-    fixture.force_dead_owner_takeover("fenced-lane");
-    let error = fixture.mark_materialized_with(&stale).unwrap_err();
-    assert_eq!(error.code(), "LANE_INITIALIZATION_OWNERSHIP_LOST");
-    assert_eq!(fixture.phase("fenced-lane"), LaneInitializationPhase::Reserved);
-}
+- [ ] **Step 2: Fence association and committed repair**
 
-#[test]
-fn terminal_transition_and_owner_release_are_one_transaction() {
-    let fixture = LaneInitializationFixture::new();
-    let fence = fixture.install_associated_owner("terminal-lane");
-    fixture.mark_observer_ready_with(&fence).unwrap();
-    assert_eq!(fixture.phase("terminal-lane"), LaneInitializationPhase::ObserverReady);
-    assert_eq!(fixture.owner_count("terminal-lane"), 0);
-}
+Before ref/lane/branch/event inserts, require the exact owner in the same `BEGIN IMMEDIATE` transaction. Lost fences roll back all association inserts. Post-association failure sets `repair_required` and removes the owner atomically; persistence failure retains `COMMITTED_REPAIR_REQUIRED` with the actual durable reread phase.
 
-#[test]
-fn owner_release_failure_preserves_committed_result_and_actual_phase() {
-    let fixture = LaneInitializationFixture::new();
-    let fence = fixture.install_associated_owner("release-failure");
-    fixture.reject_owner_delete();
-    let error = fixture.mark_observer_ready_with(&fence).unwrap_err();
-    assert_eq!(error.code(), "COMMITTED_REPAIR_REQUIRED");
-    let Error::CommittedRepairRequired { phase, .. } = error else { panic!() };
-    assert_eq!(phase, fixture.phase("release-failure"));
-}
-```
+- [ ] **Step 3: Add focused regression coverage after implementation**
 
-Extend the integration fixture with these exact methods:
+Cover stale-owner rejection after generation takeover, terminal transition plus owner release atomicity, and owner-release failure preserving the committed result and actual phase. Extend the existing fixture only as needed; do not build a parallel test-only state machine.
 
-```rust
-impl LaneInitializationFixture {
-    fn claim_owner(&self, lane: &str) -> LaneInitializationFence;
-    fn force_dead_owner_takeover(&self, lane: &str) -> LaneInitializationFence;
-    fn mark_materialized_with(&self, fence: &LaneInitializationFence) -> trail::Result<()>;
-    fn install_associated_owner(&self, lane: &str) -> LaneInitializationFence;
-    fn mark_observer_ready_with(&self, fence: &LaneInitializationFence) -> trail::Result<()>;
-    fn phase(&self, lane: &str) -> LaneInitializationPhase;
-    fn owner_count(&self, lane: &str) -> i64;
-    fn reject_owner_delete(&self);
-}
-```
-
-- [ ] **Step 2: Run RED**
-
-```bash
-cargo test -p trail --test lane_initialization_faults stale_owner_cannot_transition_after_generation_takeover -- --exact --nocapture
-cargo test -p trail --test lane_initialization_faults terminal_transition_and_owner_release_are_one_transaction -- --exact --nocapture
-```
-
-- [ ] **Step 3: Require fences in phase APIs**
-
-```rust
-pub(crate) fn transition_lane_initialization(
-    tx: &Transaction<'_>,
-    initialization_id: &str,
-    fence: &LaneInitializationFence,
-    expected: LaneInitializationPhase,
-    next: LaneInitializationPhase,
-    update: LaneInitializationUpdate<'_>,
-    release_owner: bool,
-) -> Result<()>;
-```
-
-Add an exact-owner `EXISTS` predicate to the phase update. When
-`release_owner=true`, delete the exact owner in the same transaction and require
-one deletion. Reread both rows to distinguish phase replay from lost ownership.
-
-- [ ] **Step 4: Fence association and committed repair**
-
-Before ref/lane/branch/event inserts, require the owner in the same
-`BEGIN IMMEDIATE`. Add this predicate to the associated update:
-
-```sql
-AND EXISTS (
-  SELECT 1 FROM lane_initialization_owners owner
-  WHERE owner.initialization_id=lane_initializations.initialization_id
-    AND owner.owner_token=?4 AND owner.owner_generation=?5
-)
-```
-
-Lost fences roll back all association inserts. Post-association failure sets
-`repair_required` and removes the owner atomically; persistence failure retains
-`COMMITTED_REPAIR_REQUIRED` with the actual reread phase.
-
-- [ ] **Step 5: Run GREEN and commit**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 cargo test -p trail --test lane_initialization_faults stale_owner_cannot_transition_after_generation_takeover -- --exact --nocapture
@@ -494,166 +408,21 @@ git commit -m "fix: fence lane initialization publications"
 
 ### Task 4: Contender wait, crash takeover, and public errors
 
-**Files:**
-- Modify: `trail/src/db/lane/initialization_owner.rs`
-- Modify: `trail/src/db/lane/lifecycle.rs`
-- Modify: `trail/src/error.rs`
-- Modify: `trail/src/model/reports/maintenance.rs`
-- Modify: `trail/src/mcp/response.rs`
-- Modify: `trail/tests/lane_initialization_faults.rs`
-- Modify: `trail/tests/lane_initialization.rs`
+**Files:** `trail/src/db/lane/initialization_owner.rs`, `trail/src/db/lane/lifecycle.rs`, `trail/src/error.rs`, `trail/src/model/reports/maintenance.rs`, `trail/src/mcp/response.rs`, `trail/tests/lane_initialization_faults.rs`, and `trail/tests/lane_initialization.rs`.
 
-**Interfaces:**
-- Produces `wait_for_lane_initialization`, `LaneInitializationInProgress`, and replay/takeover lifecycle.
-- Consumes Task 2 claim and Task 3 fenced transitions.
+- [ ] **Step 1: Implement wait, replay, and takeover lifecycle**
 
-- [ ] **Step 1: Write RED process replay, timeout, and crash tests**
+Use a 10 ms initial delay, 250 ms maximum, bounded jitter, and 30-minute production timeout. Read only initialization/owner rows while waiting. Retry claims for missing or liveness-proven dead/mismatched owners, replay terminal rows, heartbeat around slow work, and exact-release every pre-association early return. Never hold a SQLite write transaction during slow work.
 
-```rust
-#[test]
-fn concurrent_identical_processes_replay_one_committed_result() {
-    let fixture = SharedLaneFixture::new();
-    let reports = fixture.spawn_same_request_in_processes(16);
-    assert!(reports.iter().all(Result::is_ok));
-    assert_eq!(fixture.initialization_count(), 1);
-    assert_eq!(fixture.owner_count(), 0);
-    assert_eq!(fixture.ref_count(), 1);
-    assert_eq!(fixture.lane_count(), 1);
-    assert_eq!(fixture.spawn_event_count(), 1);
-}
+- [ ] **Step 2: Add stable outcomes**
 
-#[test]
-fn live_owner_timeout_is_stable_and_never_revokes() {
-    let fixture = SharedLaneFixture::new_with_test_wait_policy();
-    let owner = fixture.park_live_owner("busy-lane");
-    let error = fixture.spawn("busy-lane").unwrap_err();
-    assert_eq!(error.code(), "LANE_INITIALIZATION_IN_PROGRESS");
-    assert_eq!(fixture.stored_fence("busy-lane"), owner.fence());
-}
-```
+Add `LANE_INITIALIZATION_IN_PROGRESS` as a public exit-status-2 / HTTP-409 / MCP outcome with lane, initialization id, owner PID, phase, and retry guidance. Keep `LANE_INITIALIZATION_OWNERSHIP_LOST` internal: every spawn call site restarts claim/replay instead of exposing it as an ordinary user failure.
 
-The integration target defines this exact shared-workspace process helper:
+- [ ] **Step 3: Add regression coverage after implementation**
 
-```rust
-struct SharedLaneFixture { root: tempfile::TempDir, workspace: PathBuf }
-impl SharedLaneFixture {
-    fn new() -> Self;
-    fn new_with_test_wait_policy() -> Self;
-    fn spawn(&self, lane: &str) -> trail::Result<LaneSpawnReport>;
-    fn spawn_same_request_in_processes(&self, count: usize) -> Vec<trail::Result<LaneSpawnReport>>;
-    fn park_live_owner(&self, lane: &str) -> ParkedOwnerChild;
-    fn crash_owner_at(&self, boundary: &str);
-    fn initialization_count(&self) -> i64;
-    fn owner_count(&self) -> i64;
-    fn ref_count(&self) -> i64;
-    fn lane_count(&self) -> i64;
-    fn spawn_event_count(&self) -> i64;
-    fn stored_fence(&self, lane: &str) -> LaneInitializationFence;
-}
-```
+Cover 16 identical processes producing one initialization/ref/lane/spawn event and zero terminal owners, live-owner timeout preserving the exact fence, and dead-process takeover/replay at every crash boundary. Tests may inject deterministic short wait policy without changing production constants.
 
-- [ ] **Step 2: Run RED**
-
-```bash
-cargo test -p trail --test lane_initialization_faults concurrent_identical_processes_replay_one_committed_result -- --exact --nocapture
-cargo test -p trail --test lane_initialization_faults live_owner_timeout_is_stable_and_never_revokes -- --exact --nocapture
-```
-
-- [ ] **Step 3: Implement the wait policy and contender loop**
-
-```rust
-#[derive(Clone, Copy)]
-pub(crate) struct LaneInitializationWaitPolicy {
-    pub(crate) initial: Duration,
-    pub(crate) maximum: Duration,
-    pub(crate) timeout: Duration,
-}
-
-impl Default for LaneInitializationWaitPolicy {
-    fn default() -> Self {
-        Self {
-            initial: Duration::from_millis(10),
-            maximum: Duration::from_millis(250),
-            timeout: Duration::from_secs(30 * 60),
-        }
-    }
-}
-```
-
-The loop reads only initialization/owner rows, retries claim for missing/dead
-owners, and replays terminal state. Tests inject deterministic zero-jitter and
-short timeout without changing production constants.
-
-Use these exact wait and replay interfaces:
-
-```rust
-pub(crate) enum LaneInitializationWaitOutcome {
-    RetryClaim,
-    Terminal(LaneInitializationRecord),
-}
-
-pub(crate) fn wait_for_lane_initialization(
-    db: &Trail,
-    request: &ResolvedLaneSpawnRequest,
-    policy: LaneInitializationWaitPolicy,
-) -> Result<LaneInitializationWaitOutcome>;
-
-fn replay_terminal_lane_initialization(
-    record: LaneInitializationRecord,
-) -> Result<LaneSpawnReport>;
-```
-
-- [ ] **Step 4: Add stable errors**
-
-```rust
-LaneInitializationInProgress {
-    lane: String,
-    initialization_id: String,
-    owner_pid: u32,
-    phase: LaneInitializationPhase,
-    retry: String,
-},
-LaneInitializationOwnershipLost {
-    lane: String,
-    initialization_id: String,
-    phase: LaneInitializationPhase,
-},
-```
-
-Codes are `LANE_INITIALIZATION_IN_PROGRESS` and
-`LANE_INITIALIZATION_OWNERSHIP_LOST`. Only `LANE_INITIALIZATION_IN_PROGRESS`
-is a public CLI/HTTP/MCP outcome (exit status 2, HTTP 409, all fields in JSON
-details). `LANE_INITIALIZATION_OWNERSHIP_LOST` is an internal fence signal:
-every spawn call site must catch it and restart claim/replay, so it never leaks
-as a user-visible ordinary failure.
-
-- [ ] **Step 5: Replace spawn singleflight with claim/wait/replay**
-
-```rust
-let (initialization, fence, resumed) = loop {
-    match claim_lane_initialization_owner(self, &request)? {
-        LaneInitializationClaim::Owned { record, fence, resumed } => {
-            break (record, fence, resumed)
-        }
-        LaneInitializationClaim::Terminal(record) => {
-            return replay_terminal_lane_initialization(record)
-        }
-        LaneInitializationClaim::Contended { .. } => {
-            match wait_for_lane_initialization(self, &request, wait_policy)? {
-                LaneInitializationWaitOutcome::RetryClaim => continue,
-                LaneInitializationWaitOutcome::Terminal(record) => {
-                    return replay_terminal_lane_initialization(record)
-                }
-            }
-        }
-    }
-};
-```
-
-Heartbeat before/after slow phases. Exact-release every pre-association early
-return. Do not hold a transaction during slow work.
-
-- [ ] **Step 6: Run GREEN and commit**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 cargo test -p trail --test lane_initialization_faults concurrent_identical_processes_replay_one_committed_result -- --exact --nocapture
@@ -668,94 +437,21 @@ git commit -m "feat: replay concurrent lane initialization"
 
 ### Task 5: Remove filesystem authority and prove scale/resource behavior
 
-**Files:**
-- Modify: `trail/src/db/lane/lifecycle.rs`
-- Modify: `trail/src/db/lane/mod.rs`
-- Modify: `trail/src/db/mod.rs`
-- Modify: `trail/src/lib.rs`
-- Modify: `trail/tests/lane_initialization_faults.rs`
-- Modify: `trail/tests/fixtures/changed_path_raw_mutations.v1`
-- Modify: `docs/reference/cli/lanes.md`
-- Modify: `scripts/check-real-repo-lane-scale.py`
-- Modify: `scripts/test_check_real_repo_lane_scale.py`
+**Files:** `trail/src/db/lane/lifecycle.rs`, `trail/src/db/lane/mod.rs`, `trail/src/db/mod.rs`, `trail/src/lib.rs`, `trail/tests/lane_initialization_faults.rs`, `trail/tests/fixtures/changed_path_raw_mutations.v1`, `docs/reference/cli/lanes.md`, `scripts/check-real-repo-lane-scale.py`, and `scripts/test_check_real_repo_lane_scale.py`.
 
-**Interfaces:**
-- Consumes complete SQLite coordination from Tasks 1–4.
-- Produces zero lane-initialization filesystem resources and owner-row scale evidence.
+- [ ] **Step 1: Delete filesystem singleflight**
 
-- [ ] **Step 1: Write RED artifact and scale tests**
+Remove `LaneInitializationSingleflight`, its platform lock/open/rename helpers, publication hooks/counters/exports, and filesystem-only tests. Do not add compatibility readers or cleanup code because this mechanism never shipped on `main`. Remove only the corresponding reviewed raw-mutation inventory rows.
 
-```rust
-#[test]
-fn lane_initialization_coordination_creates_no_filesystem_authority_artifacts() {
-    let fixture = SharedLaneFixture::new();
-    fixture.spawn("artifact-free").unwrap();
-    let names = fixture.trail_resource_names();
-    assert!(!names.iter().any(|name| {
-        name.contains("lane-initialization-locks")
-            || name.contains("lane-initialization-publication")
-            || name.ends_with(".anchor")
-            || name.ends_with(".identity")
-    }));
-}
+- [ ] **Step 2: Add owner-count qualification and documentation**
 
-#[test]
-fn sixty_four_unrelated_initializations_finish_without_active_owners() {
-    let fixture = SharedLaneFixture::new();
-    fixture.spawn_distinct_lanes(64).unwrap();
-    assert_eq!(fixture.observer_ready_count(), 64);
-    assert_eq!(fixture.owner_total(), 0);
-}
+Query and record `active_owner_rows`; require zero after completion and cleanup while preserving existing runtime-resource equality checks. Update CLI documentation for SQLite claim, live-owner protection, liveness-proven takeover, 30-minute in-progress result, and quiescent-copy portability.
 
-#[test]
-fn quiescent_workspace_copy_replays_without_filesystem_authority() {
-    let fixture = SharedLaneFixture::new();
-    fixture.spawn("copy-lane").unwrap();
-    let copied = fixture.copy_quiescent_workspace();
-    let replay = copied.spawn("copy-lane").unwrap();
-    assert_eq!(replay.phase, LaneInitializationPhase::ObserverReady);
-    assert_eq!(copied.owner_total(), 0);
-}
-```
+- [ ] **Step 3: Add regression and scale coverage after implementation**
 
-Extend `SharedLaneFixture` for this task with:
+Cover absence of lane-initialization filesystem artifacts, 64 unrelated initializations reaching observer-ready with zero active owners, and quiescent workspace-copy replay. Add Python fixtures that reject `active_owner_rows: 1` and accept zero; retain the synthetic `.lock` leak rejection test.
 
-```rust
-impl SharedLaneFixture {
-    fn trail_resource_names(&self) -> Vec<String>;
-    fn spawn_distinct_lanes(&self, count: usize) -> trail::Result<Vec<LaneSpawnReport>>;
-    fn observer_ready_count(&self) -> i64;
-    fn owner_total(&self) -> i64;
-    fn copy_quiescent_workspace(&self) -> SharedLaneFixture;
-}
-```
-
-Add Python fixtures where `active_owner_rows: 1` is rejected and zero is
-accepted. Retain the synthetic `.lock` leak rejection test.
-
-- [ ] **Step 2: Run RED**
-
-```bash
-cargo test -p trail --test lane_initialization_faults lane_initialization_coordination_creates_no_filesystem_authority_artifacts -- --exact --nocapture
-python3 -m unittest scripts.test_check_real_repo_lane_scale
-```
-
-- [ ] **Step 3: Delete filesystem singleflight**
-
-Remove `LaneInitializationSingleflight`, platform open/lock/rename helpers used
-only by it, publication hooks/counters/exports, and filesystem-specific tests.
-Do not add compatibility readers or cleanup code because the mechanism never
-shipped on `main`. Remove only corresponding reviewed raw-mutation inventory
-rows.
-
-- [ ] **Step 4: Add scale owner count and docs**
-
-Query `SELECT COUNT(*) FROM lane_initialization_owners`, record
-`active_owner_rows`, require zero after completion/cleanup, and preserve all
-existing runtime-resource equality checks. Replace CLI docs with the SQLite
-claim, live-owner, takeover, 30-minute in-progress, and quiescent-copy contract.
-
-- [ ] **Step 5: Run GREEN and commit**
+- [ ] **Step 4: Verify and commit**
 
 ```bash
 cargo test -p trail --test lane_initialization_faults -- --nocapture
@@ -771,13 +467,7 @@ git commit -m "refactor: remove lane filesystem singleflight"
 
 ### Task 6: Qualification and merge-readiness evidence
 
-**Files:**
-- Modify only if evidence exposes a regression; every fix needs a RED test and separate commit.
-- Record: `.superpowers/sdd/sqlite-lane-coordination-final-report.md` (untracked evidence).
-
-**Interfaces:**
-- Consumes Tasks 1–5.
-- Produces exact verification evidence and independent merge verdict.
+**Files:** modify production/tests only if qualification exposes a real regression; record `.superpowers/sdd/sqlite-lane-coordination-final-report.md` as untracked evidence.
 
 - [ ] **Step 1: Run format, diff, and strict lint**
 
@@ -787,9 +477,7 @@ git diff --check main..HEAD
 cargo clippy -p trail --all-targets -- -D warnings
 ```
 
-Expected: all exit zero.
-
-- [ ] **Step 2: Run focused and serial tests**
+- [ ] **Step 2: Run focused, serial, and script suites**
 
 ```bash
 cargo test -p trail --test schema_v20_lane_initialization_owners -- --nocapture
@@ -797,54 +485,22 @@ cargo test -p trail --test lane_initialization_faults -- --nocapture
 cargo test -p trail --test lane_initialization -- --nocapture
 cargo test -p trail --test changed_path_ledger_producers -- --nocapture
 cargo test -p trail --lib -- --test-threads=1
-```
-
-Expected: zero failures. Report native observer/FSEvents transients separately;
-an isolated rerun does not make a failed broad run clean.
-
-- [ ] **Step 3: Run script tests**
-
-```bash
 python3 -m unittest scripts.test_check_real_repo_lane_scale
 python3 -m unittest scripts.test_verify_real_repo_lane_scale
 python3 -m unittest scripts.test_verify_real_repo_lane_scale_matrix
 ```
 
-Expected: all exit zero.
+- [ ] **Step 3: Run the blocking disposable Superset gate**
 
-- [ ] **Step 4: Run blocking disposable Superset gate**
+Use at least 64 COW lanes, multi-file edits, concurrent checkpoint/record, cleanup, Git handoff, and final owner/resource checks. Require zero active owners, duplicate lane/ref/spawn rows, and runtime resource leaks, plus `git_handoff_verified=true`. If the environment blocks the gate, record the exact command, exit status, and prerequisite and do not call it passed.
 
-Use the existing documented qualification command with at least 64 COW lanes,
-multi-file edits, concurrent checkpoint/record, cleanup, Git handoff, and final
-owner/resource checks. Required evidence:
+- [ ] **Step 4: Obtain independent final review**
 
-```text
-active_owner_rows=0
-duplicate_lane_rows=0
-duplicate_ref_rows=0
-duplicate_spawn_events=0
-runtime_resource_leaks=0
-git_handoff_verified=true
-```
+Package the complete branch diff from the merge base and dispatch a read-only reviewer with the design, plan, reports, and qualification evidence. Resolve every Critical or Important finding, add focused regression coverage after the fix, and re-review.
 
-If an environmental prerequisite blocks the gate, record exact command, exit
-status, and prerequisite; do not call it passed.
+- [ ] **Step 5: Record final evidence**
 
-- [ ] **Step 5: Obtain independent final review**
-
-```bash
-BASE=$(git merge-base main HEAD)
-/Users/haipingfu/.codex/plugins/cache/openai-curated-remote/superpowers/6.1.1/skills/subagent-driven-development/scripts/review-package "$BASE" HEAD
-```
-
-Dispatch a read-only reviewer with the design, plan, reports, and package. Fix
-every Critical/Important finding through a new TDD task and re-review.
-
-- [ ] **Step 6: Record final evidence**
-
-Write `.superpowers/sdd/sqlite-lane-coordination-final-report.md` with SHAs,
-commands, exit codes, counts, reviewer verdict, Windows limitations, and unrun
-scale gates. Do not commit generated evidence.
+Write the untracked final report with SHAs, commands, exit codes, counts, reviewer verdict, Windows limitations, and any unrun scale gates.
 
 ---
 
