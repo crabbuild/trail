@@ -268,21 +268,7 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
 }
 
 fn open_acp_relay_db(ctx: &RuntimeContext) -> Result<trail::Trail> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut delay = std::time::Duration::from_millis(2);
-    loop {
-        match open_db(ctx) {
-            Ok(db) => return Ok(db),
-            Err(Error::SchemaReinitializeRequired { ref found, .. })
-                if found == "schema main/WAL/SHM generation changed during mutable handoff"
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(delay);
-                delay = (delay * 2).min(std::time::Duration::from_millis(50));
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    open_db(ctx)
 }
 
 fn resolve_acp_relay_command(

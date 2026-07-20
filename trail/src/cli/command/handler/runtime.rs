@@ -29,6 +29,29 @@ pub(super) fn resolve_output_format(cli_format: Option<OutputFormat>) -> Result<
 }
 
 pub(super) fn open_db(ctx: &RuntimeContext) -> Result<Trail> {
+    // A concurrent, authenticated workspace mutation can advance SQLite's
+    // WAL/SHM generation between preflight and opening the connection. The
+    // preflight detects that race instead of accepting an unverified handle;
+    // retry that one transient condition so ordinary CLI commands get the
+    // same safe handoff behavior as ACP clients.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut delay = std::time::Duration::from_millis(2);
+    loop {
+        match open_db_once(ctx) {
+            Ok(db) => return Ok(db),
+            Err(Error::SchemaReinitializeRequired { ref found, .. })
+                if found == "schema main/WAL/SHM generation changed during mutable handoff"
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn open_db_once(ctx: &RuntimeContext) -> Result<Trail> {
     match (&ctx.workspace, &ctx.db_dir) {
         (Some(workspace), Some(db_dir)) => Trail::open_with_db_dir(workspace, db_dir),
         (Some(workspace), None) => Trail::open(workspace),
