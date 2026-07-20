@@ -2,6 +2,150 @@ use super::*;
 use crate::db::change_ledger::secure_fs::SecureDirectory;
 
 const MAX_MATERIALIZATION_OPERATION_BYTES: u64 = 64 * 1024;
+// Native COW cloning is metadata-heavy: every file is cloned, authenticated,
+// and flushed. Agent processes are already independently concurrent, so a
+// workspace-wide bound prevents a burst of lane spawns from saturating APFS
+// (or an equivalent POSIX filesystem) with clone and xattr operations.
+const MAX_CONCURRENT_NATIVE_MATERIALIZATIONS: usize = 16;
+const NATIVE_MATERIALIZATION_ADMISSION_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const MATERIALIZATION_COORDINATION_DIRECTORY: &str = "materialization-coordination";
+const MATERIALIZATION_RECOVERY_LOCK: &str = "recovery";
+
+fn materialization_coordination_directory(db_dir: &Path) -> Result<SecureDirectory> {
+    let db_dir = db_dir.canonicalize()?;
+    let authority = SecureDirectory::open_absolute(&db_dir)?;
+    match authority.open_private_dir(MATERIALIZATION_COORDINATION_DIRECTORY) {
+        Ok(directory) => Ok(directory),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match authority.create_private_dir(MATERIALIZATION_COORDINATION_DIRECTORY) {
+                Ok(directory) => Ok(directory),
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    authority.open_private_dir(MATERIALIZATION_COORDINATION_DIRECTORY)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct MaterializationRecoveryGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _lock: std::fs::File,
+}
+
+impl MaterializationRecoveryGuard {
+    fn acquire_shared(db_dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let coordination = materialization_coordination_directory(db_dir)?;
+            let file =
+                coordination.open_or_create_private_regular(MATERIALIZATION_RECOVERY_LOCK)?;
+            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
+            let mut delay = std::time::Duration::from_millis(2);
+            loop {
+                match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+                    Ok(()) => return Ok(Self { _lock: file }),
+                    Err(error) if error == rustix::io::Errno::AGAIN => {}
+                    Err(error) => return Err(Error::Io(error.into())),
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::WorkspaceLockTimeout {
+                        holder_purpose: "materialization_recovery".to_string(),
+                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        operation_id: None,
+                        retry_command: "repeat the lane spawn command".to_string(),
+                    });
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = db_dir;
+            Ok(Self {})
+        }
+    }
+
+    fn try_acquire_exclusive(db_dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let coordination = materialization_coordination_directory(db_dir)?;
+            let file =
+                coordination.open_or_create_private_regular(MATERIALIZATION_RECOVERY_LOCK)?;
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            {
+                Ok(()) => Ok(Self { _lock: file }),
+                Err(error) if error == rustix::io::Errno::AGAIN => Err(Error::WorkspaceLocked(
+                    "materialization recovery is deferred while an active materialization owns the workspace".into(),
+                )),
+                Err(error) => Err(Error::Io(error.into())),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = db_dir;
+            Ok(Self {})
+        }
+    }
+}
+
+struct NativeMaterializationAdmission {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _slot: std::fs::File,
+}
+
+impl NativeMaterializationAdmission {
+    fn acquire(db_dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let slots = materialization_coordination_directory(db_dir)?;
+            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
+            let mut delay = std::time::Duration::from_millis(2);
+            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+            loop {
+                for offset in 0..MAX_CONCURRENT_NATIVE_MATERIALIZATIONS {
+                    let slot = (first_slot + offset) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
+                    let file = slots.open_or_create_private_regular(&format!("slot-{slot:02}"))?;
+                    match rustix::fs::flock(
+                        &file,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    ) {
+                        Ok(()) => return Ok(Self { _slot: file }),
+                        Err(error) if error == rustix::io::Errno::AGAIN => {}
+                        Err(error) => return Err(Error::Io(error.into())),
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::WorkspaceLockTimeout {
+                        holder_purpose: "native_cow_materialization".to_string(),
+                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        operation_id: None,
+                        retry_command: "repeat the lane spawn command".to_string(),
+                    });
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = db_dir;
+            Ok(Self {})
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializationPolicy {
@@ -60,7 +204,19 @@ struct RegisteredMaterializationStage {
     stage_path: PathBuf,
     parent_authority: SecureDirectory,
     stage_authority: SecureDirectory,
+    _recovery_guard: MaterializationRecoveryGuard,
     record: MaterializationOperationRecord,
+}
+
+fn new_materialization_operation_id() -> Result<String> {
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+    Ok(format!(
+        "materialize-{}-{}",
+        now_nanos(),
+        hex::encode(nonce)
+    ))
 }
 
 impl RegisteredMaterializationStage {
@@ -215,6 +371,10 @@ impl Trail {
         root_id: &ObjectId,
         destination: &Path,
     ) -> std::result::Result<MaterializationOutcome, NativeAttemptError> {
+        // Hold this through source discovery, cloning, verification, and
+        // publication. Releasing it earlier merely moves the APFS saturation
+        // to source metadata scans or durable sync barriers.
+        let _admission = NativeMaterializationAdmission::acquire(&self.db_dir)?;
         let files = self.load_root_files(root_id)?;
         let source = self
             .resolve_native_materialization_source(root_id, &files)?
@@ -475,6 +635,11 @@ impl Trail {
         destination: &Path,
         root_id: &ObjectId,
     ) -> Result<RegisteredMaterializationStage> {
+        // Startup recovery holds this gate exclusively. A materialization
+        // holds it shared from journal publication through publish/abort, so
+        // a newly opened CLI cannot mistake an active stage for an abandoned
+        // one while it holds the workspace write lock for recovery.
+        let recovery_guard = MaterializationRecoveryGuard::acquire_shared(&self.db_dir)?;
         let parent = destination
             .parent()
             .ok_or_else(|| Error::InvalidPath {
@@ -496,7 +661,7 @@ impl Trail {
         for _ in 0..32 {
             let parent_authority = SecureDirectory::open_absolute(&parent)?;
             parent_authority.verify_identity((parent_device, parent_inode))?;
-            let operation_id = format!("materialize-{}", now_nanos());
+            let operation_id = new_materialization_operation_id()?;
             let stage_leaf = format!(".{leaf}.trail-{operation_id}");
             let stage = parent.join(&stage_leaf);
             let record_path = journal_dir.join(format!("{operation_id}.json"));
@@ -533,6 +698,7 @@ impl Trail {
                         stage_path: stage,
                         parent_authority,
                         stage_authority,
+                        _recovery_guard: recovery_guard,
                         record,
                     };
                     let initialized = (|| {
@@ -570,6 +736,10 @@ impl Trail {
         if !journal_dir.is_dir() {
             return Ok(());
         }
+        // This recovery path already holds the workspace write lock. Do not
+        // wait for a materializer which will later need that write lock to
+        // associate its completed stage; defer recovery to the next open.
+        let _recovery_guard = MaterializationRecoveryGuard::try_acquire_exclusive(&self.db_dir)?;
         let journal = SecureDirectory::open_absolute(&journal_dir)?;
         for entry in journal.entry_names()? {
             let Some(entry) = entry.to_str() else {
@@ -580,9 +750,15 @@ impl Trail {
             if !entry.ends_with(".json") {
                 continue;
             }
-            let bytes = journal
+            let Some(bytes) = journal
                 .read_regular_optional_bounded(entry, MAX_MATERIALIZATION_OPERATION_BYTES)?
-                .ok_or_else(|| Error::Corrupt("materialization journal entry vanished".into()))?;
+            else {
+                // A prior-version owner may finish or abort between directory
+                // enumeration and the descriptor-relative open. It is no
+                // longer recovery work; a later open will inspect any record
+                // that remains.
+                continue;
+            };
             let record: MaterializationOperationRecord = serde_json::from_slice(&bytes)?;
             if record.version != 2
                 || entry.strip_suffix(".json") != Some(record.operation_id.as_str())

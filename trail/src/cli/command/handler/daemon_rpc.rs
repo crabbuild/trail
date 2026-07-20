@@ -28,6 +28,14 @@ pub(super) fn try_handle_auto_daemon_command(
     if matches!(command, Command::Status(args) if args.branch.is_some() || ctx.branch.is_some()) {
         return Ok(false);
     }
+    // A materialized lane spawn changes the workspace generation and must
+    // retire the workspace daemon after it completes. Sending a burst of
+    // those requests through the single-threaded daemon makes each request
+    // race its predecessor's intentional retirement. Let the local lane
+    // owner perform the authenticated handoff instead.
+    if auto_daemon_command_requires_local_handoff(command) {
+        return Ok(false);
+    }
     if !daemon_supports_command(command) {
         return Ok(false);
     }
@@ -151,6 +159,15 @@ fn try_handle_auto_daemon_or_fallback(
         Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+fn auto_daemon_command_requires_local_handoff(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Lane(LaneCommand {
+            command: LaneSubcommand::Spawn(args),
+        }) if !args.no_materialize && args.materialize != Some(false)
+    )
 }
 
 fn daemon_command_requires_one_recovery_retry(error: &Error) -> bool {

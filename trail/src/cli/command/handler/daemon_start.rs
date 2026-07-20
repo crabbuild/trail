@@ -195,15 +195,13 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
     if result != 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_is_alive(endpoint.pid) {
-        if Instant::now() >= deadline {
-            return Err(Error::DaemonUnavailable(
-                "workspace daemon did not retire after its database generation changed".into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // This signal was sent only after the endpoint, socket, token, and PID
+    // start identity were all authenticated. Withdraw that exact publication
+    // immediately so concurrent local materializers do not rediscover a
+    // daemon which has already been asked to retire. Existing Unix-socket
+    // connections remain valid through the unlink; new callers wait behind
+    // the daemon's ownership lock rather than racing a dead endpoint.
+    remove_stale_publication(&authority, &endpoint)?;
     Ok(())
 }
 

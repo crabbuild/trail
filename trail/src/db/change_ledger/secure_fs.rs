@@ -189,6 +189,37 @@ impl SecureDirectory {
         Ok(file)
     }
 
+    /// Open a private regular leaf for descriptor-bound coordination. The
+    /// leaf is created with restrictive permissions if it is absent, then
+    /// authenticated again through the pinned parent descriptor so a
+    /// concurrent pathname replacement cannot redirect the caller.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn open_or_create_private_regular(&self, name: &str) -> Result<File> {
+        use rustix::fs::{fstat, openat, FileType, Mode, OFlags};
+
+        validate_leaf(name)?;
+        let file = File::from(
+            openat(
+                &self.file,
+                Path::new(name),
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|error| Error::Io(error.into()))?,
+        );
+        verify_entry_identity(&self.file, name, &file, false)?;
+        let metadata = fstat(&file).map_err(|error| Error::Io(error.into()))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_mode & 0o777 != 0o600
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(Error::InvalidInput(
+                "secure coordination file is not private".into(),
+            ));
+        }
+        Ok(file)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn read_regular_optional_bounded(
         &self,
@@ -369,6 +400,14 @@ impl SecureDirectory {
         let _ = (self, name);
         Err(Error::InvalidInput(
             "secure descriptor-relative file open is unsupported".into(),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn open_or_create_private_regular(&self, name: &str) -> Result<File> {
+        let _ = (self, name);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative coordination is unsupported".into(),
         ))
     }
 
