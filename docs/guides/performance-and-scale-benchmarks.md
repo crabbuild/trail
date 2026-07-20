@@ -321,18 +321,33 @@ mapping table.
 
 ## Reproducible Prolly Qualification
 
-Trail is qualified against the full prolly revision
+Trail's current superproject gitlink pins the full prolly revision
 `b4aaee54b77aa5e61bdc6254425b143bd2c7f811`. The configured submodule remote is
 `https://github.com/crabbuild/prolly.git`; release qualification must prove the
 full object remains fetchable rather than relying on an abbreviated hash or a
-developer's existing submodule object database:
+developer's existing submodule object database. Fetch the exact commit into a
+brand-new empty object database; `git fetch --dry-run` against the existing
+submodule is not evidence because Git can satisfy that check from local
+objects:
 
 ```sh
+set -euo pipefail
 prolly_revision=b4aaee54b77aa5e61bdc6254425b143bd2c7f811
+prolly_remote=https://github.com/crabbuild/prolly.git
+prolly_fetch_probe=$(mktemp -d "${TMPDIR:-/tmp}/trail-prolly-fetch.XXXXXX")
+trap 'test -n "${prolly_fetch_probe:-}" && rm -rf -- "$prolly_fetch_probe"' EXIT
+git init --bare "$prolly_fetch_probe"
+git -C "$prolly_fetch_probe" fetch --no-tags --depth=1 "$prolly_remote" "$prolly_revision"
+test "$(git -C "$prolly_fetch_probe" rev-parse 'FETCH_HEAD^{commit}')" = "$prolly_revision"
+git -C "$prolly_fetch_probe" cat-file -e "$prolly_revision^{commit}"
 test "$(git -C prolly rev-parse HEAD)" = "$prolly_revision"
-git -C prolly fetch --dry-run origin "$prolly_revision"
 git diff --submodule=log -- prolly Cargo.lock
 ```
+
+The empty bare repository is deliberate: the fetch must transfer or obtain the
+exact object from the configured remote, independent of the developer checkout.
+The clean recursive-clone build below remains the final proof that the committed
+superproject gitlink resolves in the release source layout.
 
 Run the focused root-map/storage, diff/merge, GC/fsck/backup, and recovery
 compatibility gates against that checkout:
