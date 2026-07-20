@@ -39,6 +39,17 @@ static CAPTURE_PROJECTION_ATTEMPTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, A
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+struct CaptureSpillActivationPause {
+    reached: AtomicBool,
+    release: AtomicBool,
+}
+
+#[cfg(test)]
+static CAPTURE_SPILL_ACTIVATION_PAUSES: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, Arc<CaptureSpillActivationPause>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 fn pause_capture_worker_for_test(
     workspace_root: &Path,
 ) -> (
@@ -72,6 +83,44 @@ fn count_capture_projection_attempts_for_test(
         Arc::clone(&attempts),
     );
     (guard, attempts)
+}
+
+#[cfg(test)]
+fn pause_capture_spill_activation_for_test(
+    spill_dir: &Path,
+) -> (
+    crate::test_support::scoped_state::ScopedTestState<PathBuf, Arc<CaptureSpillActivationPause>>,
+    Arc<CaptureSpillActivationPause>,
+) {
+    let key = fs::canonicalize(spill_dir).unwrap();
+    let pause = Arc::new(CaptureSpillActivationPause {
+        reached: AtomicBool::new(false),
+        release: AtomicBool::new(false),
+    });
+    let pauses = CAPTURE_SPILL_ACTIVATION_PAUSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = crate::test_support::scoped_state::ScopedTestState::install(
+        pauses,
+        key,
+        Arc::clone(&pause),
+    );
+    (guard, pause)
+}
+
+#[cfg(test)]
+fn wait_for_capture_spill_activation_test_pause(spill_dir: &Path) {
+    let key = fs::canonicalize(spill_dir).unwrap_or_else(|_| spill_dir.to_path_buf());
+    let pause = CAPTURE_SPILL_ACTIVATION_PAUSES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned();
+    if let Some(pause) = pause {
+        pause.reached.store(true, Ordering::Release);
+        while !pause.release.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,8 +311,7 @@ impl CaptureIngress {
                 "ACP capture ingress is shut down".to_string(),
             ));
         };
-        if self.spill_mode.load(Ordering::Acquire) {
-            self.spill_or_degrade(&frame);
+        if self.spill_mode.load(Ordering::Acquire) && self.spill_if_active_or_degrade(&frame) {
             return Ok(());
         }
         self.health.queued.fetch_add(1, Ordering::Relaxed);
@@ -272,8 +320,7 @@ impl CaptureIngress {
             Err(mpsc::TrySendError::Full(CaptureCommand::Frame(frame)))
             | Err(mpsc::TrySendError::Disconnected(CaptureCommand::Frame(frame))) => {
                 self.health.queued.fetch_sub(1, Ordering::Relaxed);
-                self.spill_mode.store(true, Ordering::Release);
-                self.spill_or_degrade(&frame);
+                self.activate_spill_or_degrade(&frame);
                 Ok(())
             }
             Err(_) => {
@@ -283,8 +330,24 @@ impl CaptureIngress {
         }
     }
 
-    fn spill_or_degrade(&self, frame: &CapturedFrame) {
-        match self.spill.append(frame) {
+    fn spill_if_active_or_degrade(&self, frame: &CapturedFrame) -> bool {
+        match self.spill.append_if_active(frame, &self.spill_mode) {
+            Ok(true) => {
+                self.health.spilled.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                if self.health.record_error(&error) {
+                    eprintln!("trail acp capture warning: durable spill failed: {error}");
+                }
+                true
+            }
+        }
+    }
+
+    fn activate_spill_or_degrade(&self, frame: &CapturedFrame) {
+        match self.spill.activate_and_append(frame, &self.spill_mode) {
             Ok(()) => {
                 self.health.spilled.fetch_add(1, Ordering::Relaxed);
             }
@@ -426,11 +489,35 @@ impl SpillStore {
         })
     }
 
+    #[cfg(test)]
     fn append(&self, frame: &CapturedFrame) -> Result<()> {
         let _guard = self
             .state
             .lock()
             .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        self.append_locked(std::slice::from_ref(frame))
+    }
+
+    fn append_if_active(&self, frame: &CapturedFrame, spill_mode: &AtomicBool) -> Result<bool> {
+        let _guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        if !spill_mode.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.append_locked(std::slice::from_ref(frame))?;
+        Ok(true)
+    }
+
+    fn activate_and_append(&self, frame: &CapturedFrame, spill_mode: &AtomicBool) -> Result<()> {
+        let _guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        spill_mode.store(true, Ordering::Release);
+        #[cfg(test)]
+        wait_for_capture_spill_activation_test_pause(&self.dir);
         self.append_locked(std::slice::from_ref(frame))
     }
 
@@ -594,15 +681,45 @@ impl SpillStore {
             .state
             .lock()
             .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        Self::remove_claimed_frames(&mut state)?;
+        if state.claimed_finish_paths.is_empty() {
+            remove_claimed_owners(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn complete_claimed_frames_and_handoff(&self, spill_mode: &AtomicBool) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        Self::remove_claimed_frames(&mut state)?;
+        if state.claimed_finish_paths.is_empty() {
+            remove_claimed_owners(&mut state)?;
+        }
+        let mut current_spill_pending = false;
+        for entry in fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if !spill_finish_path(&path)
+                && spill_connection_id(&path).as_deref() == Some(&self.connection_id)
+            {
+                current_spill_pending = true;
+                break;
+            }
+        }
+        if !current_spill_pending {
+            spill_mode.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn remove_claimed_frames(state: &mut SpillState) -> Result<()> {
         for path in state.claimed_paths.drain(..) {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Error::Io(error)),
             }
-        }
-        if state.claimed_finish_paths.is_empty() {
-            remove_claimed_owners(&mut state)?;
         }
         Ok(())
     }
@@ -731,6 +848,24 @@ fn capture_worker(
     };
     load_recovered_finish(&spill, &pending_finish);
     let mut deferred_barriers = Vec::new();
+    let mut merged_frames = false;
+    for command in rx.try_iter() {
+        match command {
+            CaptureCommand::Frame(frame) => {
+                pending.push_back((frame, true));
+                merged_frames = true;
+            }
+            CaptureCommand::Finish(reason) => store_finish(&pending_finish, reason),
+            CaptureCommand::Barrier(barrier) => deferred_barriers.push(barrier),
+            #[cfg(test)]
+            CaptureCommand::SimulateWorkerPanic => {
+                panic!("simulated ACP capture worker panic")
+            }
+        }
+    }
+    if merged_frames {
+        sort_pending_frames(&mut pending);
+    }
 
     loop {
         if stopping.load(Ordering::Acquire) {
@@ -872,7 +1007,7 @@ fn capture_worker(
                         .last_projected_sequence
                         .store(frame.sequence, Ordering::Release);
                     if pending.is_empty() {
-                        match spill.complete_claimed_frames() {
+                        match spill.complete_claimed_frames_and_handoff(&spill_mode) {
                             Err(error) => {
                                 if health.record_error(&error) {
                                     eprintln!(
@@ -880,9 +1015,7 @@ fn capture_worker(
                                     );
                                 }
                             }
-                            _ => {
-                                spill_mode.store(false, Ordering::Release);
-                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1620,6 +1753,262 @@ mod tests {
         assert!(
             !ingress.spill.finish_path_for("barrier-order").exists(),
             "finish marker remained after terminal projection was acknowledged"
+        );
+    }
+
+    #[test]
+    fn spill_replay_drains_frames_appended_during_claim_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let ingress = test_ingress(temp.path(), "spill-handoff");
+        let writer_lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
+
+        ingress
+            .append(capture_frame(
+                "spill-handoff",
+                Direction::AgentToClient,
+                1,
+                &serde_json::json!({"jsonrpc":"2.0","method":"ext/claimed"}),
+                false,
+            ))
+            .unwrap();
+        let claim_deadline = Instant::now() + Duration::from_secs(2);
+        let spill_dir = temp.path().join(".trail/acp-ingress");
+        loop {
+            let claimed = fs::read_dir(&spill_dir).unwrap().any(|entry| {
+                entry.ok().is_some_and(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "processing")
+                })
+            });
+            if claimed {
+                break;
+            }
+            assert!(
+                Instant::now() < claim_deadline,
+                "capture worker never claimed the first spilled frame"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        ingress
+            .append(capture_frame(
+                "spill-handoff",
+                Direction::AgentToClient,
+                2,
+                &serde_json::json!({"jsonrpc":"2.0","method":"ext/concurrent-spill"}),
+                false,
+            ))
+            .unwrap();
+        drop(writer_lock);
+        ingress.finish(RelayFinishReason::EditorEof);
+        assert!(
+            ingress.flush(Duration::from_secs(2)),
+            "capture worker did not settle spill replay and finish"
+        );
+
+        let db = Trail::open(temp.path()).unwrap();
+        let sequences = db
+            .list_agent_hook_receipts(Some("trail-acp"), None, 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|receipt| receipt.connection_sequence)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            sequences,
+            HashSet::from([1, 2]),
+            "spill-mode handoff stranded a frame appended during claimed projection"
+        );
+    }
+
+    #[test]
+    fn spill_activation_is_atomic_with_claim_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "spill activation fixture\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let options = AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: None,
+            from_ref: None,
+            provider: Some("fixture".to_string()),
+            model: None,
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["fixture".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+        let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
+        let (_worker_pause_guard, worker_paused) = pause_capture_worker_for_test(temp.path());
+        let ingress = CaptureIngress::new(
+            temp.path().to_path_buf(),
+            temp.path().join(".trail"),
+            coordinator,
+            "spill-activation".to_string(),
+        )
+        .unwrap();
+        for sequence in 0..ACP_CAPTURE_QUEUE_CAPACITY {
+            ingress
+                .append(capture_frame(
+                    "spill-activation",
+                    Direction::AgentToClient,
+                    u64::try_from(sequence).unwrap(),
+                    &serde_json::json!({"jsonrpc":"2.0","method":"ext/queued"}),
+                    false,
+                ))
+                .unwrap();
+        }
+
+        let spill_dir = temp.path().join(".trail/acp-ingress");
+        let (_activation_guard, activation_pause) =
+            pause_capture_spill_activation_for_test(&spill_dir);
+        thread::scope(|scope| {
+            let overflow = scope.spawn(|| {
+                ingress
+                    .append(capture_frame(
+                        "spill-activation",
+                        Direction::AgentToClient,
+                        u64::try_from(ACP_CAPTURE_QUEUE_CAPACITY).unwrap(),
+                        &serde_json::json!({"jsonrpc":"2.0","method":"ext/overflow"}),
+                        false,
+                    ))
+                    .unwrap();
+            });
+            wait_for_capture_test_signal(
+                &activation_pause.reached,
+                Duration::from_secs(2),
+                "overflow append did not pause after spill activation",
+            );
+            let (completion_tx, completion_rx) = mpsc::channel();
+            let completion_ingress = &ingress;
+            let completion = scope.spawn(move || {
+                completion_ingress
+                    .spill
+                    .complete_claimed_frames_and_handoff(&completion_ingress.spill_mode)
+                    .unwrap();
+                completion_tx.send(()).unwrap();
+            });
+            let _ = completion_rx.recv_timeout(Duration::from_millis(100));
+            activation_pause.release.store(true, Ordering::Release);
+            overflow.join().unwrap();
+            completion.join().unwrap();
+        });
+        let stranded = ingress.spill.path_for("spill-activation").is_file()
+            && !ingress.spill_mode.load(Ordering::Acquire);
+        worker_paused.store(false, Ordering::Release);
+        ingress.shutdown(CAPTURE_SHUTDOWN_TIMEOUT);
+        assert!(
+            !stranded,
+            "spill activation raced handoff and appended after spill mode was cleared"
+        );
+    }
+
+    #[test]
+    fn startup_finish_waits_for_already_queued_live_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "startup ordering fixture\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let options = AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: None,
+            from_ref: None,
+            provider: Some("fixture".to_string()),
+            model: None,
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["fixture".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+        let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap()));
+        let mut load_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/load",
+            "params": {
+                "sessionId": "startup-replay",
+                "cwd": temp.path(),
+                "mcpServers": []
+            }
+        });
+        coordinator
+            .lock()
+            .unwrap()
+            .before_client_message(&mut load_request)
+            .unwrap();
+        let mut load_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "modes": {"currentModeId": "code", "availableModes": []},
+                "configOptions": []
+            }
+        });
+        coordinator
+            .lock()
+            .unwrap()
+            .before_agent_message(&mut load_response)
+            .unwrap();
+
+        let (_pause_guard, paused) = pause_capture_worker_for_test(temp.path());
+        let ingress = CaptureIngress::new(
+            temp.path().to_path_buf(),
+            temp.path().join(".trail"),
+            coordinator,
+            "startup-ordering".to_string(),
+        )
+        .unwrap();
+        for (sequence, update) in [
+            serde_json::json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "user-1",
+                "content": {"type": "text", "text": "Question one"}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "agent-1",
+                "content": {"type": "text", "text": "Answer one"}
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ingress
+                .append(capture_frame(
+                    "startup-ordering",
+                    Direction::AgentToClient,
+                    u64::try_from(sequence).unwrap(),
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"sessionId": "startup-replay", "update": update}
+                    }),
+                    true,
+                ))
+                .unwrap();
+        }
+        ingress.finish(RelayFinishReason::EditorEof);
+        paused.store(false, Ordering::Release);
+        assert!(
+            ingress.flush(Duration::from_secs(2)),
+            "capture worker did not settle queued frames and finish"
+        );
+
+        let db = Trail::open(temp.path()).unwrap();
+        let mapping = db.try_lane_acp_session("startup-replay").unwrap().unwrap();
+        let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+        let messages = session
+            .messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.body.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![("user", "Question one"), ("assistant", "Answer one")],
+            "startup recovery projected finish before queued live frames"
         );
     }
 
