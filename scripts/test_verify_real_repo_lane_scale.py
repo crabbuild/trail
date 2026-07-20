@@ -239,6 +239,15 @@ class HarnessContractTests(unittest.TestCase):
                 CREATE TABLE refs(name TEXT PRIMARY KEY, change_id TEXT, root_id TEXT, operation_id TEXT, generation INTEGER);
                 CREATE TABLE lane_merge_queue(queue_id TEXT PRIMARY KEY, lane_id TEXT, target_ref TEXT, status TEXT);
                 CREATE TABLE lane_initializations(initialization_id TEXT PRIMARY KEY, lane_name TEXT UNIQUE, lane_id TEXT, request_fingerprint TEXT, phase TEXT, workdir TEXT, materialization_json TEXT);
+                CREATE TABLE lane_initialization_owners(
+                    initialization_id TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    owner_generation INTEGER NOT NULL,
+                    owner_pid INTEGER NOT NULL,
+                    owner_process_start_identity TEXT NOT NULL,
+                    acquired_at INTEGER NOT NULL,
+                    heartbeat_at INTEGER NOT NULL
+                );
                 CREATE TABLE changed_path_observer_owners(scope_id TEXT PRIMARY KEY, lease_state TEXT, daemon_pid INTEGER);
                 CREATE TABLE leases(lease_id TEXT PRIMARY KEY, lane_id TEXT, ref_name TEXT, path TEXT, mode TEXT, expires_at INTEGER);
                 CREATE TABLE workspace_views(view_id TEXT PRIMARY KEY, lane_id TEXT UNIQUE, backend TEXT, mountpoint TEXT, source_upper TEXT, generated_upper TEXT, scratch_upper TEXT, meta_dir TEXT, journal_path TEXT, status TEXT, owner_pid INTEGER);
