@@ -1340,12 +1340,12 @@ Compatibility tests:
 
 ## Code Facts Used
 
-- Prolly design and invariants: `prolly/DESIGN.md`
-- Prolly user-facing API: `prolly/src/prolly/README.md`
-- SlateDB prolly backend: `prolly/src/prolly/store/slatedb.rs`
-- Prolly tree handles: `prolly/src/prolly/tree.rs`
-- Prolly named root manifests: `prolly/src/prolly/manifest.rs`
-- Prolly large value/blob helpers: `prolly/src/prolly/blob.rs`
+- [Prolly design and invariants](https://github.com/crabbuild/prolly/blob/main/DESIGN.md)
+- [Prolly user-facing API](https://github.com/crabbuild/prolly/blob/main/src/prolly/README.md)
+- [SlateDB prolly backend](https://github.com/crabbuild/prolly/blob/main/src/prolly/store/slatedb.rs)
+- [Prolly tree handles](https://github.com/crabbuild/prolly/blob/main/src/prolly/tree.rs)
+- [Prolly named root manifests](https://github.com/crabbuild/prolly/blob/main/src/prolly/manifest.rs)
+- [Prolly large value/blob helpers](https://github.com/crabbuild/prolly/blob/main/src/prolly/blob.rs)
 - Trail storage design: `docs/design/storage-and-indexing.md`
 - Trail data model: `docs/design/data-model.md`
 - Git interop guide: `docs/guides/git-interop.md`

@@ -1360,10 +1360,10 @@ library prelude.
 ## Repository Layout
 
 ```text
-trail/   CLI, library API, HTTP daemon, MCP server, models, storage
-prolly/   Ordered map storage used by roots and text indexes
-docs/            User, operator, integration, reference, and design docs
-scripts/         Local helper and benchmark scripts
+trail/                          CLI, library API, HTTP daemon, MCP server, models, storage
+trail-environment-adapter-sdk/  Environment adapter SDK
+docs/                           User, operator, integration, reference, and design docs
+scripts/                        Local helper and benchmark scripts
 ```
 
 ## Documentation

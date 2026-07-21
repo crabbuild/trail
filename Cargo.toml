@@ -2,22 +2,6 @@
 members = [
     "trail",
     "trail-environment-adapter-sdk",
-    "prolly",
-    "prolly/stores/prolly-store-cosmosdb",
-    "prolly/stores/prolly-store-dynamodb",
-    "prolly/stores/prolly-store-mysql",
-    "prolly/stores/prolly-store-pglite",
-    "prolly/stores/prolly-store-postgres",
-    "prolly/stores/prolly-store-redis",
-    "prolly/stores/prolly-store-rocksdb",
-    "prolly/stores/prolly-store-slatedb",
-    "prolly/stores/prolly-store-sqlite",
-    "prolly/stores/prolly-store-spanner",
-    "prolly/stores/prolly-store-test",
-    "prolly/stores/prolly-store-turso",
-    "prolly/bindings/node/native",
-    "prolly/bindings/uniffi",
-    "prolly/bindings/wasm",
 ]
 resolver = "3"
 

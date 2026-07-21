@@ -51,8 +51,6 @@ jobs:
     timeout-minutes: 720
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Select scheduled scale

@@ -321,41 +321,24 @@ mapping table.
 
 ## Reproducible Prolly Qualification
 
-Trail's current superproject gitlink pins the full prolly revision
-`b4aaee54b77aa5e61bdc6254425b143bd2c7f811`. The configured submodule remote is
-`https://github.com/crabbuild/prolly.git`; release qualification must prove the
-full object remains fetchable rather than relying on an abbreviated hash or a
-developer's existing submodule object database. Fetch the exact commit into a
-brand-new empty object database; `git fetch --dry-run` against the existing
-submodule is not evidence because Git can satisfy that check from local
-objects:
+Trail consumes `prolly-map`, `prolly-store-sqlite`, and
+`prolly-store-slatedb` from crates.io. Release qualification must prove that
+Cargo resolves the locked registry packages rather than a developer's local
+checkout:
 
 ```sh
 set -euo pipefail
-prolly_revision=b4aaee54b77aa5e61bdc6254425b143bd2c7f811
-prolly_remote=https://github.com/crabbuild/prolly.git
-prolly_fetch_probe=$(mktemp -d "${TMPDIR:-/tmp}/trail-prolly-fetch.XXXXXX")
-trap 'test -n "${prolly_fetch_probe:-}" && rm -rf -- "$prolly_fetch_probe"' EXIT
-git init --bare "$prolly_fetch_probe"
-git -C "$prolly_fetch_probe" fetch --no-tags --depth=1 "$prolly_remote" "$prolly_revision"
-test "$(git -C "$prolly_fetch_probe" rev-parse 'FETCH_HEAD^{commit}')" = "$prolly_revision"
-git -C "$prolly_fetch_probe" cat-file -e "$prolly_revision^{commit}"
-test "$(git -C prolly rev-parse HEAD)" = "$prolly_revision"
-git diff --submodule=log -- prolly Cargo.lock
+cargo metadata --locked --format-version 1 > /tmp/trail-cargo-metadata.json
+cargo tree -p trail -i prolly-map
+cargo tree -p trail -i prolly-store-sqlite
+cargo tree -p trail -i prolly-store-slatedb
 ```
 
-The empty bare repository is deliberate: the fetch must transfer or obtain the
-exact object from the configured remote, independent of the developer checkout.
-The clean recursive-clone build below remains the final proof that the committed
-superproject gitlink resolves in the release source layout.
-
 Run the focused root-map/storage, diff/merge, GC/fsck/backup, and recovery
-compatibility gates against that checkout:
+compatibility gates against the locked packages:
 
 ```sh
 cargo test -p trail db::storage --lib -- --nocapture
-cargo test -p prolly-store-sqlite -- --nocapture
-cargo test -p prolly-store-slatedb -- --nocapture
 cargo test -p trail db::merge --lib -- --nocapture
 cargo test -p trail --test e2e init_record_why_and_fsck_work -- --exact --nocapture
 cargo test -p trail --test e2e gc_prunes_unreachable_known_objects_and_preserves_reachable_roots -- --exact --nocapture
@@ -367,14 +350,16 @@ The candidate package is named `prolly-map`, so regenerate and verify the lock
 without updating unrelated packages:
 
 ```sh
-cargo update -p prolly-map
+cargo update -p prolly-map --precise 0.5.0
+cargo update -p prolly-store-sqlite --precise 0.3.0
+cargo update -p prolly-store-slatedb --precise 0.3.0
 cargo metadata --locked --format-version 1 > /tmp/trail-cargo-metadata.json
 ```
 
-Finally, clone the committed candidate with `git clone --no-local`, initialize
-submodules recursively, and run `cargo build -p trail --locked` from that clone.
-This clean-clone gate is mandatory because an uncommitted submodule checkout can
-hide an unavailable gitlink or local dependency edits.
+Finally, clone the committed candidate with `git clone --no-local` and run
+`cargo build -p trail --locked` from that clone. This clean-clone gate is
+mandatory because a local Cargo patch or stale package cache can otherwise hide
+an unavailable registry dependency.
 
 ## Current Evidence
 

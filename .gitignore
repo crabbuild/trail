@@ -6,13 +6,3 @@
 .venv/
 __pycache__/
 *.py[cod]
-prolly/bindings/python/prolly/uniffi/*.dylib
-prolly/bindings/python/prolly/uniffi/*.so
-prolly/bindings/python/prolly/uniffi/*.dll
-prolly/bindings/python/prolly/uniffi/*.pyd
-prolly/bindings/*/target/
-prolly/bindings/node/*.node
-prolly/bindings/node/node_modules/
-prolly/bindings/ruby/Gemfile.lock
-prolly/bindings/swift/.build/
-prolly/bindings/wasm/pkg/

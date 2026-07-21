@@ -1,4 +1,0 @@
-[submodule "prolly"]
-	path = prolly
-	url = https://github.com/crabbuild/prolly.git
-	branch = main
