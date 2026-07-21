@@ -3,6 +3,7 @@ use crate::db::change_ledger::secure_fs::SecureDirectory;
 
 const MAX_MATERIALIZATION_OPERATION_BYTES: u64 = 64 * 1024;
 const MATERIALIZATION_RECOVERY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_CONCURRENT_NATIVE_MATERIALIZATION_DURABILITY_BARRIERS: usize = 16;
 const MATERIALIZATION_COORDINATION_DIRECTORY: &str = "materialization-coordination";
 const MATERIALIZATION_RECOVERY_LOCK: &str = "recovery";
 
@@ -80,6 +81,61 @@ impl MaterializationRecoveryGuard {
                     "materialization recovery is deferred while an active materialization owns the workspace".into(),
                 )),
                 Err(error) => Err(Error::Io(error.into())),
+            }
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = db_dir;
+            Ok(Self {})
+        }
+    }
+}
+
+/// Holds one workspace-wide slot only while a native-COW stage establishes
+/// its final filesystem durability boundary.
+struct NativeMaterializationDurabilityAdmission {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _slot: std::fs::File,
+}
+
+impl NativeMaterializationDurabilityAdmission {
+    fn acquire(db_dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let slots = materialization_coordination_directory(db_dir)?;
+            let deadline = std::time::Instant::now() + MATERIALIZATION_RECOVERY_LOCK_WAIT;
+            let mut delay = std::time::Duration::from_millis(2);
+            let first_slot =
+                (now_nanos() as usize) % MAX_CONCURRENT_NATIVE_MATERIALIZATION_DURABILITY_BARRIERS;
+            loop {
+                for offset in 0..MAX_CONCURRENT_NATIVE_MATERIALIZATION_DURABILITY_BARRIERS {
+                    let slot = (first_slot + offset)
+                        % MAX_CONCURRENT_NATIVE_MATERIALIZATION_DURABILITY_BARRIERS;
+                    let file =
+                        slots.open_or_create_private_regular(&format!("durability-{slot:02}"))?;
+                    match rustix::fs::flock(
+                        &file,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    ) {
+                        Ok(()) => return Ok(Self { _slot: file }),
+                        Err(error) if error == rustix::io::Errno::AGAIN => {}
+                        Err(error) => return Err(Error::Io(error.into())),
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::WorkspaceLockTimeout {
+                        holder_purpose: "native_cow_durability".to_string(),
+                        holder_age_ms: MATERIALIZATION_RECOVERY_LOCK_WAIT
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                        operation_id: None,
+                        retry_command: "repeat the lane spawn command".to_string(),
+                    });
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(50));
             }
         }
 
@@ -396,7 +452,12 @@ impl Trail {
             // bottom-up, and finally one full volume/filesystem barrier. The
             // manifest is deliberately written first so `.trail`, its file,
             // and the stage-parent binding are included in the same cut.
-            sync_native_materialization_stage(&source.root, &stage, files.keys())?;
+            let durability_admission =
+                NativeMaterializationDurabilityAdmission::acquire(&self.db_dir)?;
+            let durability_result =
+                sync_native_materialization_stage(&source.root, &stage, files.keys());
+            drop(durability_admission);
+            durability_result?;
             ensure_staged_manifest_is_clean_read_only(self, &stage, root_id, case_insensitive)?;
             operation.set_state(MaterializationOperationState::Verified)?;
             operation.publish()?;
@@ -1075,9 +1136,9 @@ where
     let inventory = native_materialization_durability_inventory(source, stage, paths)?;
     let mut files = inventory.source_files.into_iter().collect::<Vec<_>>();
     files.extend(inventory.destination_files);
-    // This durability barrier follows the same process-level concurrency
-    // policy as native cloning above. Parallel fsync calls from every active
-    // lane amplify contention without changing the required durability cut.
+    // This full-filesystem durability barrier is concurrency-limited. Parallel
+    // fsync calls from every active lane amplify contention without changing
+    // the required durability cut.
     files.iter().try_for_each(|path| -> Result<()> {
         let file = OpenOptions::new().read(true).open(path)?;
         // Rust's File::sync_all maps to F_FULLFSYNC on Apple platforms.
