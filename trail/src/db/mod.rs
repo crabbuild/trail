@@ -2566,23 +2566,20 @@ fn open_prolly_store(
     let backend = match config.storage.prolly_backend.as_str() {
         "sqlite" => {
             let store = match schema_mode {
-                SchemaOpenMode::FreshCreate => SqliteStore::open_persistent_wal(sqlite_path)?,
+                SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
                 SchemaOpenMode::Existing => {
                     if let Some(validated) = validated_schema {
-                        SqliteStore::open_existing_verified_persistent_wal(
-                            sqlite_path,
-                            |identity| {
-                                validated.verify_main_identity(identity).map_err(|error| {
-                                    prolly_store_sqlite::SqliteStoreError::new(error.to_string())
-                                })
-                            },
-                        )
+                        SqliteStore::open_existing_verified(sqlite_path, |identity| {
+                            validated.verify_main_identity(identity).map_err(|error| {
+                                prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                            })
+                        })
                         .map_err(schema_reinitialize_error)?
                     } else {
                         // The only unverified existing-open path is an internal clone made
                         // while the caller already owns the workspace writer exclusion and
                         // a fully validated Trail handle.
-                        SqliteStore::open_existing_persistent_wal(sqlite_path)?
+                        SqliteStore::open_existing(sqlite_path)?
                     }
                 }
             };
