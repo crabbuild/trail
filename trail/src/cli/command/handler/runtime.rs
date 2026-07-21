@@ -57,6 +57,7 @@ fn retryable_open_db_handoff(error: &Error) -> bool {
                 found.as_str(),
                 "schema main/WAL/SHM generation changed during mutable handoff"
                     | "schema main/WAL/SHM generation changed during snapshot validation"
+                    | "schema generation changed during predecessor inspection"
             )
         }
         // Under a large cross-process CLI burst, preflight can exhaust its

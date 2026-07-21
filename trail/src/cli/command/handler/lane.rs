@@ -12,6 +12,13 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 && args.materialize != Some(false))
             .then(|| daemon_start::workspace_from_context(ctx))
             .transpose()?;
+            // A materialized lane changes the workspace generation. Retire a
+            // verified workspace observer before the first local schema
+            // handoff, rather than after a long-lived observer has kept the
+            // SQLite WAL moving throughout a concurrent spawn burst.
+            if let Some(workspace) = materialization_workspace.as_deref() {
+                daemon_start::retire_workspace_daemon_after_external_generation_change(workspace)?;
+            }
             // Serialize only the mutable database-open handoff. Dropping the
             // guard before lane initialization preserves the separate 16-way
             // native-COW admission for the expensive filesystem work.
