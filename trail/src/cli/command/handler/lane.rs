@@ -19,16 +19,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             if let Some(workspace) = materialization_workspace.as_deref() {
                 daemon_start::retire_workspace_daemon_after_external_generation_change(workspace)?;
             }
-            // Serialize only the mutable database-open handoff. Dropping the
-            // guard before lane initialization preserves the separate 16-way
-            // native-COW admission for the expensive filesystem work.
-            let mut db = {
-                let _open_admission = materialization_workspace
-                    .as_deref()
-                    .map(trail::LaneSpawnMaterializationAdmission::acquire_for_workspace)
-                    .transpose()?;
-                open_db(ctx)?
-            };
+            let mut db = open_db(ctx)?;
             let workdir_mode = db.resolve_lane_spawn_workdir_mode(
                 args.from.as_deref(),
                 args.workdir_mode.as_deref(),
@@ -49,13 +40,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             )?;
             let report = if report.workdir.is_some() && !report.workdir_mode.is_transparent_cow() {
                 drop(db);
-                let mut reopened = {
-                    let _open_admission = materialization_workspace
-                        .as_deref()
-                        .map(trail::LaneSpawnMaterializationAdmission::acquire_for_workspace)
-                        .transpose()?;
-                    open_db(ctx)?
-                };
+                let mut reopened = open_db(ctx)?;
                 let report = reopened.resume_deferred_initial_lane_ledger(&args.name)?;
                 let workspace = reopened.workspace_root().to_path_buf();
                 drop(reopened);

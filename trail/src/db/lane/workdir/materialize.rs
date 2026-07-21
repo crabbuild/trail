@@ -2,14 +2,7 @@ use super::*;
 use crate::db::change_ledger::secure_fs::SecureDirectory;
 
 const MAX_MATERIALIZATION_OPERATION_BYTES: u64 = 64 * 1024;
-// Native COW cloning is metadata-heavy: every file is cloned, authenticated,
-// and flushed. Agent processes are already independently concurrent, so a
-// workspace-wide bound prevents a burst of lane spawns from saturating APFS
-// (or an equivalent POSIX filesystem) with clone and xattr operations.
-const MAX_CONCURRENT_NATIVE_MATERIALIZATIONS: usize = 16;
-const MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS: usize = 1;
-const NATIVE_MATERIALIZATION_ADMISSION_WAIT: std::time::Duration =
-    std::time::Duration::from_secs(120);
+const MATERIALIZATION_RECOVERY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 const MATERIALIZATION_COORDINATION_DIRECTORY: &str = "materialization-coordination";
 const MATERIALIZATION_RECOVERY_LOCK: &str = "recovery";
 
@@ -43,7 +36,7 @@ impl MaterializationRecoveryGuard {
             let coordination = materialization_coordination_directory(db_dir)?;
             let file =
                 coordination.open_or_create_private_regular(MATERIALIZATION_RECOVERY_LOCK)?;
-            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
+            let deadline = std::time::Instant::now() + MATERIALIZATION_RECOVERY_LOCK_WAIT;
             let mut delay = std::time::Duration::from_millis(2);
             loop {
                 match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
@@ -54,7 +47,7 @@ impl MaterializationRecoveryGuard {
                 if std::time::Instant::now() >= deadline {
                     return Err(Error::WorkspaceLockTimeout {
                         holder_purpose: "materialization_recovery".to_string(),
-                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
+                        holder_age_ms: MATERIALIZATION_RECOVERY_LOCK_WAIT
                             .as_millis()
                             .try_into()
                             .unwrap_or(u64::MAX),
@@ -87,117 +80,6 @@ impl MaterializationRecoveryGuard {
                     "materialization recovery is deferred while an active materialization owns the workspace".into(),
                 )),
                 Err(error) => Err(Error::Io(error.into())),
-            }
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = db_dir;
-            Ok(Self {})
-        }
-    }
-}
-
-struct NativeMaterializationAdmission {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _slot: std::fs::File,
-}
-
-impl NativeMaterializationAdmission {
-    fn acquire(db_dir: &Path) -> Result<Self> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let slots = materialization_coordination_directory(db_dir)?;
-            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
-            let mut delay = std::time::Duration::from_millis(2);
-            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
-            loop {
-                for offset in 0..MAX_CONCURRENT_NATIVE_MATERIALIZATIONS {
-                    let slot = (first_slot + offset) % MAX_CONCURRENT_NATIVE_MATERIALIZATIONS;
-                    let file = slots.open_or_create_private_regular(&format!("slot-{slot:02}"))?;
-                    match rustix::fs::flock(
-                        &file,
-                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-                    ) {
-                        Ok(()) => return Ok(Self { _slot: file }),
-                        Err(error) if error == rustix::io::Errno::AGAIN => {}
-                        Err(error) => return Err(Error::Io(error.into())),
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(Error::WorkspaceLockTimeout {
-                        holder_purpose: "native_cow_materialization".to_string(),
-                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                        operation_id: None,
-                        retry_command: "repeat the lane spawn command".to_string(),
-                    });
-                }
-                std::thread::sleep(delay);
-                delay = (delay * 2).min(std::time::Duration::from_millis(50));
-            }
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = db_dir;
-            Ok(Self {})
-        }
-    }
-}
-
-/// Holds the workspace-wide pre-open slot for a materializing CLI lane spawn.
-/// This deliberately uses a different slot namespace from the native-COW
-/// stage admission: it serializes short SQLite preflight handoffs, while the
-/// latter continues to allow bounded concurrent filesystem clone work.
-pub(crate) struct PreOpenMaterializationAdmission {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _slot: std::fs::File,
-}
-
-impl PreOpenMaterializationAdmission {
-    pub(crate) fn acquire_for_workspace(workspace: &Path) -> Result<Self> {
-        let workspace = workspace.canonicalize()?;
-        Self::acquire(&workspace.join(".trail/index"))
-    }
-
-    fn acquire(db_dir: &Path) -> Result<Self> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let slots = materialization_coordination_directory(db_dir)?;
-            let deadline = std::time::Instant::now() + NATIVE_MATERIALIZATION_ADMISSION_WAIT;
-            let mut delay = std::time::Duration::from_millis(2);
-            let first_slot = (now_nanos() as usize) % MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS;
-            loop {
-                for offset in 0..MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS {
-                    let slot =
-                        (first_slot + offset) % MAX_CONCURRENT_PREOPEN_MATERIALIZATION_SPAWNS;
-                    let file =
-                        slots.open_or_create_private_regular(&format!("spawn-slot-{slot:02}"))?;
-                    match rustix::fs::flock(
-                        &file,
-                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-                    ) {
-                        Ok(()) => return Ok(Self { _slot: file }),
-                        Err(error) if error == rustix::io::Errno::AGAIN => {}
-                        Err(error) => return Err(Error::Io(error.into())),
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(Error::WorkspaceLockTimeout {
-                        holder_purpose: "native_cow_spawn_admission".to_string(),
-                        holder_age_ms: NATIVE_MATERIALIZATION_ADMISSION_WAIT
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX),
-                        operation_id: None,
-                        retry_command: "repeat the lane spawn command".to_string(),
-                    });
-                }
-                std::thread::sleep(delay);
-                delay = (delay * 2).min(std::time::Duration::from_millis(50));
             }
         }
 
@@ -433,10 +315,6 @@ impl Trail {
         root_id: &ObjectId,
         destination: &Path,
     ) -> std::result::Result<MaterializationOutcome, NativeAttemptError> {
-        // Hold this through source discovery, cloning, verification, and
-        // publication. Releasing it earlier merely moves the APFS saturation
-        // to source metadata scans or durable sync barriers.
-        let _admission = NativeMaterializationAdmission::acquire(&self.db_dir)?;
         let files = self.load_root_files(root_id)?;
         let source = self
             .resolve_native_materialization_source(root_id, &files)?

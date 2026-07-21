@@ -61,15 +61,3 @@ pub(crate) use workspace_layer::{
     EnvironmentLayerActivation, EnvironmentLayerOutputActivation, WorkspaceLayerBinding,
 };
 pub(crate) use workspace_view::WorkspaceMountLease;
-
-pub struct LaneSpawnMaterializationAdmission {
-    _guard: workdir::PreOpenMaterializationAdmission,
-}
-
-impl LaneSpawnMaterializationAdmission {
-    pub fn acquire_for_workspace(workspace: &std::path::Path) -> Result<Self> {
-        Ok(Self {
-            _guard: workdir::PreOpenMaterializationAdmission::acquire_for_workspace(workspace)?,
-        })
-    }
-}
