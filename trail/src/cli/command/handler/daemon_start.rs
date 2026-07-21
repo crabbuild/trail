@@ -190,13 +190,28 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
             }
             return Err(Error::Io(error));
         }
+        // A peer may have authenticated the same endpoint and already
+        // unlinked its socket before removing endpoint/token publication. Do
+        // not turn that short, safe retirement window into a spurious failure
+        // for every other materializing spawn. Only accept it after the peer
+        // has removed the endpoint; a remaining or replaced publication still
+        // fails closed.
+        Err(error @ Error::DaemonUnavailable(_)) => {
+            if peer_completed_workspace_daemon_retirement(&authority)? {
+                return Ok(());
+            }
+            return Err(error);
+        }
         Err(error) => return Err(error),
     }
-    let actual_start = process_start_identity(endpoint.pid).ok_or_else(|| {
-        Error::DaemonUnavailable(
+    let Some(actual_start) = process_start_identity(endpoint.pid) else {
+        if peer_completed_workspace_daemon_retirement(&authority)? {
+            return Ok(());
+        }
+        return Err(Error::DaemonUnavailable(
             "workspace daemon process identity disappeared before retirement".into(),
-        )
-    })?;
+        ));
+    };
     if actual_start != endpoint.process_start_identity {
         return Err(Error::DaemonUnavailable(
             "workspace daemon PID was reused before retirement; refusing to signal it".into(),
@@ -204,7 +219,13 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
     }
     let result = unsafe { libc::kill(endpoint.pid as i32, libc::SIGTERM) };
     if result != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound
+            && peer_completed_workspace_daemon_retirement(&authority)?
+        {
+            return Ok(());
+        }
+        return Err(Error::Io(error));
     }
     // This signal was sent only after the endpoint, socket, token, and PID
     // start identity were all authenticated. Withdraw that exact publication
@@ -214,6 +235,19 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
     // the daemon's ownership lock rather than racing a dead endpoint.
     remove_stale_publication(&authority, &endpoint)?;
     Ok(())
+}
+
+fn peer_completed_workspace_daemon_retirement(authority: &SecureAuthority) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if read_secure_endpoint(authority)?.is_none() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 enum EndpointState {
