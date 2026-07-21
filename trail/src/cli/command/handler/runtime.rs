@@ -53,7 +53,11 @@ pub(super) fn open_db(ctx: &RuntimeContext) -> Result<Trail> {
 fn retryable_open_db_handoff(error: &Error) -> bool {
     match error {
         Error::SchemaReinitializeRequired { found, .. } => {
-            found == "schema main/WAL/SHM generation changed during mutable handoff"
+            matches!(
+                found.as_str(),
+                "schema main/WAL/SHM generation changed during mutable handoff"
+                    | "schema main/WAL/SHM generation changed during snapshot validation"
+            )
         }
         // Under a large cross-process CLI burst, preflight can exhaust its
         // deliberately short in-process WAL snapshot retry budget while
