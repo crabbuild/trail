@@ -17,7 +17,6 @@ use ignore::WalkBuilder;
 use prolly::{
     BatchBuilder, BatchOp, Cid, Config, Diff, Encoding, Prolly, SortedBatchBuilder, Store, Tree,
 };
-use prolly_store_slatedb::SlateDbStore;
 #[cfg(unix)]
 use prolly_store_sqlite::sqlite_main_file_identity;
 use prolly_store_sqlite::{SqliteMainFileIdentity, SqliteStore};
@@ -25,8 +24,6 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
-use slatedb::object_store::aws::AmazonS3Builder;
-use slatedb::object_store::ObjectStore;
 
 use crate::error::{cbor, from_cbor, Error, Result};
 use crate::ids::{
@@ -606,6 +603,7 @@ pub(crate) fn preflight_existing_schema(
     db_path: &Path,
     prolly_backend: &str,
 ) -> Result<ValidatedSchemaGeneration> {
+    require_sqlite_prolly_backend(prolly_backend)?;
     let shared_exclusion = acquire_schema_shared_exclusion(db_path)?;
     let mut generation = schema_generation(db_path).map_err(schema_reinitialize_error)?;
     let key = db_path.to_path_buf();
@@ -789,6 +787,7 @@ pub(crate) fn preflight_existing_schema(
 }
 
 pub(crate) fn inspect_existing_schema_version(db_path: &Path, prolly_backend: &str) -> Result<i64> {
+    require_sqlite_prolly_backend(prolly_backend)?;
     let _shared_exclusion = acquire_schema_shared_exclusion(db_path)?;
     let before = schema_generation(db_path).map_err(schema_reinitialize_error)?;
     let snapshot = tempfile::Builder::new()
@@ -824,17 +823,7 @@ pub(crate) fn inspect_existing_schema_version(db_path: &Path, prolly_backend: &s
         } else {
             storage::validate_schema_v19_for_migration(&conn).map_err(schema_reinitialize_error)?;
         }
-        match prolly_backend {
-            "sqlite" => storage::validate_prolly_sqlite_schema_v18(&conn)
-                .map_err(schema_reinitialize_error)?,
-            "slatedb" => storage::validate_no_prolly_sqlite_schema_v18(&conn)
-                .map_err(schema_reinitialize_error)?,
-            other => {
-                return Err(Error::InvalidInput(format!(
-                    "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-                )))
-            }
-        }
+        storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)?;
     }
     Ok(version)
 }
@@ -1776,6 +1765,7 @@ fn schema_failure_message(error: &Error) -> String {
 }
 
 fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> {
+    require_sqlite_prolly_backend(prolly_backend)?;
     #[cfg(test)]
     schema_validation_process_test_probe()?;
     #[cfg(test)]
@@ -1820,16 +1810,16 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(schema_reinitialize_error)?;
     Trail::validate_schema_v20(&conn).map_err(schema_reinitialize_error)?;
-    match prolly_backend {
-        "sqlite" => {
-            storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
-        }
-        "slatedb" => {
-            storage::validate_no_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
-        }
-        other => Err(Error::InvalidInput(format!(
-            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-        ))),
+    storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
+}
+
+fn require_sqlite_prolly_backend(prolly_backend: &str) -> Result<()> {
+    if prolly_backend == "sqlite" {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "storage.prolly_backend is no longer configurable; expected `sqlite`, got `{prolly_backend}`"
+        )))
     }
 }
 
@@ -2282,18 +2272,12 @@ pub(crate) struct WorkspaceIgnorePolicySnapshot {
 
 #[derive(Clone)]
 struct TrailProllyStore {
-    backend: TrailProllyStoreBackend,
+    backend: Arc<SqliteStore>,
     metrics: Option<Arc<OperationMetricsState>>,
 }
 
-#[derive(Clone)]
-enum TrailProllyStoreBackend {
-    Sqlite(Arc<SqliteStore>),
-    SlateDb(Arc<SlateDbStore>),
-}
-
 impl TrailProllyStore {
-    fn new(backend: TrailProllyStoreBackend, metrics: Option<Arc<OperationMetricsState>>) -> Self {
+    fn new(backend: Arc<SqliteStore>, metrics: Option<Arc<OperationMetricsState>>) -> Self {
         Self { backend, metrics }
     }
 
@@ -2356,14 +2340,10 @@ impl Store for TrailProllyStore {
 
     fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
         self.note_prolly_read_call(1);
-        let result = match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store
-                .get(key)
-                .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly get failed", err)),
-            TrailProllyStoreBackend::SlateDb(store) => store.get(key).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly get failed", err)
-            }),
-        };
+        let result = self
+            .backend
+            .get(key)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly get failed", err));
         if let Ok(Some(value)) = &result {
             self.note_prolly_read_values(std::iter::once(value));
         }
@@ -2372,26 +2352,16 @@ impl Store for TrailProllyStore {
 
     fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), Self::Error> {
         self.note_prolly_write_call(1, value.len());
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store
-                .put(key, value)
-                .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly put failed", err)),
-            TrailProllyStoreBackend::SlateDb(store) => store.put(key, value).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly put failed", err)
-            }),
-        }
+        self.backend
+            .put(key, value)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly put failed", err))
     }
 
     fn delete(&self, key: &[u8]) -> std::result::Result<(), Self::Error> {
         self.note_prolly_write_call(1, 0);
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store.delete(key).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly delete failed", err)
-            }),
-            TrailProllyStoreBackend::SlateDb(store) => store.delete(key).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly delete failed", err)
-            }),
-        }
+        self.backend
+            .delete(key)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly delete failed", err))
     }
 
     fn batch(&self, ops: &[BatchOp]) -> std::result::Result<(), Self::Error> {
@@ -2403,14 +2373,9 @@ impl Store for TrailProllyStore {
             })
             .fold(0usize, usize::saturating_add);
         self.note_prolly_write_call(ops.len(), value_bytes);
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store.batch(ops).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly batch failed", err)
-            }),
-            TrailProllyStoreBackend::SlateDb(store) => store.batch(ops).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly batch failed", err)
-            }),
-        }
+        self.backend
+            .batch(ops)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly batch failed", err))
     }
 
     fn batch_get(
@@ -2418,14 +2383,9 @@ impl Store for TrailProllyStore {
         keys: &[&[u8]],
     ) -> std::result::Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
         self.note_prolly_read_call(keys.len());
-        let result = match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store.batch_get(keys).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly batch_get failed", err)
-            }),
-            TrailProllyStoreBackend::SlateDb(store) => store.batch_get(keys).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly batch_get failed", err)
-            }),
-        };
+        let result = self.backend.batch_get(keys).map_err(|err| {
+            TrailProllyStoreError::with_source("SQLite prolly batch_get failed", err)
+        });
         if let Ok(values) = &result {
             self.note_prolly_read_values(values.values());
         }
@@ -2437,24 +2397,9 @@ impl Store for TrailProllyStore {
         keys: &[&[u8]],
     ) -> std::result::Result<Vec<Option<Vec<u8>>>, Self::Error> {
         self.note_prolly_read_call(keys.len());
-        let result = match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => {
-                store.batch_get_ordered(keys).map_err(|err| {
-                    TrailProllyStoreError::with_source(
-                        "SQLite prolly batch_get_ordered failed",
-                        err,
-                    )
-                })
-            }
-            TrailProllyStoreBackend::SlateDb(store) => {
-                store.batch_get_ordered(keys).map_err(|err| {
-                    TrailProllyStoreError::with_source(
-                        "SlateDB prolly batch_get_ordered failed",
-                        err,
-                    )
-                })
-            }
-        };
+        let result = self.backend.batch_get_ordered(keys).map_err(|err| {
+            TrailProllyStoreError::with_source("SQLite prolly batch_get_ordered failed", err)
+        });
         if let Ok(values) = &result {
             self.note_prolly_read_values(values.iter().filter_map(Option::as_ref));
         }
@@ -2467,21 +2412,13 @@ impl Store for TrailProllyStore {
             .map(|(_, value)| value.len())
             .fold(0usize, usize::saturating_add);
         self.note_prolly_write_call(entries.len(), value_bytes);
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store.batch_put(entries).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly batch_put failed", err)
-            }),
-            TrailProllyStoreBackend::SlateDb(store) => store.batch_put(entries).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly batch_put failed", err)
-            }),
-        }
+        self.backend.batch_put(entries).map_err(|err| {
+            TrailProllyStoreError::with_source("SQLite prolly batch_put failed", err)
+        })
     }
 
     fn supports_hints(&self) -> bool {
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store.supports_hints(),
-            TrailProllyStoreBackend::SlateDb(store) => store.supports_hints(),
-        }
+        self.backend.supports_hints()
     }
 
     fn get_hint(
@@ -2489,18 +2426,9 @@ impl Store for TrailProllyStore {
         namespace: &[u8],
         key: &[u8],
     ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => {
-                store.get_hint(namespace, key).map_err(|err| {
-                    TrailProllyStoreError::with_source("SQLite prolly get_hint failed", err)
-                })
-            }
-            TrailProllyStoreBackend::SlateDb(store) => {
-                store.get_hint(namespace, key).map_err(|err| {
-                    TrailProllyStoreError::with_source("SlateDB prolly get_hint failed", err)
-                })
-            }
-        }
+        self.backend
+            .get_hint(namespace, key)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly get_hint failed", err))
     }
 
     fn put_hint(
@@ -2509,18 +2437,9 @@ impl Store for TrailProllyStore {
         key: &[u8],
         value: &[u8],
     ) -> std::result::Result<(), Self::Error> {
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => {
-                store.put_hint(namespace, key, value).map_err(|err| {
-                    TrailProllyStoreError::with_source("SQLite prolly put_hint failed", err)
-                })
-            }
-            TrailProllyStoreBackend::SlateDb(store) => {
-                store.put_hint(namespace, key, value).map_err(|err| {
-                    TrailProllyStoreError::with_source("SlateDB prolly put_hint failed", err)
-                })
-            }
-        }
+        self.backend
+            .put_hint(namespace, key, value)
+            .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly put_hint failed", err))
     }
 
     fn batch_put_with_hint(
@@ -2535,24 +2454,11 @@ impl Store for TrailProllyStore {
             .map(|(_, value)| value.len())
             .fold(0usize, usize::saturating_add);
         self.note_prolly_write_call(entries.len(), value_bytes);
-        match &self.backend {
-            TrailProllyStoreBackend::Sqlite(store) => store
-                .batch_put_with_hint(entries, namespace, key, value)
-                .map_err(|err| {
-                    TrailProllyStoreError::with_source(
-                        "SQLite prolly batch_put_with_hint failed",
-                        err,
-                    )
-                }),
-            TrailProllyStoreBackend::SlateDb(store) => store
-                .batch_put_with_hint(entries, namespace, key, value)
-                .map_err(|err| {
-                    TrailProllyStoreError::with_source(
-                        "SlateDB prolly batch_put_with_hint failed",
-                        err,
-                    )
-                }),
-        }
+        self.backend
+            .batch_put_with_hint(entries, namespace, key, value)
+            .map_err(|err| {
+                TrailProllyStoreError::with_source("SQLite prolly batch_put_with_hint failed", err)
+            })
     }
 }
 
@@ -2563,82 +2469,31 @@ fn open_prolly_store(
     schema_mode: SchemaOpenMode,
     validated_schema: Option<&ValidatedSchemaGeneration>,
 ) -> Result<TrailProllyStore> {
-    let backend = match config.storage.prolly_backend.as_str() {
-        "sqlite" => {
-            let store = match schema_mode {
-                SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
-                SchemaOpenMode::Existing => {
-                    if let Some(validated) = validated_schema {
-                        SqliteStore::open_existing_verified(sqlite_path, |identity| {
-                            validated.verify_main_identity(identity).map_err(|error| {
-                                prolly_store_sqlite::SqliteStoreError::new(error.to_string())
-                            })
-                        })
-                        .map_err(schema_reinitialize_error)?
-                    } else {
-                        // The only unverified existing-open path is an internal clone made
-                        // while the caller already owns the workspace writer exclusion and
-                        // a fully validated Trail handle.
-                        SqliteStore::open_existing(sqlite_path)?
-                    }
-                }
-            };
-            TrailProllyStoreBackend::Sqlite(Arc::new(store))
+    if config.storage.prolly_backend != "sqlite" {
+        return Err(Error::InvalidInput(format!(
+            "storage.prolly_backend is no longer configurable; expected `sqlite`, got `{}`",
+            config.storage.prolly_backend
+        )));
+    }
+    let store = match schema_mode {
+        SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
+        SchemaOpenMode::Existing => {
+            if let Some(validated) = validated_schema {
+                SqliteStore::open_existing_verified(sqlite_path, |identity| {
+                    validated.verify_main_identity(identity).map_err(|error| {
+                        prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                    })
+                })
+                .map_err(schema_reinitialize_error)?
+            } else {
+                // The only unverified existing-open path is an internal clone made
+                // while the caller already owns the workspace writer exclusion and
+                // a fully validated Trail handle.
+                SqliteStore::open_existing(sqlite_path)?
+            }
         }
-        "slatedb" => open_slatedb_prolly_store(&config.storage)?,
-        other => Err(Error::InvalidInput(format!(
-            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-        )))?,
     };
-    Ok(TrailProllyStore::new(backend, metrics))
-}
-
-fn open_slatedb_prolly_store(storage: &StorageConfig) -> Result<TrailProllyStoreBackend> {
-    let path = storage.slatedb_path.trim().trim_matches('/');
-    if path.is_empty() {
-        return Err(Error::InvalidInput(
-            "storage.slatedb_path must not be empty".to_string(),
-        ));
-    }
-
-    let object_store = build_slatedb_object_store(storage)?;
-    let store = SlateDbStore::open(path, object_store)?;
-    Ok(TrailProllyStoreBackend::SlateDb(Arc::new(store)))
-}
-
-fn build_slatedb_object_store(storage: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
-    if storage.slatedb_s3_endpoint.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "storage.slatedb_s3_endpoint must not be empty".to_string(),
-        ));
-    }
-    if storage.slatedb_s3_bucket.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "storage.slatedb_s3_bucket must not be empty".to_string(),
-        ));
-    }
-    if storage.slatedb_s3_region.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "storage.slatedb_s3_region must not be empty".to_string(),
-        ));
-    }
-
-    let store = AmazonS3Builder::new()
-        .with_endpoint(storage.slatedb_s3_endpoint.trim_end_matches('/'))
-        .with_bucket_name(storage.slatedb_s3_bucket.trim())
-        .with_region(storage.slatedb_s3_region.trim())
-        .with_access_key_id(&storage.slatedb_s3_access_key_id)
-        .with_secret_access_key(&storage.slatedb_s3_secret_access_key)
-        .with_allow_http(storage.slatedb_s3_allow_http)
-        .with_virtual_hosted_style_request(false)
-        .build()
-        .map_err(|err| {
-            Error::InvalidInput(format!(
-                "failed to configure SlateDB S3 object store: {err}"
-            ))
-        })?;
-
-    Ok(Arc::new(store))
+    Ok(TrailProllyStore::new(Arc::new(store), metrics))
 }
 
 #[derive(Debug, Default)]
@@ -5642,7 +5497,7 @@ mod tests {
     fn trail_prolly_store_reports_calls_requested_keys_found_values_and_bytes_across_clones() {
         let metrics = Arc::new(OperationMetricsState::default());
         let store = TrailProllyStore::new(
-            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Some(Arc::clone(&metrics)),
         );
         store.put(b"present", b"abc").unwrap();
@@ -5702,14 +5557,12 @@ mod tests {
 
         let raw = SqliteStore::open_in_memory().unwrap();
         raw.put(b"present", b"abc").unwrap();
-        let disabled = TrailProllyStore::new(
-            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
-            None,
-        );
+        let disabled =
+            TrailProllyStore::new(Arc::new(SqliteStore::open_in_memory().unwrap()), None);
         disabled.put(b"present", b"abc").unwrap();
         let metrics = Arc::new(OperationMetricsState::default());
         let measured = TrailProllyStore::new(
-            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
             Some(Arc::clone(&metrics)),
         );
         measured.put(b"present", b"abc").unwrap();
@@ -5784,10 +5637,7 @@ mod tests {
         assert_eq!(operation_metrics_report(disabled.as_ref()), None);
 
         let untouched = Arc::new(OperationMetricsState::default());
-        let store = TrailProllyStore::new(
-            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
-            None,
-        );
+        let store = TrailProllyStore::new(Arc::new(SqliteStore::open_in_memory().unwrap()), None);
         store.put(b"present", b"abc").unwrap();
         assert_eq!(store.get(b"present").unwrap(), Some(b"abc".to_vec()));
         untouched

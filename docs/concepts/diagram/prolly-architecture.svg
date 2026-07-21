@@ -114,8 +114,8 @@
 
   <rect x="963" y="260" width="120" height="54" rx="6" fill="#0f172a"/>
   <rect x="963" y="260" width="120" height="54" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.4"/>
-  <text x="1023" y="282" class="label" text-anchor="middle">SlateDB</text>
-  <text x="1023" y="298" class="tiny" text-anchor="middle">durable object store</text>
+  <text x="1023" y="282" class="label" text-anchor="middle">Trail</text>
+  <text x="1023" y="298" class="tiny" text-anchor="middle">uses SQLite</text>
 
   <rect x="828" y="340" width="120" height="54" rx="6" fill="#0f172a"/>
   <rect x="828" y="340" width="120" height="54" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.4"/>

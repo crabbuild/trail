@@ -371,15 +371,6 @@ fn prolly_sqlite_structure(conn: &Connection) -> Result<Vec<ProllySqliteTableStr
     Ok(structure)
 }
 
-pub(crate) fn validate_no_prolly_sqlite_schema_v18(conn: &Connection) -> Result<()> {
-    if !prolly_sqlite_objects(conn)?.is_empty() {
-        return Err(Error::Corrupt(
-            "SlateDB workspace contains unexpected SQLite Prolly objects".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn prolly_sqlite_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
         "SELECT type, name, sql FROM sqlite_master

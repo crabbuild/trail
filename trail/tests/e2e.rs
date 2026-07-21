@@ -18422,11 +18422,6 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .unwrap()
         .iter()
         .any(|entry| entry["key"] == "storage.prolly_backend"));
-    assert!(http_entries
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| entry["key"] == "storage.slatedb_s3_endpoint"));
 
     let http_get = trail::server::handle_http_request(
         &mut db,
@@ -18533,22 +18528,6 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .unwrap();
     assert_eq!(eval_suites_set.old_value, "");
     assert_eq!(eval_suites_set.new_value, "regression,safety");
-    let path_set = db
-        .config_set("storage.slatedb_path", "/custom/prolly/")
-        .unwrap();
-    assert_eq!(path_set.new_value, "custom/prolly");
-    let endpoint_set = db
-        .config_set("storage.slatedb_s3_endpoint", "http://localhost:9001/")
-        .unwrap();
-    assert_eq!(endpoint_set.new_value, "http://localhost:9001");
-    let bucket_set = db
-        .config_set("storage.slatedb_s3_bucket", "test-bucket")
-        .unwrap();
-    assert_eq!(bucket_set.new_value, "test-bucket");
-    let allow_http_set = db
-        .config_set("storage.slatedb_s3_allow_http", "no")
-        .unwrap();
-    assert_eq!(allow_http_set.new_value, "false");
     let allowed_shell = db
         .guardrail_check(
             None,
@@ -18604,13 +18583,6 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         vec!["regression".to_string(), "safety".to_string()]
     );
     assert_eq!(reopened.config().storage.prolly_backend, "sqlite");
-    assert_eq!(reopened.config().storage.slatedb_path, "custom/prolly");
-    assert_eq!(
-        reopened.config().storage.slatedb_s3_endpoint,
-        "http://localhost:9001"
-    );
-    assert_eq!(reopened.config().storage.slatedb_s3_bucket, "test-bucket");
-    assert!(!reopened.config().storage.slatedb_s3_allow_http);
 
     let err = reopened
         .config_set("recording.ignore_gitignored", "sometimes")
@@ -18618,12 +18590,7 @@ fn config_api_lists_sets_persists_and_validates_keys() {
     assert!(matches!(err, Error::InvalidInput(_)));
 
     let err = reopened
-        .config_set("storage.prolly_backend", "slatedb")
-        .unwrap_err();
-    assert!(matches!(err, Error::InvalidInput(_)));
-
-    let err = reopened
-        .config_set("storage.slatedb_path", "///")
+        .config_set("storage.prolly_backend", "other")
         .unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)));
 

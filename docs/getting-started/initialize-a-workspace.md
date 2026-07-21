@@ -48,17 +48,11 @@ Supported policies are:
 
 The policy writes concrete config values such as `text.opaque_text_max_bytes`, `text.max_line_bytes`, and `text.preserve_similarity`.
 
-## Choose a Prolly Storage Backend
-
-```sh
-trail init --working-tree --prolly-backend slatedb
-```
-
-The default backend is `sqlite`. `slatedb` stores Prolly tree nodes in SlateDB backed by the configured S3-compatible object store. The default local development settings use `http://localhost:9000`, bucket `crab`, and credentials `crab`/`crab`; inspect them with `trail config get storage.slatedb_s3_endpoint` or `trail config list`.
-
 ## Files Created
 
-Initialization creates Trail state under `.trail`, including SQLite metadata storage under `.trail/index/trail.sqlite`, ref files, config, and default ignore rules. It also creates `.trailignore` when needed. With the SlateDB backend, Prolly tree nodes are stored outside SQLite under a workspace-scoped object-store path.
+Initialization creates Trail state under `.trail`, including SQLite metadata and
+Prolly node storage under `.trail/index/trail.sqlite`, ref files, config, and
+default ignore rules. It also creates `.trailignore` when needed.
 
 Default `.trailignore` patterns include `.trail/`, `.git/`, `.env`, `.env.*`, private key file extensions, `node_modules/`, `target/`, `dist/`, `build/`, and `coverage/`.
 

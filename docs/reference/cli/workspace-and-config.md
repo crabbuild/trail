@@ -3,7 +3,7 @@
 ## `init`
 
 ```text
-trail init [--from-git] [--working-tree] [--branch <BRANCH>] [--text-policy <POLICY>] [--prolly-backend <BACKEND>] [--force]
+trail init [--from-git] [--working-tree] [--branch <BRANCH>] [--text-policy <POLICY>] [--force]
 ```
 
 Options:
@@ -12,7 +12,6 @@ Options:
 - `--working-tree`: import visible working tree files.
 - `--branch <BRANCH>`: initial branch, default `main`.
 - `--text-policy <minimal|balanced|full>`: configure text tracking thresholds.
-- `--prolly-backend <sqlite|slatedb>`: choose the Prolly tree node backend for the new workspace.
 - `--force`: allow initializing over existing state where the implementation permits it.
 
 ## `config`

@@ -1144,7 +1144,7 @@ cargo test -p trail db::core::fsck --lib -- --nocapture
 cargo test -p trail db::change_ledger::recovery --lib -- --nocapture
 ```
 
-Expected: PASS for SQLite and SlateDB root maps, diff/merge, GC/fsck, backup, and recovery paths.
+Expected: PASS for SQLite root maps, diff/merge, GC/fsck, backup, and recovery paths.
 
 - [ ] **Step 3: Regenerate the lockfile from the exact gitlink**
 

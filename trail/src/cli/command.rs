@@ -210,6 +210,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn init_rejects_removed_prolly_backend_option() {
+        assert!(Cli::try_parse_from(["trail", "init", "--prolly-backend", "sqlite"]).is_err());
+    }
+
+    #[test]
     fn parses_environment_adapter_catalog() {
         let cli = Cli::try_parse_from(["trail", "env", "adapters"])
             .expect("environment adapter catalog command should parse");

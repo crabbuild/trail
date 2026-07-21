@@ -321,8 +321,8 @@ mapping table.
 
 ## Reproducible Prolly Qualification
 
-Trail consumes `prolly-map`, `prolly-store-sqlite`, and
-`prolly-store-slatedb` from crates.io. Release qualification must prove that
+Trail consumes `prolly-map` and `prolly-store-sqlite` from crates.io. Release
+qualification must prove that
 Cargo resolves the locked registry packages rather than a developer's local
 checkout:
 
@@ -331,7 +331,6 @@ set -euo pipefail
 cargo metadata --locked --format-version 1 > /tmp/trail-cargo-metadata.json
 cargo tree -p trail -i prolly-map
 cargo tree -p trail -i prolly-store-sqlite
-cargo tree -p trail -i prolly-store-slatedb
 ```
 
 Run the focused root-map/storage, diff/merge, GC/fsck/backup, and recovery
@@ -352,7 +351,6 @@ without updating unrelated packages:
 ```sh
 cargo update -p prolly-map --precise 0.5.0
 cargo update -p prolly-store-sqlite --precise 0.3.0
-cargo update -p prolly-store-slatedb --precise 0.3.0
 cargo metadata --locked --format-version 1 > /tmp/trail-cargo-metadata.json
 ```
 

@@ -16,14 +16,7 @@ Use `trail config list`, `get`, and `set` to inspect and edit workspace config.
 | `text.opaque_text_max_bytes` | u64 | no | Greater than zero. |
 | `text.max_line_bytes` | u64 | no | Greater than zero. |
 | `text.preserve_similarity` | f32 | no | Finite value from `0.0` to `1.0`. |
-| `storage.prolly_backend` | string | yes | `sqlite` or `slatedb`. |
-| `storage.slatedb_path` | string | no | Non-empty object-store path. |
-| `storage.slatedb_s3_endpoint` | string | no | Non-empty S3-compatible endpoint URL. |
-| `storage.slatedb_s3_bucket` | string | no | Non-empty bucket name. |
-| `storage.slatedb_s3_region` | string | no | Non-empty region. |
-| `storage.slatedb_s3_access_key_id` | string | no | Non-empty access key ID. |
-| `storage.slatedb_s3_secret_access_key` | string | no | Non-empty secret access key. |
-| `storage.slatedb_s3_allow_http` | bool | no | Boolean parser values. |
+| `storage.prolly_backend` | string | yes | Always `sqlite`. |
 | `lane.default_materialize` | bool | no | Boolean parser values. |
 | `lane.require_test_gate` | bool | no | Boolean parser values. |
 | `lane.require_eval_gate` | bool | no | Boolean parser values. |
@@ -61,20 +54,10 @@ False values:
 
 `trail init --text-policy minimal|balanced|full` applies preset text thresholds before the config is written.
 
-## Prolly Storage Backend
+## Prolly Storage
 
-`trail init --prolly-backend sqlite|slatedb` chooses where Prolly tree nodes are stored for a new workspace. `sqlite` keeps nodes in `.trail/index/trail.sqlite`. `slatedb` stores nodes in SlateDB backed by the configured S3-compatible object store.
-
-When initialized with `--prolly-backend slatedb`, Trail writes a workspace-scoped default `storage.slatedb_path` of `trail/workspaces/<workspace-id>/prolly`. The default S3-compatible settings target local RustFS-compatible development:
-
-```text
-storage.slatedb_s3_endpoint = "http://localhost:9000"
-storage.slatedb_s3_bucket = "crab"
-storage.slatedb_s3_region = "us-east-1"
-storage.slatedb_s3_access_key_id = "crab"
-storage.slatedb_s3_secret_access_key = "crab"
-storage.slatedb_s3_allow_http = true
-```
+Trail stores Prolly tree nodes in `.trail/index/trail.sqlite`. The read-only
+`storage.prolly_backend` value remains in workspace config as a format marker.
 
 ## Lane Hardening Keys
 
