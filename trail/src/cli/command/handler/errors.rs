@@ -391,7 +391,6 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
         | Error::Serialization(_)
         | Error::Prolly(_)
         | Error::ProllySqlite(_)
-        | Error::ProllySlateDb(_)
         | Error::Json(_)
         | Error::TomlSer(_)
         | Error::TomlDe(_) => {

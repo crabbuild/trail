@@ -12,13 +12,8 @@ The Trail index lives under:
 
 The `prolly` crate is re-exported from the `trail` crate and is used for map roots and content-addressed tree structures.
 
-By default, Prolly tree nodes are stored in SQLite. New workspaces can opt into SlateDB-backed node storage with:
-
-```sh
-trail init --working-tree --prolly-backend slatedb
-```
-
-SlateDB uses the `storage.slatedb_*` config keys and writes nodes to the configured S3-compatible object store. The SQLite database remains the local metadata store for refs, operations, derived indexes, and workspace bookkeeping.
+Prolly tree nodes are stored in SQLite alongside Trail metadata for refs,
+operations, derived indexes, and workspace bookkeeping.
 
 ## Derived Indexes
 

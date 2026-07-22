@@ -484,16 +484,8 @@ Store keys are CID bytes. Store values are serialized node bytes. That means
 the storage backend does not need to understand the logical key-value data. It
 only needs to persist content-addressed blobs.
 
-Trail can store prolly nodes in SQLite by default. New workspaces can choose
-SlateDB-backed node storage:
-
-```sh
-trail init --working-tree --prolly-backend slatedb
-```
-
-SQLite remains the metadata store for refs, operations, derived indexes, and
-workspace bookkeeping. With SlateDB, prolly nodes can live in an object-store
-path configured by `storage.slatedb_*`.
+Trail stores prolly nodes in SQLite alongside refs, operations, derived indexes,
+and workspace bookkeeping.
 
 ## Caches and Hints
 

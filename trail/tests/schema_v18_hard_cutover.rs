@@ -136,17 +136,6 @@ impl SchemaFixture {
         visit(&trail_dir, &trail_dir, &mut files);
         files
     }
-
-    fn use_slatedb_backend(&self) {
-        let config_path = self.root().join(".trail/config.toml");
-        let config = fs::read_to_string(&config_path).unwrap();
-        let config = config.replace(
-            "prolly_backend = \"sqlite\"",
-            "prolly_backend = \"slatedb\"",
-        );
-        assert!(config.contains("prolly_backend = \"slatedb\""));
-        fs::write(config_path, config).unwrap();
-    }
 }
 
 fn open_error(root: &Path) -> trail::Error {
@@ -424,14 +413,18 @@ fn extra_views_and_triggers_are_rejected_without_mutation() {
 }
 
 #[test]
-fn slatedb_backend_runs_sql_schema_preflight_before_mutable_backend_open() {
-    let fixture = SchemaFixture::versioned(17);
-    fixture.use_slatedb_backend();
+fn removed_slatedb_backend_is_rejected_explicitly() {
+    let fixture = SchemaFixture::fresh_v18();
+    let config_path = fixture.root().join(".trail/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "prolly_backend = \"sqlite\"",
+        "prolly_backend = \"slatedb\"",
+    );
+    fs::write(config_path, config).unwrap();
+
     let err = open_error(fixture.root());
-    assert!(matches!(
-        err,
-        trail::Error::SchemaReinitializeRequired { .. }
-    ));
+    assert!(matches!(err, trail::Error::InvalidInput(_)));
+    assert!(err.to_string().contains("expected `sqlite`"));
 }
 
 #[cfg(target_os = "linux")]

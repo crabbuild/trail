@@ -294,25 +294,7 @@ impl Trail {
         force: bool,
         text_policy: Option<&str>,
     ) -> Result<InitReport> {
-        Self::init_with_options(workspace_root, branch, mode, force, text_policy, None)
-    }
-
-    pub fn init_with_text_policy_and_prolly_backend(
-        workspace_root: impl AsRef<Path>,
-        branch: impl Into<String>,
-        mode: InitImportMode,
-        force: bool,
-        text_policy: Option<&str>,
-        prolly_backend: Option<&str>,
-    ) -> Result<InitReport> {
-        Self::init_with_options(
-            workspace_root,
-            branch,
-            mode,
-            force,
-            text_policy,
-            prolly_backend,
-        )
+        Self::init_with_options(workspace_root, branch, mode, force, text_policy)
     }
 
     fn init_with_options(
@@ -321,7 +303,6 @@ impl Trail {
         mode: InitImportMode,
         force: bool,
         text_policy: Option<&str>,
-        prolly_backend: Option<&str>,
     ) -> Result<InitReport> {
         let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
         super::backup::recover_restore_publication(&workspace_root)?;
@@ -349,22 +330,6 @@ impl Trail {
         let branch = branch.into();
         let workspace_id = WorkspaceId::new(workspace_root.to_string_lossy().as_bytes());
         let mut config = TrailConfig::new(workspace_id.clone(), branch.clone());
-        if let Some(prolly_backend) = prolly_backend {
-            match prolly_backend {
-                "sqlite" | "slatedb" => {
-                    config.storage.prolly_backend = prolly_backend.to_string();
-                    if prolly_backend == "slatedb" {
-                        config.storage.slatedb_path =
-                            format!("trail/workspaces/{}/prolly", workspace_id.0);
-                    }
-                }
-                other => {
-                    return Err(Error::InvalidInput(format!(
-                        "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-                    )));
-                }
-            }
-        }
         let explicit_text_policy = text_policy.is_some();
         apply_text_policy(&mut config.text, text_policy)?;
         if !explicit_text_policy
@@ -915,17 +880,12 @@ fn migrate_existing_schema_to_v20(
 }
 
 fn validate_predecessor_prolly_schema(conn: &Connection, prolly_backend: &str) -> Result<()> {
-    match prolly_backend {
-        "sqlite" => {
-            storage::validate_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
-        }
-        "slatedb" => {
-            storage::validate_no_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
-        }
-        other => Err(Error::InvalidInput(format!(
-            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-        ))),
+    if prolly_backend != "sqlite" {
+        return Err(Error::InvalidInput(format!(
+            "storage.prolly_backend is no longer configurable; expected `sqlite`, got `{prolly_backend}`"
+        )));
     }
+    storage::validate_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
 }
 
 fn git_tracked_import_is_large(workspace_root: &Path) -> Result<bool> {
@@ -1459,7 +1419,7 @@ mod schema_handoff_tests {
             &response,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &original_key,
-            "slatedb",
+            "other",
         )
         .is_none());
     }
@@ -1687,42 +1647,6 @@ mod schema_handoff_tests {
             );
             drop(writer);
         }
-
-        let root = tempfile::tempdir().unwrap();
-        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
-        let db_dir = root.path().join(".trail");
-        let db_path = db_dir.join(DB_RELATIVE_PATH);
-        let writer = open_stable_writer(&db_path, "backend-before");
-        let counter = root.path().join("backend-count");
-        let sqlite_go = root.path().join("backend-sqlite-go");
-        let children =
-            spawn_schema_children(root.path(), &counter, &sqlite_go, 16, "success", |_| {});
-        release_and_wait(children, &sqlite_go);
-        assert_eq!(validation_count(&counter), 1);
-        drop(writer);
-        let lock = acquire_workspace_lock(&db_dir).unwrap();
-        let config_path = db_dir.join(CONFIG_FILE);
-        let config = fs::read_to_string(&config_path).unwrap().replace(
-            "prolly_backend = \"sqlite\"",
-            "prolly_backend = \"slatedb\"",
-        );
-        fs::write(&config_path, config).unwrap();
-        drop(lock);
-        let slatedb_go = root.path().join("backend-slatedb-go");
-        let children = spawn_schema_children(
-            root.path(),
-            &counter,
-            &slatedb_go,
-            16,
-            "schema-failure",
-            |_| {},
-        );
-        release_and_wait(children, &slatedb_go);
-        assert_eq!(
-            validation_count(&counter),
-            2,
-            "backend change reused the sqlite validation result"
-        );
     }
 
     #[test]

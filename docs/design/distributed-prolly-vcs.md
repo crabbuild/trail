@@ -1,8 +1,8 @@
 # Distributed Prolly VCS
 
-This document proposes a Git-like distributed version-control engine built on
-Trail's prolly maps, content-addressed objects, SlateDB/object-store storage,
-and existing Git import/export primitives.
+This archived document proposed a Git-like distributed version-control engine
+built on Trail's prolly maps, content-addressed objects, SlateDB/object-store
+storage, and existing Git import/export primitives.
 
 The design is intentionally implementable in stages. It keeps today's local
 Trail `Operation` graph and SQLite indexes useful, while adding a portable
@@ -11,7 +11,9 @@ with Git repositories.
 
 ## Status
 
-Proposed.
+Archived. Trail no longer supports the SlateDB backend and stores Prolly nodes
+in SQLite. The proposal remains for historical context; it does not describe
+the current implementation or roadmap.
 
 ## Goals
 
@@ -1342,7 +1344,6 @@ Compatibility tests:
 
 - [Prolly design and invariants](https://github.com/crabbuild/prolly/blob/main/DESIGN.md)
 - [Prolly user-facing API](https://github.com/crabbuild/prolly/blob/main/src/prolly/README.md)
-- [SlateDB prolly backend](https://github.com/crabbuild/prolly/blob/main/src/prolly/store/slatedb.rs)
 - [Prolly tree handles](https://github.com/crabbuild/prolly/blob/main/src/prolly/tree.rs)
 - [Prolly named root manifests](https://github.com/crabbuild/prolly/blob/main/src/prolly/manifest.rs)
 - [Prolly large value/blob helpers](https://github.com/crabbuild/prolly/blob/main/src/prolly/blob.rs)

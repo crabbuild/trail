@@ -37,9 +37,8 @@ pub(crate) use schema::{
     install_schema_v20_migration_failure, SchemaV19MigrationBoundary, SchemaV20MigrationBoundary,
 };
 pub(crate) use schema::{
-    migrate_schema_v18_to_v19, migrate_schema_v19_to_v20, validate_no_prolly_sqlite_schema_v18,
-    validate_prolly_sqlite_schema_v18, validate_schema_v18_for_migration,
-    validate_schema_v19_for_migration, validate_schema_v20,
+    migrate_schema_v18_to_v19, migrate_schema_v19_to_v20, validate_prolly_sqlite_schema_v18,
+    validate_schema_v18_for_migration, validate_schema_v19_for_migration, validate_schema_v20,
 };
 pub(crate) use worktree_index::{
     file_kind_from_index, PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile,
