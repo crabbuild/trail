@@ -110,7 +110,7 @@ impl Trail {
         let mut warnings = Vec::new();
         let mut next_steps = Vec::new();
 
-        let report = self.lane_readiness(&entry.lane_id)?;
+        let report = self.lane_readiness(&entry.lane)?;
         blockers.extend(report.blockers.clone());
         warnings.extend(report.warnings.clone());
         next_steps.extend(lane_merge_queue_readiness_next_steps(&entry.lane, &report));

@@ -89,20 +89,75 @@ impl Trail {
         )?;
 
         let view = self.lane_workspace_view(lane)?;
-        let discovery = match self
-            .discover_workspace_environment(lane, None)
-            .and_then(|report| {
-                if report.conflicts.is_empty() {
-                    self.workspace_environment_graph(lane, None)
-                        .map(|graph| (report, graph))
-                } else {
-                    Err(Error::InvalidInput(format!(
-                        "environment discovery found {} unresolved component identity conflict(s)",
-                        report.conflicts.len()
-                    )))
-                }
-            }) {
-            Ok(discovery) => discovery,
+        let discovered = match self.discover_workspace_environment(lane, None) {
+            Ok(report) if report.conflicts.is_empty() => report,
+            Ok(report) => {
+                let error = Error::InvalidInput(format!(
+                    "environment discovery found {} unresolved component identity conflict(s)",
+                    report.conflicts.len()
+                ));
+                self.push_managed_execution_phase(
+                    &mut phases,
+                    &branch.lane_id,
+                    &execution_id,
+                    surface,
+                    &command_fingerprint,
+                    "discover_plan",
+                    "failed",
+                    Some(&error.to_string()),
+                    None,
+                )?;
+                return Err(error);
+            }
+            Err(error) => {
+                self.push_managed_execution_phase(
+                    &mut phases,
+                    &branch.lane_id,
+                    &execution_id,
+                    surface,
+                    &command_fingerprint,
+                    "discover_plan",
+                    "failed",
+                    Some(&error.to_string()),
+                    None,
+                )?;
+                return Err(error);
+            }
+        };
+        if view.is_none() && !discovered.components.is_empty() {
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "discover_plan",
+                "succeeded",
+                None,
+                Some(serde_json::json!({
+                    "component_count": discovered.components.len(),
+                    "graph_nodes": 0,
+                    "graph_edges": 0,
+                })),
+            )?;
+            let error = Error::InvalidInput(format!(
+                "lane `{lane}` declares workspace environments but does not use a layered COW workdir"
+            ));
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "sync_all",
+                "failed",
+                Some(&error.to_string()),
+                None,
+            )?;
+            return Err(error);
+        }
+        let graph = match self.workspace_environment_graph(lane, None) {
+            Ok(graph) => graph,
             Err(error) => {
                 self.push_managed_execution_phase(
                     &mut phases,
@@ -128,9 +183,9 @@ impl Trail {
             "succeeded",
             None,
             Some(serde_json::json!({
-                "component_count": discovery.0.components.len(),
-                "graph_nodes": discovery.1.total_nodes,
-                "graph_edges": discovery.1.total_edges,
+                "component_count": discovered.components.len(),
+                "graph_nodes": graph.total_nodes,
+                "graph_edges": graph.total_edges,
             })),
         )?;
 
@@ -139,7 +194,14 @@ impl Trail {
         } else {
             Vec::new()
         };
-        let must_sync = !discovery.0.components.is_empty() || !existing_environment.is_empty();
+        let desired_environment = graph
+            .nodes
+            .iter()
+            .map(|node| (node.component_id.clone(), node.component_key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let has_environment = !desired_environment.is_empty() || !existing_environment.is_empty();
+        let must_sync = has_environment
+            && !managed_environment_is_current(&desired_environment, &existing_environment);
         if must_sync && view.is_none() {
             let error = Error::InvalidInput(format!(
                 "lane `{lane}` declares workspace environments but does not use a layered COW workdir"
@@ -699,6 +761,18 @@ fn managed_execution_id(lane: &str, surface: &str, command: &[String]) -> Result
     ))
 }
 
+fn managed_environment_is_current(
+    desired: &BTreeMap<String, String>,
+    existing: &[WorkspaceEnvironmentReport],
+) -> bool {
+    desired.len() == existing.len()
+        && existing.iter().all(|state| {
+            state.status == "ready"
+                && state.attached_key.as_deref() == Some(state.expected_key.as_str())
+                && desired.get(&state.adapter) == Some(&state.expected_key)
+        })
+}
+
 fn workspace_checkpoint_from_lane_record(record: LaneRecordReport) -> WorkspaceCheckpointReport {
     WorkspaceCheckpointReport {
         view_id: String::new(),
@@ -719,6 +793,53 @@ fn workspace_checkpoint_from_lane_record(record: LaneRecordReport) -> WorkspaceC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_environment_sync_is_skipped_only_for_exact_ready_bindings() {
+        let desired = BTreeMap::from([("cargo-target-seed".to_string(), "key-a".to_string())]);
+        let ready = WorkspaceEnvironmentReport {
+            view_id: "view-a".to_string(),
+            adapter: "cargo-target-seed".to_string(),
+            expected_key: "key-a".to_string(),
+            attached_key: Some("key-a".to_string()),
+            status: "ready".to_string(),
+            reason: None,
+            updated_at: 1,
+        };
+        assert!(managed_environment_is_current(
+            &desired,
+            std::slice::from_ref(&ready)
+        ));
+
+        let mut stale = ready.clone();
+        stale.status = "stale".to_string();
+        assert!(!managed_environment_is_current(&desired, &[stale]));
+
+        let mut detached = ready.clone();
+        detached.attached_key = Some("key-old".to_string());
+        assert!(!managed_environment_is_current(&desired, &[detached]));
+
+        assert!(!managed_environment_is_current(
+            &BTreeMap::from([("cargo-target-seed".to_string(), "key-new".to_string())]),
+            std::slice::from_ref(&ready)
+        ));
+        assert!(!managed_environment_is_current(
+            &BTreeMap::from([
+                ("cargo-target-seed".to_string(), "key-a".to_string()),
+                ("python-venv".to_string(), "key-b".to_string()),
+            ]),
+            std::slice::from_ref(&ready)
+        ));
+        assert!(!managed_environment_is_current(
+            &BTreeMap::new(),
+            std::slice::from_ref(&ready)
+        ));
+        assert!(!managed_environment_is_current(
+            &BTreeMap::from([("python-venv".to_string(), "key-a".to_string())]),
+            &[ready]
+        ));
+        assert!(managed_environment_is_current(&BTreeMap::new(), &[]));
+    }
 
     #[test]
     fn command_and_cleanup_failures_are_both_retained_in_lifecycle_receipt() {
