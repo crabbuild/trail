@@ -17,6 +17,16 @@ const OPERATION_METRICS_HEADER: &str = "x-trail-operation-metrics";
 const DAEMON_READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DAEMON_MUTATING_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+#[cfg(not(unix))]
+pub(super) fn try_handle_auto_daemon_command(
+    _ctx: &RuntimeContext,
+    _daemon_token: Option<String>,
+    _command: &Command,
+) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
 pub(super) fn try_handle_auto_daemon_command(
     ctx: &RuntimeContext,
     daemon_token: Option<String>,
@@ -1305,6 +1315,7 @@ pub(super) struct LedgerFenceProof {
     pub(super) folded_offset: u64,
 }
 
+#[cfg(unix)]
 pub(super) fn authenticated_ledger_fence(
     endpoint: &daemon_start::WorkspaceDaemonEndpoint,
 ) -> Result<LedgerFenceProof> {

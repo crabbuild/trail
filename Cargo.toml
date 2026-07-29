@@ -29,13 +29,14 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Whether to consider the binaries in a package for distribution (defaults true)
 dist = false
 # Whether to publish prereleases to package managers
 publish-prereleases = false
-# Which actions to run on pull requests
-pr-run-mode = "plan"
+# Build and upload every configured target on pull requests so release changes
+# prove the full artifact matrix before a tag is created.
+pr-run-mode = "upload"
 # Block every cargo-dist release phase on Linux and macOS native ledger gates
 # executed against the exact tag SHA.
 plan-jobs = ["./changed-path-ledger-native"]
@@ -49,6 +50,12 @@ install-path = "CARGO_HOME"
 install-success-msg = "Trail is installed. Run `trail --version` to verify it."
 # Whether to install an updater program
 install-updater = false
+
+[workspace.metadata.dist.github-custom-runners.aarch64-pc-windows-msvc]
+# Build Windows ARM64 on a Windows host. cargo-dist otherwise uses cargo-xwin
+# from Linux, whose clang-cl include flags are incompatible with ring's direct
+# clang invocation for ARM64 assembly.
+runner = "windows-2025"
 
 [workspace.dependencies]
 axoupdater = { version = "0.10.0", features = ["blocking"] }

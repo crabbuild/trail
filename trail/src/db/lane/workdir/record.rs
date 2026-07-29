@@ -942,14 +942,14 @@ impl Trail {
             LaneWorkdirMode::FuseCow => self.fuse_cow_candidate_paths_for_lane(lane),
             LaneWorkdirMode::NfsCow => self.nfs_cow_candidate_paths_for_lane(lane),
             LaneWorkdirMode::DokanCow => {
-                #[cfg(target_os = "windows")]
+                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
                 {
                     self.dokan_cow_candidate_paths_for_lane(lane)
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
                 {
                     Err(Error::InvalidInput(
-                        "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                        "dokan-cow workdirs require an x86_64 Windows build".to_string(),
                     ))
                 }
             }

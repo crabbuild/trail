@@ -426,10 +426,32 @@ impl ValidatedSchemaGeneration {
         #[cfg(unix)]
         let identity = sqlite_main_file_identity(conn).map_err(schema_reinitialize_error)?;
         #[cfg(not(unix))]
-        let identity = SqliteMainFileIdentity {
-            device: 0,
-            inode: 0,
-            length: 0,
+        let identity = {
+            let connection_path: String = conn
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(schema_reinitialize_error)?;
+            let connection_path =
+                fs::canonicalize(connection_path).map_err(schema_reinitialize_error)?;
+            let expected_path =
+                fs::canonicalize(&self.db_path).map_err(schema_reinitialize_error)?;
+            if connection_path != expected_path {
+                return Err(schema_reinitialize_error(
+                    "SQLite main-file path does not match validated schema authority",
+                ));
+            }
+            SqliteMainFileIdentity {
+                device: 0,
+                inode: 0,
+                length: self
+                    .main_authority
+                    .metadata()
+                    .map_err(schema_reinitialize_error)?
+                    .len(),
+            }
         };
         self.verify_main_identity(identity)
     }
@@ -461,10 +483,26 @@ impl ValidatedSchemaGeneration {
         }
         #[cfg(not(unix))]
         {
-            let _ = identity;
-            return Err(schema_reinitialize_error(
-                "verified SQLite main-file handles are unsupported on this platform",
-            ));
+            let retained = self
+                .main_authority
+                .metadata()
+                .map_err(schema_reinitialize_error)?;
+            let current = schema_generation(&self.db_path).map_err(schema_reinitialize_error)?;
+            let current = current
+                .0
+                .iter()
+                .find(|file| file.suffix.is_empty() && file.present)
+                .ok_or_else(|| {
+                    schema_reinitialize_error("schema main database disappeared after validation")
+                })?;
+            if identity.length != expected.length
+                || retained.len() != expected.length
+                || current != expected
+            {
+                return Err(schema_reinitialize_error(
+                    "SQLite main-file path does not match validated schema authority",
+                ));
+            }
         }
         Ok(())
     }
@@ -575,12 +613,23 @@ fn open_schema_main_authority(
 
 #[cfg(not(unix))]
 fn open_schema_main_authority(
-    _db_path: &Path,
-    _generation: &SchemaGeneration,
+    db_path: &Path,
+    generation: &SchemaGeneration,
 ) -> Result<(File, File)> {
-    Err(schema_reinitialize_error(
-        "verified SQLite main-file handles are unsupported on this platform",
-    ))
+    let expected = generation
+        .0
+        .iter()
+        .find(|file| file.suffix.is_empty() && file.present)
+        .ok_or_else(|| schema_reinitialize_error("schema main database is missing"))?;
+    let file = File::open(db_path).map_err(schema_reinitialize_error)?;
+    let metadata = file.metadata().map_err(schema_reinitialize_error)?;
+    if !metadata.is_file() || metadata.len() != expected.length {
+        return Err(schema_reinitialize_error(
+            "schema main-file authority changed after validation",
+        ));
+    }
+    let retained = file.try_clone().map_err(schema_reinitialize_error)?;
+    Ok((retained, file))
 }
 
 impl Drop for ValidatedSchemaGeneration {
@@ -2018,10 +2067,66 @@ fn schema_wal_generation_matches_authority(
 }
 
 #[cfg(not(unix))]
-fn schema_wal_digest(_db_path: &Path, _expected: &SchemaGeneration) -> Result<String> {
-    Err(schema_reinitialize_error(
-        "schema WAL digest is unsupported on this platform",
-    ))
+fn schema_wal_digest(db_path: &Path, expected: &SchemaGeneration) -> Result<String> {
+    schema_wal_digest_portable(db_path, expected)
+}
+
+#[cfg(not(unix))]
+fn schema_wal_digest_allowing_wal_ctime_transition(
+    db_path: &Path,
+    expected: &SchemaGeneration,
+) -> Result<String> {
+    schema_wal_digest_portable(db_path, expected)
+}
+
+#[cfg(not(unix))]
+fn schema_wal_digest_portable(db_path: &Path, expected: &SchemaGeneration) -> Result<String> {
+    let before = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    if &before != expected {
+        return Err(schema_reinitialize_error(
+            "schema generation changed before WAL digest",
+        ));
+    }
+    let wal = before
+        .0
+        .iter()
+        .find(|file| file.suffix == "-wal")
+        .ok_or_else(|| schema_reinitialize_error("schema generation omitted WAL authority"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"trail-schema-wal-v1\0");
+    digest.update([u8::from(wal.present)]);
+    if wal.present {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push("-wal");
+        let mut file = File::open(PathBuf::from(path)).map_err(schema_reinitialize_error)?;
+        let opened = file.metadata().map_err(schema_reinitialize_error)?;
+        if !opened.file_type().is_file() || opened.len() != wal.length {
+            return Err(schema_reinitialize_error(
+                "schema WAL descriptor changed before digest",
+            ));
+        }
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(schema_reinitialize_error)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let hashed = file.metadata().map_err(schema_reinitialize_error)?;
+        if !hashed.file_type().is_file() || hashed.len() != opened.len() {
+            return Err(schema_reinitialize_error(
+                "schema WAL descriptor changed during digest",
+            ));
+        }
+    }
+    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    if after != before {
+        return Err(schema_reinitialize_error(
+            "schema generation changed during WAL digest",
+        ));
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 #[cfg(unix)]
@@ -2480,17 +2585,41 @@ fn open_prolly_store(
         SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
         SchemaOpenMode::Existing => {
             if let Some(validated) = validated_schema {
-                SqliteStore::open_existing_verified(sqlite_path, |identity| {
-                    validated.verify_main_identity(identity).map_err(|error| {
-                        prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                #[cfg(unix)]
+                {
+                    SqliteStore::open_existing_verified(sqlite_path, |identity| {
+                        validated.verify_main_identity(identity).map_err(|error| {
+                            prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                        })
                     })
-                })
-                .map_err(schema_reinitialize_error)?
+                    .map_err(schema_reinitialize_error)?
+                }
+                #[cfg(not(unix))]
+                {
+                    validated.verify_unchanged()?;
+                    // prolly-store-sqlite's existing-open entry point fails
+                    // closed on non-Unix platforms because it cannot inspect
+                    // SQLite's VFS handle. Trail has already retained and
+                    // verified the main-file authority above, so use the
+                    // ordinary entry point and immediately revalidate the
+                    // exact schema generation before exposing the store.
+                    let store =
+                        SqliteStore::open(sqlite_path).map_err(schema_reinitialize_error)?;
+                    validated.verify_unchanged()?;
+                    store
+                }
             } else {
                 // The only unverified existing-open path is an internal clone made
                 // while the caller already owns the workspace writer exclusion and
                 // a fully validated Trail handle.
-                SqliteStore::open_existing(sqlite_path)?
+                #[cfg(unix)]
+                {
+                    SqliteStore::open_existing(sqlite_path)?
+                }
+                #[cfg(not(unix))]
+                {
+                    SqliteStore::open(sqlite_path)?
+                }
             }
         }
     };
@@ -4737,12 +4866,13 @@ pub(crate) fn set_lane_initialization_owner_liveness_unknown_for_current_thread(
 pub(crate) fn clear_lane_initialization_owner_liveness_overrides_for_current_thread() {
     lane::clear_process_liveness_overrides();
 }
+#[cfg(all(debug_assertions, unix))]
+pub(crate) use lane::run_changed_path_view_flow;
 #[cfg(debug_assertions)]
 pub(crate) use lane::{
     clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,
     install_schema_v18_authenticated_lane_evidence, install_schema_v19_backfill_times,
-    run_changed_path_view_flow, schema_v19_backfill_times_remaining,
-    set_lane_association_failure_for_current_thread,
+    schema_v19_backfill_times_remaining, set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
     set_lane_initialization_materialization_barrier_for_current_thread,
     set_lane_record_postcommit_failure_for_current_thread,

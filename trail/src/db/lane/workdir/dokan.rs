@@ -181,7 +181,7 @@ impl Trail {
         prepare_dokan_cow_workdir(self, lane, dir, custom_workdir)
     }
 
-    pub fn mount_dokan_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+    pub fn mount_dokan_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop + use<>> {
         mount_dokan_cow_for_lane(self, lane)
     }
 

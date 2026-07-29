@@ -971,12 +971,11 @@ impl Trail {
                             self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
                         }
                         LaneWorkdirMode::DokanCow => {
-                            #[cfg(target_os = "windows")]
+                            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
                             self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
-                            #[cfg(not(target_os = "windows"))]
+                            #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
                             return Err(Error::InvalidInput(
-                                "dokan-cow workdirs are currently supported only on Windows"
-                                    .to_string(),
+                                "dokan-cow workdirs require an x86_64 Windows build".to_string(),
                             ));
                         }
                         LaneWorkdirMode::NfsCow => {
@@ -2432,9 +2431,9 @@ fn validate_lane_workdir_mode_request(
                     "dokan-cow lane workdir mode cannot be combined with sparse paths".to_string(),
                 ));
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
             return Err(Error::InvalidInput(
-                "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                "dokan-cow workdirs require an x86_64 Windows build".to_string(),
             ));
         }
         LaneWorkdirMode::NfsCow => {

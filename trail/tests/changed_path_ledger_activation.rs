@@ -266,18 +266,20 @@ fn authoritative_materialized_lane_can_preview_and_run_a_queued_merge_after_reco
     fs::write(temp.path().join("tracked.txt"), b"base\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
-    let spawned = db
-        .spawn_lane_with_workdir_mode_paths_and_neighbors(
-            "merge-bot",
-            Some("main"),
-            LaneWorkdirMode::NativeCow,
-            None,
-            None,
-            None,
-            &[],
-            false,
-        )
-        .unwrap();
+    let spawned = match db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "merge-bot",
+        Some("main"),
+        LaneWorkdirMode::NativeCow,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    ) {
+        Ok(spawned) => spawned,
+        Err(trail::Error::CloneUnsupported) => return,
+        Err(error) => panic!("native COW lane setup failed: {error}"),
+    };
     let workdir = spawned.workdir.unwrap();
 
     trail::test_support::set_changed_path_authority_override(true);

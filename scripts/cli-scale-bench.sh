@@ -295,6 +295,45 @@ sys.exit(1)
 PY
 }
 
+request_mount_stop_without_database() {
+  local repo="$1"
+  local mount_pid="$2"
+  python3 - "$repo" "$mount_pid" <<'PY'
+import json
+import os
+import pathlib
+import sys
+import time
+
+trail_dir = pathlib.Path(sys.argv[1]) / ".trail"
+mount_pid = int(sys.argv[2])
+deadline = time.time() + 30
+while time.time() < deadline:
+    for mount_path in trail_dir.rglob("mount.json"):
+        try:
+            mount = json.loads(mount_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if mount.get("owner_pid") != mount_pid:
+            continue
+        stop_path = mount_path.with_name("unmount-request.json")
+        temporary = stop_path.with_name(
+            f".{stop_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(json.dumps({
+            "view_id": mount.get("view_id"),
+            "requester_pid": os.getpid(),
+        }))
+        os.replace(temporary, stop_path)
+        print(stop_path)
+        raise SystemExit(0)
+    time.sleep(0.1)
+raise SystemExit(
+    f"could not find mount control file owned by process {mount_pid}"
+)
+PY
+}
+
 run_http_timed() {
   local scale="$1"
   local name="$2"
@@ -939,7 +978,10 @@ for i in range(k):
 PY
         prepare_cow_changed_path_external_oracle "$scale" "ledger_cow_checkpoint_k$k" \
           "$cow_workdir" "$cow_oracle_baseline" "$k"
-        "$BIN" --workspace "$repo" lane unmount ledger-cow >/dev/null
+        # The foreground mount owns the live schema WAL. Request teardown
+        # through its control file instead of opening the database from a
+        # second process merely to write that file.
+        request_mount_stop_without_database "$repo" "$mount_pid" >/dev/null
         wait "$mount_pid"
         run_changed_path_scoped "$scale" "$k" cow_checkpoint "$repo" \
           "$BIN" --workspace "$repo" --json lane checkpoint ledger-cow \

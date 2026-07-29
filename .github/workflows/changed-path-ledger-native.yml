@@ -17,10 +17,10 @@ on:
         type: string
         default: "100000"
       require_cow:
-        description: "Require the native COW checkpoint cases"
+        description: "Require native COW checkpoint cases (needs mount-capable runners)"
         required: false
         type: boolean
-        default: true
+        default: false
   push:
     branches: [main]
   pull_request:
@@ -68,15 +68,19 @@ jobs:
           case "$files" in 100000|1000000) ;; *) exit 2 ;; esac
           if [ -n "$requested_files" ]; then
             require_cow="${{ inputs.require_cow }}"
-          else
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
             require_cow=true
+          else
+            require_cow=false
           fi
           echo "files=$files" >> "$GITHUB_OUTPUT"
           echo "require_cow=$require_cow" >> "$GITHUB_OUTPUT"
           if [ "$require_cow" = true ]; then
             echo "cow_mode=1" >> "$GITHUB_OUTPUT"
           else
-            echo "cow_mode=auto" >> "$GITHUB_OUTPUT"
+            # GitHub-hosted Linux can expose /dev/fuse while denying mounts.
+            # Release gates must not infer mount authority from device presence.
+            echo "cow_mode=0" >> "$GITHUB_OUTPUT"
           fi
       - name: Prove native filesystem
         id: filesystem

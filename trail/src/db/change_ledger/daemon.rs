@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
@@ -2347,6 +2348,8 @@ enum PlatformObserver {
     Linux(super::observer::linux::LinuxInotifyObserver),
     #[cfg(target_os = "macos")]
     MacOs(super::observer::macos::MacOsFseventsObserver),
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Unsupported,
 }
 
 impl PlatformObserver {
@@ -2356,6 +2359,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.shutdown(),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.shutdown(),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2425,6 +2430,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.lease(),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.lease(),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2445,6 +2452,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.seal_after_fence(expected, fence),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.seal_after_fence(expected, fence),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2458,6 +2467,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.controlled_end_fence(expected, start),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.controlled_end_fence(expected, start),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2472,6 +2483,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.install_rotation_anchor(expected, end, anchor),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.install_rotation_anchor(expected, end, anchor),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2485,6 +2498,8 @@ impl PlatformObserver {
             Self::Linux(observer) => observer.authenticated_cut(expected, fence),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.authenticated_cut(expected, fence),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 }
@@ -2496,6 +2511,8 @@ impl QualifiedObserver for PlatformObserver {
             Self::Linux(observer) => observer.begin_observation(expected),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.begin_observation(expected),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2505,6 +2522,8 @@ impl QualifiedObserver for PlatformObserver {
             Self::Linux(observer) => observer.end_fence(expected, start),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.end_fence(expected, start),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2525,6 +2544,8 @@ impl QualifiedObserver for PlatformObserver {
             Self::MacOs(observer) => {
                 observer.drain_through(expected, root_handle_identity, start, end, sink)
             }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2553,6 +2574,8 @@ impl QualifiedObserver for PlatformObserver {
                 end,
                 sink,
             ),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
 
@@ -2567,8 +2590,15 @@ impl QualifiedObserver for PlatformObserver {
             Self::Linux(observer) => observer.rebind_retained_tail(previous, next, anchor),
             #[cfg(target_os = "macos")]
             Self::MacOs(observer) => observer.rebind_retained_tail(previous, next, anchor),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Self::Unsupported => Err(unsupported_platform_observer_error()),
         }
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported_platform_observer_error() -> Error {
+    Error::DaemonUnavailable("changed-path workspace daemon requires Linux or macOS".into())
 }
 
 fn workspace_scope_id(db: &Trail) -> ScopeId {
@@ -2683,6 +2713,7 @@ fn platform_capabilities() -> ProviderCapabilities {
     }
 }
 
+#[cfg(unix)]
 fn root_identity(path: &Path) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
@@ -2699,6 +2730,11 @@ fn root_identity(path: &Path) -> Result<Vec<u8>> {
         metadata.gid()
     )
     .into_bytes())
+}
+
+#[cfg(not(unix))]
+fn root_identity(_path: &Path) -> Result<Vec<u8>> {
+    Err(unsupported_platform_observer_error())
 }
 
 fn decode_fingerprint(value: &str) -> Result<[u8; 32]> {

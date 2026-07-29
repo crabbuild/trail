@@ -398,7 +398,8 @@ owner,repo,output,run_id=sys.argv[1:]
 repo_path=pathlib.Path(repo).resolve()
 owner_path=pathlib.Path(owner)
 expected_owner=repo_path/".trail"/"scale-disposable-owner.json"
-if owner_path != expected_owner: raise SystemExit(f"owner file must use exact reserved path {expected_owner}")
+canonical_owner=owner_path.parent.resolve()/owner_path.name
+if canonical_owner != expected_owner: raise SystemExit(f"owner file must use exact reserved path {expected_owner}")
 descriptor=os.open(owner,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
 try:
     info=os.fstat(descriptor)
@@ -478,7 +479,18 @@ db_path=$TRAIL_SCALE_REPO/.trail/index/trail.sqlite
 [[ $TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256 =~ ^[0-9a-f]{64}$ ]] || die "TRAIL_SCALE_EXPECTED_FAULT_DRIVER_SHA256 must be an exact lowercase SHA-256"
 candidate_binary_sha256=$(sha256_file "$TRAIL_BIN")
 [[ $candidate_binary_sha256 == "$TRAIL_SCALE_EXPECTED_BINARY_SHA256" ]] || die "candidate binary SHA-256 does not match TRAIL_SCALE_EXPECTED_BINARY_SHA256"
-candidate_binary_size=$(stat -f %z "$TRAIL_BIN" 2>/dev/null || stat -c %s "$TRAIL_BIN")
+file_size() {
+  case "$(uname -s)" in
+    Darwin) stat -f %z "$1" ;;
+    *) stat -c %s -- "$1" ;;
+  esac
+}
+observer_log_bytes() {
+  find "$1" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -print0 |
+    while IFS= read -r -d '' path; do file_size "$path"; done |
+    awk '{sum+=$1} END{print sum+0}'
+}
+candidate_binary_size=$(file_size "$TRAIL_BIN")
 trail_source_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
 [[ $trail_source_commit == "$TRAIL_SCALE_EXPECTED_SOURCE_COMMIT" ]] || die "source commit does not match TRAIL_SCALE_EXPECTED_SOURCE_COMMIT"
 source_status_baseline=$(git -C "$PROJECT_ROOT" status --porcelain=v1 --untracked-files=normal)
@@ -782,17 +794,14 @@ run_command baseline-status baseline "" true "" 0 trail status
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.change_id) == "$baseline_trail_commit" ]] || die "Trail commit changed after preflight"
 [[ $(json_payload_field "$TRAIL_SCALE_OUTPUT/commands/baseline-status.json" head.root_id) == "$baseline_trail_root" ]] || die "Trail root changed after preflight"
 capture_resource_inventory "$TRAIL_SCALE_OUTPUT/runtime-resources.json"
-db_bytes_before=$(stat -f %z "$db_path" 2>/dev/null || stat -c %s "$db_path")
-file_bytes() { [[ -f $1 ]] && (stat -f %z "$1" 2>/dev/null || stat -c %s "$1") || echo 0; }
+db_bytes_before=$(file_size "$db_path")
+file_bytes() { [[ -f $1 ]] && file_size "$1" || echo 0; }
 disk_bytes() { du -sk "$1" | awk '{printf "%.0f\n", $1*1024}'; }
 db_wal_bytes_before=$(file_bytes "$db_path-wal")
 db_shm_bytes_before=$(file_bytes "$db_path-shm")
 repo_disk_bytes_before=$(disk_bytes "$TRAIL_SCALE_REPO")
 trail_disk_bytes_before=$(disk_bytes "$TRAIL_SCALE_REPO/.trail")
-observer_log_bytes_before=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -exec stat -f %z {} \; 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
-if [[ -z $observer_log_bytes_before ]]; then
-  observer_log_bytes_before=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
-fi
+observer_log_bytes_before=$(observer_log_bytes "$TRAIL_SCALE_REPO/.trail")
 
 expected_paths_file=$TRAIL_SCALE_OUTPUT/expected-paths.txt
 python3 - "$TRAIL_SCALE_REPO" "$TRAIL_SCALE_OUTPUT/manifests" "$expected_paths_file" "$TRAIL_SCALE_LANES" "$TRAIL_SCALE_FILES_PER_LANE" <<'PY' || die "repository lacks enough safe existing regular tracked files"
@@ -1065,16 +1074,13 @@ for ((index=0; index<TRAIL_SCALE_LANES; index++)); do cat "$TRAIL_SCALE_OUTPUT/r
 for ((index=0; index<fault_index; index++)); do cat "$TRAIL_SCALE_OUTPUT/rows/faultrow-$index.tsv"; done >> "$TRAIL_SCALE_OUTPUT/faults.tsv"
 rm -rf -- "$TRAIL_SCALE_OUTPUT/rows" "$TRAIL_SCALE_OUTPUT/workdirs"
 
-db_bytes_after=$(stat -f %z "$db_path" 2>/dev/null || stat -c %s "$db_path")
+db_bytes_after=$(file_size "$db_path")
 db_wal_bytes_after=$(file_bytes "$db_path-wal")
 db_shm_bytes_after=$(file_bytes "$db_path-shm")
 repo_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_REPO")
 trail_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_REPO/.trail")
 output_disk_bytes_after=$(disk_bytes "$TRAIL_SCALE_OUTPUT")
-observer_log_bytes_after=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -exec stat -f %z {} \; 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
-if [[ -z $observer_log_bytes_after ]]; then
-  observer_log_bytes_after=$(find "$TRAIL_SCALE_REPO/.trail" -type f \( -name '*observer*.log' -o -name '*changed-path*.log' \) -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
-fi
+observer_log_bytes_after=$(observer_log_bytes "$TRAIL_SCALE_REPO/.trail")
 final_git_head=$(git -C "$TRAIL_SCALE_REPO" rev-parse HEAD)
 final_git_branch=$(git -C "$TRAIL_SCALE_REPO" symbolic-ref --short -q HEAD)
 final_git_index=$(git -C "$TRAIL_SCALE_REPO" rev-parse 'HEAD^{tree}')

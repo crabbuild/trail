@@ -13,6 +13,10 @@ mod acp;
 mod agent;
 mod collaboration;
 mod daemon_rpc;
+#[cfg(unix)]
+mod daemon_start;
+#[cfg(not(unix))]
+#[path = "handler/daemon_start_unsupported.rs"]
 mod daemon_start;
 mod errors;
 mod inspect;

@@ -218,15 +218,15 @@ impl Trail {
                 drop(mount);
             }
             LaneWorkdirMode::DokanCow => {
-                #[cfg(target_os = "windows")]
+                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
                 {
                     let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
                     self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
                     drop(mount);
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
                 return Err(Error::InvalidInput(
-                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                    "dokan-cow workdirs require an x86_64 Windows build".to_string(),
                 ));
             }
             _ => {
