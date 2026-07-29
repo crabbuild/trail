@@ -5,6 +5,15 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-29
+
+### Added
+
+- Added `trail upgrade` for installation-aware stable upgrades through
+  Homebrew or cargo-dist release installer receipts.
+- Added `trail upgrade --check` and non-blocking, once-daily interactive
+  update notices. Set `TRAIL_NO_UPDATE_CHECK=1` to disable automatic checks.
+
 ### Changed
 
 - **Breaking:** Trail CLI human output now uses the unified outcome-first
@@ -38,5 +47,6 @@ All notable changes to Trail are documented in this file. Trail follows
 - CLI, HTTP daemon, MCP stdio server, ACP relay, and Rust API integration surfaces.
 - Backup, restore, filesystem checks, index rebuilding, and maintenance commands.
 
-[Unreleased]: https://github.com/crabbuild/trail/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/crabbuild/trail/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/crabbuild/trail/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/crabbuild/trail/releases/tag/v0.1.0

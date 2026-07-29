@@ -8,7 +8,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.89"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT OR Apache-2.0"
 authors = ["Crab Build"]
 repository = "https://github.com/crabbuild/trail"
@@ -51,6 +51,7 @@ install-success-msg = "Trail is installed. Run `trail --version` to verify it."
 install-updater = false
 
 [workspace.dependencies]
+axoupdater = { version = "0.10.0", features = ["blocking"] }
 bzip2 = "0.5"
 ed25519-dalek = "2.2"
 flate2 = "1.0"

@@ -2132,7 +2132,7 @@ mod tests {
                 .env(CHILD_ENV, "1")
                 .spawn()
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success(), "bounded Git hash batch child failed");

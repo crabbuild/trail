@@ -20,6 +20,7 @@ mod lane;
 mod maintenance;
 mod parsing;
 mod runtime;
+mod upgrade;
 mod workspace;
 mod worktree;
 
@@ -117,6 +118,14 @@ fn run(cli: Cli) -> Result<()> {
                 .to_string(),
         ));
     }
+    match &command {
+        Command::Upgrade(args) => return upgrade::handle_upgrade_command(&ctx, args),
+        Command::UpdateCheckBackground => {
+            upgrade::handle_background_update_check();
+            return Ok(());
+        }
+        _ => upgrade::maybe_notify_about_update(&ctx),
+    }
     if let Some(daemon_url) = daemon_url {
         if daemon_rpc::try_handle_daemon_command(
             &ctx,
@@ -192,6 +201,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Daemon(args) => maintenance::handle_daemon_command(&ctx, args),
         Command::Mcp => maintenance::handle_mcp_command(&ctx),
         Command::Doctor => maintenance::handle_doctor_command(&ctx),
+        Command::Upgrade(_) | Command::UpdateCheckBackground => {
+            unreachable!("workspace-independent update commands are handled before daemon routing")
+        }
         Command::Backup(backup) => maintenance::handle_backup_command(&ctx, backup),
         Command::Fsck => maintenance::handle_fsck_command(&ctx),
         Command::Index(index) => maintenance::handle_index_command(&ctx, index),

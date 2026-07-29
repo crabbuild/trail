@@ -301,14 +301,13 @@ impl Trail {
                     rejection = Some("parent_output_policy_is_not_immutable");
                 }
             }
-            if rejection.is_none() {
-                if let Some(layer_id) = component.layer_id.as_deref() {
-                    match self.verify_workspace_layer_for_attach(layer_id) {
-                        Ok(layer)
-                            if inheritable_workspace_layer_scope(&layer.portability_scope) => {}
-                        Ok(_) => rejection = Some("unsupported_portability_scope"),
-                        Err(_) => rejection = Some("layer_verification_failed"),
-                    }
+            if rejection.is_none()
+                && let Some(layer_id) = component.layer_id.as_deref()
+            {
+                match self.verify_workspace_layer_for_attach(layer_id) {
+                    Ok(layer) if inheritable_workspace_layer_scope(&layer.portability_scope) => {}
+                    Ok(_) => rejection = Some("unsupported_portability_scope"),
+                    Err(_) => rejection = Some("layer_verification_failed"),
                 }
             }
             let compatible = rejection.is_none();

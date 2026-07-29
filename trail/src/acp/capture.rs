@@ -706,9 +706,9 @@ impl SpillStore {
                 continue;
             }
             let finish = spill_finish_path(&path);
-            if !path
+            if path
                 .extension()
-                .is_some_and(|extension| extension == "processing")
+                .is_none_or(|extension| extension != "processing")
             {
                 let counter = SPILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let claimed_path = path.with_extension(format!(
@@ -1176,7 +1176,8 @@ fn capture_worker(
                 if let Some(pause) = &worker_pause {
                     pause.reached.store(true, Ordering::Release);
                 }
-                if ready_tx.send(()).is_err() {
+                let ready_send_failed = ready_tx.send(()).is_err();
+                if ready_send_failed {
                     stopping.store(true, Ordering::Release);
                     continue;
                 }

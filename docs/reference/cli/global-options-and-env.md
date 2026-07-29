@@ -60,6 +60,10 @@ Parse errors and runtime errors are rendered as JSON when `--json`, `--format js
 
 `--format ndjson` is accepted globally. It is a record-stream contract: supported streaming commands (currently `trail index watch` and lane watch commands) emit one report per line. Commands that return a single report use `--format json` instead.
 
+Set `TRAIL_NO_UPDATE_CHECK=1` to disable Trail's cached, once-daily stable
+release checks. Update notices are limited to interactive human/plain output
+and never appear in JSON, NDJSON, quiet, CI, or non-terminal execution.
+
 ## Human-output cutoff
 
 Trail's human output is deliberately not a compatibility API. The former
