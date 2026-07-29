@@ -1241,79 +1241,71 @@ impl Trail {
                 };
                 let expected = plan.component_id.clone();
                 (plan, None, None, expected, component_root.to_string())
-            } else {
-                if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector) {
-                    let expected = adapter.component_id(component_root)?;
-                    if component_id.is_some_and(|component_id| component_id != expected) {
-                        return Err(Error::InvalidInput(format!(
+            } else if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector)
+            {
+                let expected = adapter.component_id(component_root)?;
+                if component_id.is_some_and(|component_id| component_id != expected) {
+                    return Err(Error::InvalidInput(format!(
                         "adapter `{}` proposes component `{expected}`, not requested component `{}`",
                         adapter.identity(),
                         component_id.unwrap_or_default()
                     )));
-                    }
-                    (
-                        adapter.plan(self, &head.root_id, component_root)?,
-                        Some(adapter),
-                        None,
-                        expected,
-                        component_root.to_string(),
-                    )
-                } else if let Some(plugin) =
-                    self.environment_plugin_for_selector(adapter_selector)?
-                {
-                    let discovered = self
-                        .discover_environment_plugin_component(
-                            &plugin,
-                            &head.root_id,
-                            component_root,
-                        )?
-                        .ok_or_else(|| {
-                            Error::InvalidInput(format!(
-                                "adapter `{}` did not detect a component at `{}`",
-                                plugin.manifest.adapter.canonical_identity,
-                                if component_root.is_empty() {
-                                    "."
-                                } else {
-                                    component_root
-                                }
-                            ))
-                        })?;
-                    if component_id
-                        .is_some_and(|component_id| component_id != discovered.component_id)
-                    {
-                        return Err(Error::InvalidInput(format!(
-                            "adapter `{}` proposes component `{}`, not requested component `{}`",
+                }
+                (
+                    adapter.plan(self, &head.root_id, component_root)?,
+                    Some(adapter),
+                    None,
+                    expected,
+                    component_root.to_string(),
+                )
+            } else if let Some(plugin) = self.environment_plugin_for_selector(adapter_selector)? {
+                let discovered = self
+                    .discover_environment_plugin_component(&plugin, &head.root_id, component_root)?
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "adapter `{}` did not detect a component at `{}`",
                             plugin.manifest.adapter.canonical_identity,
-                            discovered.component_id,
-                            component_id.unwrap_or_default()
-                        )));
-                    }
-                    let expected = discovered.component_id;
-                    let plan = self.plan_environment_plugin_component(
-                        &plugin,
-                        &head.root_id,
-                        component_root,
-                        &expected,
-                    )?;
-                    (
-                        plan,
-                        None,
-                        Some(plugin),
-                        expected,
-                        component_root.to_string(),
-                    )
-                } else {
-                    let available = self
-                        .workspace_environment_adapters()?
-                        .adapters
-                        .into_iter()
-                        .map(|adapter| adapter.canonical_identity)
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                            if component_root.is_empty() {
+                                "."
+                            } else {
+                                component_root
+                            }
+                        ))
+                    })?;
+                if component_id.is_some_and(|component_id| component_id != discovered.component_id)
+                {
                     return Err(Error::InvalidInput(format!(
+                        "adapter `{}` proposes component `{}`, not requested component `{}`",
+                        plugin.manifest.adapter.canonical_identity,
+                        discovered.component_id,
+                        component_id.unwrap_or_default()
+                    )));
+                }
+                let expected = discovered.component_id;
+                let plan = self.plan_environment_plugin_component(
+                    &plugin,
+                    &head.root_id,
+                    component_root,
+                    &expected,
+                )?;
+                (
+                    plan,
+                    None,
+                    Some(plugin),
+                    expected,
+                    component_root.to_string(),
+                )
+            } else {
+                let available = self
+                    .workspace_environment_adapters()?
+                    .adapters
+                    .into_iter()
+                    .map(|adapter| adapter.canonical_identity)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::InvalidInput(format!(
                     "unknown workspace environment adapter `{adapter_selector}`; available adapters: {available}"
                 )));
-                }
             };
         if let Some(adapter) = builtin_adapter {
             self.validate_workspace_environment_plan(adapter, &resolved_component_root, &plan)?;

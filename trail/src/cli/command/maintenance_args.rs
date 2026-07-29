@@ -2,6 +2,13 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+#[derive(Args)]
+pub(super) struct UpgradeArgs {
+    /// Check the latest stable release without changing the installation.
+    #[arg(long)]
+    pub(super) check: bool,
+}
+
 #[derive(Subcommand)]
 pub(super) enum GitSubcommand {
     /// Export a range as Git patch or commit.

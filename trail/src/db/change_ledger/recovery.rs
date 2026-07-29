@@ -1253,6 +1253,7 @@ fn journal_missing_quarantine_allocations(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn abandon_quarantine_allocation_and_replace(
     conn: &Connection,
     expected: &RetirementIdentity,

@@ -195,6 +195,8 @@ enum Command {
     Mcp,
     /// Run full local diagnostics for workspace and integration readiness.
     Doctor,
+    /// Check for and install the latest stable Trail release.
+    Upgrade(UpgradeArgs),
     /// Export, verify, and restore workspace backup bundles.
     Backup(BackupCommand),
     /// Verify repository integrity and report structural or reference issues.
@@ -203,6 +205,8 @@ enum Command {
     Index(IndexCommand),
     /// Prune unused objects and stale index references.
     Gc(GcArgs),
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheckBackground,
 }
 
 #[cfg(test)]
@@ -212,6 +216,16 @@ mod tests {
     #[test]
     fn init_rejects_removed_prolly_backend_option() {
         assert!(Cli::try_parse_from(["trail", "init", "--prolly-backend", "sqlite"]).is_err());
+    }
+
+    #[test]
+    fn parses_upgrade_check_without_workspace_arguments() {
+        let cli = Cli::try_parse_from(["trail", "upgrade", "--check"])
+            .expect("upgrade check command should parse");
+        let Command::Upgrade(args) = cli.command else {
+            panic!("expected upgrade command");
+        };
+        assert!(args.check);
     }
 
     #[test]

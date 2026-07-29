@@ -211,13 +211,12 @@ impl Trail {
             .bounded_filesystem_walk_count
             .saturating_add(1);
         let mut files = Vec::new();
-        self.read_record_dir_unfiltered_profiled(&abs, path, &mut files, &mut filesystem_metrics)?;
+        Self::read_record_dir_unfiltered_profiled(&abs, path, &mut files, &mut filesystem_metrics)?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
     }
 
     fn read_record_dir_unfiltered_profiled(
-        &self,
         dir: &Path,
         rel_dir: &str,
         files: &mut Vec<DiskFile>,
@@ -244,7 +243,7 @@ impl Trail {
                 continue;
             }
             if metadata.is_dir() {
-                self.read_record_dir_unfiltered_profiled(&path, &rel, files, filesystem_metrics)?;
+                Self::read_record_dir_unfiltered_profiled(&path, &rel, files, filesystem_metrics)?;
             } else if metadata.is_file() {
                 filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
                     .delta

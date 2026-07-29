@@ -16,6 +16,41 @@ fn serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn retry_native_observer_start<T>(
+    mut operation: impl FnMut() -> trail::Result<T>,
+) -> trail::Result<T> {
+    const MAX_ATTEMPTS: usize = 5;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < MAX_ATTEMPTS && retryable_native_observer_start(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded native observer retry loop always returns")
+}
+
+fn retryable_native_observer_start(error: &trail::Error) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match error {
+        trail::Error::ChangeLedgerReconcileRequired { reason, .. } => {
+            matches!(
+                reason.as_str(),
+                "fsevents_must_scan_subdirs" | "fsevents_null_callback_context_generation_changed"
+            )
+        }
+        trail::Error::DaemonUnavailable(message) => {
+            message.contains("fsevents_must_scan_subdirs")
+                || message.contains("fsevents_null_callback_context_generation_changed")
+        }
+        _ => false,
+    }
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -71,6 +106,7 @@ fn authority_requires_every_checked_gate_and_supported_platform() {
 
 #[test]
 fn recovery_corruption_and_native_fault_matrix_remains_fail_closed() {
+    let _guard = serial();
     trail::test_support::changed_path_intent_crash_matrix().unwrap();
     trail::test_support::changed_path_qualified_proof_revalidation().unwrap();
     trail::test_support::changed_path_missing_sidecar_rejection().unwrap();
@@ -106,6 +142,7 @@ fn linux_observer_process_owner_child() {
 #[cfg(target_os = "macos")]
 #[test]
 fn fsevents_restart_root_cursor_overflow_and_worker_death_fail_closed() {
+    let _guard = serial();
     if std::env::var_os("TRAIL_MACOS_OBSERVER_OWNER_CHILD_ROOT").is_some() {
         trail::test_support::changed_path_macos_continuity_fault_matrix().unwrap();
     }
@@ -131,7 +168,7 @@ fn first_authoritative_status_starts_and_reconciles_the_workspace_daemon() {
     fs::write(temp.path().join("tracked.txt"), b"changed\n").unwrap();
 
     trail::test_support::set_changed_path_authority_override(true);
-    let result = db.status(None);
+    let result = retry_native_observer_start(|| db.status(None));
     trail::test_support::set_changed_path_authority_override(false);
     let report = result.unwrap();
     assert!(
@@ -164,7 +201,7 @@ fn tracked_gitignored_file_remains_clean_after_git_import() {
     let mut db = Trail::open(temp.path()).unwrap();
 
     trail::test_support::set_changed_path_authority_override(true);
-    let result = db.status(None);
+    let result = retry_native_observer_start(|| db.status(None));
     trail::test_support::set_changed_path_authority_override(false);
 
     let status = result.unwrap();
@@ -198,7 +235,7 @@ fn activated_non_git_workspace_uses_ledger_without_git_qualification() {
 
     trail::test_support::set_changed_path_authority_override(true);
     let result = (|| {
-        let status = db.status(None)?;
+        let status = retry_native_observer_start(|| db.status(None))?;
         let diff = db.diff_dirty(false, false)?;
         let record = db.record(
             Some("main"),
@@ -245,7 +282,7 @@ fn authoritative_materialized_lane_can_preview_and_run_a_queued_merge_after_reco
 
     trail::test_support::set_changed_path_authority_override(true);
     let result = (|| {
-        db.lane_status("merge-bot")?;
+        retry_native_observer_start(|| db.lane_status("merge-bot"))?;
         fs::write(Path::new(&workdir).join("tracked.txt"), b"lane edit\n")?;
         db.record_lane_workdir("merge-bot", Some("record lane edit".into()))?;
         db.agent_mark_reviewed("merge-bot", Some("review recorded edit".into()))?;
@@ -279,7 +316,7 @@ fn second_direct_handle_cannot_evict_a_live_workspace_observer() {
     let first = Trail::open(temp.path()).unwrap();
 
     trail::test_support::set_changed_path_authority_override(true);
-    first.status(None).unwrap();
+    retry_native_observer_start(|| first.status(None)).unwrap();
     let second = Trail::open(temp.path()).unwrap();
     let error = second.status(None).unwrap_err();
     assert!(
@@ -309,7 +346,7 @@ fn performance_metrics_file_emits_complete_append_only_jsonl() {
     // of the environment mutation and opened Trail handle.
     unsafe { std::env::set_var("TRAIL_PERFORMANCE_METRICS_FILE", &metrics) };
     let db = Trail::open(temp.path()).unwrap();
-    db.status(None).unwrap();
+    retry_native_observer_start(|| db.status(None)).unwrap();
     let _ = db.diff_range("invalid", false);
     unsafe { std::env::remove_var("TRAIL_PERFORMANCE_METRICS_FILE") };
 

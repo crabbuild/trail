@@ -611,11 +611,11 @@ mod fuse_overlay {
             _lock_owner: u64,
             reply: ReplyEmpty,
         ) {
-            if let Some(file) = self.handles.get(&fh) {
-                if let Err(err) = file.sync_data() {
-                    reply.error(io_err(err));
-                    return;
-                }
+            if let Some(file) = self.handles.get(&fh)
+                && let Err(err) = file.sync_data()
+            {
+                reply.error(io_err(err));
+                return;
             }
             reply.ok();
         }
@@ -642,11 +642,11 @@ mod fuse_overlay {
             _datasync: bool,
             reply: ReplyEmpty,
         ) {
-            if let Some(file) = self.handles.get(&fh) {
-                if let Err(err) = file.sync_all() {
-                    reply.error(io_err(err));
-                    return;
-                }
+            if let Some(file) = self.handles.get(&fh)
+                && let Err(err) = file.sync_all()
+            {
+                reply.error(io_err(err));
+                return;
             }
             reply.ok();
         }

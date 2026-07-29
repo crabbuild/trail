@@ -10,7 +10,7 @@ Use it when you want to:
 - Expose Trail as an MCP server.
 - Capture ACP sessions from an editor.
 - Export or import Git changes.
-- Run diagnostics, backups, indexing, cleanup, or the daemon.
+- Upgrade Trail or run diagnostics, backups, indexing, cleanup, or the daemon.
 
 For day-to-day code-agent work, start with the `agent` commands. They create
 fresh task lanes, keep agent work isolated, record checkpoints, and guide review
@@ -84,6 +84,7 @@ validation, apply, or recovery step.
 | `api` | Generate OpenAPI output |
 | `daemon` | Run Trail as a local HTTP service |
 | `doctor` | Workspace and integration diagnostics |
+| `upgrade` | Check for or install the latest stable Trail release |
 | `backup` | Create, verify, and restore backups |
 | `fsck` | Verify repository integrity |
 | `index` | Rebuild or watch rich-text indexes |
@@ -471,6 +472,22 @@ automation.
 
 Rate-limit and timeout values must be greater than zero.
 
+## Upgrade
+
+```text
+trail upgrade [--check]
+```
+
+`trail upgrade --check` queries the latest stable GitHub release without
+changing the installation. `trail upgrade` delegates Homebrew installations to
+`brew upgrade crabbuild/tap/trail` and release-installer installations to the
+cargo-dist receipt-aware updater. Source builds and unknown installations are
+never overwritten.
+
+Normal interactive commands read a local cache and may start a silent release
+check when it is older than 24 hours. The foreground command does not wait for
+the network. Set `TRAIL_NO_UPDATE_CHECK=1` to disable these checks.
+
 ## Doctor
 
 ```text
@@ -536,4 +553,5 @@ Use these files when you need to verify the CLI surface from code:
 
 - `trail/src/cli/command/maintenance_args.rs`
 - `trail/src/cli/command/handler/maintenance.rs`
+- `trail/src/cli/command/handler/upgrade.rs`
 - `trail/src/model/reports/maintenance.rs`

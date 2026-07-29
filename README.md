@@ -455,6 +455,19 @@ irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.
 trail --version
 ```
 
+Upgrade any release-installer or Homebrew installation without opening a Trail
+workspace:
+
+```sh
+trail upgrade --check
+trail upgrade
+```
+
+Interactive Trail commands check for a newer stable release at most once every
+24 hours and print a non-blocking notice. Set `TRAIL_NO_UPDATE_CHECK=1` to
+disable those background checks. JSON, NDJSON, quiet, CI, and non-terminal
+commands never emit update notices.
+
 The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
 macFUSE, and the Dokan driver are otherwise relevant only to their
 corresponding mounted-workspace modes.
@@ -819,6 +832,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail agent acp sessions` | List captured ACP sessions |
 | `trail transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
 | `trail doctor` | Run workspace and integration diagnostics |
+| `trail upgrade [--check]` | Check for or install the latest stable release |
 | `trail backup create <output>` | Create a Trail workspace backup |
 | `trail fsck` | Verify repository integrity |
 
