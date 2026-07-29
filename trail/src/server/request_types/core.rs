@@ -54,6 +54,22 @@ pub(crate) struct ConfigSetRequest {
     pub(crate) value: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentMarkReviewedRequest {
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentApplyRequest {
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
 pub(crate) fn default_completed_status() -> String {
     "completed".to_string()
 }

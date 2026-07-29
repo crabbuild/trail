@@ -933,6 +933,10 @@ trail lane exec task-a -- <command>
 trail lane checkpoint task-a -m "checkpoint"
 trail lane update task-a --from main
 trail lane space task-a
+trail lane archive task-a
+trail lane unarchive task-a
+trail lane rm task-a --force
+trail lane purge <exact-lane-id> --force
 
 trail deps status task-a
 trail deps sync task-a
@@ -945,8 +949,12 @@ trail cache verify <layer>
 trail doctor --workspace-views
 ```
 
-`trail agent start`, `continue`, `test`, `eval`, and `finish` should use the
-same core lifecycle rather than independently managing mounts.
+`trail agent start`, materialized ACP prompts, `lane exec`, tests, and evals
+use the same managed lifecycle: discover and plan, synchronize all components,
+reconcile runtime resources, mount, execute, checkpoint durable source,
+dispose execution-owned runtime resources, and unmount. Every phase produces a
+durable receipt. Generated and scratch changes are accounted for but excluded
+from the source checkpoint.
 
 Shared report types include:
 

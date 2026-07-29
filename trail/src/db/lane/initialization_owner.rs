@@ -590,7 +590,7 @@ mod tests {
             Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
             let mut db = Trail::open(workspace.path()).unwrap();
             db.conn = Connection::open_in_memory().unwrap();
-            db.create_schema_v20().unwrap();
+            db.create_schema_v21().unwrap();
             let request = ResolvedLaneSpawnRequest::new(
                 "workspace-test",
                 "lane-a",

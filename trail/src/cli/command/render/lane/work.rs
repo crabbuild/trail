@@ -166,7 +166,31 @@ pub(crate) fn render_workspace_exec(
         ("View".to_string(), report.view_id.clone()),
         ("Backend".to_string(), report.backend.clone()),
         ("Generation".to_string(), report.generation.to_string()),
+        (
+            "Execution".to_string(),
+            report.lifecycle.execution_id.clone(),
+        ),
+        (
+            "Checkpointed source paths".to_string(),
+            report
+                .lifecycle
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.source_paths.len().to_string())
+                .unwrap_or_else(|| "failed".to_string()),
+        ),
     ]));
+    for (label, error) in [
+        (
+            "Checkpoint error",
+            report.lifecycle.checkpoint_error.as_ref(),
+        ),
+        ("Disposal error", report.lifecycle.disposal_error.as_ref()),
+    ] {
+        if let Some(error) = error {
+            document = document.block(UiBlock::Notice(format!("{label}: {error}")));
+        }
+    }
     if options.verbose {
         document = document.block(UiBlock::Metadata(vec![(
             "Source root".to_string(),
@@ -605,6 +629,25 @@ pub(crate) fn render_lane_remove(
         document = document.block(UiBlock::Notice(format!("Removed workdir: {workdir}")));
     }
     render_document(&document, options)
+}
+
+pub(crate) fn render_lane_purge(
+    report: &LaneRetirementReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    render_document(
+        &TerminalDocument::new(format!("Purged lane {}", report.lane_id), UiTone::Success).block(
+            UiBlock::Metadata(vec![
+                ("Former name".to_string(), report.former_name.clone()),
+                ("Retirement".to_string(), report.retirement_id.clone()),
+            ]),
+        ),
+        options,
+    )
 }
 
 fn byte_count(value: u64) -> String {

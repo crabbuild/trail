@@ -103,8 +103,14 @@ pub(super) enum LaneSubcommand {
     Timeline(LaneTimelineArgs),
     /// Preview or materialize a lane branch into workspace.
     Checkout(LaneCheckoutArgs),
+    /// Reversibly hide a lane while retaining its ref, view, and environment.
+    Archive(LaneLifecycleArgs),
+    /// Restore a previously archived lane.
+    Unarchive(LaneLifecycleArgs),
     /// Remove a lane branch and associated workdir materialization.
     Rm(LaneRemoveArgs),
+    /// Irreversibly erase a removed lane's compact tombstone and provenance.
+    Purge(LaneRemoveArgs),
 }
 
 #[derive(Args)]
@@ -147,6 +153,11 @@ pub(super) struct LaneSpawnArgs {
 
 #[derive(Args)]
 pub(super) struct LaneRepairInitializationArgs {
+    pub(super) name: String,
+}
+
+#[derive(Args)]
+pub(super) struct LaneLifecycleArgs {
     pub(super) name: String,
 }
 

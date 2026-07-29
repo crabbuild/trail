@@ -79,10 +79,24 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.lane_handoff(&lane, args.limit.unwrap_or(50))?)
         }
+        "trail.lane_archive" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.archive_lane(&lane)?)
+        }
+        "trail.lane_unarchive" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.unarchive_lane(&lane)?)
+        }
         "trail.lane_remove" => {
             let args: LaneRemoveArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.remove_lane(&lane, args.force)?)
+        }
+        "trail.lane_purge" => {
+            let args: LaneRemoveArgs = parse_args(arguments)?;
+            tool_result(db.purge_lane(&args.lane, args.force)?)
         }
         "trail.lane_rewind" => {
             let args: LaneRewindArgs = parse_args(arguments)?;

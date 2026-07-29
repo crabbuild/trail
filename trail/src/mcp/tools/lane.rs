@@ -133,13 +133,38 @@ pub(super) fn tools() -> Value {
             }), vec!["lane"])
         },
         {
+            "name": "trail.lane_archive",
+            "title": "Archive Lane",
+            "description": "Reversibly hide a lane while retaining its ref, workspace view, private uppers, and environment generation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_unarchive",
+            "title": "Unarchive Lane",
+            "description": "Restore an archived lane after validating its retained ref and workspace state.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
             "name": "trail.lane_remove",
             "title": "Remove Lane",
-            "description": "Remove a lane branch and materialized workdir. Requires force when the branch has unmerged changes.",
+            "description": "Retire a lane, dispose its private environment state, and retain compact provenance. Requires force when the branch has unmerged changes.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" },
                 "force": { "type": "boolean" }
             }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_purge",
+            "title": "Purge Removed Lane",
+            "description": "Irreversibly erase a removed lane tombstone and lane-owned compact provenance. Requires an exact lane ID and force.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "force": { "type": "boolean" }
+            }), vec!["lane", "force"])
         },
         {
             "name": "trail.lane_rewind",

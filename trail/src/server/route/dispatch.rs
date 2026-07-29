@@ -2,7 +2,7 @@ use crate::server::transport::{HttpRequest, HttpResponse, ServerAuth};
 use crate::{Error, Result};
 
 use super::utils;
-use super::{agent_hooks, lane, system};
+use super::{agent, agent_hooks, lane, system};
 
 pub(crate) fn route_request_result(
     db: &mut crate::Trail,
@@ -49,6 +49,10 @@ pub(crate) fn route_request_result(
 
     if let Some(response) = agent_hooks::handle_agent_hook_route(db, &request, path, query, &parts)?
     {
+        return Ok(response);
+    }
+
+    if let Some(response) = agent::handle_agent_route(db, &request, path, &parts)? {
         return Ok(response);
     }
 

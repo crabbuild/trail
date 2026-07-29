@@ -1230,6 +1230,8 @@ pub struct AgentRunReport {
     pub exit_code: Option<i32>,
     pub recorded: Option<LaneRecordReport>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ManagedExecutionLifecycleReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

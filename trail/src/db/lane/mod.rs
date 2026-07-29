@@ -14,6 +14,7 @@ pub(crate) use initialization::{
 };
 mod leases;
 mod lifecycle;
+pub(crate) mod managed_execution;
 #[cfg(debug_assertions)]
 pub(crate) use initialization_owner::steal_owner_on_next_heartbeat_for_current_thread;
 #[cfg(debug_assertions)]
@@ -27,6 +28,7 @@ mod patch_edits;
 mod patch_policy;
 mod patching;
 mod readiness;
+mod retirement;
 mod rewind;
 mod turns;
 mod workdir;

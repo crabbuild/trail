@@ -83,6 +83,18 @@ from discovery are unbound with crash-recoverable upper resets in the same activ
 and deleting the final component creates an inspectable empty generation. A scoped
 `sync-all --path` never retires components outside that scope.
 
+### Lane fork inheritance
+
+When `lane spawn --from` resolves to another lane at the same source root,
+Trail may create the child environment generation by reference. A component is
+eligible only when its adapter identity, kind, component key, immutable output
+policy, portability scope, and verified layer manifest remain compatible with
+the child's discovery graph. Corrupt, mutable, missing, or incompatible
+components are rejected independently, so a mixed generation can still reuse
+its valid layers. Runtime allocations, secrets, leases, and synchronization
+attempts are never inherited. Source, generated, and scratch uppers are always
+new for the child.
+
 Large recipe graphs are batch-planned: Trail parses the complete recipe document twice
 (discovery plus planning), not once per component, reuses executable identity checks by
 path, and performs target, mount, and source-shadow checks with ordered prefix indexes

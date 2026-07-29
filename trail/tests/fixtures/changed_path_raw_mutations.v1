@@ -151,7 +151,8 @@ pending_task12|db/lane/workdir/dokan.rs|prepare_overlay_mountpoint|fs::create_di
 pending_task12|db/lane/workdir/fuse.rs|mount_fuse_cow_for_lane_with_view|fs::create_dir_all|2
 pending_task12|db/lane/workdir/fuse.rs|prepare_fuse_cow_workdir|fs::create_dir_all|1
 pending_task12|db/lane/workdir/fuse.rs|prepare_overlay_mountpoint|fs::create_dir_all|1
-reviewed|db/lane/workdir/lifecycle.rs|remove_lane|fs::remove_dir_all|2
+reviewed|db/lane/retirement.rs|delete_lane_retirement_private_paths|fs::remove_dir_all|1
+reviewed|db/lane/retirement.rs|delete_lane_retirement_private_paths|fs::remove_file|1
 reviewed|db/lane/workdir/manifest.rs|remove_clean_workdir_manifest_path|fs::remove_file|1
 reviewed|db/lane/workdir/manifest.rs|write_clean_workdir_manifest_entries_to_path|fs::create_dir_all|1
 reviewed|db/lane/workdir/materialize.rs|prepare_staged_destination|fs::remove_dir|1
@@ -343,8 +344,8 @@ reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::create_dir_all|1
 reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::create_dir|1
 reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::write|1
 reviewed|db/storage/lifecycle/rebuild.rs|remove_path_index_derived_mirror|fs::remove_file|1
-reviewed|db/storage/schema.rs|create_schema_v18_fixture_for_test|fs::remove_file|1
-reviewed|db/storage/schema.rs|create_schema_v18_fixture_for_test|fs::rename|1
+reviewed|db/storage/schema.rs|create_schema_fixture_for_test|fs::remove_file|1
+reviewed|db/storage/schema.rs|create_schema_fixture_for_test|fs::rename|1
 reviewed|db/util/config_io.rs|write_config|fs::remove_file|1
 reviewed|db/util/config_io.rs|write_config|fs::rename|1
 reviewed|db/util/config_io.rs|write_config|fs::write|1

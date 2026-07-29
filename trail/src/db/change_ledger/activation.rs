@@ -4,14 +4,14 @@ use sha2::{Digest, Sha256};
 const APPROVED_PRODUCER_INVENTORY_SHA256: &str =
     "af2cca0566976a6d6f6cea00e99fe5089c91e357ca1d0a50fd5397edcda32833";
 const APPROVED_RAW_MUTATION_INVENTORY_SHA256: &str =
-    "fcd05a2e4a79571a7e61e09f190db73b021aa5741177bce51e40e1d95c95cafd";
+    "518bf5bd912aac5274da496c154e3d3500aef0a831fa6c88cd976ec2bd6c1676";
 const APPROVED_ACTIVATION_AUDIT_SHA256: &str =
-    "6945f74e987f8269a20d73a08c5f3b2e524f75b37bc1857c138be04be62922d2";
+    "24922f50f884ab18efc7c0fe8045c446dc24a70f1c63e2ea7feecdf0a460cb42";
 const ACTIVATION_AUDIT_MANIFEST: &str = concat!(
     "trail-changed-path-activation-v1\n",
-    "schema=20\n",
+    "schema=21\n",
     "producer=af2cca0566976a6d6f6cea00e99fe5089c91e357ca1d0a50fd5397edcda32833\n",
-    "raw=fcd05a2e4a79571a7e61e09f190db73b021aa5741177bce51e40e1d95c95cafd\n",
+    "raw=518bf5bd912aac5274da496c154e3d3500aef0a831fa6c88cd976ec2bd6c1676\n",
     "linux_suite=changed_path_ledger_linux\n",
     "macos_suite=changed_path_ledger_macos\n",
     "recovery_suite=changed_path_ledger_recovery\n",
@@ -72,7 +72,7 @@ impl ActivationEvidence {
         let checked_activation_audit = activation_audit_sha256 == APPROVED_ACTIVATION_AUDIT_SHA256;
         Ok(Self {
             schema_hard_cutover: checked_activation_audit
-                && super::super::TRAIL_SCHEMA_VERSION == 20,
+                && super::super::TRAIL_SCHEMA_VERSION == 21,
             producer_inventory_complete: checked_activation_audit,
             // These fields declare the checked build contract. Exact-SHA
             // workflow dependencies, rather than this self-hash, authorize a

@@ -62,6 +62,10 @@ pub mod test_support {
         crate::db::create_schema_v18_fixture_for_test(workspace).map_err(|error| error.to_string())
     }
 
+    pub fn create_schema_v20_fixture(workspace: &std::path::Path) -> Result<(), String> {
+        crate::db::create_schema_v20_fixture_for_test(workspace).map_err(|error| error.to_string())
+    }
+
     pub fn fail_schema_v19_migration_after_ddl(db_path: &std::path::Path) {
         crate::db::install_schema_v19_migration_failure(
             db_path,
@@ -92,6 +96,27 @@ pub mod test_support {
 
     pub fn clear_schema_v20_migration_failure(db_path: &std::path::Path) {
         crate::db::clear_schema_v20_migration_failure(db_path);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SchemaV21MigrationBoundary {
+        AfterDdlBeforeUserVersion,
+    }
+
+    pub fn install_schema_v21_migration_failure(
+        db_path: &std::path::Path,
+        boundary: SchemaV21MigrationBoundary,
+    ) {
+        let boundary = match boundary {
+            SchemaV21MigrationBoundary::AfterDdlBeforeUserVersion => {
+                crate::db::SchemaV21MigrationBoundary::AfterDdlBeforeUserVersion
+            }
+        };
+        crate::db::install_schema_v21_migration_failure(db_path, boundary);
+    }
+
+    pub fn clear_schema_v21_migration_failure(db_path: &std::path::Path) {
+        crate::db::clear_schema_v21_migration_failure(db_path);
     }
 
     pub fn install_schema_v19_backfill_times(times: Vec<i64>) {

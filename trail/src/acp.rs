@@ -1215,6 +1215,7 @@ struct CaptureCoordinator {
     sessions_by_acp: HashMap<String, SessionState>,
     active_turns: HashMap<String, ActiveTurn>,
     terminals: HashMap<String, CapturedTerminal>,
+    managed_prompts: HashMap<String, crate::db::ManagedExecutionContext>,
     upstream_command_json: Option<String>,
 }
 
@@ -1278,6 +1279,7 @@ impl CaptureCoordinator {
             sessions_by_acp: HashMap::new(),
             active_turns: HashMap::new(),
             terminals: HashMap::new(),
+            managed_prompts: HashMap::new(),
             upstream_command_json,
         })
     }
@@ -1999,6 +2001,20 @@ impl CaptureCoordinator {
             )
             .ok()
             .map(|report| report.span.span_id);
+        let managed = if session.materialized {
+            let managed_command = if self.options.upstream_command.is_empty() {
+                vec!["acp-prompt".to_string()]
+            } else {
+                self.options.upstream_command.clone()
+            };
+            Some(db.prepare_managed_lane_execution(
+                &session.lane_name,
+                "acp_prompt",
+                &managed_command,
+            )?)
+        } else {
+            None
+        };
 
         let pending = PendingPrompt {
             acp_session_id: acp_session_id.clone(),
@@ -2012,6 +2028,10 @@ impl CaptureCoordinator {
             request_id,
             PendingOperation::Prompt(pending.clone()),
         )?;
+        if let Some(managed) = managed {
+            self.managed_prompts
+                .insert(pending.turn_id.clone(), managed);
+        }
         self.active_turns.insert(
             acp_session_id,
             ActiveTurn {
@@ -2056,7 +2076,51 @@ impl CaptureCoordinator {
             self.flush_turn_events(active_turn)?;
             self.flush_assistant_messages(active_turn, "prompt_completed")?;
         }
-        let checkpoint_error = if pending.materialized {
+        let lifecycle = if let Some(mut managed) = self.managed_prompts.remove(&pending.turn_id) {
+            db.mark_managed_lane_execution_command(
+                &mut managed,
+                if matches!(status, "completed" | "end_turn") {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                error_summary(message).as_deref(),
+                None,
+            )?;
+            Some(db.finalize_managed_lane_execution_for_turn(
+                managed,
+                Some("ACP prompt workdir checkpoint".to_string()),
+                Some(&pending.turn_id),
+            ))
+        } else {
+            None
+        };
+        let checkpoint_error = if let Some(lifecycle) = lifecycle.as_ref() {
+            if let Some(error) = lifecycle.checkpoint_error.as_ref() {
+                let error_code = lifecycle
+                    .checkpoint_error_code
+                    .as_deref()
+                    .unwrap_or("UNKNOWN");
+                db.add_lane_turn_event(
+                    &pending.turn_id,
+                    "acp_workdir_checkpoint_failed",
+                    Some(redact_json(serde_json::json!({
+                        "protocol": "acp",
+                        "lane": pending.lane_name,
+                        "error_code": error_code,
+                        "error": error,
+                        "recovery": if error_code == "PATH_INDEX_REQUIRED" {
+                            Some("trail index rebuild")
+                        } else {
+                            None
+                        }
+                    }))),
+                    None,
+                    None,
+                )?;
+            }
+            lifecycle.checkpoint_error.clone()
+        } else if pending.materialized {
             self.record_prompt_workdir_checkpoint(
                 &mut db,
                 &pending.lane_name,
@@ -2085,7 +2149,8 @@ impl CaptureCoordinator {
                 "cancel_requested": cancel_requested,
                 "stop_reason": stop_reason(message),
                 "error": message.get("error").cloned(),
-                "checkpoint_error": checkpoint_error
+                "checkpoint_error": checkpoint_error,
+                "managed_execution_id": lifecycle.as_ref().map(|receipt| &receipt.execution_id)
             }))),
             None,
             None,
@@ -2825,6 +2890,47 @@ impl CaptureCoordinator {
                     "finish_reason": format!("{reason:?}")
                 }),
             )?;
+        }
+        let managed_prompts = self.managed_prompts.drain().collect::<Vec<_>>();
+        for (turn_id, mut managed) in managed_prompts {
+            let mut db = self.open_db()?;
+            let turn_already_finished = db.lane_turn(&turn_id)?.ended_at.is_some();
+            db.mark_managed_lane_execution_command(
+                &mut managed,
+                if turn_already_finished {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                (!turn_already_finished).then_some("ACP relay ended before the prompt completed"),
+                None,
+            )?;
+            let lifecycle = if turn_already_finished {
+                db.finalize_managed_lane_execution(
+                    managed,
+                    Some("ACP completed prompt shutdown checkpoint".to_string()),
+                )
+            } else {
+                db.finalize_managed_lane_execution_for_turn(
+                    managed,
+                    Some("ACP interrupted prompt checkpoint".to_string()),
+                    Some(&turn_id),
+                )
+            };
+            if !turn_already_finished {
+                db.add_lane_turn_event(
+                    &turn_id,
+                    "acp_managed_execution_interrupted",
+                    Some(serde_json::json!({
+                        "finish_reason": format!("{reason:?}"),
+                        "execution_id": lifecycle.execution_id,
+                        "checkpoint_error": lifecycle.checkpoint_error,
+                        "disposal_error": lifecycle.disposal_error
+                    })),
+                    None,
+                    None,
+                )?;
+            }
         }
         Ok(())
     }
@@ -5058,5 +5164,103 @@ mod tests {
             .workdir_changed_paths
             .iter()
             .any(|path| path.path == "RECOVERABLE.md"));
+        let managed_phases = db
+            .list_lane_events(Some(lane), None, None, Some("managed_execution_phase"), 100)
+            .unwrap();
+        assert!(managed_phases.iter().any(|event| {
+            event.payload.as_ref().is_some_and(|payload| {
+                payload["surface"] == "acp_prompt" && payload["phase"] == "checkpoint"
+            })
+        }));
+    }
+
+    #[test]
+    fn acp_relay_shutdown_finalizes_managed_prompt_and_checkpoints_source() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let lane = "agent-interrupted";
+        let mut coordinator = CaptureCoordinator::new(AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: Some(lane.to_string()),
+            from_ref: None,
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            materialize: true,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["codex".to_string()],
+            upstream_env: BTreeMap::new(),
+        })
+        .unwrap();
+
+        let mut session_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "sessionId": "client-session",
+                "cwd": temp.path().to_string_lossy()
+            }
+        });
+        coordinator
+            .before_client_message(&mut session_request)
+            .unwrap();
+        let mut session_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"sessionId": "upstream-session"}
+        });
+        coordinator
+            .before_agent_message(&mut session_response)
+            .unwrap();
+        let mut prompt_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "upstream-session",
+                "prompt": [{"type": "text", "text": "Create INTERRUPTED.md"}]
+            }
+        });
+        coordinator
+            .before_client_message(&mut prompt_request)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let workdir = PathBuf::from(db.lane_details(lane).unwrap().branch.workdir.unwrap());
+        fs::write(workdir.join("INTERRUPTED.md"), "recover me\n").unwrap();
+        drop(db);
+
+        coordinator
+            .capture_callback_shutdown(&RelayFinishReason::EditorEof)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let phases = db
+            .list_lane_events(Some(lane), None, None, Some("managed_execution_phase"), 100)
+            .unwrap();
+        for phase in ["execute", "checkpoint", "dispose", "unmount"] {
+            assert!(
+                phases.iter().any(|event| {
+                    event.payload.as_ref().is_some_and(|payload| {
+                        payload["surface"] == "acp_prompt" && payload["phase"] == phase
+                    })
+                }),
+                "missing managed ACP shutdown phase {phase}"
+            );
+        }
+        let interruption = db
+            .transcript(lane)
+            .unwrap()
+            .turns
+            .into_iter()
+            .flat_map(|turn| turn.events)
+            .find(|event| event.event_type == "acp_managed_execution_interrupted")
+            .expect("ACP interruption must be durable");
+        assert_eq!(interruption.payload.unwrap()["finish_reason"], "EditorEof");
+        let branch = db.lane_branch(lane).unwrap();
+        assert_ne!(branch.head_change, branch.base_change);
     }
 }

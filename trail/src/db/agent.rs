@@ -2295,7 +2295,11 @@ impl Trail {
         selector: &str,
         note: Option<String>,
     ) -> Result<AgentMarkReviewedReport> {
-        let _lock = self.acquire_write_lock()?;
+        let _lock = if crate::db::change_ledger::command_authority_enabled() {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         let view = self.agent_task_view(selector)?;
         let lane = view.task.lane.clone();
         let branch = self.lane_branch(&lane)?;

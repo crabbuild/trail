@@ -84,6 +84,48 @@ If the branch should be abandoned back to a known-good state, use `lane rewind`
 instead of silently moving refs. It records an auditable rewind operation and can
 preserve the current head for later inspection.
 
+## Archive, Remove, and Purge
+
+These operations have deliberately different retention semantics:
+
+```sh
+trail lane archive doc-bot
+trail lane unarchive doc-bot
+trail lane rm doc-bot --force
+trail lane purge <exact-lane-id> --force
+```
+
+- `archive` is reversible. It preserves lane identity, refs, workdir metadata,
+  environment bindings, and provenance, but rejects new execution until the lane
+  is unarchived.
+- `rm` retires the lane. It checkpoints no new data, stops and removes Trail-owned
+  runtime resources, unbinds environment generations and immutable layers,
+  deletes the lane's private source/generated/scratch uppers, and retains a
+  compact tombstone. Interrupted removal resumes from its durable phase when the
+  workspace is reopened.
+- `purge` irreversibly erases the completed tombstone and remaining lane-owned
+  sessions, turns, messages, events, agent mappings, attestations, and provenance.
+  It requires both an exact `lane_...` identity and `--force`.
+
+Forking a layered lane with `--from <lane>` creates fresh private uppers and
+reuses only verified, compatible immutable environment layers. Trail records
+both inherited and rejected components in a `lane_environment_inheritance`
+event.
+
+## Managed Execution
+
+`lane exec`, lane tests/evals, terminal agents, and materialized ACP prompt
+turns use one lifecycle:
+
+```text
+resolve → discover/plan → sync-all → reconcile → mount → execute
+        → checkpoint source → dispose runtime → unmount
+```
+
+Each phase emits a `managed_execution_phase` lane event. Command failure does
+not skip source checkpointing or cleanup. Dependency, generated, scratch,
+secret, and Trail-internal paths stay outside the recorded source change.
+
 ## Code Facts Used
 
 - Lane CLI surface: `trail/src/cli/command/lane_args.rs`

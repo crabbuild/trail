@@ -1459,22 +1459,6 @@ fn run_terminal_agent_task(
     let workdir = spawn.workdir.clone().ok_or_else(|| {
         Error::InvalidInput("agent start requires a filesystem lane workdir".to_string())
     })?;
-    let fuse_mount = if workdir_mode == LaneWorkdirMode::FuseCow {
-        Some(db.mount_fuse_cow_workdir_for_lane(&lane)?)
-    } else {
-        None
-    };
-    let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
-        Some(db.mount_nfs_cow_workdir_for_lane(&lane)?)
-    } else {
-        None
-    };
-    #[cfg(target_os = "windows")]
-    let dokan_mount = if workdir_mode == LaneWorkdirMode::DokanCow {
-        Some(db.mount_dokan_cow_workdir_for_lane(&lane)?)
-    } else {
-        None
-    };
     let session = db
         .start_lane_session(&lane, Some(format!("Agent terminal {}", provider)), None)?
         .session;
@@ -1500,7 +1484,30 @@ fn run_terminal_agent_task(
             "from": from
         })),
     )?;
-    let mut workspace_environment = db.lane_workspace_environment(&lane)?;
+    let project_hook_settings = if provider == "claude-code" {
+        db.list_agent_hook_installations(Some(&provider))?
+            .into_iter()
+            .find(|installation| {
+                installation.status == "installed"
+                    && installation.scope == AgentHookInstallScope::Project
+                    && installation.config_path.is_file()
+            })
+            .map(|installation| installation.config_path)
+    } else {
+        None
+    };
+    let command_is_default = command.is_empty();
+    let mut command = if command_is_default {
+        default_terminal_agent_command(&provider)?
+    } else {
+        command
+    };
+    if command_is_default && let Some(settings) = project_hook_settings {
+        command.push("--settings".to_string());
+        command.push(settings.to_string_lossy().into_owned());
+    }
+    let mut managed = db.prepare_managed_lane_execution(&lane, "terminal_agent", &command)?;
+    let mut workspace_environment = managed.environment.clone();
     workspace_environment.extend([
         ("TRAIL_CAPTURE_MODE".to_string(), "terminal".to_string()),
         (
@@ -1516,58 +1523,55 @@ fn run_terminal_agent_task(
             capture_run.lane_id.clone().unwrap_or_else(|| lane.clone()),
         ),
     ]);
-    let project_hook_settings = if provider == "claude-code" {
-        db.list_agent_hook_installations(Some(&provider))?
-            .into_iter()
-            .find(|installation| {
-                installation.status == "installed"
-                    && installation.scope == AgentHookInstallScope::Project
-                    && installation.config_path.is_file()
-            })
-            .map(|installation| installation.config_path)
-    } else {
-        None
-    };
     let workspace_root = db.workspace_root().to_path_buf();
     drop(db);
 
-    let command_is_default = command.is_empty();
-    let mut command = if command_is_default {
-        default_terminal_agent_command(&provider)?
-    } else {
-        command
+    let launch_setup = (|| -> Result<_> {
+        if !ctx.json {
+            render_document(
+                &TerminalDocument::new(format!("Launching agent task {lane}"), UiTone::Success)
+                    .block(UiBlock::Metadata(vec![
+                        ("Workdir".to_string(), workdir.clone()),
+                        ("Command".to_string(), command.join(" ")),
+                    ])),
+                &ctx.render,
+            )?;
+        }
+        let (launch_program, launch_args) =
+            confined_terminal_agent_command(&command, &workspace_root, Path::new(&workdir))?;
+        let mut git_ceiling_directories = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !git_ceiling_directories
+            .iter()
+            .any(|path| path == &workspace_root)
+        {
+            git_ceiling_directories.push(workspace_root.clone());
+        }
+        let git_ceiling_directories =
+            std::env::join_paths(git_ceiling_directories).map_err(|error| {
+                Error::InvalidInput(format!("cannot construct Git discovery ceiling: {error}"))
+            })?;
+        Ok((launch_program, launch_args, git_ceiling_directories))
+    })();
+    let (launch_program, launch_args, git_ceiling_directories) = match launch_setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            let mut db = open_db(ctx)?;
+            db.mark_managed_lane_execution_command(
+                &mut managed,
+                "failed",
+                Some(&error.to_string()),
+                None,
+            )?;
+            let _ = db.finalize_managed_lane_execution(
+                managed,
+                Some(format!("Agent task `{lane}` failed-setup checkpoint")),
+            );
+            return Err(error);
+        }
     };
-    if command_is_default && let Some(settings) = project_hook_settings {
-        command.push("--settings".to_string());
-        command.push(settings.to_string_lossy().into_owned());
-    }
-    if !ctx.json {
-        render_document(
-            &TerminalDocument::new(format!("Launching agent task {lane}"), UiTone::Success).block(
-                UiBlock::Metadata(vec![
-                    ("Workdir".to_string(), workdir.clone()),
-                    ("Command".to_string(), command.join(" ")),
-                ]),
-            ),
-            &ctx.render,
-        )?;
-    }
-    let (launch_program, launch_args) =
-        confined_terminal_agent_command(&command, &workspace_root, Path::new(&workdir))?;
     let mut process = ProcessCommand::new(launch_program);
-    let mut git_ceiling_directories = std::env::var_os("GIT_CEILING_DIRECTORIES")
-        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if !git_ceiling_directories
-        .iter()
-        .any(|path| path == &workspace_root)
-    {
-        git_ceiling_directories.push(workspace_root.clone());
-    }
-    let git_ceiling_directories =
-        std::env::join_paths(git_ceiling_directories).map_err(|error| {
-            Error::InvalidInput(format!("cannot construct Git discovery ceiling: {error}"))
-        })?;
     process
         .args(launch_args)
         .current_dir(&workdir)
@@ -1582,7 +1586,24 @@ fn run_terminal_agent_task(
     } else {
         process.stdout(Stdio::inherit());
     }
-    let mut child = process.spawn().map_err(Error::from)?;
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let error = Error::from(error);
+            let mut db = open_db(ctx)?;
+            db.mark_managed_lane_execution_command(
+                &mut managed,
+                "failed",
+                Some(&error.to_string()),
+                None,
+            )?;
+            let _ = db.finalize_managed_lane_execution(
+                managed,
+                Some(format!("Agent task `{lane}` failed-launch checkpoint")),
+            );
+            return Err(error);
+        }
+    };
     let stdout_proxy = if ctx.json {
         child.stdout.take().map(|mut stdout| {
             std::thread::spawn(move || {
@@ -1593,15 +1614,43 @@ fn run_terminal_agent_task(
     } else {
         None
     };
-    let status = child.wait().map_err(Error::from)?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let error = Error::from(error);
+            let mut db = open_db(ctx)?;
+            db.mark_managed_lane_execution_command(
+                &mut managed,
+                "failed",
+                Some(&error.to_string()),
+                None,
+            )?;
+            let _ = db.finalize_managed_lane_execution(
+                managed,
+                Some(format!("Agent task `{lane}` interrupted checkpoint")),
+            );
+            return Err(error);
+        }
+    };
     if let Some(proxy) = stdout_proxy {
         let _ = proxy.join();
     }
     let exit_code = status.code();
 
     let mut db = open_db(ctx)?;
-    let recorded =
-        db.record_lane_workdir(&lane, Some(format!("Agent task `{lane}` checkpoint")))?;
+    db.mark_managed_lane_execution_command(
+        &mut managed,
+        if exit_code == Some(0) {
+            "succeeded"
+        } else {
+            "failed"
+        },
+        None,
+        exit_code,
+    )?;
+    let lifecycle = db
+        .finalize_managed_lane_execution(managed, Some(format!("Agent task `{lane}` checkpoint")));
+    let recorded = lifecycle.recorded.clone();
     let status = if exit_code == Some(0) {
         "completed"
     } else {
@@ -1628,13 +1677,10 @@ fn run_terminal_agent_task(
         command,
         workdir: Some(workdir),
         exit_code,
-        recorded: Some(recorded),
+        recorded,
         status: status.to_string(),
+        lifecycle: Some(lifecycle),
     };
-    drop(fuse_mount);
-    drop(nfs_mount);
-    #[cfg(target_os = "windows")]
-    drop(dokan_mount);
     Ok(report)
 }
 

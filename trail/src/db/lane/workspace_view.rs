@@ -800,89 +800,90 @@ impl Trail {
     }
 
     pub fn exec_lane_workspace(
-        &self,
+        &mut self,
         lane: &str,
         command: &[String],
     ) -> Result<WorkspaceExecReport> {
-        if command.is_empty() {
-            return Err(Error::InvalidInput(
-                "lane workspace exec requires a command".to_string(),
-            ));
-        }
-        let branch = self.lane_branch(lane)?;
-        let record = self.lane_record(&branch.lane_id)?;
-        let mode = self.lane_workdir_mode_for(&record, &branch)?;
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+        let mut context = self.prepare_managed_lane_execution(lane, "lane_exec", command)?;
+        let view = context.view.clone().ok_or_else(|| {
             Error::InvalidInput(format!(
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        let head = self.get_ref(&branch.ref_name)?;
-        let run = || self.run_workspace_command(&view, &head.root_id, command);
-        let exit_code = match mode {
-            LaneWorkdirMode::FuseCow => {
-                let mount = self.mount_fuse_cow_workdir_for_lane(lane)?;
-                let result = run();
-                drop(mount);
-                result?
+        let exit_code = match self.run_workspace_command(&view, &context.source_root, command) {
+            Ok(exit_code) => {
+                self.mark_managed_lane_execution_command(
+                    &mut context,
+                    if exit_code == 0 {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                    None,
+                    Some(exit_code),
+                )?;
+                exit_code
             }
-            LaneWorkdirMode::NfsCow => {
-                let mount = self.mount_nfs_cow_workdir_for_lane(lane)?;
-                let result = run();
-                drop(mount);
-                result?
-            }
-            LaneWorkdirMode::DokanCow => {
-                #[cfg(target_os = "windows")]
-                {
-                    let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
-                    let result = run();
-                    drop(mount);
-                    result?
+            Err(error) => {
+                self.mark_managed_lane_execution_command(
+                    &mut context,
+                    "failed",
+                    Some(&error.to_string()),
+                    None,
+                )?;
+                let lifecycle = self.finalize_managed_lane_execution(
+                    context,
+                    Some("Managed lane execution checkpoint".to_string()),
+                );
+                let finalization_errors = [
+                    lifecycle.checkpoint_error.as_deref(),
+                    lifecycle.disposal_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if finalization_errors.is_empty() {
+                    return Err(error);
                 }
-                #[cfg(not(target_os = "windows"))]
-                return Err(Error::InvalidInput(
-                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
-                ));
-            }
-            _ => {
-                return Err(Error::InvalidInput(format!(
-                    "lane `{lane}` uses `{}` rather than a layered workspace view",
-                    mode.as_str()
+                return Err(Error::Corrupt(format!(
+                    "{error}; managed execution finalization also failed: {}",
+                    finalization_errors.join("; ")
                 )));
             }
         };
-        let environment_generation = self
-            .conn
-            .query_row(
-                "SELECT generation_id FROM environment_view_generations WHERE view_id = ?1",
-                params![&view.view_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let lifecycle = self.finalize_managed_lane_execution(
+            context,
+            Some("Managed lane execution checkpoint".to_string()),
+        );
         self.insert_lane_event(
-            &branch.lane_id,
+            &view.lane_id,
             "workspace_view_exec_completed",
-            Some(&head.change_id),
+            None,
             None,
             &serde_json::json!({
                 "view_id": view.view_id,
-                "source_root": head.root_id.0,
+                "source_root": lifecycle.checkpoint.as_ref().map(|checkpoint| &checkpoint.root_id.0),
                 "generation": view.generation,
-                "environment_generation": environment_generation,
+                "environment_generation": lifecycle.environment_generation,
                 "command_fingerprint": sha256_hex(&serde_json::to_vec(command)?),
                 "exit_code": exit_code,
+                "execution_id": lifecycle.execution_id,
             }),
         )?;
         Ok(WorkspaceExecReport {
             view_id: view.view_id,
-            lane_id: branch.lane_id,
-            source_root: head.root_id,
+            lane_id: view.lane_id,
+            source_root: lifecycle
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.root_id.clone())
+                .unwrap_or_else(|| view.base_root.clone()),
             generation: view.generation,
-            environment_generation,
+            environment_generation: lifecycle.environment_generation.clone(),
             backend: view.backend,
             command: command.to_vec(),
             exit_code,
+            lifecycle,
         })
     }
 

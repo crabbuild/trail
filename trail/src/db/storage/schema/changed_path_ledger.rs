@@ -1429,7 +1429,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                     OR EXISTS(
                        SELECT 1 FROM changed_path_observer_segments segment
                        WHERE segment.scope_id=scope.scope_id
-                         AND (segment.epoch<>scope.epoch OR segment.state<>'retired'))
+                         AND segment.state<>'retired')
                     OR EXISTS(
                        SELECT 1 FROM changed_path_observer_segments segment
                        WHERE segment.scope_id=scope.scope_id
@@ -1459,7 +1459,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                     OR EXISTS(
                        SELECT 1 FROM changed_path_observer_segments segment
                        WHERE segment.scope_id=scope.scope_id
-                         AND (segment.epoch<>scope.epoch OR segment.state<>'retiring'
+                         AND (segment.state<>'retiring'
                               OR segment.retirement_source_state IS NULL))
                     OR EXISTS(
                        SELECT 1 FROM changed_path_observer_owners owner
@@ -1488,13 +1488,14 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
              JOIN changed_path_observer_owners owner ON owner.scope_id=segment.scope_id
              WHERE scope.retired_at IS NULL OR scope.trust_reason<>'scope_retired'
                 OR segment.state<>'retired' OR allocation.state<>'bound'
-                OR owner.epoch<>segment.epoch OR owner.lease_state<>'revoked'
+                OR owner.lease_state<>'revoked'
                 OR deletion.retirement_continuity_generation<>scope.continuity_generation
                 OR deletion.retirement_fence_nonce<>owner.fence_nonce
                 OR deletion.original_leaf<>segment.segment_path
                 OR deletion.log_format_version<>segment.log_format_version
                 OR deletion.owner_token<>segment.owner_token
-                OR deletion.owner_token<>owner.owner_token
+                OR (deletion.epoch=owner.epoch
+                    AND deletion.owner_token<>owner.owner_token)
                 OR deletion.provider_id<>segment.provider_id
                 OR deletion.provider_id<>owner.provider_id
                 OR deletion.provider_id IS NOT scope.provider_id

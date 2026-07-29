@@ -100,7 +100,11 @@ impl Trail {
         &mut self,
         selector: &str,
     ) -> Result<LaneMergeQueueExplainReport> {
-        let _lock = self.acquire_write_lock()?;
+        let _lock = if crate::db::change_ledger::command_authority_enabled() {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         let entry = self.lane_merge_queue_entry_by_selector(selector)?;
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
@@ -163,7 +167,11 @@ impl Trail {
         &mut self,
         limit: Option<usize>,
     ) -> Result<LaneMergeQueueRunReport> {
-        let _lock = self.acquire_write_lock()?;
+        let _lock = if crate::db::change_ledger::command_authority_enabled() {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         let entries = self.queued_lane_merge_entries(limit)?;
         let mut processed = Vec::new();
         let mut stopped_on_conflict = false;

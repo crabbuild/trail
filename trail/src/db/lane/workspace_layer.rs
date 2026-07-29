@@ -7,6 +7,23 @@ const LAYER_BUILD_LEASE_SECS: i64 = 300;
 const WORKSPACE_LAYER_VERIFICATION_STAMP_VERSION: u16 = 1;
 const WORKSPACE_LAYER_SIDECAR_MAX_BYTES: u64 = 64 * 1024;
 
+fn inheritable_workspace_layer_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        "platform"
+            | "workspace"
+            | "host"
+            | "portable"
+            | "platform-architecture-node-abi"
+            | "source-root-toolchain-target-platform"
+            | "source-root-go-toolchain-platform"
+            | "plugin-tool-host"
+            | "plugin-tool-platform"
+            | "recipe-tool-host"
+            | "recipe-tool-platform"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceLayerBinding {
     /// Durable identity used by filesystem-side activation recovery. For an
@@ -121,6 +138,333 @@ std::thread_local! {
 }
 
 impl Trail {
+    pub(crate) fn inherit_workspace_environment_generation(
+        &self,
+        parent_lane_id: &str,
+        child_lane_id: &str,
+    ) -> Result<Option<String>> {
+        let parent_view = match self.workspace_view_by_lane_id(parent_lane_id)? {
+            Some(view) => view,
+            None => return Ok(None),
+        };
+        let child_view = self
+            .workspace_view_by_lane_id(child_lane_id)?
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                "child lane `{child_lane_id}` has no workspace view for environment inheritance"
+            ))
+            })?;
+        if let Some(existing) = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id=?1",
+                [&child_view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(Some(existing));
+        }
+        let parent_generation = self
+            .conn
+            .query_row(
+                "SELECT g.generation_id,g.source_root,g.specification_digest
+                 FROM environment_view_generations active
+                 JOIN environment_generations g ON g.generation_id=active.generation_id
+                 WHERE active.view_id=?1 AND g.state='active'",
+                [&parent_view.view_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((parent_generation_id, parent_source_root, parent_specification_digest)) =
+            parent_generation
+        else {
+            self.insert_lane_event(
+                child_lane_id,
+                "lane_environment_inheritance",
+                None,
+                None,
+                &serde_json::json!({
+                    "parent_lane_id": parent_lane_id,
+                    "status": "skipped",
+                    "reason": "parent_has_no_active_generation"
+                }),
+            )?;
+            return Ok(None);
+        };
+        if parent_source_root != child_view.base_root.0 {
+            self.insert_lane_event(
+                child_lane_id,
+                "lane_environment_inheritance",
+                None,
+                None,
+                &serde_json::json!({
+                    "parent_lane_id": parent_lane_id,
+                    "parent_generation_id": parent_generation_id,
+                    "status": "skipped",
+                    "reason": "source_root_mismatch"
+                }),
+            )?;
+            return Ok(None);
+        }
+        let desired = self
+            .workspace_environment_graph(child_lane_id, None)
+            .ok()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .into_iter()
+                    .map(|node| (node.component_id.clone(), node))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        #[derive(Clone)]
+        struct InheritedComponent {
+            component_id: String,
+            adapter_identity: String,
+            kind: String,
+            component_key: String,
+            layer_id: Option<String>,
+            mount_path: Option<String>,
+            source_path: String,
+            priority: i64,
+        }
+
+        let candidates = {
+            let mut statement = self.conn.prepare(
+                "SELECT c.component_id,c.adapter_identity,c.kind,c.component_key,
+                        c.layer_id,c.mount_path,COALESCE(binding.source_path,''),
+                        COALESCE(binding.priority,100)
+                 FROM environment_generation_components c
+                 LEFT JOIN workspace_view_layers binding
+                   ON binding.view_id=?2
+                  AND binding.layer_id=c.layer_id
+                  AND binding.mount_path=c.mount_path
+                 WHERE c.generation_id=?1
+                 ORDER BY c.component_id",
+            )?;
+            statement
+                .query_map(
+                    params![&parent_generation_id, &parent_view.view_id],
+                    |row| {
+                        Ok(InheritedComponent {
+                            component_id: row.get(0)?,
+                            adapter_identity: row.get(1)?,
+                            kind: row.get(2)?,
+                            component_key: row.get(3)?,
+                            layer_id: row.get(4)?,
+                            mount_path: row.get(5)?,
+                            source_path: row.get(6)?,
+                            priority: row.get(7)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut inherited = Vec::new();
+        let mut decisions = Vec::new();
+        for component in candidates {
+            let mut rejection = None;
+            if let Some(planned) = desired.get(&component.component_id) {
+                if planned.adapter_identity != component.adapter_identity {
+                    rejection = Some("adapter_identity_mismatch");
+                } else if planned.kind != component.kind {
+                    rejection = Some("component_kind_mismatch");
+                } else if planned.component_key != component.component_key {
+                    rejection = Some("component_key_mismatch");
+                } else if planned
+                    .outputs
+                    .iter()
+                    .any(|output| !output.policy.starts_with("immutable"))
+                {
+                    rejection = Some("output_policy_is_not_immutable");
+                }
+            } else if !desired.is_empty() {
+                rejection = Some("component_not_discovered_in_child");
+            }
+            if rejection.is_none() {
+                let mutable_outputs = self.conn.query_row(
+                    "SELECT COUNT(*) FROM environment_generation_outputs
+                     WHERE generation_id=?1 AND component_id=?2
+                       AND policy NOT LIKE 'immutable%'",
+                    params![&parent_generation_id, &component.component_id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if mutable_outputs != 0 {
+                    rejection = Some("parent_output_policy_is_not_immutable");
+                }
+            }
+            if rejection.is_none() {
+                if let Some(layer_id) = component.layer_id.as_deref() {
+                    match self.verify_workspace_layer_for_attach(layer_id) {
+                        Ok(layer)
+                            if inheritable_workspace_layer_scope(&layer.portability_scope) => {}
+                        Ok(_) => rejection = Some("unsupported_portability_scope"),
+                        Err(_) => rejection = Some("layer_verification_failed"),
+                    }
+                }
+            }
+            let compatible = rejection.is_none();
+            decisions.push(serde_json::json!({
+                "component_id": component.component_id,
+                "adapter_identity": component.adapter_identity,
+                "component_key": component.component_key,
+                "layer_id": component.layer_id,
+                "status": if compatible { "inherited" } else { "rejected" },
+                "reason": rejection
+            }));
+            if compatible {
+                inherited.push(component);
+            }
+        }
+        if inherited.is_empty() {
+            self.insert_lane_event(
+                child_lane_id,
+                "lane_environment_inheritance",
+                None,
+                None,
+                &serde_json::json!({
+                    "parent_lane_id": parent_lane_id,
+                    "parent_generation_id": parent_generation_id,
+                    "status": "skipped",
+                    "reason": "no_compatible_components",
+                    "components": decisions
+                }),
+            )?;
+            return Ok(None);
+        }
+
+        let generation_id = format!(
+            "envgen_{}",
+            &sha256_hex(
+                format!(
+                    "{}:{}:{}:{}",
+                    child_view.view_id,
+                    parent_generation_id,
+                    child_view.base_root.0,
+                    parent_specification_digest
+                )
+                .as_bytes()
+            )[..32]
+        );
+        let now = now_ts();
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let inheritance = (|| -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO environment_generations(
+                     generation_id,view_id,generation_sequence,source_root,
+                     specification_digest,predecessor_generation_id,state,
+                     created_at,activated_at,retired_at)
+                 VALUES(?1,?2,1,?3,?4,?5,'active',?6,?6,NULL)",
+                params![
+                    &generation_id,
+                    &child_view.view_id,
+                    child_view.base_root.0,
+                    &parent_specification_digest,
+                    &parent_generation_id,
+                    now
+                ],
+            )?;
+            for component in &inherited {
+                self.conn.execute(
+                    "INSERT INTO environment_generation_components(
+                         generation_id,component_id,adapter_identity,kind,component_key,
+                         layer_id,mount_path)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        &generation_id,
+                        &component.component_id,
+                        &component.adapter_identity,
+                        &component.kind,
+                        &component.component_key,
+                        &component.layer_id,
+                        &component.mount_path
+                    ],
+                )?;
+                if let (Some(layer_id), Some(mount_path)) = (
+                    component.layer_id.as_deref(),
+                    component.mount_path.as_deref(),
+                ) {
+                    self.conn.execute(
+                        "INSERT INTO workspace_view_layers(
+                             view_id,layer_id,mount_path,priority,read_only,source_path)
+                         VALUES(?1,?2,?3,?4,1,?5)",
+                        params![
+                            &child_view.view_id,
+                            layer_id,
+                            mount_path,
+                            component.priority,
+                            &component.source_path
+                        ],
+                    )?;
+                }
+                self.conn.execute(
+                    "INSERT INTO environment_generation_caches(
+                         generation_id,component_id,cache_name,namespace_id,protocol,
+                         access,compatibility_json)
+                     SELECT ?1,component_id,cache_name,namespace_id,protocol,access,
+                            compatibility_json
+                     FROM environment_generation_caches
+                     WHERE generation_id=?2 AND component_id=?3",
+                    params![
+                        &generation_id,
+                        &parent_generation_id,
+                        &component.component_id
+                    ],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO environment_generation_outputs(
+                         generation_id,component_id,output_name,policy,storage_identity,
+                         layer_id,mount_path,layer_subpath)
+                     SELECT ?1,component_id,output_name,policy,storage_identity,
+                            layer_id,mount_path,layer_subpath
+                     FROM environment_generation_outputs
+                     WHERE generation_id=?2 AND component_id=?3
+                       AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
+                    params![
+                        &generation_id,
+                        &parent_generation_id,
+                        &component.component_id
+                    ],
+                )?;
+            }
+            self.conn.execute(
+                "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
+                 VALUES(?1,?2,?3)",
+                params![&child_view.view_id, &generation_id, now],
+            )?;
+            Ok(())
+        })();
+        match inheritance {
+            Ok(()) => self.conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+        self.insert_lane_event(
+            child_lane_id,
+            "lane_environment_inheritance",
+            None,
+            None,
+            &serde_json::json!({
+                "parent_lane_id": parent_lane_id,
+                "parent_generation_id": parent_generation_id,
+                "child_generation_id": generation_id,
+                "status": "inherited",
+                "components": decisions
+            }),
+        )?;
+        Ok(Some(generation_id))
+    }
+
     pub fn workspace_layer_cache_key(&self, key: &WorkspaceLayerKeyV1) -> Result<String> {
         validate_layer_key(key)?;
         Ok(sha256_hex(&serde_json::to_vec(key)?))
@@ -3659,6 +4003,34 @@ mod tests {
             architecture: std::env::consts::ARCH.to_string(),
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
+        }
+    }
+
+    #[test]
+    fn inheritance_accepts_every_builtin_immutable_layer_scope() {
+        for scope in [
+            "platform",
+            "workspace",
+            "host",
+            "portable",
+            "platform-architecture-node-abi",
+            "source-root-toolchain-target-platform",
+            "source-root-go-toolchain-platform",
+            "plugin-tool-host",
+            "plugin-tool-platform",
+            "recipe-tool-host",
+            "recipe-tool-platform",
+        ] {
+            assert!(inheritable_workspace_layer_scope(scope), "{scope}");
+        }
+        for scope in [
+            "lane-private-host-python",
+            "lane-private-host-tool",
+            "external-oci-digest-platform",
+            "legacy",
+            "",
+        ] {
+            assert!(!inheritable_workspace_layer_scope(scope), "{scope}");
         }
     }
 

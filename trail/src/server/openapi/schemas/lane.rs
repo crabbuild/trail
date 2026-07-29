@@ -2,6 +2,144 @@ use serde_json::{json, Value};
 
 pub(super) fn lane_schemas() -> Value {
     json!({
+        "LaneRemoveReport": {
+            "type": "object",
+            "required": ["lane_id", "ref_name", "removed_workdir", "forced"],
+            "additionalProperties": false,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "ref_name": { "type": "string" },
+                "removed_workdir": { "type": ["string", "null"] },
+                "forced": { "type": "boolean" }
+            }
+        },
+        "LaneRetirementProvenance": {
+            "type": "object",
+            "required": ["ref_name", "base_change", "head_change", "base_root", "head_root", "view_id", "environment_generation_ids", "source_bytes", "generated_bytes", "scratch_bytes"],
+            "additionalProperties": false,
+            "properties": {
+                "ref_name": { "type": "string" },
+                "base_change": { "type": "string" },
+                "head_change": { "type": "string" },
+                "base_root": { "type": "string" },
+                "head_root": { "type": "string" },
+                "view_id": { "type": ["string", "null"] },
+                "environment_generation_ids": { "type": "array", "items": { "type": "string" } },
+                "source_bytes": { "type": "integer", "minimum": 0 },
+                "generated_bytes": { "type": "integer", "minimum": 0 },
+                "scratch_bytes": { "type": "integer", "minimum": 0 }
+            }
+        },
+        "LaneRetirementReport": {
+            "type": "object",
+            "required": ["retirement_id", "lane_id", "former_name", "kind", "phase", "resume_phase", "forced", "provenance", "private_paths", "last_error_code", "last_error_message", "repair_command", "created_at", "updated_at", "completed_at"],
+            "additionalProperties": false,
+            "properties": {
+                "retirement_id": { "type": "string" },
+                "lane_id": { "type": "string" },
+                "former_name": { "type": "string" },
+                "kind": { "type": "string", "enum": ["remove", "purge"] },
+                "phase": { "type": "string", "enum": ["prepared", "runtime_stopped", "bindings_retired", "private_deleted", "completed", "repair_required"] },
+                "resume_phase": { "type": ["string", "null"], "enum": ["prepared", "runtime_stopped", "bindings_retired", "private_deleted", "completed", "repair_required", null] },
+                "forced": { "type": "boolean" },
+                "provenance": { "$ref": "#/components/schemas/LaneRetirementProvenance" },
+                "private_paths": { "type": "array", "items": { "type": "string" } },
+                "last_error_code": { "type": ["string", "null"] },
+                "last_error_message": { "type": ["string", "null"] },
+                "repair_command": { "type": ["string", "null"] },
+                "created_at": { "type": "integer" },
+                "updated_at": { "type": "integer" },
+                "completed_at": { "type": ["integer", "null"] }
+            }
+        },
+        "WorkspaceCheckpointReport": {
+            "type": "object",
+            "required": ["view_id", "operation", "root_id", "journal_sequence", "source_paths", "generated_dirty_paths", "generated_path_accounting", "upper_recovery_walks"],
+            "additionalProperties": false,
+            "properties": {
+                "view_id": { "type": "string" },
+                "operation": { "type": ["string", "null"] },
+                "root_id": { "type": "string" },
+                "journal_sequence": { "type": "integer", "minimum": 0 },
+                "source_paths": { "type": "array", "items": { "type": "string" } },
+                "generated_dirty_paths": { "type": "integer", "minimum": 0 },
+                "generated_path_accounting": { "type": "string" },
+                "upper_recovery_walks": { "type": "integer", "minimum": 0 }
+            }
+        },
+        "ManagedExecutionPhaseReceipt": {
+            "type": "object",
+            "required": ["phase", "status"],
+            "additionalProperties": false,
+            "properties": {
+                "phase": { "type": "string", "enum": ["resolve", "discover_plan", "sync_all", "reconcile", "mount", "execute", "checkpoint", "dispose", "unmount"] },
+                "status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
+                "error": { "type": "string" }
+            }
+        },
+        "ManagedExecutionLifecycleReport": {
+            "type": "object",
+            "required": ["execution_id", "surface", "command_fingerprint", "phases"],
+            "additionalProperties": false,
+            "properties": {
+                "execution_id": { "type": "string" },
+                "surface": { "type": "string", "enum": ["lane_exec", "lane_test", "lane_eval", "terminal_agent", "acp_prompt"] },
+                "command_fingerprint": { "type": "string" },
+                "environment_generation": { "type": "string" },
+                "checkpoint": { "$ref": "#/components/schemas/WorkspaceCheckpointReport" },
+                "checkpoint_error": { "type": "string" },
+                "checkpoint_error_code": { "type": "string" },
+                "disposal_error": { "type": "string" },
+                "recorded": { "$ref": "#/components/schemas/LaneRecordReport" },
+                "phases": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionPhaseReceipt" } }
+            }
+        },
+        "WorkspaceExecReport": {
+            "type": "object",
+            "required": ["view_id", "lane_id", "source_root", "generation", "environment_generation", "backend", "command", "exit_code", "lifecycle"],
+            "additionalProperties": false,
+            "properties": {
+                "view_id": { "type": "string" },
+                "lane_id": { "type": "string" },
+                "source_root": { "type": "string" },
+                "generation": { "type": "integer", "minimum": 0 },
+                "environment_generation": { "type": ["string", "null"] },
+                "backend": { "type": "string" },
+                "command": { "type": "array", "items": { "type": "string" } },
+                "exit_code": { "type": "integer" },
+                "lifecycle": { "$ref": "#/components/schemas/ManagedExecutionLifecycleReport" }
+            }
+        },
+        "LaneTestReport": {
+            "type": "object",
+            "required": ["lane_id", "turn_id", "session_id", "workdir", "source_root", "command", "kind", "status", "success", "exit_code", "timed_out", "duration_ms", "stdout_object", "stderr_object", "stdout_bytes", "stderr_bytes", "stdout_preview", "stderr_preview", "stdout_truncated", "stderr_truncated", "started_event_id", "finished_event_id", "lifecycle"],
+            "additionalProperties": true,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "turn_id": { "type": "string" },
+                "session_id": { "type": ["string", "null"] },
+                "workdir": { "type": "string" },
+                "source_root": { "type": "string" },
+                "command": { "type": "array", "items": { "type": "string" } },
+                "kind": { "type": "string", "enum": ["test", "eval"] },
+                "status": { "type": "string" },
+                "success": { "type": "boolean" },
+                "exit_code": { "type": ["integer", "null"] },
+                "timed_out": { "type": "boolean" },
+                "duration_ms": { "type": "integer", "minimum": 0 },
+                "stdout_object": { "type": "string" },
+                "stderr_object": { "type": "string" },
+                "stdout_bytes": { "type": "integer", "minimum": 0 },
+                "stderr_bytes": { "type": "integer", "minimum": 0 },
+                "stdout_preview": { "type": "string" },
+                "stderr_preview": { "type": "string" },
+                "stdout_truncated": { "type": "boolean" },
+                "stderr_truncated": { "type": "boolean" },
+                "started_event_id": { "type": "string" },
+                "finished_event_id": { "type": "string" },
+                "lifecycle": { "$ref": "#/components/schemas/ManagedExecutionLifecycleReport" }
+            }
+        },
         "LaneSpawnReport": {
             "type": "object",
             "required": ["initialization_id", "request_fingerprint", "phase", "committed", "resumed", "lane_id", "ref_name", "base_change", "requested_workdir_mode", "workdir_mode", "sparse_paths", "transparent_cow_available"],

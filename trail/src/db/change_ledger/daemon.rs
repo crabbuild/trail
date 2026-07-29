@@ -518,6 +518,16 @@ pub(crate) fn materialized_lane_daemon_fence(
     Ok(proof)
 }
 
+pub(crate) fn retire_materialized_lane_daemon(db: &Trail, lane: &str) -> Result<()> {
+    let lane_id = db.lane_branch(lane)?.lane_id;
+    let runtime = daemon_registry(db).materialized_lanes.remove(&lane_id);
+    if let Some(runtime) = runtime.as_ref() {
+        runtime.observer.shutdown()?;
+    }
+    drop(runtime);
+    Ok(())
+}
+
 /// Establish an exact sidecar boundary immediately before preparing a
 /// controlled materialized-lane intent.  The returned scope's provider cursor
 /// is the start cursor of the newly-opened segment, so the subsequent intent
@@ -2340,6 +2350,15 @@ enum PlatformObserver {
 }
 
 impl PlatformObserver {
+    fn shutdown(&self) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.shutdown(),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.shutdown(),
+        }
+    }
+
     fn start(
         root: &Path,
         writer: SegmentWriter,

@@ -631,7 +631,7 @@ impl Trail {
             "WHERE generation_id IN (
                  SELECT generation_id FROM environment_generations
                  WHERE view_id = ?1 AND state = 'retired'
-             ) AND status != 'stopped'
+             )
              ORDER BY generation_id, component_id, resource_name",
             [generation.view_id.as_str()],
         )?;
@@ -641,6 +641,45 @@ impl Trail {
         let provider = CliRuntimeProvider::detect(&self.config.workspace.id.0)?;
         self.cleanup_retired_workspace_environment_runtime_with(&provider, &allocations)?;
         Ok(generation)
+    }
+
+    pub(crate) fn cleanup_retired_workspace_environment_runtime_for_view(
+        &self,
+        view_id: &str,
+    ) -> Result<()> {
+        self.recover_workspace_runtime_leases()?;
+        let allocations = self.runtime_allocations_where(
+            "WHERE generation_id IN (
+                 SELECT generation_id FROM environment_generations
+                 WHERE view_id = ?1 AND state = 'retired'
+             )
+             ORDER BY generation_id, component_id, resource_name",
+            [view_id],
+        )?;
+        if allocations.is_empty() {
+            return Ok(());
+        }
+        let provider = CliRuntimeProvider::detect(&self.config.workspace.id.0)?;
+        self.cleanup_retired_workspace_environment_runtime_for_view_with(view_id, &provider)
+    }
+
+    fn cleanup_retired_workspace_environment_runtime_for_view_with(
+        &self,
+        view_id: &str,
+        provider: &dyn RuntimeProvider,
+    ) -> Result<()> {
+        let allocations = self.runtime_allocations_where(
+            "WHERE generation_id IN (
+                 SELECT generation_id FROM environment_generations
+                 WHERE view_id = ?1 AND state = 'retired'
+             )
+             ORDER BY generation_id, component_id, resource_name",
+            [view_id],
+        )?;
+        if allocations.is_empty() {
+            return Ok(());
+        }
+        self.cleanup_retired_workspace_environment_runtime_with(provider, &allocations)
     }
 
     fn cleanup_retired_workspace_environment_runtime_with(
@@ -1897,6 +1936,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retired_status, "stopped");
+    }
+
+    #[test]
+    fn lane_retirement_removes_provider_objects_even_after_runtime_was_stopped() {
+        let lane = "runtime-lane-retirement";
+        let (_workspace, db) = runtime_workspace(lane);
+        let generation = db.active_environment_generation(lane).unwrap().unwrap();
+        let provider = FakeRuntimeProvider::new(false);
+        let allocations = db
+            .runtime_allocations_for_generation(&generation.generation_id)
+            .unwrap();
+        db.reconcile_workspace_environment_runtime_with(&provider, &allocations)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE environment_generation_runtime_resources
+                 SET status='stopped',health_status='stopped',
+                     owner_pid=NULL,owner_start_token=NULL
+                 WHERE generation_id=?1",
+                [&generation.generation_id],
+            )
+            .unwrap();
+        {
+            let mut state = provider.state.lock().unwrap();
+            state.running = false;
+        }
+        db.conn
+            .execute(
+                "UPDATE environment_generations
+                 SET state='retired',retired_at=1
+                 WHERE generation_id=?1",
+                [&generation.generation_id],
+            )
+            .unwrap();
+
+        db.cleanup_retired_workspace_environment_runtime_for_view_with(
+            &generation.view_id,
+            &provider,
+        )
+        .unwrap();
+
+        let state = provider.state.lock().unwrap();
+        assert_eq!(state.remove_container_count, 1);
+        assert_eq!(state.remove_network_count, 1);
+        assert_eq!(state.remove_volume_count, 1);
     }
 
     #[test]

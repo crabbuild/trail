@@ -18,10 +18,26 @@ pub(super) fn lane_paths() -> Value {
             "get": openapi_operation("laneShow", "Show lane", "Show lane metadata and branch state.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], None, true),
-            "delete": openapi_operation("laneRemove", "Remove lane", "Remove a lane branch and its materialized workdir. Requires force when the branch has unmerged changes.", vec![
+            "delete": openapi_operation_with_response_schema("laneRemove", "Remove lane", "Durably retire a lane, stop and remove lane-private runtime resources, detach shared layers, delete private workspace artifacts, retain compact provenance, and tombstone its name. Requires force when the branch has unmerged changes.", vec![
                 openapi_path_param("lane_or_id", "string"),
                 openapi_query("force", "boolean")
+            ], None, "LaneRemoveReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/archive": {
+            "post": openapi_operation("laneArchive", "Archive lane", "Hide an inactive lane from normal work while retaining its ref, workspace, environment bindings, and full history.", vec![
+                openapi_path_param("lane_or_id", "string")
             ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/unarchive": {
+            "post": openapi_operation("laneUnarchive", "Unarchive lane", "Restore a retained archived lane to active status after validating its ref.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_id}/purge": {
+            "post": openapi_operation_with_response_schema("lanePurge", "Purge retired lane provenance", "Irreversibly delete the compact provenance retained after completed lane removal. Requires an exact lane ID and force=true.", vec![
+                openapi_path_param("lane_id", "string"),
+                openapi_query("force", "boolean")
+            ], None, "LaneRetirementReport", true)
         },
         "/v1/lanes/{lane_or_id}/status": {
             "get": openapi_operation("laneStatus", "Lane status", "Show a lane branch status.", vec![
@@ -175,14 +191,14 @@ pub(super) fn lane_paths() -> Value {
             ], None, "EnvironmentGenerationReport", true)
         },
         "/v1/lanes/{lane_or_id}/checkpoint": {
-            "post": openapi_operation("laneWorkspaceCheckpoint", "Checkpoint lane workspace", "Checkpoint source-upper mutations into the lane ref under a mutation barrier.", vec![
+            "post": openapi_operation_with_response_schema("laneWorkspaceCheckpoint", "Checkpoint lane workspace", "Checkpoint source-upper mutations into the lane ref under a mutation barrier while excluding generated and scratch artifacts.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("WorkspaceCheckpointRequest"), true)
+            ], Some("WorkspaceCheckpointRequest"), "WorkspaceCheckpointReport", true)
         },
         "/v1/lanes/{lane_or_id}/exec": {
-            "post": openapi_operation("laneWorkspaceExec", "Execute in lane workspace", "Mount the layered lane for one open-world command with isolated cache and target variables.", vec![
+            "post": openapi_operation_with_response_schema("laneWorkspaceExec", "Execute in lane workspace", "Discover, synchronize, reconcile, mount, execute, checkpoint source changes, dispose runtime artifacts, and unmount one managed lane command.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("WorkspaceExecRequest"), true)
+            ], Some("WorkspaceExecRequest"), "WorkspaceExecReport", true)
         },
         "/v1/lanes/{lane_or_id}/diff": {
             "get": openapi_operation("laneDiff", "Lane diff", "Show the diff from a lane branch base to head.", vec![
@@ -218,14 +234,14 @@ pub(super) fn lane_paths() -> Value {
             ], Some("LaneRewindRequest"), true)
         },
         "/v1/lanes/{lane_or_id}/tests": {
-            "post": openapi_operation("laneRunTest", "Run lane test", "Run a command in a lane workdir and record test events.", vec![
+            "post": openapi_operation_with_response_schema("laneRunTest", "Run lane test", "Run a command through the managed lane lifecycle, checkpoint source changes even on command failure, dispose runtime artifacts, and record test events.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("LaneTestRequest"), true)
+            ], Some("LaneTestRequest"), "LaneTestReport", true)
         },
         "/v1/lanes/{lane_or_id}/evals": {
-            "post": openapi_operation("laneRunEval", "Run lane eval", "Run an evaluation command in a lane workdir and record eval events.", vec![
+            "post": openapi_operation_with_response_schema("laneRunEval", "Run lane eval", "Run an evaluation command through the managed lane lifecycle, checkpoint source changes, dispose runtime artifacts, and record eval events.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("LaneTestRequest"), true)
+            ], Some("LaneTestRequest"), "LaneTestReport", true)
         },
         "/v1/lanes/{lane_or_id}/patches": {
             "post": openapi_operation_with_response_schema("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![

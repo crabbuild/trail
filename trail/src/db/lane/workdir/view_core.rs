@@ -116,11 +116,17 @@ pub(crate) struct ViewCore {
     whiteouts: BTreeSet<String>,
     ino_by_path: HashMap<String, u64>,
     path_by_ino: HashMap<u64, String>,
+    immutable_read_files: HashMap<u64, CachedImmutableReadFile>,
     dir_mtime: HashMap<String, SystemTime>,
     dir_epoch: SystemTime,
     next_ino: u64,
     journal: ViewMutationJournal,
     generation_lease: ViewGenerationLease,
+}
+
+struct CachedImmutableReadFile {
+    file: File,
+    attr: ViewNodeAttr,
 }
 
 const LAYER_MOUNT_RESET_INTENT_VERSION: u16 = 2;
@@ -237,6 +243,7 @@ impl ViewCore {
             whiteouts: BTreeSet::new(),
             ino_by_path: HashMap::from([(String::new(), VIEW_ROOT_INO)]),
             path_by_ino: HashMap::from([(VIEW_ROOT_INO, String::new())]),
+            immutable_read_files: HashMap::new(),
             dir_mtime: HashMap::from([(String::new(), dir_epoch)]),
             dir_epoch,
             next_ino: VIEW_ROOT_INO + 1,
@@ -291,6 +298,12 @@ impl ViewCore {
 
     pub(crate) fn path_for_ino(&self, ino: u64) -> std::result::Result<String, i32> {
         self.path_by_ino.get(&ino).cloned().ok_or(ENOENT)
+    }
+
+    pub(crate) fn immutable_read_attr(&self, ino: u64) -> Option<ViewNodeAttr> {
+        self.immutable_read_files
+            .get(&ino)
+            .map(|cached| cached.attr.clone())
     }
 
     pub(crate) fn child_path(&self, parent: u64, name: &str) -> std::result::Result<String, i32> {
@@ -756,6 +769,15 @@ impl ViewCore {
         offset: u64,
         count: u32,
     ) -> std::result::Result<(Vec<u8>, bool), i32> {
+        if let Some(cached) = self.immutable_read_files.get(&ino) {
+            let mut bytes = vec![0; count as usize];
+            let read = read_file_at(&cached.file, &mut bytes, offset).map_err(io_errno)?;
+            bytes.truncate(read);
+            return Ok((
+                bytes,
+                offset.saturating_add(read as u64) >= cached.attr.size,
+            ));
+        }
         let path = self.path_for_ino(ino)?;
         if self.node_kind(&path)? != Some(ViewNodeKind::File) {
             return Err(EISDIR);
@@ -778,6 +800,19 @@ impl ViewCore {
             let mut bytes = vec![0; count as usize];
             let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
             bytes.truncate(read);
+            self.immutable_read_files.insert(
+                ino,
+                CachedImmutableReadFile {
+                    file,
+                    attr: ViewNodeAttr {
+                        ino,
+                        kind: ViewNodeKind::File,
+                        mode: copy_up_mode(&metadata),
+                        size: metadata.len(),
+                        modified: SystemTime::UNIX_EPOCH,
+                    },
+                },
+            );
             Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
         } else {
             let entry = self.lower_file(&path)?.ok_or(ENOENT)?;
@@ -786,6 +821,23 @@ impl ViewCore {
             let mut bytes = vec![0; count as usize];
             let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
             bytes.truncate(read);
+            self.immutable_read_files.insert(
+                ino,
+                CachedImmutableReadFile {
+                    file,
+                    attr: ViewNodeAttr {
+                        ino,
+                        kind: ViewNodeKind::File,
+                        mode: if entry.executable {
+                            0o755
+                        } else {
+                            entry.mode & 0o777
+                        },
+                        size: entry.size_bytes,
+                        modified: SystemTime::UNIX_EPOCH,
+                    },
+                },
+            );
             Ok((
                 bytes,
                 offset.saturating_add(read as u64) >= entry.size_bytes,
@@ -931,6 +983,7 @@ impl ViewCore {
         path: &str,
         truncate: bool,
     ) -> std::result::Result<File, i32> {
+        self.invalidate_immutable_reads(path);
         if self.node_kind(path)? == Some(ViewNodeKind::Directory) {
             return Err(EISDIR);
         }
@@ -1044,6 +1097,7 @@ impl ViewCore {
         // TRAIL_FS_PRODUCER: mounted_cow_create CowPublication controlled
         let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
+        self.invalidate_immutable_reads(&path);
         if exclusive && self.node_kind(&path)?.is_some() {
             return Err(EEXIST);
         }
@@ -1198,6 +1252,7 @@ impl ViewCore {
         // TRAIL_FS_PRODUCER: mounted_cow_remove CowPublication controlled
         let barrier = self.begin_qualified_view_mutation()?;
         let path = self.child_path(parent, name)?;
+        self.invalidate_immutable_reads(&path);
         self.enforce_mutation_quota(&path, None, false)?;
         let kind = self.node_kind(&path)?.ok_or(ENOENT)?;
         let ino = self.ensure_ino(&path);
@@ -1496,6 +1551,8 @@ impl ViewCore {
         if old == new {
             return Ok(());
         }
+        self.invalidate_immutable_reads(&old);
+        self.invalidate_immutable_reads(&new);
         self.enforce_mutation_quota(&old, None, false)?;
         let kind = self.node_kind(&old)?.ok_or(ENOENT)?;
         if kind == ViewNodeKind::Directory && new.starts_with(&format!("{old}/")) {
@@ -1597,6 +1654,19 @@ impl ViewCore {
         }
         barrier.validate().map_err(|_| EIO)?;
         Ok(())
+    }
+
+    fn invalidate_immutable_reads(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        let invalidated = self
+            .path_by_ino
+            .iter()
+            .filter(|(_, candidate)| *candidate == path || candidate.starts_with(&prefix))
+            .map(|(ino, _)| *ino)
+            .collect::<Vec<_>>();
+        for ino in invalidated {
+            self.immutable_read_files.remove(&ino);
+        }
     }
 
     /// Returns the checkpoint candidate set without walking the composed view.
@@ -2524,6 +2594,22 @@ mod tests {
         assert!(view.lookup(VIEW_ROOT_INO, "README.md").is_err());
         let reopened = core(&db, &root, upper);
         assert!(reopened.is_whiteouted("README.md"));
+    }
+
+    #[test]
+    fn immutable_read_cache_is_invalidated_before_copy_up() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper);
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+
+        assert_eq!(view.read(readme, 0, 9).unwrap().0, b"baseline\n");
+        assert!(view.immutable_read_files.contains_key(&readme));
+        assert_eq!(view.immutable_read_attr(readme).unwrap().size, 9);
+
+        view.write(readme, 0, b"changed\n").unwrap();
+        assert!(!view.immutable_read_files.contains_key(&readme));
+        assert!(view.immutable_read_attr(readme).is_none());
+        assert_eq!(view.read(readme, 0, 9).unwrap().0, b"changed\n\n");
     }
 
     #[test]

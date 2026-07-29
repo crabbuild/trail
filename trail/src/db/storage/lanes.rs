@@ -132,7 +132,9 @@ impl Trail {
         after_change: Option<&ChangeId>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE lane_turns SET status = ?1, after_change = ?2 WHERE turn_id = ?3",
+            "UPDATE lane_turns
+             SET status = ?1, after_change = ?2
+             WHERE turn_id = ?3 AND ended_at IS NULL",
             params![
                 status,
                 after_change.map(|change_id| change_id.0.clone()),

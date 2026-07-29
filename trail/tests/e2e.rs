@@ -1276,6 +1276,39 @@ fn agent_apply_reports_one_tracked_status_query() {
 }
 
 #[test]
+fn agent_git_handoff_http_routes_mark_reviewed_and_preview_apply() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let reviewed = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/agents/apply-bot/reviewed",
+            serde_json::json!({"note": "daemon review"}),
+        ),
+    );
+    assert_eq!(reviewed.status, 200);
+    let reviewed: serde_json::Value = reviewed.body_json().unwrap();
+    assert_eq!(reviewed["marker"]["note"], "daemon review");
+
+    let applied = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/agents/apply-bot/apply",
+            serde_json::json!({"dry_run": true}),
+        ),
+    );
+    assert_eq!(applied.status, 200);
+    let applied: serde_json::Value = applied.body_json().unwrap();
+    assert_eq!(applied["status"], "ready");
+    assert_eq!(applied["dry_run"], true);
+}
+
+#[test]
 fn agent_apply_actual_reports_mapped_delta_metrics() {
     if !git_available() {
         return;
@@ -1639,6 +1672,39 @@ fn repair_initialization_cli_is_idempotent() {
     assert_eq!(repaired["initialization_id"], spawned["initialization_id"]);
     assert_eq!(repaired["phase"], "observer_ready");
     assert_eq!(repaired["resumed"], true);
+}
+
+#[test]
+fn materialized_lane_cli_only_reports_resumed_for_a_replayed_request() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let first = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "materialized-resume",
+            "--workdir-mode",
+            "portable-copy",
+        ],
+    );
+    let replay = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "materialized-resume",
+            "--workdir-mode",
+            "portable-copy",
+        ],
+    );
+
+    assert_eq!(first["resumed"], false);
+    assert_eq!(replay["resumed"], true);
+    assert_eq!(replay["initialization_id"], first["initialization_id"]);
+    assert_eq!(replay["request_fingerprint"], first["request_fingerprint"]);
 }
 
 fn make_current_branch_root_legacy(workspace: &Path) -> ObjectId {
@@ -2330,7 +2396,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 20
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 21
         }));
     }
 
@@ -2400,6 +2466,72 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         .unwrap();
     assert_eq!(pending.status, "warning");
     assert_eq!(pending.details.as_ref().unwrap()["count"], 1);
+}
+
+#[test]
+fn doctor_treats_removed_lane_tombstones_as_audit_history() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "retired-doctor-bot",
+        Some("main"),
+        LaneWorkdirMode::NativeCow,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    db.remove_lane("retired-doctor-bot", true).unwrap();
+
+    let doctor = db.doctor().unwrap();
+    let lanes = doctor
+        .checks
+        .iter()
+        .find(|check| check.name == "lanes")
+        .unwrap();
+    assert_eq!(lanes.status, "ok");
+}
+
+#[test]
+fn lane_archive_and_unarchive_cli_are_reversible() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    run_trail_json(
+        temp.path(),
+        &["lane", "spawn", "archive-cli", "--workdir-mode", "virtual"],
+    );
+
+    let archived = run_trail_json(temp.path(), &["lane", "archive", "archive-cli"]);
+    assert_eq!(archived["branch"]["status"], "archived");
+    let restored = run_trail_json(temp.path(), &["lane", "unarchive", "archive-cli"]);
+    assert_eq!(restored["branch"]["status"], "active");
+    assert_eq!(restored["record"]["lane_id"], archived["record"]["lane_id"]);
+}
+
+#[test]
+fn lane_purge_cli_requires_exact_removed_lane_id() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let spawned = run_trail_json(
+        temp.path(),
+        &["lane", "spawn", "purge-cli", "--workdir-mode", "virtual"],
+    );
+    run_trail_json(temp.path(), &["lane", "rm", "purge-cli", "--force"]);
+
+    let purged = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "purge",
+            spawned["lane_id"].as_str().unwrap(),
+            "--force",
+        ],
+    );
+    assert_eq!(purged["kind"], "purge");
+    assert_eq!(purged["phase"], "completed");
 }
 
 #[test]
@@ -2523,7 +2655,7 @@ fn trail_refuses_workspaces_with_newer_schema_versions() {
     assert!(matches!(
         err,
         Error::SchemaReinitializeRequired { ref found, .. }
-            if found.contains("found version 999; expected version 20")
+            if found.contains("found version 999; expected version 21")
     ));
 }
 
