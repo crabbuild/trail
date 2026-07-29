@@ -51,7 +51,7 @@ impl Trail {
             .target_ref
             .strip_prefix(MAIN_REF_PREFIX)
             .unwrap_or(&entry.target_ref);
-        self.merge_lane_unlocked(&entry.lane_id, target, false, false)
+        self.merge_lane_unlocked(&entry.lane, target, false, false)
     }
 
     pub(crate) fn lane_merge_queue_entry_dry_run(
@@ -62,7 +62,7 @@ impl Trail {
             .target_ref
             .strip_prefix(MAIN_REF_PREFIX)
             .unwrap_or(&entry.target_ref);
-        self.merge_lane_unlocked(&entry.lane_id, target, true, false)
+        self.merge_lane_unlocked(&entry.lane, target, true, false)
     }
 
     pub(crate) fn lane_merge_queue_entry_by_selector(

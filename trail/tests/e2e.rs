@@ -25377,6 +25377,90 @@ fn lane_merge_queue_runs_lane_branch_into_main() {
 }
 
 #[test]
+fn lane_merge_queue_preserves_environment_gate_qualification() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"queue-environment\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("src/lib.rs"), "pub fn qualified() {}\n").unwrap();
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "cargo generate-lockfile failed: {}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
+    } else {
+        LaneWorkdirMode::FuseCow
+    };
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "environment-bot",
+        Some("main"),
+        mode,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    let edit = db
+        .exec_lane_workspace(
+            "environment-bot",
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p docs && printf 'qualified\\n' > docs/environment.md".to_string(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(edit.exit_code, 0);
+
+    let gate = db
+        .run_lane_test(
+            "environment-bot",
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "test -f Cargo.lock".to_string(),
+            ],
+            None,
+            30,
+        )
+        .unwrap();
+    assert!(gate.success);
+    assert!(!gate.environment_keys.is_empty());
+    assert!(db.lane_readiness("environment-bot").unwrap().ready);
+
+    let queued = db.enqueue_lane_merge("environment-bot", "main", 0).unwrap();
+    let explain = db.explain_lane_merge_queue(&queued.entry.queue_id).unwrap();
+    assert!(
+        explain.blockers.is_empty(),
+        "queue explain lost the lane's environment qualification: {:?}",
+        explain.blockers
+    );
+
+    let run = db.run_lane_merge_queue(None).unwrap();
+    assert_eq!(run.processed.len(), 1);
+    assert_eq!(run.processed[0].status, "merged");
+    assert!(!run.stopped_on_failure);
+}
+
+#[test]
 fn lane_merge_queue_rejects_branch_sources() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();

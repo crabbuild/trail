@@ -2097,6 +2097,25 @@ mod macos {
                 fs::read_to_string(target_a.join("lane-a-private")).unwrap(),
                 "lane-a\n"
             );
+            let repeated_lane_a = db
+                .exec_lane_workspace(
+                    "rust-nfs-a",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "test \"$(cat target/lane-a-private)\" = lane-a".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                repeated_lane_a.exit_code, 0,
+                "a repeated managed execution must preserve the lane-private target upper"
+            );
+            assert!(repeated_lane_a
+                .lifecycle
+                .phases
+                .iter()
+                .any(|phase| { phase.phase == "sync_all" && phase.status == "skipped" }));
 
             let layer = db
                 .sync_workspace_environment("rust-nfs-b", "cargo", None)
