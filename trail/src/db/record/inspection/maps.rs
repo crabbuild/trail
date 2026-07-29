@@ -15,10 +15,16 @@ impl Trail {
             .transpose()?
             .unwrap_or_default();
         let end_bytes = end.map(parse_map_key_spec).transpose()?;
-        let tree = tree_from_root_hex(Some(map_id))?;
-        let iter = self
-            .prolly
-            .range(&tree, &start_bytes, end_bytes.as_deref())?;
+        let (prolly, tree) = match map_type {
+            MapInspectType::Path | MapInspectType::FileIndex => (
+                &self.root_prolly,
+                root_map_tree_from_root_hex(Some(map_id))?,
+            ),
+            MapInspectType::Raw | MapInspectType::TextOrder | MapInspectType::LineIndex => {
+                (&self.prolly, tree_from_root_hex(Some(map_id))?)
+            }
+        };
+        let iter = prolly.range(&tree, &start_bytes, end_bytes.as_deref())?;
         let mut entries = Vec::new();
         let mut truncated = false;
         for item in iter {
@@ -57,11 +63,19 @@ impl Trail {
             .transpose()?
             .unwrap_or_default();
         let end_bytes = end.map(parse_map_key_spec).transpose()?;
-        let left = tree_from_root_hex(Some(left_map_id))?;
-        let right = tree_from_root_hex(Some(right_map_id))?;
-        let diffs = self
-            .prolly
-            .range_diff(&left, &right, &start_bytes, end_bytes.as_deref())?;
+        let (prolly, left, right) = match map_type {
+            MapInspectType::Path | MapInspectType::FileIndex => (
+                &self.root_prolly,
+                root_map_tree_from_root_hex(Some(left_map_id))?,
+                root_map_tree_from_root_hex(Some(right_map_id))?,
+            ),
+            MapInspectType::Raw | MapInspectType::TextOrder | MapInspectType::LineIndex => (
+                &self.prolly,
+                tree_from_root_hex(Some(left_map_id))?,
+                tree_from_root_hex(Some(right_map_id))?,
+            ),
+        };
+        let diffs = prolly.range_diff(&left, &right, &start_bytes, end_bytes.as_deref())?;
         let mut changes = Vec::new();
         let mut truncated = false;
         for diff in diffs {

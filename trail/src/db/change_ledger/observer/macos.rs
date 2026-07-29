@@ -1393,7 +1393,16 @@ impl MacOsFseventsObserver {
         Ok(issued.clone())
     }
 
-    fn shutdown_inner(&self) -> Result<()> {
+    pub(crate) fn shutdown(&self) -> Result<()> {
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        if workers.is_empty() {
+            return Ok(());
+        }
         self.shared.shutdown.store(true, Ordering::Release);
         let _ = self.commands.try_send(DurabilityCommand::Shutdown);
         unsafe {
@@ -1401,12 +1410,6 @@ impl MacOsFseventsObserver {
                 self.stream.run_loop as fs_events::core_foundation::CFRunLoopRef,
             );
         }
-        let workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
-        );
         let deadline = Instant::now() + FENCE_TIMEOUT;
         let mut failure = None;
         for worker in workers {
@@ -1640,7 +1643,7 @@ impl MacOsFseventsObserver {
 
 impl Drop for MacOsFseventsObserver {
     fn drop(&mut self) {
-        let _ = self.shutdown_inner();
+        let _ = self.shutdown();
     }
 }
 

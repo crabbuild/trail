@@ -14,7 +14,7 @@ use crate::{Error, Result};
 pub(crate) const ACP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_PUMP_DRAIN_TIMEOUT: Duration = ACP_SHUTDOWN_TIMEOUT;
-const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum RelayFinishReason {

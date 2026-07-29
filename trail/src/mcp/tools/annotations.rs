@@ -206,6 +206,8 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.lane_claim"
         | "trail.lane_checkpoint"
         | "trail.lane_update"
+        | "trail.lane_archive"
+        | "trail.lane_unarchive"
         | "trail.lane_mount"
         | "trail.lane_merge_queue_add"
         | "trail.begin_turn"
@@ -215,6 +217,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.span_end"
         | "trail.end_turn" => Some(ToolRiskClass::Write),
         "trail.lane_remove"
+        | "trail.lane_purge"
         | "trail.agent_apply"
         | "trail.agent_finish"
         | "trail.agent_rewind"

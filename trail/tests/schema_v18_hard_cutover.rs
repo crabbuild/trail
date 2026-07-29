@@ -353,18 +353,18 @@ fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
         trail::Error::SchemaReinitializeRequired { found, guidance } => {
             assert_eq!(
                 found,
-                "database corrupt: found version 17; expected version 20"
+                "database corrupt: found version 17; expected version 21"
             );
             assert_eq!(
                 guidance,
-                "back up this workspace, then run `trail init --force` to create schema v20"
+                "back up this workspace, then run `trail init --force` to create schema v21"
             );
         }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(
         err.to_string(),
-        "workspace schema database corrupt: found version 17; expected version 20 cannot be opened; back up this workspace, then run `trail init --force` to create schema v20"
+        "workspace schema database corrupt: found version 17; expected version 21 cannot be opened; back up this workspace, then run `trail init --force` to create schema v21"
     );
     assert_tree_unchanged(&fixture, &before);
 }
@@ -450,7 +450,7 @@ fn partial_v18_is_rejected_without_repair() {
 }
 
 #[test]
-fn schema_v18_migrates_to_v20_and_unsupported_versions_are_rejected() {
+fn schema_v18_migrates_to_v21_and_unsupported_versions_are_rejected() {
     let predecessor = SchemaFixture::predecessor_v18();
     Trail::open(predecessor.root()).unwrap();
     assert_eq!(
@@ -458,10 +458,10 @@ fn schema_v18_migrates_to_v20_and_unsupported_versions_are_rejected() {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        20
+        21
     );
 
-    for version in [0, 17, 21] {
+    for version in [0, 17, 22] {
         let fixture = SchemaFixture::versioned(version);
         let before = fixture.snapshot_tree_bytes();
         let err = open_error(fixture.root());
@@ -472,17 +472,17 @@ fn schema_v18_migrates_to_v20_and_unsupported_versions_are_rejected() {
 }
 
 #[test]
-fn fresh_init_creates_the_exact_v20_ledger_shape() {
+fn fresh_init_creates_the_exact_v21_ledger_shape() {
     let fixture = SchemaFixture::fresh_v18();
     let conn = Connection::open(fixture.sqlite_path()).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        20
+        21
     );
 
     let metadata = [
-        ("schema.version", "20"),
+        ("schema.version", "21"),
         ("changed_path.observer_log_format_min", "1"),
         ("changed_path.observer_log_format_max", "1"),
     ];

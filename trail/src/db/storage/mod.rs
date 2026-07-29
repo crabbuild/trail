@@ -33,12 +33,15 @@ pub(crate) use git::{
 #[cfg(any(test, debug_assertions))]
 pub(crate) use schema::{
     clear_schema_v19_migration_failure, clear_schema_v20_migration_failure,
-    create_schema_v18_fixture_for_test, install_schema_v19_migration_failure,
-    install_schema_v20_migration_failure, SchemaV19MigrationBoundary, SchemaV20MigrationBoundary,
+    clear_schema_v21_migration_failure, create_schema_v18_fixture_for_test,
+    create_schema_v20_fixture_for_test, install_schema_v19_migration_failure,
+    install_schema_v20_migration_failure, install_schema_v21_migration_failure,
+    SchemaV19MigrationBoundary, SchemaV20MigrationBoundary, SchemaV21MigrationBoundary,
 };
 pub(crate) use schema::{
-    migrate_schema_v18_to_v19, migrate_schema_v19_to_v20, validate_prolly_sqlite_schema_v18,
-    validate_schema_v18_for_migration, validate_schema_v19_for_migration, validate_schema_v20,
+    migrate_schema_v18_to_v19, migrate_schema_v19_to_v20, migrate_schema_v20_to_v21,
+    validate_prolly_sqlite_schema_v18, validate_schema_v18_for_migration,
+    validate_schema_v19_for_migration, validate_schema_v20_for_migration, validate_schema_v21,
 };
 pub(crate) use worktree_index::{
     file_kind_from_index, PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile,

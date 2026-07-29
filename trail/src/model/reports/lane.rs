@@ -727,7 +727,7 @@ pub struct WorkspaceMountReport {
     pub healthy: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceExecReport {
     pub view_id: String,
     pub lane_id: String,
@@ -737,6 +737,35 @@ pub struct WorkspaceExecReport {
     pub backend: String,
     pub command: Vec<String>,
     pub exit_code: i32,
+    pub lifecycle: ManagedExecutionLifecycleReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionPhaseReceipt {
+    pub phase: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManagedExecutionLifecycleReport {
+    pub execution_id: String,
+    pub surface: String,
+    pub command_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<WorkspaceCheckpointReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposal_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<LaneRecordReport>,
+    pub phases: Vec<ManagedExecutionPhaseReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1015,6 +1044,7 @@ pub struct LaneTestReport {
     pub stderr_truncated: bool,
     pub started_event_id: String,
     pub finished_event_id: String,
+    pub lifecycle: ManagedExecutionLifecycleReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

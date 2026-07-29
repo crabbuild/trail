@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use trail::Actor;
-use trail::{InitImportMode, Trail};
+use trail::{InitImportMode, LaneWorkdirMode, Trail};
 
 static ACTIVATION_STATE: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -51,15 +51,15 @@ fn authority_requires_every_checked_gate_and_supported_platform() {
     }
     assert_eq!(
         complete["producer_inventory_sha256"],
-        "a13fa0330d89ad442a4f796a5fd37b55177ab4fdf7805354925b99fc18199d0e"
+        "af2cca0566976a6d6f6cea00e99fe5089c91e357ca1d0a50fd5397edcda32833"
     );
     assert_eq!(
         complete["raw_mutation_inventory_sha256"],
-        "fcd05a2e4a79571a7e61e09f190db73b021aa5741177bce51e40e1d95c95cafd"
+        "518bf5bd912aac5274da496c154e3d3500aef0a831fa6c88cd976ec2bd6c1676"
     );
     assert_eq!(
         complete["activation_audit_sha256"],
-        "523350cb7a2dcc1404acb5703991d687bf92f4954b745cb043e9e6afc071f315"
+        "24922f50f884ab18efc7c0fe8045c446dc24a70f1c63e2ea7feecdf0a460cb42"
     );
     assert!(!trail::test_support::changed_path_authority_enabled_for("windows").unwrap());
     assert!(!trail::test_support::changed_path_authority_enabled_for("freebsd").unwrap());
@@ -219,6 +219,54 @@ fn activated_non_git_workspace_uses_ledger_without_git_qualification() {
         .changed_paths
         .iter()
         .any(|path| path.path == "tracked.txt"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn authoritative_materialized_lane_can_preview_and_run_a_queued_merge_after_recording() {
+    let _guard = serial();
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("tracked.txt"), b"base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "merge-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    let workdir = spawned.workdir.unwrap();
+
+    trail::test_support::set_changed_path_authority_override(true);
+    let result = (|| {
+        db.lane_status("merge-bot")?;
+        fs::write(Path::new(&workdir).join("tracked.txt"), b"lane edit\n")?;
+        db.record_lane_workdir("merge-bot", Some("record lane edit".into()))?;
+        db.agent_mark_reviewed("merge-bot", Some("review recorded edit".into()))?;
+
+        let preview = db.merge_lane_user_with_options("merge-bot", "main", true, false)?;
+        let queued = db.enqueue_lane_merge("merge-bot", "main", 0)?;
+        let explain = db.explain_lane_merge_queue(&queued.entry.queue_id)?;
+        let run = db.run_lane_merge_queue(None)?;
+        let removed = db.remove_lane("merge-bot", false)?;
+        let fsck = db.fsck()?;
+        Ok::<_, trail::Error>((preview, explain, run, removed, fsck))
+    })();
+    trail::test_support::set_changed_path_authority_override(false);
+
+    let (preview, explain, run, removed, fsck) = result.unwrap();
+    assert_eq!(preview.changed_paths.len(), 1);
+    assert!(explain.blockers.is_empty());
+    assert_eq!(run.processed.len(), 1);
+    assert_eq!(run.processed[0].status, "merged");
+    assert_eq!(removed.lane_id, run.processed[0].lane_id);
+    assert!(fsck.errors.is_empty());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

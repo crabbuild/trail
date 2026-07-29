@@ -47,10 +47,148 @@ impl Trail {
         let suite = options.suite.clone();
         let score = options.score;
         let threshold = options.threshold;
-        if self.lane_workspace_view(lane)?.is_some() {
-            self.refresh_workspace_environment_staleness(lane)?;
-        }
+        let surface = if kind == "test" {
+            "lane_test"
+        } else {
+            "lane_eval"
+        };
+        let mut managed = self.prepare_managed_lane_execution(lane, surface, &command)?;
 
+        let setup = (|| -> Result<_> {
+            let (
+                lane_id,
+                session_id,
+                workdir,
+                turn_id,
+                head_change,
+                source_root,
+                _workdir_mode,
+                view,
+                environment_keys,
+                layer_ids,
+                started_event_id,
+            ) = {
+                let _lock = self.acquire_write_lock()?;
+                let branch = self.lane_branch(lane)?;
+                let lane_record = self.lane_record(&branch.lane_id)?;
+                let workdir_mode = self.lane_workdir_mode_for(&lane_record, &branch)?;
+                let Some(workdir) = branch.workdir.clone() else {
+                    return Err(Error::InvalidInput(format!(
+                        "lane `{lane}` does not have a materialized workdir"
+                    )));
+                };
+                let workdir_path = PathBuf::from(&workdir);
+                if !workdir_path.is_dir() {
+                    return Err(Error::WorkspaceNotFound(workdir_path));
+                }
+                let head = self.get_ref(&branch.ref_name)?;
+                let view = self.lane_workspace_view(lane)?;
+                let environments = if view.is_some() {
+                    self.workspace_environment_status(lane)?
+                } else {
+                    Vec::new()
+                };
+                if let Some(environment) = environments
+                    .iter()
+                    .find(|environment| environment.status != "ready")
+                {
+                    return Err(Error::InvalidInput(format!(
+                    "lane `{lane}` dependency environment `{}` is {}; run `trail deps sync {lane}` before validation",
+                    environment.adapter, environment.status
+                )));
+                }
+                let environment_keys = environments
+                    .iter()
+                    .map(|environment| environment.expected_key.clone())
+                    .collect::<Vec<_>>();
+                let layer_ids = if let Some(view) = &view {
+                    self.workspace_layer_bindings_for_source_upper(Path::new(&view.source_upper))?
+                        .into_iter()
+                        .filter_map(|binding| binding.layer_id)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let (turn_id, session_id) = if let Some(turn_id) = turn_id {
+                    let turn = self.lane_turn(turn_id)?;
+                    if turn.lane_id != branch.lane_id {
+                        return Err(Error::InvalidInput(format!(
+                            "turn `{turn_id}` does not belong to lane `{lane}`"
+                        )));
+                    }
+                    if turn.ended_at.is_some() {
+                        return Err(Error::InvalidInput(format!(
+                            "turn `{turn_id}` is already ended"
+                        )));
+                    }
+                    (turn.turn_id, turn.session_id)
+                } else {
+                    let turn_id = self.open_lane_turn(
+                        &branch.lane_id,
+                        branch.session_id.as_deref(),
+                        &branch.base_change,
+                        &head.change_id,
+                        Some(&serde_json::json!({
+                            "kind": run_kind,
+                            "command": command.clone(),
+                            "suite": suite.clone(),
+                            "score": score,
+                            "threshold": threshold
+                        })),
+                    )?;
+                    (turn_id, branch.session_id.clone())
+                };
+                let started_event_id = self.insert_lane_event_with_context(
+                    &branch.lane_id,
+                    session_id.as_deref(),
+                    Some(&turn_id),
+                    started_event_type,
+                    Some(&head.change_id),
+                    None,
+                    &serde_json::json!({
+                        "kind": kind,
+                        "command": command.clone(),
+                        "suite": suite.clone(),
+                        "score": score,
+                        "threshold": threshold,
+                        "workdir": workdir.clone(),
+                        "timeout_secs": timeout_secs,
+                        "head_change": head.change_id.0.clone(),
+                        "source_root": head.root_id.0.clone(),
+                        "view_id": view.as_ref().map(|view| view.view_id.as_str()),
+                        "view_generation": view.as_ref().map(|view| view.generation),
+                        "environment_keys": environment_keys.clone(),
+                        "layer_ids": layer_ids.clone()
+                    }),
+                )?;
+                (
+                    branch.lane_id,
+                    session_id,
+                    workdir,
+                    turn_id,
+                    head.change_id,
+                    head.root_id,
+                    workdir_mode,
+                    view,
+                    environment_keys,
+                    layer_ids,
+                    started_event_id,
+                )
+            };
+            Ok((
+                lane_id,
+                session_id,
+                workdir,
+                turn_id,
+                head_change,
+                source_root,
+                _workdir_mode,
+                view,
+                environment_keys,
+                layer_ids,
+                started_event_id,
+            ))
+        })();
         let (
             lane_id,
             session_id,
@@ -58,151 +196,88 @@ impl Trail {
             turn_id,
             head_change,
             source_root,
-            workdir_mode,
+            _workdir_mode,
             view,
             environment_keys,
             layer_ids,
             started_event_id,
-        ) = {
-            let _lock = self.acquire_write_lock()?;
-            let branch = self.lane_branch(lane)?;
-            let lane_record = self.lane_record(&branch.lane_id)?;
-            let workdir_mode = self.lane_workdir_mode_for(&lane_record, &branch)?;
-            let Some(workdir) = branch.workdir.clone() else {
-                return Err(Error::InvalidInput(format!(
-                    "lane `{lane}` does not have a materialized workdir"
-                )));
-            };
-            let workdir_path = PathBuf::from(&workdir);
-            if !workdir_path.is_dir() {
-                return Err(Error::WorkspaceNotFound(workdir_path));
-            }
-            let head = self.get_ref(&branch.ref_name)?;
-            let view = self.lane_workspace_view(lane)?;
-            let environments = if view.is_some() {
-                self.workspace_environment_status(lane)?
-            } else {
-                Vec::new()
-            };
-            if let Some(environment) = environments
-                .iter()
-                .find(|environment| environment.status != "ready")
-            {
-                return Err(Error::InvalidInput(format!(
-                    "lane `{lane}` dependency environment `{}` is {}; run `trail deps sync {lane}` before validation",
-                    environment.adapter, environment.status
-                )));
-            }
-            let environment_keys = environments
-                .iter()
-                .map(|environment| environment.expected_key.clone())
-                .collect::<Vec<_>>();
-            let layer_ids = if let Some(view) = &view {
-                self.workspace_layer_bindings_for_source_upper(Path::new(&view.source_upper))?
-                    .into_iter()
-                    .filter_map(|binding| binding.layer_id)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let (turn_id, session_id) = if let Some(turn_id) = turn_id {
-                let turn = self.lane_turn(turn_id)?;
-                if turn.lane_id != branch.lane_id {
-                    return Err(Error::InvalidInput(format!(
-                        "turn `{turn_id}` does not belong to lane `{lane}`"
-                    )));
-                }
-                if turn.ended_at.is_some() {
-                    return Err(Error::InvalidInput(format!(
-                        "turn `{turn_id}` is already ended"
-                    )));
-                }
-                (turn.turn_id, turn.session_id)
-            } else {
-                let turn_id = self.open_lane_turn(
-                    &branch.lane_id,
-                    branch.session_id.as_deref(),
-                    &branch.base_change,
-                    &head.change_id,
-                    Some(&serde_json::json!({
-                        "kind": run_kind,
-                        "command": command.clone(),
-                        "suite": suite.clone(),
-                        "score": score,
-                        "threshold": threshold
-                    })),
+        ) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                self.mark_managed_lane_execution_command(
+                    &mut managed,
+                    "failed",
+                    Some(&format!("managed lane {kind} setup failed: {error}")),
+                    None,
                 )?;
-                (turn_id, branch.session_id.clone())
-            };
-            let started_event_id = self.insert_lane_event_with_context(
-                &branch.lane_id,
-                session_id.as_deref(),
-                Some(&turn_id),
-                started_event_type,
-                Some(&head.change_id),
-                None,
-                &serde_json::json!({
-                    "kind": kind,
-                    "command": command.clone(),
-                    "suite": suite.clone(),
-                    "score": score,
-                    "threshold": threshold,
-                    "workdir": workdir.clone(),
-                    "timeout_secs": timeout_secs,
-                    "head_change": head.change_id.0.clone(),
-                    "source_root": head.root_id.0.clone(),
-                    "view_id": view.as_ref().map(|view| view.view_id.as_str()),
-                    "view_generation": view.as_ref().map(|view| view.generation),
-                    "environment_keys": environment_keys.clone(),
-                    "layer_ids": layer_ids.clone()
-                }),
-            )?;
-            (
-                branch.lane_id,
-                session_id,
-                workdir,
-                turn_id,
-                head.change_id,
-                head.root_id,
-                workdir_mode,
-                view,
-                environment_keys,
-                layer_ids,
-                started_event_id,
-            )
+                let lifecycle = self.finalize_managed_lane_execution(
+                    managed,
+                    Some(format!("Managed lane {kind} failed-setup checkpoint")),
+                );
+                let cleanup = [
+                    lifecycle.checkpoint_error.as_deref(),
+                    lifecycle.disposal_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if cleanup.is_empty() {
+                    return Err(error);
+                }
+                return Err(Error::Corrupt(format!(
+                    "{error}; managed finalization also failed: {}",
+                    cleanup.join("; ")
+                )));
+            }
         };
 
-        let fuse_mount = if workdir_mode == LaneWorkdirMode::FuseCow {
-            Some(self.mount_fuse_cow_workdir_for_lane(lane)?)
-        } else {
-            None
-        };
-        let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
-            Some(self.mount_nfs_cow_workdir_for_lane(lane)?)
-        } else {
-            None
-        };
-        #[cfg(target_os = "windows")]
-        let dokan_mount = if workdir_mode == LaneWorkdirMode::DokanCow {
-            Some(self.mount_dokan_cow_workdir_for_lane(lane)?)
-        } else {
-            None
-        };
-        let environment = view
-            .as_ref()
-            .map(|view| self.workspace_command_environment(view, &source_root))
-            .transpose()?
-            .unwrap_or_default();
-        let run = run_command_with_timeout_env(
+        let environment = managed.environment.clone();
+        let run = match run_command_with_timeout_env(
             &command,
-            Path::new(&workdir),
+            &managed.workdir,
             Duration::from_secs(timeout_secs),
             &environment,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                self.mark_managed_lane_execution_command(
+                    &mut managed,
+                    "failed",
+                    Some(&error.to_string()),
+                    None,
+                )?;
+                let lifecycle = self.finalize_managed_lane_execution(
+                    managed,
+                    Some(format!("Managed lane {kind} failed-launch checkpoint")),
+                );
+                let cleanup = [
+                    lifecycle.checkpoint_error.as_deref(),
+                    lifecycle.disposal_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if cleanup.is_empty() {
+                    return Err(error);
+                }
+                return Err(Error::Corrupt(format!(
+                    "{error}; managed finalization also failed: {}",
+                    cleanup.join("; ")
+                )));
+            }
+        };
+        let execution_error = (!run.success && run.exit_code.is_none())
+            .then(|| String::from_utf8_lossy(&run.stderr).trim().to_string());
+        self.mark_managed_lane_execution_command(
+            &mut managed,
+            if run.success { "succeeded" } else { "failed" },
+            execution_error.as_deref(),
+            run.exit_code,
         )?;
-        drop(nfs_mount);
-        drop(fuse_mount);
-        #[cfg(target_os = "windows")]
-        drop(dokan_mount);
+        let lifecycle = self.finalize_managed_lane_execution(
+            managed,
+            Some(format!("Managed lane {kind} checkpoint")),
+        );
         let threshold_met = score
             .zip(threshold)
             .map(|(score, threshold)| score >= threshold);
@@ -295,6 +370,7 @@ impl Trail {
             stderr_truncated,
             started_event_id,
             finished_event_id,
+            lifecycle,
         })
     }
 }

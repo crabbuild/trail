@@ -21,6 +21,14 @@ use crate::{Error, Result, Trail};
 
 pub(crate) const ACP_CAPTURE_QUEUE_CAPACITY: usize = 4_096;
 const CAPTURE_MESSAGE_LIMIT: usize = 512 * 1024;
+// Projection runs off the protocol-forwarding path, so it can use the same
+// bounded writer admission as inline semantic capture. Shorter deadlines can
+// expire midway through a multi-step prompt finalization and leave durable
+// workdir progress waiting for spill replay.
+#[cfg(not(test))]
+const CAPTURE_PROJECT_LOCK_WAIT: Duration = Duration::from_secs(30);
+// Unit spill/replay tests deliberately hold the writer beyond this boundary.
+#[cfg(test)]
 const CAPTURE_PROJECT_LOCK_WAIT: Duration = Duration::from_millis(250);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);

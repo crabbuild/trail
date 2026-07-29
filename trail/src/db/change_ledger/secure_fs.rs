@@ -198,15 +198,24 @@ impl SecureDirectory {
         use rustix::fs::{fstat, openat, FileType, Mode, OFlags};
 
         validate_leaf(name)?;
-        let file = File::from(
-            openat(
+        let existing_flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let file = match openat(&self.file, Path::new(name), existing_flags, Mode::empty()) {
+            Ok(file) => File::from(file),
+            Err(rustix::io::Errno::NOENT) => match openat(
                 &self.file,
                 Path::new(name),
-                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                existing_flags | OFlags::CREATE | OFlags::EXCL,
                 Mode::from_raw_mode(0o600),
-            )
-            .map_err(|error| Error::Io(error.into()))?,
-        );
+            ) {
+                Ok(file) => File::from(file),
+                Err(rustix::io::Errno::EXIST) => File::from(
+                    openat(&self.file, Path::new(name), existing_flags, Mode::empty())
+                        .map_err(|error| Error::Io(error.into()))?,
+                ),
+                Err(error) => return Err(Error::Io(error.into())),
+            },
+            Err(error) => return Err(Error::Io(error.into())),
+        };
         verify_entry_identity(&self.file, name, &file, false)?;
         let metadata = fstat(&file).map_err(|error| Error::Io(error.into()))?;
         if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile

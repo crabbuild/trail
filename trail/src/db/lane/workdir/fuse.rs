@@ -890,21 +890,49 @@ mod fuse_overlay {
                 .unwrap();
             assert_eq!(first.exit_code, 0);
             let lane_a_head = db.lane_details("rust-seed-a").unwrap().branch.head_change;
-            let checkpoint = db.checkpoint_lane_workspace("rust-seed-a", None).unwrap();
+            let checkpoint = first
+                .lifecycle
+                .checkpoint
+                .as_ref()
+                .expect("managed Cargo execution must emit its checkpoint");
             assert!(checkpoint.source_paths.is_empty());
             assert!(checkpoint.generated_dirty_paths > 0);
             assert_eq!(
                 db.lane_details("rust-seed-a").unwrap().branch.head_change,
                 lane_a_head
             );
+            let generation_a = db
+                .active_environment_generation("rust-seed-a")
+                .unwrap()
+                .expect("managed Cargo execution must activate an environment");
+            let layer_ids_a = generation_a
+                .components
+                .iter()
+                .filter_map(|component| component.layer_id.clone())
+                .collect::<BTreeSet<_>>();
             let view_a = db.lane_workspace_view("rust-seed-a").unwrap().unwrap();
             let target_a = PathBuf::from(&view_a.generated_upper).join("target");
-            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+            let lane_a_private = db
+                .exec_lane_workspace(
+                    "rust-seed-a",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf 'lane-a\\n' > target/lane-a-private".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(lane_a_private.exit_code, 0);
+            assert_eq!(
+                fs::read_to_string(target_a.join("lane-a-private")).unwrap(),
+                "lane-a\n"
+            );
 
             let layer = db
                 .sync_workspace_environment("rust-seed-b", "cargo", None)
                 .unwrap();
             assert_eq!(layer.adapter, "cargo-target-seed");
+            assert!(layer_ids_a.contains(&layer.layer_id));
 
             let second = db
                 .exec_lane_workspace(
@@ -917,12 +945,22 @@ mod fuse_overlay {
                 )
                 .unwrap();
             assert_eq!(second.exit_code, 0);
+            let generation_b = db
+                .active_environment_generation("rust-seed-b")
+                .unwrap()
+                .expect("second managed Cargo execution must activate an environment");
+            assert!(generation_b
+                .components
+                .iter()
+                .filter_map(|component| component.layer_id.as_deref())
+                .any(|layer_id| layer_id == layer.layer_id));
             let view_b = db.lane_workspace_view("rust-seed-b").unwrap().unwrap();
             let target_b = PathBuf::from(&view_b.generated_upper).join("target");
             assert!(
                 !tree_has_name_fragment(&target_b, "libshared_dep"),
                 "the second lane rebuilt a dependency that was available in its immutable target seed"
             );
+            assert!(!target_b.join("lane-a-private").exists());
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),
                 "libshared_dep"
@@ -932,7 +970,10 @@ mod fuse_overlay {
                 .exec_lane_workspace("rust-seed-b", &["cargo".to_string(), "clean".to_string()])
                 .unwrap();
             assert_eq!(clean.exit_code, 0);
-            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+            assert_eq!(
+                fs::read_to_string(target_a.join("lane-a-private")).unwrap(),
+                "lane-a\n"
+            );
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),
                 "libshared_dep"

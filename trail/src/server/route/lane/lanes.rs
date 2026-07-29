@@ -84,6 +84,33 @@ pub(super) fn handle_lane_resources(
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "purge"
+        && request.method == "POST"
+    {
+        reject_unexpected_body(request, "POST /v1/lanes/{lane_id}/purge")?;
+        let report = db.purge_lane(parts[2], query_flag(query, "force"))?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && request.method == "POST"
+        && matches!(parts[3], "archive" | "unarchive")
+    {
+        reject_unexpected_body(request, "POST /v1/lanes/{lane_or_id}/{archive|unarchive}")?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = match parts[3] {
+            "archive" => db.archive_lane(&lane)?,
+            "unarchive" => db.unarchive_lane(&lane)?,
+            _ => unreachable!(),
+        };
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
     if parts.len() == 3 && parts[0] == "v1" && parts[1] == "lanes" {
         let lane = db.resolve_lane_handle(parts[2])?;
         if request.method == "GET" {

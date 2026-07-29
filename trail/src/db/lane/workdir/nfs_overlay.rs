@@ -63,6 +63,9 @@ mod macos {
         }
         async fn getattr(&self, id: fileid3) -> std::result::Result<fattr3, nfsstat3> {
             let mut core = self.core.lock().unwrap();
+            if let Some(attr) = core.immutable_read_attr(id) {
+                return Ok(to_nfs_attr(&attr));
+            }
             let path = core.path_for_ino(id).map_err(nfs_error)?;
             core.attr(&path)
                 .map(|attr| to_nfs_attr(&attr))
@@ -463,16 +466,21 @@ mod macos {
             mounted: false,
             committed: false,
         };
-        // Directory mutations must be visible to the checkpoint scan that runs
-        // immediately after the agent exits. Attribute caching can otherwise
-        // retain a pre-create READDIR result and omit brand-new paths. macOS
-        // also defaults to `nosync`, where a write syscall may return before
-        // this userspace server has received the WRITE RPC. A lane can then be
-        // unmounted and remounted with only the preceding truncate visible.
-        // `sync` makes successful writes an actual durability boundary; the
-        // server itself fsyncs every WRITE before reporting FILE_SYNC.
+        // Checkpointing reads the pinned source upper and authenticated view
+        // journal directly, so it does not depend on an uncached READDIR of
+        // this mount. Retain a short attribute cache: disabling it makes every
+        // repeated parent lookup cross the userspace NFS server and turns
+        // framework builds with thousands of files into multi-minute metadata
+        // walks. Negative-name caching uses the same short lifetime. All live
+        // mutations pass through this one client mount, so CREATE/RENAME
+        // invalidates its own cached directory state; the cache only suppresses
+        // repeated misses from Node-style module resolution. macOS defaults to
+        // `nosync`, where a write syscall may return before this userspace server
+        // has received the WRITE RPC. `sync` keeps successful writes as an
+        // actual durability boundary; the server itself fsyncs every WRITE
+        // before reporting FILE_SYNC.
         let opts = format!(
-            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,noac,actimeo=0,nonegnamecache,nobrowse,port={port},mountport={port}"
+            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,actimeo=1,nobrowse,port={port},mountport={port}"
         );
         let status = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])
@@ -1288,9 +1296,11 @@ mod macos {
             assert_eq!(exec.exit_code, 0);
             let workdir = PathBuf::from(db.lane_workdir("local-exec").unwrap().workdir.unwrap());
             assert!(!is_nfs_mount(&workdir));
-            let checkpoint = db
-                .checkpoint_lane_workspace("local-exec", Some("local".to_string()))
-                .unwrap();
+            let checkpoint = exec
+                .lifecycle
+                .checkpoint
+                .as_ref()
+                .expect("managed lane exec must checkpoint source changes");
             assert_eq!(checkpoint.source_paths, vec!["local.txt"]);
             let built = tempfile::tempdir().unwrap();
             fs::write(built.path().join("tool"), "shared\n").unwrap();
@@ -1330,19 +1340,24 @@ mod macos {
                 .unwrap();
             assert!(gate.success);
             assert_eq!(gate.source_root, checkpoint.root_id);
-            assert_eq!(gate.environment_keys, vec![layer.cache_key.clone()]);
+            assert!(gate.environment_keys.is_empty());
             assert_eq!(gate.layer_ids, vec![layer.layer_id]);
 
-            db.exec_lane_workspace(
-                "local-exec",
-                &[
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf 'newer\\n' > local.txt".to_string(),
-                ],
-            )
-            .unwrap();
-            let newer = db.checkpoint_lane_workspace("local-exec", None).unwrap();
+            let newer_exec = db
+                .exec_lane_workspace(
+                    "local-exec",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf 'newer\\n' > local.txt".to_string(),
+                    ],
+                )
+                .unwrap();
+            let newer = newer_exec
+                .lifecycle
+                .checkpoint
+                .as_ref()
+                .expect("managed lane exec must checkpoint later source changes");
             assert_ne!(newer.root_id, gate.source_root);
             let readiness = db.lane_readiness("local-exec").unwrap();
             assert!(readiness
@@ -1512,7 +1527,8 @@ mod macos {
             let lane_head_before = db.lane_details("node-nfs-a").unwrap().branch.head_change;
             let checkpoint = db.checkpoint_lane_workspace("node-nfs-a", None).unwrap();
             assert!(checkpoint.source_paths.is_empty());
-            assert_eq!(checkpoint.generated_dirty_paths, 0);
+            assert!(checkpoint.generated_dirty_paths > 0);
+            assert_eq!(checkpoint.generated_path_accounting, "journal_interval");
             assert_eq!(
                 db.lane_details("node-nfs-a").unwrap().branch.head_change,
                 lane_head_before
@@ -1541,6 +1557,85 @@ mod macos {
             );
             drop(mount_b);
             drop(remount_a);
+
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "node-nfs-child",
+                Some("node-nfs-a"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let child_view = db.lane_workspace_view("node-nfs-child").unwrap().unwrap();
+            assert_ne!(child_view.source_upper, view_a.source_upper);
+            assert_ne!(child_view.generated_upper, view_a.generated_upper);
+            assert_ne!(child_view.scratch_upper, view_a.scratch_upper);
+            let child_generation = db
+                .active_environment_generation("node-nfs-child")
+                .unwrap()
+                .expect("fork must inherit the active Node generation");
+            assert!(child_generation.components.iter().any(|component| {
+                component.layer_id.as_deref() == Some(first.layer_id.as_str())
+                    && component.mount_path.as_deref() == Some("node_modules")
+            }));
+            let child_mount = db.mount_nfs_cow_workdir_for_lane("node-nfs-child").unwrap();
+            let child_workdir =
+                PathBuf::from(db.lane_workdir("node-nfs-child").unwrap().workdir.unwrap());
+            let child_node = Command::new("node")
+                .args([
+                    "-e",
+                    "const _ = require('lodash'); if (_.chunk([1,2,3], 2).length !== 2) process.exit(2)",
+                ])
+                .current_dir(&child_workdir)
+                .output()
+                .unwrap();
+            assert!(
+                child_node.status.success(),
+                "fork could not consume inherited Node layer: {}",
+                String::from_utf8_lossy(&child_node.stderr)
+            );
+            fs::write(
+                child_workdir.join("node_modules/lodash/lodash.js"),
+                "child-private\n",
+            )
+            .unwrap();
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+            drop(child_mount);
+
+            db.remove_lane("node-nfs-a", true).unwrap();
+            db.remove_lane("node-nfs-b", true).unwrap();
+            let shared_gc = db.workspace_cache_gc(true, Some(0)).unwrap();
+            assert!(!shared_gc
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == first.layer_id));
+            assert!(Path::new(&child_view.generated_upper)
+                .join("node_modules/lodash/lodash.js")
+                .is_file());
+
+            db.remove_lane("node-nfs-child", true).unwrap();
+            for private_path in [
+                &child_view.source_upper,
+                &child_view.generated_upper,
+                &child_view.scratch_upper,
+                &child_view.meta_dir,
+            ] {
+                assert!(!Path::new(private_path).exists());
+            }
+            let collectable_gc = db.workspace_cache_gc(true, Some(0)).unwrap();
+            assert!(collectable_gc
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == first.layer_id));
+            let collected_gc = db.workspace_cache_gc(false, Some(0)).unwrap();
+            assert!(collected_gc
+                .deleted
+                .iter()
+                .any(|candidate| candidate.id == first.layer_id));
+            assert!(!Path::new(&first.storage_path).exists());
         }
 
         struct NfsFrameworkFixture<'a> {
@@ -1609,8 +1704,8 @@ mod macos {
                     bin: "next",
                     build_args: &["build"],
                     build_mode: "turbopack",
-                    build_timeout_secs: 120,
-                    require_build_success: false,
+                    build_timeout_secs: 300,
+                    require_build_success: true,
                     build_output: ".next/BUILD_ID",
                     min_layer_entries: 2_000,
                 },
@@ -1965,21 +2060,49 @@ mod macos {
                 .unwrap();
             assert_eq!(first.exit_code, 0);
             let lane_a_head = db.lane_details("rust-nfs-a").unwrap().branch.head_change;
-            let checkpoint = db.checkpoint_lane_workspace("rust-nfs-a", None).unwrap();
+            let checkpoint = first
+                .lifecycle
+                .checkpoint
+                .as_ref()
+                .expect("managed Cargo execution must emit its checkpoint");
             assert!(checkpoint.source_paths.is_empty());
             assert!(checkpoint.generated_dirty_paths > 0);
             assert_eq!(
                 db.lane_details("rust-nfs-a").unwrap().branch.head_change,
                 lane_a_head
             );
+            let generation_a = db
+                .active_environment_generation("rust-nfs-a")
+                .unwrap()
+                .expect("managed Cargo execution must activate an environment");
+            let layer_ids_a = generation_a
+                .components
+                .iter()
+                .filter_map(|component| component.layer_id.clone())
+                .collect::<BTreeSet<_>>();
             let view_a = db.lane_workspace_view("rust-nfs-a").unwrap().unwrap();
             let target_a = PathBuf::from(&view_a.generated_upper).join("target");
-            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+            let lane_a_private = db
+                .exec_lane_workspace(
+                    "rust-nfs-a",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf 'lane-a\\n' > target/lane-a-private".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(lane_a_private.exit_code, 0);
+            assert_eq!(
+                fs::read_to_string(target_a.join("lane-a-private")).unwrap(),
+                "lane-a\n"
+            );
 
             let layer = db
                 .sync_workspace_environment("rust-nfs-b", "cargo", None)
                 .unwrap();
             assert_eq!(layer.adapter, "cargo-target-seed");
+            assert!(layer_ids_a.contains(&layer.layer_id));
 
             let second = db
                 .exec_lane_workspace(
@@ -1992,12 +2115,22 @@ mod macos {
                 )
                 .unwrap();
             assert_eq!(second.exit_code, 0);
+            let generation_b = db
+                .active_environment_generation("rust-nfs-b")
+                .unwrap()
+                .expect("second managed Cargo execution must activate an environment");
+            assert!(generation_b
+                .components
+                .iter()
+                .filter_map(|component| component.layer_id.as_deref())
+                .any(|layer_id| layer_id == layer.layer_id));
             let view_b = db.lane_workspace_view("rust-nfs-b").unwrap().unwrap();
             let target_b = PathBuf::from(&view_b.generated_upper).join("target");
             assert!(
                 !tree_has_name_fragment(&target_b, "libshared_dep"),
                 "the second NFS lane rebuilt a dependency present in its immutable target seed"
             );
+            assert!(!target_b.join("lane-a-private").exists());
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),
                 "libshared_dep"
@@ -2007,7 +2140,10 @@ mod macos {
                 .exec_lane_workspace("rust-nfs-b", &["cargo".to_string(), "clean".to_string()])
                 .unwrap();
             assert_eq!(clean.exit_code, 0);
-            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+            assert_eq!(
+                fs::read_to_string(target_a.join("lane-a-private")).unwrap(),
+                "lane-a\n"
+            );
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),
                 "libshared_dep"

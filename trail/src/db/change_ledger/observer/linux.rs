@@ -791,7 +791,7 @@ impl LinuxInotifyObserver {
         }
     }
 
-    fn shutdown_inner(&self) -> Result<()> {
+    pub(crate) fn shutdown(&self) -> Result<()> {
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.changed.notify_all();
         let workers = std::mem::take(
@@ -1056,7 +1056,7 @@ impl LinuxInotifyObserver {
 
 impl Drop for LinuxInotifyObserver {
     fn drop(&mut self) {
-        let _ = self.shutdown_inner();
+        let _ = self.shutdown();
     }
 }
 

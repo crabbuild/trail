@@ -351,7 +351,11 @@ impl Trail {
         into: &str,
         dry_run: bool,
     ) -> Result<MergeReport> {
-        let _lock = self.acquire_write_lock()?;
+        let _lock = if crate::db::change_ledger::command_authority_enabled() {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         self.merge_lane_unlocked(lane, into, dry_run, true)
     }
 
@@ -362,7 +366,11 @@ impl Trail {
         dry_run: bool,
         direct: bool,
     ) -> Result<MergeReport> {
-        let _lock = self.acquire_write_lock()?;
+        let _lock = if crate::db::change_ledger::command_authority_enabled() {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
         self.ensure_direct_lane_merge_allowed(lane, into, dry_run, direct)?;
         self.merge_lane_unlocked(lane, into, dry_run, true)
     }

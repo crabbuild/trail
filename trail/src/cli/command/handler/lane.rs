@@ -39,9 +39,11 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.include_neighbors,
             )?;
             let report = if report.workdir.is_some() && !report.workdir_mode.is_transparent_cow() {
+                let initial_resumed = report.resumed;
                 drop(db);
                 let mut reopened = open_db(ctx)?;
-                let report = reopened.resume_deferred_initial_lane_ledger(&args.name)?;
+                let mut report = reopened.resume_deferred_initial_lane_ledger(&args.name)?;
+                report.resumed = initial_resumed;
                 let workspace = reopened.workspace_root().to_path_buf();
                 drop(reopened);
                 daemon_start::retire_workspace_daemon_after_external_generation_change(&workspace)?;
@@ -161,7 +163,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             render_workspace_space(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Exec(args) => {
-            let db = open_db(ctx)?;
+            let mut db = open_db(ctx)?;
             let report = db.exec_lane_workspace(&args.name, &args.command)?;
             render_workspace_exec(&report, ctx.json, &ctx.render)
         }
@@ -286,10 +288,25 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             )?;
             render_checkout(&report, ctx.json, &ctx.render)
         }
+        LaneSubcommand::Archive(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.archive_lane(&args.name)?;
+            render_lane_details(&report, ctx.json, &ctx.render)
+        }
+        LaneSubcommand::Unarchive(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.unarchive_lane(&args.name)?;
+            render_lane_details(&report, ctx.json, &ctx.render)
+        }
         LaneSubcommand::Rm(args) => {
             let mut db = open_db(ctx)?;
             let report = db.remove_lane(&args.name, args.force)?;
             render_lane_remove(&report, ctx.json, &ctx.render)
+        }
+        LaneSubcommand::Purge(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.purge_lane(&args.name, args.force)?;
+            render_lane_purge(&report, ctx.json, &ctx.render)
         }
     }
 }

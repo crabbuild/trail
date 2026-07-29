@@ -246,6 +246,7 @@ pub(super) fn try_handle_daemon_command(
         Command::History(args) => handle_history_command(ctx, &client, args),
         Command::CodeFrom(args) => handle_code_from_command(ctx, &client, args),
         Command::Lane(lane) => handle_lane_command(ctx, &client, lane),
+        Command::Agent(agent) => handle_agent_git_handoff_command(ctx, &client, agent),
         Command::Session(session) => handle_session_command(ctx, &client, session),
         Command::Approvals(approvals) => handle_approvals_command(ctx, &client, approvals),
         Command::Lease(lease) => handle_lease_command(ctx, &client, lease),
@@ -280,6 +281,7 @@ fn daemon_supports_command(command: &Command) -> bool {
                 | LaneSubcommand::List
                 | LaneSubcommand::Show(_)
                 | LaneSubcommand::Status(_)
+                | LaneSubcommand::Space(_)
                 | LaneSubcommand::Review(_)
                 | LaneSubcommand::Contribution(_)
                 | LaneSubcommand::Gates(_)
@@ -301,6 +303,14 @@ fn daemon_supports_command(command: &Command) -> bool {
                 | LaneSubcommand::RepairInitialization(_)
                 | LaneSubcommand::Turn(_)
                 | LaneSubcommand::Trace(_)
+                | LaneSubcommand::Archive(_)
+                | LaneSubcommand::Unarchive(_)
+                | LaneSubcommand::Rm(_)
+                | LaneSubcommand::Purge(_)
+        ),
+        Command::Agent(agent) => matches!(
+            &agent.command,
+            Some(AgentSubcommand::MarkReviewed(_) | AgentSubcommand::Apply(_))
         ),
         _ => false,
     }
@@ -380,6 +390,12 @@ fn handle_lane_command(
             render_lane_status(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
+        LaneSubcommand::Space(args) => {
+            let report: WorkspaceSpaceReport =
+                client.get_json(&format!("/v1/lanes/{}/space", args.name))?;
+            render_workspace_space(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
         LaneSubcommand::Review(args) => {
             let report: LaneReviewPacketReport = client.get_json(&format!(
                 "/v1/lanes/{}/review?limit={}",
@@ -441,6 +457,43 @@ fn handle_lane_command(
                 args.name, args.limit
             ))?;
             render_lane_handoff(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        LaneSubcommand::Archive(args) | LaneSubcommand::Unarchive(args) => {
+            let action = match &lane.command {
+                LaneSubcommand::Archive(_) => "archive",
+                LaneSubcommand::Unarchive(_) => "unarchive",
+                _ => unreachable!(),
+            };
+            let report: LaneDetails = client.post_json(
+                &format!("/v1/lanes/{}/{action}", args.name),
+                &serde_json::json!({}),
+            )?;
+            render_lane_details(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        LaneSubcommand::Rm(args) => {
+            let path = append_query(
+                &format!("/v1/lanes/{}", args.name),
+                args.force
+                    .then(|| "force=true".to_string())
+                    .into_iter()
+                    .collect(),
+            );
+            let report: LaneRemoveReport = client.delete_json(&path)?;
+            render_lane_remove(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        LaneSubcommand::Purge(args) => {
+            let path = append_query(
+                &format!("/v1/lanes/{}/purge", args.name),
+                args.force
+                    .then(|| "force=true".to_string())
+                    .into_iter()
+                    .collect(),
+            );
+            let report: LaneRetirementReport = client.post_json(&path, &serde_json::json!({}))?;
+            render_lane_purge(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Claim(args) => {
@@ -595,6 +648,33 @@ fn handle_lane_command(
         }
         LaneSubcommand::Turn(turn) => handle_lane_turn_command(ctx, client, turn),
         LaneSubcommand::Trace(trace) => handle_lane_trace_command(ctx, client, trace),
+        _ => Ok(false),
+    }
+}
+
+fn handle_agent_git_handoff_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    agent: &AgentCommand,
+) -> Result<bool> {
+    match &agent.command {
+        Some(AgentSubcommand::MarkReviewed(args)) => {
+            let body = serde_json::json!({ "note": args.note });
+            let report: AgentMarkReviewedReport =
+                client.post_json(&format!("/v1/agents/{}/reviewed", args.selector), &body)?;
+            render_agent_mark_reviewed(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        Some(AgentSubcommand::Apply(args)) => {
+            let body = serde_json::json!({
+                "dry_run": args.dry_run,
+                "message": args.message,
+            });
+            let report: AgentApplyReport =
+                client.post_json(&format!("/v1/agents/{}/apply", args.selector), &body)?;
+            render_agent_apply(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -1534,6 +1614,17 @@ fn error_from_daemon_response(status: u16, body: &[u8]) -> Error {
                     .unwrap_or_else(|| "trail index reconcile".to_string()),
             };
         }
+        if let Some(code) = error.error.code.as_ref().and_then(DaemonErrorCode::as_text) {
+            let message = error.error.message.clone();
+            match code {
+                "GIT_ERROR" => return Error::Git(message),
+                "GIT_MAPPING_REQUIRED" => return Error::GitMappingRequired(message),
+                "GIT_HEAD_CHANGED" => return Error::GitHeadChanged(message),
+                "GIT_WORKTREE_DIRTY" => return Error::GitWorktreeDirty(message),
+                "GIT_DELTA_EXPORT_REQUIRED" => return Error::GitDeltaExportRequired(message),
+                _ => {}
+            }
+        }
         let numeric_code = error
             .error
             .code
@@ -1690,6 +1781,28 @@ mod tests {
     }
 
     #[test]
+    fn lane_space_and_remove_are_routed_to_the_materialized_observer_owner() {
+        for args in [
+            vec!["trail", "lane", "space", "scale-lane"],
+            vec!["trail", "lane", "rm", "scale-lane"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(daemon_supports_command(&cli.command));
+        }
+    }
+
+    #[test]
+    fn agent_git_handoff_commands_are_routed_to_the_lane_observer_owner() {
+        for args in [
+            vec!["trail", "agent", "mark-reviewed", "scale-lane"],
+            vec!["trail", "agent", "apply", "scale-lane", "--dry-run"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(daemon_supports_command(&cli.command));
+        }
+    }
+
+    #[test]
     fn daemon_metrics_emission_appends_exactly_one_json_line() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("metrics.jsonl");
@@ -1745,6 +1858,25 @@ mod tests {
                 assert!(message.contains("trail index rebuild"));
             }
             error => panic!("unexpected daemon error: {error}"),
+        }
+    }
+
+    #[test]
+    fn daemon_error_parser_preserves_git_handoff_types() {
+        for (code, expected) in [
+            ("GIT_ERROR", "GIT_ERROR"),
+            ("GIT_MAPPING_REQUIRED", "GIT_MAPPING_REQUIRED"),
+            ("GIT_HEAD_CHANGED", "GIT_HEAD_CHANGED"),
+            ("GIT_WORKTREE_DIRTY", "GIT_WORKTREE_DIRTY"),
+            ("GIT_DELTA_EXPORT_REQUIRED", "GIT_DELTA_EXPORT_REQUIRED"),
+        ] {
+            let body = format!(
+                r#"{{"error":{{"code":"{code}","status":409,"exit":10,"message":"git handoff refused"}}}}"#
+            );
+            assert_eq!(
+                error_from_daemon_response(409, body.as_bytes()).code(),
+                expected
+            );
         }
     }
 }

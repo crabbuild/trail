@@ -1157,7 +1157,7 @@ fn external_lane_spawn_ignores_daemon_response_delay_without_duplicate_fallback(
 
 #[cfg(target_os = "macos")]
 #[test]
-fn daemon_routed_lane_spawn_preserves_explicit_nfs_cow_mode() {
+fn materialized_lane_spawn_handoff_preserves_explicit_nfs_cow_mode() {
     let fixture = Fixture::new();
     let direct = fixture.run(&[
         "lane",
@@ -1176,25 +1176,32 @@ fn daemon_routed_lane_spawn_preserves_explicit_nfs_cow_mode() {
     let direct: serde_json::Value = serde_json::from_slice(&direct.stdout).unwrap();
 
     assert!(fixture.status().status.success());
-    let daemon = fixture.endpoint();
-    let routed = fixture.run(&[
+    let before_handoff = fixture.endpoint();
+    let after_handoff = fixture.run(&[
         "lane",
         "spawn",
-        "routed-nfs-cow",
+        "after-handoff-nfs-cow",
         "--from",
         "main",
         "--workdir-mode",
         "nfs-cow",
     ]);
     assert!(
-        routed.status.success(),
-        "daemon-routed nfs-cow spawn failed: {}",
-        String::from_utf8_lossy(&routed.stderr)
+        after_handoff.status.success(),
+        "post-handoff nfs-cow spawn failed: {}",
+        String::from_utf8_lossy(&after_handoff.stderr)
     );
-    let routed: serde_json::Value = serde_json::from_slice(&routed.stdout).unwrap();
-    assert_eq!(fixture.endpoint().pid, daemon.pid);
+    let after_handoff: serde_json::Value = serde_json::from_slice(&after_handoff.stdout).unwrap();
+    assert!(
+        !fixture.endpoint_path().exists(),
+        "materialized spawn must retire the prior workspace daemon"
+    );
 
-    for report in [&direct, &routed] {
+    assert!(fixture.status().status.success());
+    let restarted = fixture.endpoint();
+    assert!(restarted.epoch > before_handoff.epoch);
+
+    for report in [&direct, &after_handoff] {
         assert_eq!(report["requested_workdir_mode"], "nfs-cow");
         assert_eq!(report["workdir_mode"], "nfs-cow");
         assert_eq!(report["workdir_backend"], "nfs");
@@ -1203,16 +1210,6 @@ fn daemon_routed_lane_spawn_preserves_explicit_nfs_cow_mode() {
             .as_str()
             .is_some_and(|path| !path.is_empty()));
     }
-    assert_eq!(
-        direct["requested_workdir_mode"],
-        routed["requested_workdir_mode"]
-    );
-    assert_eq!(direct["workdir_mode"], routed["workdir_mode"]);
-    assert_eq!(direct["workdir_backend"], routed["workdir_backend"]);
-    assert_eq!(
-        direct["transparent_cow_available"],
-        routed["transparent_cow_available"]
-    );
 }
 
 #[test]
@@ -1335,7 +1332,17 @@ fn rejected_patch_audit_does_not_retire_daemon_and_explicit_empty_patch_is_route
         "COW spawn failed: {}",
         String::from_utf8_lossy(&cow.stderr)
     );
-    assert_eq!(fixture.endpoint().pid, daemon.pid, "COW spawn");
+    assert!(
+        !fixture.endpoint_path().exists(),
+        "materialized COW spawn must complete the local daemon handoff"
+    );
+    let restarted = fixture.status();
+    assert!(
+        restarted.status.success(),
+        "daemon restart after COW spawn failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert_ne!(fixture.endpoint().pid, daemon.pid, "COW spawn restart");
 }
 
 #[test]

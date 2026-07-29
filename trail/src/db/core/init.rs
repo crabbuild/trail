@@ -502,13 +502,15 @@ impl Trail {
     ) -> Result<Self> {
         let recovery = (schema_mode == SchemaOpenMode::Existing)
             .then(|| OpenRecoveryParticipant::register(&db_dir));
-        let db =
+        let mut db =
             Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode, false)?;
+        db.recover_lane_retirements_before_derived_paths()?;
         if let Some(recovery) = recovery {
             db.recover_after_open_in_cohort(recovery)?;
         } else {
             db.recover_after_open()?;
         }
+        db.recover_lane_retirements()?;
         Ok(db)
     }
 
@@ -638,7 +640,7 @@ impl Trail {
             operation_metrics,
         };
         if schema_mode == SchemaOpenMode::FreshCreate {
-            db.create_schema_v20()?;
+            db.create_schema_v21()?;
         }
         Ok(db)
     }
@@ -825,15 +827,18 @@ fn preflight_existing_schema_with_migration(
         Err(error) => error,
     };
     let predecessor = inspect_existing_schema_version(db_path, prolly_backend)?;
-    if !matches!(predecessor, SCHEMA_V18_VERSION | SCHEMA_V19_VERSION) {
+    if !matches!(
+        predecessor,
+        SCHEMA_V18_VERSION | SCHEMA_V19_VERSION | SCHEMA_V20_VERSION
+    ) {
         return Err(original_error);
     }
 
-    migrate_existing_schema_to_v20(db_dir, db_path, prolly_backend)?;
+    migrate_existing_schema_to_v21(db_dir, db_path, prolly_backend)?;
     preflight_existing_schema(db_path, prolly_backend)
 }
 
-fn migrate_existing_schema_to_v20(
+fn migrate_existing_schema_to_v21(
     db_dir: &Path,
     db_path: &Path,
     prolly_backend: &str,
@@ -843,7 +848,7 @@ fn migrate_existing_schema_to_v20(
         db_path,
         WorkspaceLockAdmission {
             purpose: WorkspaceLockPurpose::SchemaTransition,
-            operation_id: Some("schema-to-v20"),
+            operation_id: Some("schema-to-v21"),
             deadline: Duration::ZERO,
             retry_command: "trail init --force",
         },
@@ -860,18 +865,25 @@ fn migrate_existing_schema_to_v20(
         .map_err(schema_reinitialize_error)?;
     match current {
         TRAIL_SCHEMA_VERSION => {
-            storage::validate_schema_v20(&conn).map_err(schema_reinitialize_error)
+            storage::validate_schema_v21(&conn).map_err(schema_reinitialize_error)
+        }
+        SCHEMA_V20_VERSION => {
+            storage::validate_schema_v20_for_migration(&conn).map_err(schema_reinitialize_error)?;
+            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
+            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
         }
         SCHEMA_V19_VERSION => {
             storage::validate_schema_v19_for_migration(&conn).map_err(schema_reinitialize_error)?;
             validate_predecessor_prolly_schema(&conn, prolly_backend)?;
-            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)
+            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)?;
+            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
         }
         SCHEMA_V18_VERSION => {
             storage::validate_schema_v18_for_migration(&conn).map_err(schema_reinitialize_error)?;
             validate_predecessor_prolly_schema(&conn, prolly_backend)?;
             storage::migrate_schema_v18_to_v19(&mut conn).map_err(schema_reinitialize_error)?;
-            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)
+            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)?;
+            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
         }
         found => Err(schema_reinitialize_error(format!(
             "database corrupt: found version {found}; expected version {TRAIL_SCHEMA_VERSION}"

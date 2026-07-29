@@ -463,7 +463,7 @@ impl Trail {
                     }
                     if use_disk_manifest_for_clean {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
-                            &workdir_path,
+                            record_scan_root,
                             layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
@@ -471,7 +471,7 @@ impl Trail {
                         )?;
                     } else {
                         self.write_lane_clean_workdir_manifest(
-                            &workdir_path,
+                            record_scan_root,
                             layered_manifest_path.as_deref(),
                             &head.root_id,
                             &previous_files,
@@ -604,7 +604,7 @@ impl Trail {
                     let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
                     if summaries.is_empty() {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
-                            &workdir_path,
+                            record_scan_root,
                             layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
@@ -650,7 +650,7 @@ impl Trail {
             }
             if let Some(disk_manifest) = &clean_disk_manifest {
                 self.write_lane_clean_workdir_manifest_from_disk_manifest(
-                    &workdir_path,
+                    record_scan_root,
                     layered_manifest_path.as_deref(),
                     &head.root_id,
                     disk_manifest,
@@ -658,7 +658,7 @@ impl Trail {
                 )?;
             } else {
                 self.write_lane_clean_workdir_manifest(
-                    &workdir_path,
+                    record_scan_root,
                     layered_manifest_path.as_deref(),
                     &head.root_id,
                     &built.files,
@@ -814,7 +814,7 @@ impl Trail {
             }
             if let Some(disk_manifest) = &clean_disk_manifest {
                 self.write_lane_clean_workdir_manifest_from_disk_manifest(
-                    &workdir_path,
+                    record_scan_root,
                     layered_manifest_path.as_deref(),
                     &built.root_id,
                     disk_manifest,
@@ -822,7 +822,7 @@ impl Trail {
                 )?;
             } else {
                 self.write_lane_clean_workdir_manifest(
-                    &workdir_path,
+                    record_scan_root,
                     layered_manifest_path.as_deref(),
                     &built.root_id,
                     &built.files,

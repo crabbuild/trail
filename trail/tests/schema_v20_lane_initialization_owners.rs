@@ -174,7 +174,7 @@ impl SchemaV20Fixture {
 fn v19_open_migrates_owner_authority_atomically_to_v20() {
     let fixture = SchemaV20Fixture::from_v19();
     let db = fixture.open();
-    assert_eq!(db.schema_user_version_for_test(), 20);
+    assert_eq!(db.schema_user_version_for_test(), 21);
     let owner_columns = fixture.owner_columns();
     let owner_columns = owner_columns
         .iter()
@@ -190,7 +190,7 @@ fn v19_open_migrates_owner_authority_atomically_to_v20() {
 fn v18_open_runs_v19_backfill_then_v20_owner_migration() {
     let fixture = SchemaV20Fixture::from_v18_with_lane();
     let db = fixture.open();
-    assert_eq!(db.schema_user_version_for_test(), 20);
+    assert_eq!(db.schema_user_version_for_test(), 21);
     assert_eq!(fixture.initialization_count(), 1);
     assert_eq!(fixture.owner_count(), 0);
 }

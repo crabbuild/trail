@@ -142,7 +142,7 @@ pub(super) fn push_lanes_check(db: &Trail, checks: &mut Vec<DoctorCheck>) {
             let mut missing_workdirs = Vec::new();
             let mut inspect_errors = Vec::new();
             for lane in &lanes {
-                if lane.branch.workdir.is_none() {
+                if lane.branch.status == "removed" || lane.branch.workdir.is_none() {
                     continue;
                 }
                 match db.lane_status(&lane.branch.lane_id) {

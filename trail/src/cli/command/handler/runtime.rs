@@ -66,9 +66,28 @@ fn retryable_open_db_handoff(error: &Error) -> bool {
         // same transient handoff as the generation result above; retry only
         // this exact bounded diagnostic, never a generic workspace lock.
         Error::WorkspaceLocked(message) => {
-            message == "SQLite WAL remained active throughout bounded schema snapshot validation; retry the command"
+            matches!(
+                message.as_str(),
+                "SQLite WAL remained active throughout bounded schema snapshot validation; retry the command"
+                    | "schema generation changed during predecessor inspection; retry the command"
+            )
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{retryable_open_db_handoff, Error};
+
+    #[test]
+    fn predecessor_generation_race_is_a_retryable_open_handoff() {
+        assert!(retryable_open_db_handoff(&Error::WorkspaceLocked(
+            "schema generation changed during predecessor inspection; retry the command".into()
+        )));
+        assert!(!retryable_open_db_handoff(&Error::WorkspaceLocked(
+            "another writer owns a user operation".into()
+        )));
     }
 }
 

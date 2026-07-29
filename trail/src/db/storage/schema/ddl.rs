@@ -1113,19 +1113,49 @@ CREATE TABLE lane_initialization_owners (
 );
 "#;
 
+pub(super) const LANE_RETIREMENTS_V21: &str = r#"
+CREATE TABLE lane_retirements (
+    retirement_id TEXT PRIMARY KEY,
+    lane_id TEXT NOT NULL UNIQUE,
+    former_name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('remove','purge')),
+    phase TEXT NOT NULL CHECK (phase IN
+        ('prepared','runtime_stopped','bindings_retired','private_deleted',
+         'completed','repair_required')),
+    resume_phase TEXT CHECK (resume_phase IN
+        ('prepared','runtime_stopped','bindings_retired','private_deleted')),
+    forced INTEGER NOT NULL CHECK (forced IN (0,1)),
+    provenance_json BLOB NOT NULL,
+    private_paths_json BLOB NOT NULL,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    repair_command TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
+CREATE INDEX lane_retirements_phase_updated_idx
+    ON lane_retirements(phase, updated_at);
+"#;
+
 impl Trail {
-    pub(crate) fn create_schema_v20(&self) -> Result<()> {
-        create_schema_v20(&self.conn)
+    pub(crate) fn create_schema_v21(&self) -> Result<()> {
+        create_schema_v21(&self.conn)
     }
 }
 
-pub(crate) fn create_schema_v20(conn: &Connection) -> Result<()> {
+pub(crate) fn create_schema_v21(conn: &Connection) -> Result<()> {
     create_schema(conn, TRAIL_SCHEMA_VERSION, true)
 }
 
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn create_schema_v18_for_test(conn: &Connection) -> Result<()> {
     create_schema(conn, SCHEMA_V18_VERSION, false)
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn create_schema_v20_for_test(conn: &Connection) -> Result<()> {
+    create_schema(conn, SCHEMA_V20_VERSION, true)
 }
 
 fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) -> Result<()> {
@@ -1141,8 +1171,11 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
         if lane_initializations {
             conn.execute_batch(LANE_INITIALIZATIONS_V19)?;
         }
-        if version == TRAIL_SCHEMA_VERSION {
+        if version >= SCHEMA_V20_VERSION {
             conn.execute_batch(LANE_INITIALIZATION_OWNERS_V20)?;
+        }
+        if version >= TRAIL_SCHEMA_VERSION {
+            conn.execute_batch(LANE_RETIREMENTS_V21)?;
         }
         validate_schema_v18_shape(conn)?;
         let now = now_ts();
@@ -1162,7 +1195,9 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
         }
         conn.pragma_update(None, "user_version", version)?;
         if version == TRAIL_SCHEMA_VERSION {
-            validate_schema_v20(conn)
+            validate_schema_v21(conn)
+        } else if version == SCHEMA_V20_VERSION {
+            validate_schema_v20_for_migration(conn)
         } else if lane_initializations {
             validate_schema_v19_for_migration(conn)
         } else {
@@ -1206,6 +1241,42 @@ pub(super) fn validate_lane_initialization_owners_v20_shape(conn: &Connection) -
         ));
     }
     Ok(())
+}
+
+pub(super) fn validate_lane_retirements_v21_shape(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(LANE_RETIREMENTS_V21)?;
+    let actual = lane_retirement_objects(conn)?;
+    let wanted = lane_retirement_objects(&expected)?;
+    if actual != wanted {
+        return Err(Error::Corrupt(
+            "lane retirement schema v21 sqlite_master shape does not match".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lane_retirement_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
+         WHERE (name LIKE 'lane_retirements%' OR tbl_name='lane_retirements')
+           AND name NOT LIKE 'sqlite_%'
+         ORDER BY type,name",
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                normalize_sql(&row.get::<_, String>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn lane_retirement_objects_absent(conn: &Connection) -> Result<bool> {
+    Ok(lane_retirement_objects(conn)?.is_empty())
 }
 
 fn lane_initialization_owner_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
@@ -1319,6 +1390,7 @@ fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
            AND name NOT LIKE 'changed_path_%'
            AND name NOT LIKE 'lane_initializations%'
            AND name NOT LIKE 'lane_initialization_owners%'
+           AND name NOT LIKE 'lane_retirements%'
          ORDER BY type, name",
     )?;
     let objects = statement
@@ -1369,7 +1441,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
 
-        assert!(create_schema_v20(&conn).is_err());
+        assert!(create_schema_v21(&conn).is_err());
 
         assert_eq!(master_objects(&conn), before);
         assert_eq!(

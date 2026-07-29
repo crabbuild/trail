@@ -829,6 +829,7 @@ impl Trail {
         // TRAIL_FS_PRODUCER: lane_spawn_materialize Materialize controlled
         let ledger_authority = crate::db::change_ledger::command_authority_enabled();
         validate_ref_segment(name)?;
+        self.recover_lane_retirement_before_spawn(name)?;
         validate_lane_workdir_mode_request(&workdir_mode, workdir.is_some(), sparse_paths)?;
         let sparse_paths = normalize_record_paths(sparse_paths)?;
         let source = match from {
@@ -840,6 +841,10 @@ impl Trail {
             Some(refish) => self.resolve_refish(refish)?,
             None => self.resolve_branch_ref(&self.current_branch()?)?,
         };
+        let source_lane_id = from
+            .and_then(|handle| self.lane_branch(handle).ok())
+            .filter(|branch| branch.ref_name == source.name)
+            .map(|branch| branch.lane_id);
         let mut lane_id = format!("lane_{}", crate::ids::short_hash(name.as_bytes(), 8));
         let ref_name = lane_ref(name);
         let workdir_path = if workdir_mode.materializes() {
@@ -1320,13 +1325,17 @@ impl Trail {
                     let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
                         Error::Corrupt("transparent COW lane has no mountpoint".to_string())
                     })?;
-                    self.create_workspace_view(
+                    let view = self.create_workspace_view(
                         &lane_id,
                         &request.source_change,
                         &request.source_root,
                         platform_workspace_backend(&request.requested_workdir_mode),
                         Path::new(mountpoint),
-                    )
+                    )?;
+                    if let Some(parent_lane_id) = source_lane_id.as_deref() {
+                        self.inherit_workspace_environment_generation(parent_lane_id, &lane_id)?;
+                    }
+                    Ok(view)
                 })();
                 self.committed_lane_initialization_step(&initialization, &fence, workspace_view)?;
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;

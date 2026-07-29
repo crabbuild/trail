@@ -36,7 +36,8 @@ const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
 const SCHEMA_EXCLUSION_FILE: &str = "schema-exclusion.lock";
 const SCHEMA_VALIDATION_LEADER_FILE: &str = "schema-validation.lock";
-const TRAIL_SCHEMA_VERSION: i64 = 20;
+const TRAIL_SCHEMA_VERSION: i64 = 21;
+const SCHEMA_V20_VERSION: i64 = 20;
 const SCHEMA_V19_VERSION: i64 = 19;
 const SCHEMA_V18_VERSION: i64 = 18;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
@@ -1809,7 +1810,7 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     let conn = rusqlite::Connection::open(&snapshot_db).map_err(schema_reinitialize_error)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(schema_reinitialize_error)?;
-    Trail::validate_schema_v20(&conn).map_err(schema_reinitialize_error)?;
+    Trail::validate_schema_v21(&conn).map_err(schema_reinitialize_error)?;
     storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
 }
 
@@ -2202,7 +2203,7 @@ fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
 fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
     Error::SchemaReinitializeRequired {
         found: err.to_string(),
-        guidance: "back up this workspace, then run `trail init --force` to create schema v20"
+        guidance: "back up this workspace, then run `trail init --force` to create schema v21"
             .into(),
     }
 }
@@ -4705,6 +4706,7 @@ pub(crate) use change_ledger::{
 };
 mod core;
 mod lane;
+pub(crate) use lane::managed_execution::ManagedExecutionContext;
 
 #[cfg(debug_assertions)]
 pub(crate) fn set_lane_initialization_wait_timeout_for_current_thread(
@@ -4758,8 +4760,10 @@ use self::performance::*;
 #[cfg(any(test, debug_assertions))]
 pub(crate) use storage::{
     clear_schema_v19_migration_failure, clear_schema_v20_migration_failure,
-    create_schema_v18_fixture_for_test, install_schema_v19_migration_failure,
-    install_schema_v20_migration_failure, SchemaV19MigrationBoundary, SchemaV20MigrationBoundary,
+    clear_schema_v21_migration_failure, create_schema_v18_fixture_for_test,
+    create_schema_v20_fixture_for_test, install_schema_v19_migration_failure,
+    install_schema_v20_migration_failure, install_schema_v21_migration_failure,
+    SchemaV19MigrationBoundary, SchemaV20MigrationBoundary, SchemaV21MigrationBoundary,
 };
 #[cfg(debug_assertions)]
 pub(crate) use storage::{
