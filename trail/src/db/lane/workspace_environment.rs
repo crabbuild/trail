@@ -1139,68 +1139,15 @@ impl Trail {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
         let command_metadata = &super::workspace_recipe::COMMAND_RECIPE_ADAPTER_METADATA;
-        let (plan, builtin_adapter, plugin_adapter, expected_component_id) = if adapter_selector
-            == "auto"
-        {
-            let discovery = self.discover_workspace_environment(lane, Some(component_root))?;
-            if !discovery.conflicts.is_empty() {
-                return Err(Error::InvalidInput(format!(
-                    "environment discovery found {} unresolved component conflict(s) at `{}`",
-                    discovery.conflicts.len(),
-                    if component_root.is_empty() {
-                        "."
-                    } else {
-                        component_root
-                    }
-                )));
-            }
-            let candidates = discovery
-                .components
-                .iter()
-                .filter(|component| component_id.is_none_or(|id| component.component_id == id))
-                .collect::<Vec<_>>();
-            match candidates.as_slice() {
-                [component]
-                    if component.adapter_identity == command_metadata.canonical_identity =>
-                {
-                    (
-                        self.command_recipe_plan(&head.root_id, &component.component_id)?,
-                        None,
-                        None,
-                        component.component_id.clone(),
-                    )
-                }
-                [component] => {
-                    if let Some(adapter) =
-                        builtin_environment_adapter_for_selector(&component.adapter_identity)
-                    {
-                        (
-                            adapter.plan(self, &head.root_id, &component.component_root)?,
-                            Some(adapter),
-                            None,
-                            component.component_id.clone(),
-                        )
-                    } else {
-                        let plugin = self
-                            .environment_plugin_for_selector(&component.adapter_identity)?
-                            .ok_or_else(|| {
-                                Error::Corrupt(format!(
-                                    "discovered adapter `{}` is no longer installed",
-                                    component.adapter_identity
-                                ))
-                            })?;
-                        let plan = self.plan_environment_plugin_component(
-                            &plugin,
-                            &head.root_id,
-                            &component.component_root,
-                            &component.component_id,
-                        )?;
-                        (plan, None, Some(plugin), component.component_id.clone())
-                    }
-                }
-                [] => {
+        let (plan, builtin_adapter, plugin_adapter, expected_component_id, resolved_component_root) =
+            if adapter_selector == "auto" {
+                let discovery_root = (!component_root.is_empty() || component_id.is_none())
+                    .then_some(component_root);
+                let discovery = self.discover_workspace_environment(lane, discovery_root)?;
+                if !discovery.conflicts.is_empty() {
                     return Err(Error::InvalidInput(format!(
-                        "no workspace environment adapter detected at `{}`; specify --adapter explicitly",
+                        "environment discovery found {} unresolved component conflict(s) at `{}`",
+                        discovery.conflicts.len(),
                         if component_root.is_empty() {
                             "."
                         } else {
@@ -1208,8 +1155,70 @@ impl Trail {
                         }
                     )));
                 }
-                components => {
-                    return Err(Error::InvalidInput(format!(
+                let candidates = discovery
+                    .components
+                    .iter()
+                    .filter(|component| component_id.is_none_or(|id| component.component_id == id))
+                    .collect::<Vec<_>>();
+                match candidates.as_slice() {
+                    [component]
+                        if component.adapter_identity == command_metadata.canonical_identity =>
+                    {
+                        (
+                            self.command_recipe_plan(&head.root_id, &component.component_id)?,
+                            None,
+                            None,
+                            component.component_id.clone(),
+                            component.component_root.clone(),
+                        )
+                    }
+                    [component] => {
+                        if let Some(adapter) =
+                            builtin_environment_adapter_for_selector(&component.adapter_identity)
+                        {
+                            (
+                                adapter.plan(self, &head.root_id, &component.component_root)?,
+                                Some(adapter),
+                                None,
+                                component.component_id.clone(),
+                                component.component_root.clone(),
+                            )
+                        } else {
+                            let plugin = self
+                                .environment_plugin_for_selector(&component.adapter_identity)?
+                                .ok_or_else(|| {
+                                    Error::Corrupt(format!(
+                                        "discovered adapter `{}` is no longer installed",
+                                        component.adapter_identity
+                                    ))
+                                })?;
+                            let plan = self.plan_environment_plugin_component(
+                                &plugin,
+                                &head.root_id,
+                                &component.component_root,
+                                &component.component_id,
+                            )?;
+                            (
+                                plan,
+                                None,
+                                Some(plugin),
+                                component.component_id.clone(),
+                                component.component_root.clone(),
+                            )
+                        }
+                    }
+                    [] => {
+                        return Err(Error::InvalidInput(format!(
+                        "no workspace environment adapter detected at `{}`; specify --adapter explicitly",
+                        if component_root.is_empty() {
+                            "."
+                        } else {
+                            component_root
+                        }
+                    )));
+                    }
+                    components => {
+                        return Err(Error::InvalidInput(format!(
                         "multiple workspace environment adapters or components detected at `{}`: {}; specify --adapter explicitly",
                         if component_root.is_empty() {
                             "."
@@ -1222,78 +1231,92 @@ impl Trail {
                             .collect::<Vec<_>>()
                             .join(", ")
                     )));
+                    }
                 }
-            }
-        } else if command_metadata.selectors.contains(&adapter_selector) {
-            let plan = if let Some(component_id) = component_id {
-                self.command_recipe_plan(&head.root_id, component_id)?
+            } else if command_metadata.selectors.contains(&adapter_selector) {
+                let plan = if let Some(component_id) = component_id {
+                    self.command_recipe_plan(&head.root_id, component_id)?
+                } else {
+                    self.command_recipe_plan_for_root(&head.root_id, component_root)?
+                };
+                let expected = plan.component_id.clone();
+                (plan, None, None, expected, component_root.to_string())
             } else {
-                self.command_recipe_plan_for_root(&head.root_id, component_root)?
-            };
-            let expected = plan.component_id.clone();
-            (plan, None, None, expected)
-        } else {
-            if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector) {
-                let expected = adapter.component_id(component_root)?;
-                if component_id.is_some_and(|component_id| component_id != expected) {
-                    return Err(Error::InvalidInput(format!(
+                if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector) {
+                    let expected = adapter.component_id(component_root)?;
+                    if component_id.is_some_and(|component_id| component_id != expected) {
+                        return Err(Error::InvalidInput(format!(
                         "adapter `{}` proposes component `{expected}`, not requested component `{}`",
                         adapter.identity(),
                         component_id.unwrap_or_default()
                     )));
-                }
-                (
-                    adapter.plan(self, &head.root_id, component_root)?,
-                    Some(adapter),
-                    None,
-                    expected,
-                )
-            } else if let Some(plugin) = self.environment_plugin_for_selector(adapter_selector)? {
-                let discovered = self
-                    .discover_environment_plugin_component(&plugin, &head.root_id, component_root)?
-                    .ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "adapter `{}` did not detect a component at `{}`",
-                            plugin.manifest.adapter.canonical_identity,
-                            if component_root.is_empty() {
-                                "."
-                            } else {
-                                component_root
-                            }
-                        ))
-                    })?;
-                if component_id.is_some_and(|component_id| component_id != discovered.component_id)
+                    }
+                    (
+                        adapter.plan(self, &head.root_id, component_root)?,
+                        Some(adapter),
+                        None,
+                        expected,
+                        component_root.to_string(),
+                    )
+                } else if let Some(plugin) =
+                    self.environment_plugin_for_selector(adapter_selector)?
                 {
+                    let discovered = self
+                        .discover_environment_plugin_component(
+                            &plugin,
+                            &head.root_id,
+                            component_root,
+                        )?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "adapter `{}` did not detect a component at `{}`",
+                                plugin.manifest.adapter.canonical_identity,
+                                if component_root.is_empty() {
+                                    "."
+                                } else {
+                                    component_root
+                                }
+                            ))
+                        })?;
+                    if component_id
+                        .is_some_and(|component_id| component_id != discovered.component_id)
+                    {
+                        return Err(Error::InvalidInput(format!(
+                            "adapter `{}` proposes component `{}`, not requested component `{}`",
+                            plugin.manifest.adapter.canonical_identity,
+                            discovered.component_id,
+                            component_id.unwrap_or_default()
+                        )));
+                    }
+                    let expected = discovered.component_id;
+                    let plan = self.plan_environment_plugin_component(
+                        &plugin,
+                        &head.root_id,
+                        component_root,
+                        &expected,
+                    )?;
+                    (
+                        plan,
+                        None,
+                        Some(plugin),
+                        expected,
+                        component_root.to_string(),
+                    )
+                } else {
+                    let available = self
+                        .workspace_environment_adapters()?
+                        .adapters
+                        .into_iter()
+                        .map(|adapter| adapter.canonical_identity)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     return Err(Error::InvalidInput(format!(
-                        "adapter `{}` proposes component `{}`, not requested component `{}`",
-                        plugin.manifest.adapter.canonical_identity,
-                        discovered.component_id,
-                        component_id.unwrap_or_default()
-                    )));
-                }
-                let expected = discovered.component_id;
-                let plan = self.plan_environment_plugin_component(
-                    &plugin,
-                    &head.root_id,
-                    component_root,
-                    &expected,
-                )?;
-                (plan, None, Some(plugin), expected)
-            } else {
-                let available = self
-                    .workspace_environment_adapters()?
-                    .adapters
-                    .into_iter()
-                    .map(|adapter| adapter.canonical_identity)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(Error::InvalidInput(format!(
                     "unknown workspace environment adapter `{adapter_selector}`; available adapters: {available}"
                 )));
-            }
-        };
+                }
+            };
         if let Some(adapter) = builtin_adapter {
-            self.validate_workspace_environment_plan(adapter, component_root, &plan)?;
+            self.validate_workspace_environment_plan(adapter, &resolved_component_root, &plan)?;
         } else if let Some(plugin) = &plugin_adapter {
             self.validate_environment_plugin_plan(plugin, &expected_component_id, &plan)?;
         } else {

@@ -258,6 +258,47 @@ mod tests {
     }
 
     #[test]
+    fn component_selector_resolves_nested_discovered_adapter_without_path() {
+        if resolve_python_executable().is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let component_root = workspace.path().join("crates/python");
+        fs::create_dir_all(&component_root).unwrap();
+        fs::write(
+            component_root.join("pyproject.toml"),
+            "[project]\nname = \"nested-example\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "python-nested",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let plan = db
+            .plan_workspace_environment_component(
+                "python-nested",
+                "auto",
+                None,
+                Some("python-venv:crates/python"),
+            )
+            .unwrap();
+
+        assert_eq!(plan.component_id, "python-venv:crates/python");
+        assert_eq!(plan.adapter_identity, "trail/python-venv@1");
+        assert_eq!(plan.mount_path, "crates/python/.venv");
+    }
+
+    #[test]
     fn python_venv_is_keyed_private_and_initialized_at_the_mounted_lane() {
         if resolve_python_executable().is_err() {
             return;
