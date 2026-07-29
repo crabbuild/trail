@@ -53,10 +53,12 @@ pub(crate) use lifecycle::{
     set_lane_initialization_materialization_barrier_for_current_thread,
     set_sparse_selection_write_failure_for_current_thread,
 };
+#[cfg(all(debug_assertions, unix))]
+pub(crate) use workdir::run_changed_path_view_flow;
 pub(crate) use workdir::ViewMutationBarrier;
 #[cfg(debug_assertions)]
 pub(crate) use workdir::{
-    install_lane_record_after_c2_write_for_current_thread, run_changed_path_view_flow,
+    install_lane_record_after_c2_write_for_current_thread,
     set_lane_record_postcommit_failure_for_current_thread,
 };
 pub(crate) use workspace_layer::{

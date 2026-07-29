@@ -1,5 +1,5 @@
 use super::*;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 use rusqlite::ffi::{
@@ -18,7 +18,7 @@ pub(crate) fn register_sqlite_vec_extension() -> Result<()> {
                 *const (),
                 unsafe extern "C" fn(
                     *mut rusqlite::ffi::sqlite3,
-                    *mut *const i8,
+                    *mut *const c_char,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> i32,
             >(sqlite3_vec_init as *const ())))

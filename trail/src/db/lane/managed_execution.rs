@@ -327,16 +327,15 @@ impl Trail {
                     .mount_nfs_cow_workdir_for_lane(lane)
                     .map(|mount| Box::new(mount) as Box<dyn Any + Send>),
                 LaneWorkdirMode::DokanCow => {
-                    #[cfg(target_os = "windows")]
+                    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
                     {
                         self.mount_dokan_cow_workdir_for_lane(lane)
                             .map(|mount| Box::new(mount) as Box<dyn Any + Send>)
                     }
-                    #[cfg(not(target_os = "windows"))]
+                    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
                     {
                         Err(Error::InvalidInput(
-                            "dokan-cow workdirs are currently supported only on Windows"
-                                .to_string(),
+                            "dokan-cow workdirs require an x86_64 Windows build".to_string(),
                         ))
                     }
                 }

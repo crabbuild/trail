@@ -213,9 +213,15 @@ fn canonical_decimal_u64(value: &str) -> bool {
         .is_ok_and(|parsed| parsed.to_string() == value)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn workspace_daemon_process_is_alive(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn workspace_daemon_process_is_alive(_pid: u32) -> bool {
+    false
 }
 
 fn workspace_daemon_process_start_identity(pid: u32) -> Option<String> {

@@ -2880,7 +2880,7 @@ impl Trail {
 
         let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
         let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {

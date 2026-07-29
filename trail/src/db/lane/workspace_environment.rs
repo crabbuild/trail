@@ -2828,7 +2828,7 @@ impl Trail {
                 result
             }
             LaneWorkdirMode::DokanCow => {
-                #[cfg(target_os = "windows")]
+                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
                 {
                     let mount = self.mount_dokan_cow_workdir_for_lane_with_ephemeral_bindings(
                         lane,
@@ -2840,9 +2840,9 @@ impl Trail {
                     drop(mount);
                     result
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
                 return Err(Error::InvalidInput(
-                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                    "dokan-cow workdirs require an x86_64 Windows build".to_string(),
                 ));
             }
             _ => unreachable!(),
@@ -7019,7 +7019,7 @@ mod tests {
             inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
-            command,
+            command: Some(command),
             mounted_commands: Vec::new(),
             caches: Vec::new(),
             external_artifacts: Vec::new(),

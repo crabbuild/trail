@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod dokan;
 mod fuse;
 mod lifecycle;

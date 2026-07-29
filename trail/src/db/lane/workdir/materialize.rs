@@ -1143,11 +1143,25 @@ where
         let file = OpenOptions::new().read(true).open(path)?;
         // Rust's File::sync_all maps to F_FULLFSYNC on Apple platforms.
         // Use POSIX fsync for each inode, then one F_FULLFSYNC below.
-        rustix::fs::fsync(&file).map_err(|error| Error::Io(error.into()))
+        #[cfg(not(windows))]
+        {
+            rustix::fs::fsync(&file).map_err(|error| Error::Io(error.into()))
+        }
+        #[cfg(windows)]
+        {
+            file.sync_all().map_err(Error::Io)
+        }
     })?;
     for directory in inventory.directories_bottom_up {
         let directory = OpenOptions::new().read(true).open(directory)?;
-        rustix::fs::fsync(&directory).map_err(|error| Error::Io(error.into()))?;
+        #[cfg(not(windows))]
+        {
+            rustix::fs::fsync(&directory).map_err(|error| Error::Io(error.into()))?;
+        }
+        #[cfg(windows)]
+        {
+            directory.sync_all()?;
+        }
     }
     let stage_authority = OpenOptions::new().read(true).open(stage)?;
     #[cfg(target_os = "linux")]

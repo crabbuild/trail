@@ -70,10 +70,12 @@ nfsserve = "0.11"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["errhandlingapi", "fileapi", "handleapi", "jobapi2", "minwinbase", "ntdef", "ntstatus", "processthreadsapi", "sddl", "securitybaseapi", "synchapi", "userenv", "winbase", "winerror", "winnt"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 dokan = "0.3.1"
 dokan-sys = "0.3.1"
 widestring = "0.4.3"
-winapi = { version = "0.3", features = ["errhandlingapi", "fileapi", "handleapi", "jobapi2", "minwinbase", "ntdef", "ntstatus", "processthreadsapi", "sddl", "securitybaseapi", "synchapi", "userenv", "winbase", "winerror", "winnt"] }
 
 [dev-dependencies]
 proptest = "=1.8.0"
