@@ -16,6 +16,12 @@ All notable changes to Trail are documented in this file. Trail follows
 - Terminal-agent `--workdir-mode auto` now selects a supported transparent COW
   backend for environment-backed tasks, while retaining native/portable
   fallback on hosts without one.
+- Agent apply releases its temporary layered-workdir mount before checking
+  merge readiness, so an automatic COW lane no longer reports its own mount as
+  an active writer.
+- Backup restore re-secures private `.trail` directories and permits the
+  restored changed-path scope to rebind to the current host on its next daemon
+  startup.
 - Lane archive and unarchive daemon requests no longer send an unexpected JSON
   body, and interrupted observer retirement with a failed owner can be reopened
   and resumed instead of being reported as a corrupt schema.

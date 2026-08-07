@@ -58,6 +58,7 @@ impl Trail {
                 temp_dir.join(DB_RELATIVE_PATH),
             )?;
             copy_dir_recursive(&backup_path.join("worktrees"), &temp_dir.join("worktrees"))?;
+            secure_restored_db_dir(&temp_dir)?;
             let restored_conn = Connection::open(temp_dir.join(DB_RELATIVE_PATH))?;
             let filesystem_identity = fresh_restored_filesystem_identity(&workspace_root)?;
             let scope_root = restored_scope_root(&workspace_root);
@@ -132,6 +133,17 @@ impl Trail {
             checked_texts: fsck.checked_texts,
         })
     }
+}
+
+fn secure_restored_db_dir(db_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(db_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(db_dir.join("index"), fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn restored_scope_root(workspace_root: &Path) -> String {

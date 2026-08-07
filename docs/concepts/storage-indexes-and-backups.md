@@ -64,7 +64,11 @@ trail backup verify /tmp/trail-backup
 trail backup restore /tmp/trail-backup
 ```
 
-Restore rewrites materialized lane workdir paths so they point inside the restored workspace.
+Restore rewrites materialized lane workdir paths so they point inside the restored workspace,
+re-secures the private `.trail` and `.trail/index` directories, and rotates the
+changed-path filesystem identity. The next daemon-backed command rebinds the
+observer to the restored host and reconciles the workspace before trusting its
+incremental ledger again.
 
 ## Garbage Collection
 
