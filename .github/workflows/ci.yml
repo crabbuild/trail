@@ -44,10 +44,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run schema-19 contracts
-        run: cargo test -p trail --test schema_v19_lane_initializations -- --nocapture
-      - name: Run schema-20 owner contracts
-        run: cargo test -p trail --test schema_v20_lane_initialization_owners -- --nocapture
+      - name: Run schema-v1 hard-cutover contracts
+        run: cargo test -p trail --test schema_v1_hard_cutover -- --nocapture
       - name: Run lane initialization fault contracts
         run: cargo test -p trail --test lane_initialization_faults -- --nocapture
       - name: Run Linux native changed-path contracts
@@ -71,8 +69,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run schema-20 owner contracts
-        run: cargo test -p trail --test schema_v20_lane_initialization_owners -- --nocapture
+      - name: Run schema-v1 hard-cutover contracts
+        run: cargo test -p trail --test schema_v1_hard_cutover -- --nocapture
       - name: Run lane initialization contracts
         run: cargo test -p trail --test lane_initialization -- --nocapture
       - name: Run lane initialization fault contracts

@@ -640,6 +640,27 @@ impl Trail {
         Ok(mode)
     }
 
+    /// Resolve the workdir mode used by a terminal agent task.
+    ///
+    /// Agent execution may discover and materialize workspace environments.
+    /// Those environments require a transparent copy-on-write view so that
+    /// source files remain in Trail while generated layers are writable. Keep
+    /// ordinary lane `auto` semantics unchanged, but choose the host's
+    /// transparent backend for an agent's `auto` request when one is
+    /// available.
+    pub fn resolve_agent_workdir_mode(
+        &self,
+        from: Option<&str>,
+        requested_mode: Option<&str>,
+    ) -> Result<LaneWorkdirMode> {
+        if requested_mode == Some("auto")
+            && let Some(mode) = platform_agent_workdir_mode()
+        {
+            return Ok(mode);
+        }
+        self.resolve_lane_spawn_workdir_mode(from, requested_mode, Some(true), false, false, &[])
+    }
+
     pub fn spawn_lane(
         &mut self,
         name: &str,
@@ -2373,6 +2394,32 @@ fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
     }
 }
 
+fn platform_agent_workdir_mode() -> Option<LaneWorkdirMode> {
+    #[cfg(target_os = "linux")]
+    {
+        let is_fuse_device = std::fs::metadata("/dev/fuse")
+            .map(|metadata| std::os::unix::fs::FileTypeExt::is_char_device(&metadata.file_type()))
+            .unwrap_or(false);
+        if is_fuse_device {
+            return Some(LaneWorkdirMode::FuseCow);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/sbin/mount_nfs").is_file() || Path::new("/usr/sbin/mount_nfs").is_file() {
+            return Some(LaneWorkdirMode::NfsCow);
+        }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Some(LaneWorkdirMode::DokanCow);
+    }
+
+    None
+}
+
 fn validate_lane_workdir_mode_request(
     mode: &LaneWorkdirMode,
     custom_workdir: bool,
@@ -2635,6 +2682,17 @@ mod hard_cutover_tests {
         let native_message = native_error.to_string();
         assert!(native_message.contains("renamed to `native-cow`"));
         assert!(native_message.contains("remove and recreate the lane"));
+    }
+
+    #[test]
+    fn agent_auto_uses_the_host_transparent_cow_backend_when_available() {
+        let (_workspace, db) = initialized_trail();
+        let resolved = db.resolve_agent_workdir_mode(None, Some("auto")).unwrap();
+        assert_eq!(
+            resolved,
+            platform_agent_workdir_mode().unwrap_or(LaneWorkdirMode::Auto)
+        );
+        assert!(resolved.is_transparent_cow() || resolved == LaneWorkdirMode::Auto);
     }
 
     #[test]

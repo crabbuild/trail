@@ -36,10 +36,7 @@ const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
 const SCHEMA_EXCLUSION_FILE: &str = "schema-exclusion.lock";
 const SCHEMA_VALIDATION_LEADER_FILE: &str = "schema-validation.lock";
-const TRAIL_SCHEMA_VERSION: i64 = 21;
-const SCHEMA_V20_VERSION: i64 = 20;
-const SCHEMA_V19_VERSION: i64 = 19;
-const SCHEMA_V18_VERSION: i64 = 18;
+const TRAIL_SCHEMA_VERSION: i64 = 1;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
@@ -834,48 +831,6 @@ pub(crate) fn preflight_existing_schema(
             authenticated_wal_digest: authenticated_wal_digest.unwrap(),
         });
     }
-}
-
-pub(crate) fn inspect_existing_schema_version(db_path: &Path, prolly_backend: &str) -> Result<i64> {
-    require_sqlite_prolly_backend(prolly_backend)?;
-    let _shared_exclusion = acquire_schema_shared_exclusion(db_path)?;
-    let before = schema_generation(db_path).map_err(schema_reinitialize_error)?;
-    let snapshot = tempfile::Builder::new()
-        .prefix("trail-schema-version-")
-        .tempdir()
-        .map_err(schema_reinitialize_error)?;
-    let snapshot_db = snapshot.path().join("trail.sqlite");
-    for suffix in ["", "-wal", "-journal"] {
-        let mut source = db_path.as_os_str().to_os_string();
-        source.push(suffix);
-        let source = PathBuf::from(source);
-        if source.exists() {
-            let mut destination = snapshot_db.as_os_str().to_os_string();
-            destination.push(suffix);
-            fs::copy(source, PathBuf::from(destination)).map_err(schema_reinitialize_error)?;
-        }
-    }
-    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
-    if before != after {
-        return Err(Error::WorkspaceLocked(
-            "schema generation changed during predecessor inspection; retry the command".into(),
-        ));
-    }
-    let conn = Connection::open(&snapshot_db).map_err(schema_reinitialize_error)?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(schema_reinitialize_error)?;
-    let version = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(schema_reinitialize_error)?;
-    if matches!(version, SCHEMA_V18_VERSION | SCHEMA_V19_VERSION) {
-        if version == SCHEMA_V18_VERSION {
-            storage::validate_schema_v18_for_migration(&conn).map_err(schema_reinitialize_error)?;
-        } else {
-            storage::validate_schema_v19_for_migration(&conn).map_err(schema_reinitialize_error)?;
-        }
-        storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)?;
-    }
-    Ok(version)
 }
 
 fn schema_snapshot_generation_is_retryable_volatile_change(
@@ -1859,8 +1814,8 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
     let conn = rusqlite::Connection::open(&snapshot_db).map_err(schema_reinitialize_error)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(schema_reinitialize_error)?;
-    Trail::validate_schema_v21(&conn).map_err(schema_reinitialize_error)?;
-    storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
+    Trail::validate_schema(&conn).map_err(schema_reinitialize_error)?;
+    storage::validate_prolly_sqlite_schema(&conn).map_err(schema_reinitialize_error)
 }
 
 fn require_sqlite_prolly_backend(prolly_backend: &str) -> Result<()> {
@@ -2308,7 +2263,7 @@ fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
 fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
     Error::SchemaReinitializeRequired {
         found: err.to_string(),
-        guidance: "back up this workspace, then run `trail init --force` to create schema v21"
+        guidance: "back up this workspace, then run `trail init --force` to create schema v1"
             .into(),
     }
 }
@@ -4870,9 +4825,8 @@ pub(crate) fn clear_lane_initialization_owner_liveness_overrides_for_current_thr
 pub(crate) use lane::run_changed_path_view_flow;
 #[cfg(debug_assertions)]
 pub(crate) use lane::{
-    clear_schema_v19_backfill_times, install_lane_record_after_c2_write_for_current_thread,
-    install_schema_v18_authenticated_lane_evidence, install_schema_v19_backfill_times,
-    schema_v19_backfill_times_remaining, set_lane_association_failure_for_current_thread,
+    install_lane_record_after_c2_write_for_current_thread,
+    set_lane_association_failure_for_current_thread,
     set_lane_initialization_io_failure_for_current_thread,
     set_lane_initialization_materialization_barrier_for_current_thread,
     set_lane_record_postcommit_failure_for_current_thread,
@@ -4887,14 +4841,6 @@ pub(crate) use record::{
 };
 mod storage;
 use self::performance::*;
-#[cfg(any(test, debug_assertions))]
-pub(crate) use storage::{
-    clear_schema_v19_migration_failure, clear_schema_v20_migration_failure,
-    clear_schema_v21_migration_failure, create_schema_v18_fixture_for_test,
-    create_schema_v20_fixture_for_test, install_schema_v19_migration_failure,
-    install_schema_v20_migration_failure, install_schema_v21_migration_failure,
-    SchemaV19MigrationBoundary, SchemaV20MigrationBoundary, SchemaV21MigrationBoundary,
-};
 #[cfg(debug_assertions)]
 pub(crate) use storage::{
     install_git_qualification_after_c2_hook, install_git_qualification_after_porcelain_hook,

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const BASE_SCHEMA_V18: &str = r#"
+pub(super) const BASE_SCHEMA: &str = r#"
 CREATE TABLE agent_attestation_key_revocations (
                  key_id TEXT PRIMARY KEY,
                  public_key_hex TEXT NOT NULL,
@@ -1077,7 +1077,7 @@ CREATE INDEX workspace_view_layers_layer_idx ON workspace_view_layers(layer_id);
 CREATE INDEX workspace_views_status_idx ON workspace_views(status, updated_at);
 "#;
 
-pub(super) const LANE_INITIALIZATIONS_V19: &str = r#"
+pub(super) const LANE_INITIALIZATIONS: &str = r#"
 CREATE TABLE lane_initializations (
     initialization_id TEXT PRIMARY KEY,
     lane_name TEXT NOT NULL UNIQUE,
@@ -1098,7 +1098,7 @@ CREATE INDEX lane_initializations_phase_updated_idx
     ON lane_initializations(phase, updated_at);
 "#;
 
-pub(super) const LANE_INITIALIZATION_OWNERS_V20: &str = r#"
+pub(super) const LANE_INITIALIZATION_OWNERS: &str = r#"
 CREATE TABLE lane_initialization_owners (
     initialization_id TEXT PRIMARY KEY
         REFERENCES lane_initializations(initialization_id) ON DELETE CASCADE,
@@ -1113,7 +1113,7 @@ CREATE TABLE lane_initialization_owners (
 );
 "#;
 
-pub(super) const LANE_RETIREMENTS_V21: &str = r#"
+pub(super) const LANE_RETIREMENTS: &str = r#"
 CREATE TABLE lane_retirements (
     retirement_id TEXT PRIMARY KEY,
     lane_id TEXT NOT NULL UNIQUE,
@@ -1139,26 +1139,12 @@ CREATE INDEX lane_retirements_phase_updated_idx
 "#;
 
 impl Trail {
-    pub(crate) fn create_schema_v21(&self) -> Result<()> {
-        create_schema_v21(&self.conn)
+    pub(crate) fn create_schema(&self) -> Result<()> {
+        create_schema(&self.conn)
     }
 }
 
-pub(crate) fn create_schema_v21(conn: &Connection) -> Result<()> {
-    create_schema(conn, TRAIL_SCHEMA_VERSION, true)
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn create_schema_v18_for_test(conn: &Connection) -> Result<()> {
-    create_schema(conn, SCHEMA_V18_VERSION, false)
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn create_schema_v20_for_test(conn: &Connection) -> Result<()> {
-    create_schema(conn, SCHEMA_V20_VERSION, true)
-}
-
-fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) -> Result<()> {
+pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     if conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? != 0 {
         return Err(Error::Corrupt(
             "fresh schema connection is not empty".into(),
@@ -1166,21 +1152,15 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
     }
     conn.execute_batch("SAVEPOINT create_schema;")?;
     let result = (|| {
-        conn.execute_batch(BASE_SCHEMA_V18)?;
+        conn.execute_batch(BASE_SCHEMA)?;
         super::changed_path_ledger::create_changed_path_ledger_schema(conn)?;
-        if lane_initializations {
-            conn.execute_batch(LANE_INITIALIZATIONS_V19)?;
-        }
-        if version >= SCHEMA_V20_VERSION {
-            conn.execute_batch(LANE_INITIALIZATION_OWNERS_V20)?;
-        }
-        if version >= TRAIL_SCHEMA_VERSION {
-            conn.execute_batch(LANE_RETIREMENTS_V21)?;
-        }
-        validate_schema_v18_shape(conn)?;
+        conn.execute_batch(LANE_INITIALIZATIONS)?;
+        conn.execute_batch(LANE_INITIALIZATION_OWNERS)?;
+        conn.execute_batch(LANE_RETIREMENTS)?;
+        validate_base_schema_shape(conn)?;
         let now = now_ts();
         for (key, value) in [
-            (SCHEMA_META_VERSION_KEY, version.to_string()),
+            (SCHEMA_META_VERSION_KEY, TRAIL_SCHEMA_VERSION.to_string()),
             (
                 SCHEMA_META_APP_VERSION_KEY,
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -1193,16 +1173,8 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
                 params![key, value, now],
             )?;
         }
-        conn.pragma_update(None, "user_version", version)?;
-        if version == TRAIL_SCHEMA_VERSION {
-            validate_schema_v21(conn)
-        } else if version == SCHEMA_V20_VERSION {
-            validate_schema_v20_for_migration(conn)
-        } else if lane_initializations {
-            validate_schema_v19_for_migration(conn)
-        } else {
-            validate_schema_v18_for_migration(conn)
-        }
+        conn.pragma_update(None, "user_version", TRAIL_SCHEMA_VERSION)?;
+        super::validate_schema(conn)
     })();
     match result {
         Ok(()) => conn
@@ -1215,42 +1187,42 @@ fn create_schema(conn: &Connection, version: i64, lane_initializations: bool) ->
     }
 }
 
-pub(super) fn validate_lane_initializations_v19_shape(conn: &Connection) -> Result<()> {
+pub(super) fn validate_lane_initializations_shape(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(LANE_INITIALIZATIONS_V19)?;
+    expected.execute_batch(LANE_INITIALIZATIONS)?;
     let actual = lane_initialization_objects(conn)?;
     let wanted = lane_initialization_objects(&expected)?;
     if actual != wanted {
         return Err(Error::Corrupt(
-            "lane initialization schema v19 sqlite_master shape does not match".into(),
+            "lane initialization schema v1 sqlite_master shape does not match".into(),
         ));
     }
     Ok(())
 }
 
-pub(super) fn validate_lane_initialization_owners_v20_shape(conn: &Connection) -> Result<()> {
+pub(super) fn validate_lane_initialization_owners_shape(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.pragma_update(None, "foreign_keys", true)?;
-    expected.execute_batch(LANE_INITIALIZATIONS_V19)?;
-    expected.execute_batch(LANE_INITIALIZATION_OWNERS_V20)?;
+    expected.execute_batch(LANE_INITIALIZATIONS)?;
+    expected.execute_batch(LANE_INITIALIZATION_OWNERS)?;
     let actual = lane_initialization_owner_objects(conn)?;
     let wanted = lane_initialization_owner_objects(&expected)?;
     if actual != wanted {
         return Err(Error::Corrupt(
-            "lane initialization owner schema v20 sqlite_master shape does not match".into(),
+            "lane initialization owner schema v1 sqlite_master shape does not match".into(),
         ));
     }
     Ok(())
 }
 
-pub(super) fn validate_lane_retirements_v21_shape(conn: &Connection) -> Result<()> {
+pub(super) fn validate_lane_retirements_shape(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(LANE_RETIREMENTS_V21)?;
+    expected.execute_batch(LANE_RETIREMENTS)?;
     let actual = lane_retirement_objects(conn)?;
     let wanted = lane_retirement_objects(&expected)?;
     if actual != wanted {
         return Err(Error::Corrupt(
-            "lane retirement schema v21 sqlite_master shape does not match".into(),
+            "lane retirement schema v1 sqlite_master shape does not match".into(),
         ));
     }
     Ok(())
@@ -1275,10 +1247,6 @@ fn lane_retirement_objects(conn: &Connection) -> Result<Vec<(String, String, Str
         .map_err(Into::into)
 }
 
-pub(super) fn lane_retirement_objects_absent(conn: &Connection) -> Result<bool> {
-    Ok(lane_retirement_objects(conn)?.is_empty())
-}
-
 fn lane_initialization_owner_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
         "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
@@ -1299,10 +1267,6 @@ fn lane_initialization_owner_objects(conn: &Connection) -> Result<Vec<(String, S
         .map_err(Into::into)
 }
 
-pub(super) fn lane_initialization_owner_objects_absent(conn: &Connection) -> Result<bool> {
-    Ok(lane_initialization_owner_objects(conn)?.is_empty())
-}
-
 fn lane_initialization_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
         "SELECT type,name,COALESCE(sql,'') FROM sqlite_master
@@ -1321,23 +1285,20 @@ fn lane_initialization_objects(conn: &Connection) -> Result<Vec<(String, String,
         .map_err(Into::into)
 }
 
-pub(super) fn validate_schema_v18_shape(conn: &Connection) -> Result<()> {
+pub(super) fn validate_base_schema_shape(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.pragma_update(None, "foreign_keys", true)?;
-    expected.execute_batch(BASE_SCHEMA_V18)?;
+    expected.execute_batch(BASE_SCHEMA)?;
     if schema_objects(conn)? != schema_objects(&expected)? {
         return Err(Error::Corrupt(
-            "base schema v18 sqlite_master shape does not match".into(),
+            "base schema v1 sqlite_master shape does not match".into(),
         ));
     }
     Ok(())
 }
 
-pub(super) fn base_schema_complete_for_version(
-    conn: &Connection,
-    expected_version: i64,
-) -> Result<bool> {
-    if validate_schema_v18_shape(conn).is_err() {
+pub(super) fn base_schema_complete(conn: &Connection, expected_version: i64) -> Result<bool> {
+    if validate_base_schema_shape(conn).is_err() {
         return Ok(false);
     }
     let mut statement = conn.prepare(
@@ -1376,10 +1337,6 @@ pub(super) fn base_schema_complete_for_version(
             )
             .optional()?
             == Some(true))
-}
-
-pub(super) fn lane_initialization_objects_absent(conn: &Connection) -> Result<bool> {
-    Ok(lane_initialization_objects(conn)?.is_empty())
 }
 
 fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
@@ -1441,7 +1398,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
 
-        assert!(create_schema_v21(&conn).is_err());
+        assert!(create_schema(&conn).is_err());
 
         assert_eq!(master_objects(&conn), before);
         assert_eq!(

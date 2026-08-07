@@ -120,14 +120,14 @@ Trail stores durable state across filesystem sidecars, SQLite, content-addressed
 
 Schema changes require special care:
 
-1. Update schema creation and migration logic in `trail/src/db/storage/schema/`.
-2. Keep `PRAGMA user_version` and `schema_meta` coherent.
-3. Refuse unsupported future schema versions explicitly.
-4. Make migrations safe under interruption and concurrent openers.
-5. Add migration, reopen, corruption, rollback, and fault-injection coverage as applicable.
+1. Update the single fresh-schema creator and validator in `trail/src/db/storage/schema/`.
+2. Keep `PRAGMA user_version=1` and `schema_meta` coherent.
+3. Refuse every version other than schema v1 explicitly; Trail has no database migration path.
+4. Make fresh creation atomic under its savepoint and workspace lock.
+5. Add schema-v1 reopen, corruption, rollback, and fault-injection coverage as applicable.
 6. Update reports, OpenAPI/MCP schemas, reference docs, and compatibility notes when stored meaning becomes public.
 
-Never rewrite a user's `.trail/` state manually in a test or migration when an existing Trail API or migration fixture can express the scenario.
+Never rewrite a user's `.trail/` state manually in a test. Existing non-v1 workspaces must fail closed with backup and `trail init --force` guidance.
 
 ## Paths, security, and process boundaries
 
@@ -224,11 +224,8 @@ cargo test -p trail --test acp_faults --locked
 cargo test -p trail --test acp_interop --locked
 scripts/test-acp-v1-reference-interop.sh
 
-# Current schema and migration boundaries
-cargo test -p trail --test schema_v18_hard_cutover --locked
-cargo test -p trail --test schema_v19_lane_initializations --locked
-cargo test -p trail --test schema_v20_lane_initialization_owners --locked
-cargo test -p trail --test schema_v21_lane_retirements --locked
+# Current schema hard-cutover boundary
+cargo test -p trail --test schema_v1_hard_cutover --locked
 
 # Changed-path ledger on its native host
 cargo test -p trail --test changed_path_ledger_linux --locked    # Linux

@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 use rusqlite::Connection;
-use trail::{InitImportMode, Trail};
+use trail::{InitImportMode, LaneRetirementPhase, LaneWorkdirMode, Trail};
 
 struct SchemaFixture {
     temp: tempfile::TempDir,
@@ -16,17 +16,8 @@ struct SchemaFixture {
 }
 
 impl SchemaFixture {
-    fn predecessor_v18() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        trail::test_support::create_schema_v18_fixture(temp.path()).unwrap();
-        Self {
-            temp,
-            wal_writer: None,
-        }
-    }
-
     fn versioned(version: i64) -> Self {
-        let fixture = Self::fresh_v18();
+        let fixture = Self::fresh_schema();
         let conn = Connection::open(fixture.sqlite_path()).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
         conn.execute(
@@ -38,8 +29,8 @@ impl SchemaFixture {
         fixture
     }
 
-    fn partial_v18(missing_table: &str) -> Self {
-        let fixture = Self::fresh_v18();
+    fn partial_schema(missing_table: &str) -> Self {
+        let fixture = Self::fresh_schema();
         let conn = Connection::open(fixture.sqlite_path()).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(&format!("DROP TABLE {missing_table};"))
@@ -49,7 +40,7 @@ impl SchemaFixture {
     }
 
     fn with_sql(mutator: impl FnOnce(&Connection)) -> Self {
-        let fixture = Self::fresh_v18();
+        let fixture = Self::fresh_schema();
         let conn = Connection::open(fixture.sqlite_path()).unwrap();
         mutator(&conn);
         drop(conn);
@@ -57,7 +48,7 @@ impl SchemaFixture {
     }
 
     fn with_persistent_wal(mutator: impl FnOnce(&Connection)) -> Self {
-        let mut fixture = Self::fresh_v18();
+        let mut fixture = Self::fresh_schema();
         let conn = Connection::open(fixture.sqlite_path()).unwrap();
         assert_eq!(
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
@@ -93,7 +84,7 @@ impl SchemaFixture {
         })
     }
 
-    fn fresh_v18() -> Self {
+    fn fresh_schema() -> Self {
         let temp = tempfile::tempdir().unwrap();
         Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
         Self {
@@ -353,18 +344,18 @@ fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
         trail::Error::SchemaReinitializeRequired { found, guidance } => {
             assert_eq!(
                 found,
-                "database corrupt: found version 17; expected version 21"
+                "database corrupt: found version 17; expected version 1"
             );
             assert_eq!(
                 guidance,
-                "back up this workspace, then run `trail init --force` to create schema v21"
+                "back up this workspace, then run `trail init --force` to create schema v1"
             );
         }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(
         err.to_string(),
-        "workspace schema database corrupt: found version 17; expected version 21 cannot be opened; back up this workspace, then run `trail init --force` to create schema v21"
+        "workspace schema database corrupt: found version 17; expected version 1 cannot be opened; back up this workspace, then run `trail init --force` to create schema v1"
     );
     assert_tree_unchanged(&fixture, &before);
 }
@@ -414,7 +405,7 @@ fn extra_views_and_triggers_are_rejected_without_mutation() {
 
 #[test]
 fn removed_slatedb_backend_is_rejected_explicitly() {
-    let fixture = SchemaFixture::fresh_v18();
+    let fixture = SchemaFixture::fresh_schema();
     let config_path = fixture.root().join(".trail/config.toml");
     let config = fs::read_to_string(&config_path).unwrap().replace(
         "prolly_backend = \"sqlite\"",
@@ -441,8 +432,8 @@ fn existing_schema_opens_from_a_non_utf8_workspace_path() {
 }
 
 #[test]
-fn partial_v18_is_rejected_without_repair() {
-    let fixture = SchemaFixture::partial_v18("changed_path_scopes");
+fn partial_schema_is_rejected_without_repair() {
+    let fixture = SchemaFixture::partial_schema("changed_path_scopes");
     let before = fixture.snapshot_tree_bytes();
     let err = open_error(fixture.root());
     assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
@@ -450,18 +441,8 @@ fn partial_v18_is_rejected_without_repair() {
 }
 
 #[test]
-fn schema_v18_migrates_to_v21_and_unsupported_versions_are_rejected() {
-    let predecessor = SchemaFixture::predecessor_v18();
-    Trail::open(predecessor.root()).unwrap();
-    assert_eq!(
-        Connection::open(predecessor.sqlite_path())
-            .unwrap()
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        21
-    );
-
-    for version in [0, 17, 22] {
+fn schema_versions_other_than_v1_are_rejected_without_mutation() {
+    for version in [0, 2, 17, 18, 19, 20, 21, 22] {
         let fixture = SchemaFixture::versioned(version);
         let before = fixture.snapshot_tree_bytes();
         let err = open_error(fixture.root());
@@ -472,17 +453,17 @@ fn schema_v18_migrates_to_v21_and_unsupported_versions_are_rejected() {
 }
 
 #[test]
-fn fresh_init_creates_the_exact_v21_ledger_shape() {
-    let fixture = SchemaFixture::fresh_v18();
+fn fresh_init_creates_the_exact_v1_ledger_shape() {
+    let fixture = SchemaFixture::fresh_schema();
     let conn = Connection::open(fixture.sqlite_path()).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        21
+        1
     );
 
     let metadata = [
-        ("schema.version", "21"),
+        ("schema.version", "1"),
         ("changed_path.observer_log_format_min", "1"),
         ("changed_path.observer_log_format_max", "1"),
     ];
@@ -749,7 +730,43 @@ fn fresh_init_creates_the_exact_v21_ledger_shape() {
 }
 
 #[test]
-fn malformed_v18_attributes_are_rejected_read_only() {
+fn schema_v1_backup_restore_preserves_completed_retirement_provenance() {
+    let source = tempfile::tempdir().unwrap();
+    Trail::init(source.path(), "main", InitImportMode::Empty, false).unwrap();
+    let mut db = Trail::open(source.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "retired-before-backup",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    db.remove_lane("retired-before-backup", true).unwrap();
+
+    let archives = tempfile::tempdir().unwrap();
+    let backup = archives.path().join("schema-v1-backup");
+    db.create_backup(&backup, false).unwrap();
+    drop(db);
+    let restored = tempfile::tempdir().unwrap();
+    Trail::restore_backup(restored.path(), &backup, false).unwrap();
+
+    let restored_db = Trail::open(restored.path()).unwrap();
+    assert_eq!(restored_db.schema_user_version_for_test(), 1);
+    let retirement = restored_db
+        .lane_retirement(&spawned.lane_id)
+        .unwrap()
+        .expect("restored backup lost lane retirement provenance");
+    assert_eq!(retirement.former_name, "retired-before-backup");
+    assert_eq!(retirement.phase, LaneRetirementPhase::Completed);
+}
+
+#[test]
+fn malformed_schema_attributes_are_rejected_read_only() {
     let fixtures = [
         SchemaFixture::mutated_master_sql(
             "changed_path_scopes",

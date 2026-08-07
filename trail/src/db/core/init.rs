@@ -567,11 +567,7 @@ impl Trail {
             SchemaOpenMode::Existing if writer_exclusion_held => None,
             SchemaOpenMode::Existing => {
                 Some(Self::with_write_lock_wait(Duration::from_secs(10), || {
-                    preflight_existing_schema_with_migration(
-                        &db_dir,
-                        &sqlite_path,
-                        &config.storage.prolly_backend,
-                    )
+                    preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)
                 })?)
             }
         };
@@ -640,7 +636,7 @@ impl Trail {
             operation_metrics,
         };
         if schema_mode == SchemaOpenMode::FreshCreate {
-            db.create_schema_v21()?;
+            db.create_schema()?;
         }
         Ok(db)
     }
@@ -815,89 +811,6 @@ impl Trail {
         lock.observer_write_exclusion = Some(exclusion);
         Ok(lock)
     }
-}
-
-fn preflight_existing_schema_with_migration(
-    db_dir: &Path,
-    db_path: &Path,
-    prolly_backend: &str,
-) -> Result<ValidatedSchemaGeneration> {
-    let original_error = match preflight_existing_schema(db_path, prolly_backend) {
-        Ok(validated) => return Ok(validated),
-        Err(error) => error,
-    };
-    let predecessor = inspect_existing_schema_version(db_path, prolly_backend)?;
-    if !matches!(
-        predecessor,
-        SCHEMA_V18_VERSION | SCHEMA_V19_VERSION | SCHEMA_V20_VERSION
-    ) {
-        return Err(original_error);
-    }
-
-    migrate_existing_schema_to_v21(db_dir, db_path, prolly_backend)?;
-    preflight_existing_schema(db_path, prolly_backend)
-}
-
-fn migrate_existing_schema_to_v21(
-    db_dir: &Path,
-    db_path: &Path,
-    prolly_backend: &str,
-) -> Result<()> {
-    let _lock = acquire_workspace_lock_with_admission(
-        db_dir,
-        db_path,
-        WorkspaceLockAdmission {
-            purpose: WorkspaceLockPurpose::SchemaTransition,
-            operation_id: Some("schema-to-v21"),
-            deadline: Duration::ZERO,
-            retry_command: "trail init --force",
-        },
-    )?;
-    let mut conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(schema_reinitialize_error)?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(schema_reinitialize_error)?;
-    let current = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(schema_reinitialize_error)?;
-    match current {
-        TRAIL_SCHEMA_VERSION => {
-            storage::validate_schema_v21(&conn).map_err(schema_reinitialize_error)
-        }
-        SCHEMA_V20_VERSION => {
-            storage::validate_schema_v20_for_migration(&conn).map_err(schema_reinitialize_error)?;
-            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
-            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
-        }
-        SCHEMA_V19_VERSION => {
-            storage::validate_schema_v19_for_migration(&conn).map_err(schema_reinitialize_error)?;
-            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
-            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)?;
-            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
-        }
-        SCHEMA_V18_VERSION => {
-            storage::validate_schema_v18_for_migration(&conn).map_err(schema_reinitialize_error)?;
-            validate_predecessor_prolly_schema(&conn, prolly_backend)?;
-            storage::migrate_schema_v18_to_v19(&mut conn).map_err(schema_reinitialize_error)?;
-            storage::migrate_schema_v19_to_v20(&mut conn).map_err(schema_reinitialize_error)?;
-            storage::migrate_schema_v20_to_v21(&mut conn).map_err(schema_reinitialize_error)
-        }
-        found => Err(schema_reinitialize_error(format!(
-            "database corrupt: found version {found}; expected version {TRAIL_SCHEMA_VERSION}"
-        ))),
-    }
-}
-
-fn validate_predecessor_prolly_schema(conn: &Connection, prolly_backend: &str) -> Result<()> {
-    if prolly_backend != "sqlite" {
-        return Err(Error::InvalidInput(format!(
-            "storage.prolly_backend is no longer configurable; expected `sqlite`, got `{prolly_backend}`"
-        )));
-    }
-    storage::validate_prolly_sqlite_schema_v18(conn).map_err(schema_reinitialize_error)
 }
 
 fn git_tracked_import_is_large(workspace_root: &Path) -> Result<bool> {

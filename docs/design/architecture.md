@@ -160,7 +160,7 @@ Initialization creates:
 - `.trailignore`
 - initial schema and refs
 
-Opening a workspace applies SQLite pragmas, constructs prolly clients, initializes or validates schema, and refuses schema versions newer than the binary supports.
+Opening a workspace applies SQLite pragmas, constructs prolly clients, initializes or validates schema v1, and refuses every other schema version. Trail intentionally has no database migration path while the product is pre-user.
 
 ## Write Coordination
 
@@ -179,7 +179,7 @@ Advisory leases are separate from the write lock. The write lock protects databa
 
 ## Failure Modes
 
-- Future schema version: opening fails with invalid input.
+- Any schema version other than v1: opening fails closed with backup and `trail init --force` guidance.
 - Missing workspace: CLI exits with `WORKSPACE_NOT_FOUND`.
 - Dirty worktree/materialized workdir: checkout or merge may refuse.
 - Workspace lock held: mutating operations fail with `WORKSPACE_LOCKED`.

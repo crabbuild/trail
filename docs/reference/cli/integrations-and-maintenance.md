@@ -44,8 +44,10 @@ trail agent start aider
 trail agent start opencode
 ```
 
-Use `--workdir-mode fuse-cow` when a large repository should be exposed as a
-mounted COW filesystem view instead of a full copied workdir:
+The default `--workdir-mode auto` selects the host transparent COW backend when
+one is available, which lets environment-backed tasks use layered workspace
+views without copying the full tree. Use `--workdir-mode fuse-cow` when a large
+repository should be exposed as a mounted COW filesystem view explicitly:
 
 ```sh
 trail agent start codex --workdir-mode fuse-cow

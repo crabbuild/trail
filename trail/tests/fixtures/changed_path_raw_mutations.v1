@@ -140,7 +140,6 @@ reviewed|db/core/init.rs|init_with_options|fs::write|4
 reviewed|db/core/init.rs|open_at_without_recovery|fs::create_dir_all|1
 reviewed|db/core/workspace/ignore.rs|ignore_add|fs::write|1
 reviewed|db/core/workspace/ignore.rs|ignore_remove|fs::write|1
-reviewed|db/lane/initialization.rs|install_schema_v18_authenticated_lane_evidence|fs::set_permissions|1
 reviewed|db/lane/lifecycle.rs|lane_initialization_crash_cut|OpenOptions::create_new|1
 reviewed|db/lane/lifecycle.rs|lane_initialization_crash_cut|OpenOptions::write|1
 reviewed|db/lane/lifecycle.rs|write_sparse_workdir_manifest|fs::create_dir_all|1
@@ -322,7 +321,6 @@ reviewed|db/mod.rs|create_workspace_lock_candidate|OpenOptions::create_new|1
 reviewed|db/mod.rs|create_workspace_lock_candidate|OpenOptions::write|1
 reviewed|db/mod.rs|inspect_existing_workspace_lock|fs::remove_file|1
 reviewed|db/mod.rs|inspect_existing_workspace_lock|OpenOptions::write|1
-reviewed|db/mod.rs|inspect_existing_schema_version|fs::copy|1
 reviewed|db/mod.rs|publish_workspace_lock|fs::remove_file|1
 reviewed|db/mod.rs|remove_owned_workspace_lock|fs::remove_file|1
 reviewed|db/mod.rs|remove_workspace_lock_candidate_if_matches|fs::remove_file|1
@@ -344,8 +342,6 @@ reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::create_dir_all|1
 reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::create_dir|1
 reviewed|db/storage/git.rs|git_write_tree_from_head_delta|fs::write|1
 reviewed|db/storage/lifecycle/rebuild.rs|remove_path_index_derived_mirror|fs::remove_file|1
-reviewed|db/storage/schema.rs|create_schema_fixture_for_test|fs::remove_file|1
-reviewed|db/storage/schema.rs|create_schema_fixture_for_test|fs::rename|1
 reviewed|db/util/config_io.rs|write_config|fs::remove_file|1
 reviewed|db/util/config_io.rs|write_config|fs::rename|1
 reviewed|db/util/config_io.rs|write_config|fs::write|1

@@ -509,6 +509,7 @@ fn begin_scope_retirement(
         |row| row.get(0),
     )?;
     if trust_reason == "scope_retiring" {
+        normalize_failed_retirement_owner(conn, expected)?;
         return load_retirement_identity(conn, &expected.scope_id.to_text())?
             .ok_or_else(|| Error::Corrupt("retiring scope disappeared".into()));
     }
@@ -597,6 +598,60 @@ fn begin_scope_retirement(
     crate::db::util::test_crash_point("changed_path_deletion_after_retirement_fence_barrier");
     load_retirement_identity(conn, &expected.scope_id.to_text())?
         .ok_or_else(|| Error::Corrupt("retiring scope disappeared after fence".into()))
+}
+
+/// A failed observer has already invalidated its owner and persisted an
+/// `error` lease. Once the scope is in the durable retirement state there is
+/// no writer left to fence, so mint the retirement fence that the deletion
+/// journal requires and make the owner explicitly revoked. Keeping this
+/// recovery at the retirement boundary lets an interrupted lane removal be
+/// resumed after a process restart without weakening normal observer-owner
+/// admission.
+fn normalize_failed_retirement_owner(
+    conn: &Connection,
+    expected: &RetirementIdentity,
+) -> Result<()> {
+    let has_failed_owner: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM changed_path_observer_owners
+             WHERE scope_id=?1 AND epoch=?2 AND lease_state='error'
+         )",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "retirement owner epoch")?
+        ],
+        |row| row.get(0),
+    )?;
+    if !has_failed_owner {
+        return Ok(());
+    }
+
+    let mut fence_nonce = [0_u8; 32];
+    getrandom::getrandom(&mut fence_nonce).map_err(|error| {
+        Error::InvalidInput(format!(
+            "retirement recovery fence nonce generation failed: {error}"
+        ))
+    })?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE changed_path_observer_owners
+         SET lease_state='revoked',fence_nonce=?1,error_state=NULL,error_at=NULL,
+             expires_at=?2,updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND lease_state='error'",
+        params![
+            fence_nonce,
+            now_ts(),
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "retirement owner epoch")?
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::WorkspaceLocked(
+            "retirement owner changed before recovery fence publication".into(),
+        ));
+    }
+    tx.commit()?;
+    durable_intent_barrier(conn)
 }
 
 fn load_retirement_identity(
@@ -3756,7 +3811,84 @@ mod harness {
             )
             .unwrap();
         assert_eq!(incomplete, 0);
-        Trail::validate_schema_v21(&fixture.db.conn).unwrap();
+        Trail::validate_schema(&fixture.db.conn).unwrap();
+    }
+
+    #[test]
+    fn interrupted_retirement_with_failed_owner_reopens_and_rearms() {
+        let fixture = Fixture::new(0x9a).unwrap();
+        create_real_retirement_segment(&fixture, 0x9a).unwrap();
+        let retirement =
+            load_retirement_identity(&fixture.db.conn, &fixture.expected.scope_id.to_text())
+                .unwrap()
+                .unwrap();
+        let retirement = begin_scope_retirement(&fixture.db.conn, &retirement).unwrap();
+        let (scope_identity, rows) = inspect_segments_before_allocation(
+            &fixture.db.conn,
+            &fixture.db.sqlite_path,
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+        )
+        .unwrap();
+        journal_missing_quarantine_allocations(
+            &fixture.db.conn,
+            &retirement,
+            fixture.expected.epoch,
+            scope_identity,
+            &rows,
+        )
+        .unwrap();
+        drop(rows);
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_observer_owners
+                 SET lease_state='error',fence_nonce=?1,error_state='observer_writer_dropped',
+                     error_at=?2,expires_at=?2
+                 WHERE scope_id=?3 AND epoch=?4",
+                params![
+                    vec![0x9a_u8; 24],
+                    now_ts(),
+                    fixture.expected.scope_id.to_text(),
+                    sql_u64(fixture.expected.epoch, "fixture epoch").unwrap()
+                ],
+            )
+            .unwrap();
+
+        let workspace = fixture.db.workspace_root().to_path_buf();
+        let expected = fixture.expected.clone();
+        let root = fixture._root;
+        drop(fixture.db);
+
+        let reopened = Trail::open(&workspace).unwrap();
+        let owner_state: (String, i64) = reopened
+            .conn
+            .query_row(
+                "SELECT lease_state,length(fence_nonce)
+                 FROM changed_path_observer_owners WHERE scope_id=?1",
+                [expected.scope_id.to_text()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_state.0, "error");
+        assert_eq!(owner_state.1, 24);
+
+        let tokens = retire_scope(&reopened.conn, &reopened.sqlite_path, &expected).unwrap();
+        assert_eq!(tokens.len(), 1);
+        let owner_state: (String, i64) = reopened
+            .conn
+            .query_row(
+                "SELECT lease_state,length(fence_nonce)
+                 FROM changed_path_observer_owners WHERE scope_id=?1",
+                [expected.scope_id.to_text()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_state, ("revoked".into(), 32));
+        remove_retired_segments(&reopened.conn, &tokens).unwrap();
+        Trail::validate_schema(&reopened.conn).unwrap();
+        drop(root);
     }
 
     fn create_real_retirement_segment(fixture: &Fixture, tag: u8) -> Result<String> {
