@@ -381,7 +381,7 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
     let fake_claude = bin.path().join("claude");
     fs::write(
         &fake_claude,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > CLAUDE_ARGS.txt\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" | tee CLAUDE_ARGS.txt >&2\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&fake_claude).unwrap().permissions();
@@ -416,10 +416,13 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
     assert_eq!(
-        fs::read_to_string(workdir.join("CLAUDE_ARGS.txt")).unwrap(),
+        String::from_utf8_lossy(&output.stderr),
         format!("--settings\n{settings}\n")
+    );
+    assert_eq!(
+        report["lifecycle"]["checkpoint"]["source_paths"],
+        serde_json::json!(["CLAUDE_ARGS.txt"])
     );
 }
 

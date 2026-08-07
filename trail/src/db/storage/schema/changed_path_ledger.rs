@@ -1464,15 +1464,19 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                     OR EXISTS(
                        SELECT 1 FROM changed_path_observer_owners owner
                        WHERE owner.scope_id=scope.scope_id
-                         AND (owner.epoch<>scope.epoch OR owner.lease_state<>'revoked'
-                              OR length(owner.fence_nonce)<>32))
+                         AND (owner.epoch<>scope.epoch
+                              OR owner.lease_state NOT IN ('revoked','error')
+                              OR (owner.lease_state='error' AND owner.error_state IS NULL)
+                              OR (owner.lease_state='revoked' AND length(owner.fence_nonce)<>32)))
                     OR (EXISTS(SELECT 1 FROM changed_path_observer_segments segment
                                WHERE segment.scope_id=scope.scope_id)
                         AND NOT EXISTS(SELECT 1 FROM changed_path_observer_owners owner
                                        WHERE owner.scope_id=scope.scope_id
                                          AND owner.epoch=scope.epoch
-                                         AND owner.lease_state='revoked'
-                                         AND length(owner.fence_nonce)=32))
+                                         AND (
+                                             (owner.lease_state='error' AND owner.error_state IS NOT NULL)
+                                             OR (owner.lease_state='revoked'
+                                                 AND length(owner.fence_nonce)=32))))
                     OR EXISTS(
                        SELECT 1 FROM changed_path_segment_deletions deletion
                        WHERE deletion.scope_id=scope.scope_id))

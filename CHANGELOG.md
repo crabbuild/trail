@@ -5,6 +5,15 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal-agent `--workdir-mode auto` now selects a supported transparent COW
+  backend for environment-backed tasks, while retaining native/portable
+  fallback on hosts without one.
+- Lane archive and unarchive daemon requests no longer send an unexpected JSON
+  body, and interrupted observer retirement with a failed owner can be reopened
+  and resumed instead of being reported as a corrupt schema.
+
 ## [0.1.1] - 2026-07-29
 
 ### Added

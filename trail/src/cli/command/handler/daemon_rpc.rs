@@ -475,10 +475,7 @@ fn handle_lane_command(
                 LaneSubcommand::Unarchive(_) => "unarchive",
                 _ => unreachable!(),
             };
-            let report: LaneDetails = client.post_json(
-                &format!("/v1/lanes/{}/{action}", args.name),
-                &serde_json::json!({}),
-            )?;
+            let report: LaneDetails = request_lane_lifecycle_action(client, &args.name, action)?;
             render_lane_details(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
@@ -1204,6 +1201,14 @@ fn append_query(path: &str, params: Vec<String>) -> String {
     }
 }
 
+fn request_lane_lifecycle_action<T: DeserializeOwned>(
+    client: &DaemonClient,
+    lane: &str,
+    action: &str,
+) -> Result<T> {
+    client.post_empty_json(&format!("/v1/lanes/{lane}/{action}"))
+}
+
 pub(super) struct DaemonClient {
     endpoint: DaemonTransport,
     token: Option<String>,
@@ -1750,6 +1755,9 @@ fn discover_db_dir(ctx: &RuntimeContext) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn daemon_response_carries_one_request_scoped_metrics_report() {
@@ -1789,6 +1797,39 @@ mod tests {
             daemon_request_timeout("POST", "/v1/index/reconcile"),
             Duration::from_secs(15 * 60)
         );
+    }
+
+    #[test]
+    fn lane_archive_rpc_uses_an_empty_request_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_request = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *captured_request.lock().unwrap() = request;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+        });
+
+        let client = DaemonClient::new(&format!("http://{address}"), None).unwrap();
+        let _: Value = request_lane_lifecycle_action(&client, "archive-me", "archive").unwrap();
+        server.join().unwrap();
+
+        let request = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(request.starts_with("POST /v1/lanes/archive-me/archive HTTP/1.1\r\n"));
+        assert!(request.contains("Content-Length: 0\r\n"));
+        assert!(!request.contains("Content-Type: application/json"));
     }
 
     #[test]

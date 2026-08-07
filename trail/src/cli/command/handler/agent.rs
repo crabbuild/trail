@@ -1358,14 +1358,8 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
         configured_provider.as_deref(),
     )?;
     let lane = db.fresh_agent_lane_name(&provider, args.name.as_deref());
-    let workdir_mode = db.resolve_lane_spawn_workdir_mode(
-        args.from.as_deref(),
-        Some(&args.workdir_mode),
-        Some(true),
-        false,
-        false,
-        &[],
-    )?;
+    let workdir_mode =
+        db.resolve_agent_workdir_mode(args.from.as_deref(), Some(&args.workdir_mode))?;
     let report = run_terminal_agent_task(
         ctx,
         db,
@@ -1395,14 +1389,8 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
         .unwrap_or_else(|| format!("{} follow-up", source.task.title));
     let lane = db.fresh_agent_lane_name(&provider, Some(&name));
     let source_task = source.task.clone();
-    let workdir_mode = db.resolve_lane_spawn_workdir_mode(
-        Some(&from_change.0),
-        Some(&args.workdir_mode),
-        Some(true),
-        false,
-        false,
-        &[],
-    )?;
+    let workdir_mode =
+        db.resolve_agent_workdir_mode(Some(&from_change.0), Some(&args.workdir_mode))?;
     let run = run_terminal_agent_task(
         ctx,
         db,

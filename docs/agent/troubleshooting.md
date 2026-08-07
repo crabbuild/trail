@@ -64,6 +64,10 @@ Use the portable mode while diagnosing the host setup:
 trail agent start codex --workdir-mode native-cow
 ```
 
+The default `--workdir-mode auto` selects a transparent backend on supported
+hosts so environment-backed tasks can run without copying the full tree. Use
+`native-cow` or `portable-copy` explicitly when diagnosing a backend setup.
+
 On macOS, `nfs-cow` is another large-workspace option:
 
 ```sh
