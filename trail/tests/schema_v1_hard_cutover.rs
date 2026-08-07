@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use rusqlite::Connection;
 use trail::{InitImportMode, LaneRetirementPhase, LaneWorkdirMode, Trail};
@@ -757,6 +759,25 @@ fn schema_v1_backup_restore_preserves_completed_retirement_provenance() {
 
     let restored_db = Trail::open(restored.path()).unwrap();
     assert_eq!(restored_db.schema_user_version_for_test(), 1);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(restored.path().join(".trail"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(restored.path().join(".trail/index"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
     let retirement = restored_db
         .lane_retirement(&spawned.lane_id)
         .unwrap()

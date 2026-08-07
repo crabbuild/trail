@@ -2878,50 +2878,61 @@ impl Trail {
         self.ensure_git_head_matches_root(&target_ref.root_id, &git_identity.head)?;
         self.set_git_export_mode(GitExportMode::MappedDelta);
 
-        let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
-        let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
-        let would_record = self.lane_workdir_dirty(&lane)?;
-        if dry_run && would_record {
-            let git_state = self.tracked_git_state(&git_identity)?;
-            validate_git_publication_state(&git_identity.head, &git_state)?;
-            let view = self.agent_task_view(&lane)?;
-            let plan = AgentGitApplyPlan {
-                crab_branch,
-                git_branch,
-                base_change: target_ref.change_id,
-                result_change: None,
-                range: None,
-                would_record: true,
-                would_create_git_commit: false,
-                would_fast_forward: false,
-            };
-            return Ok(AgentApplyReport {
-                task: view.task,
-                status: "would_record".to_string(),
-                dry_run,
-                git_apply_plan: plan,
-                recorded: None,
-                merge: None,
-                git_export: None,
-                fast_forwarded: false,
-                performance: self.git_handoff_metrics_report(),
-                warnings: vec![
-                    "lane workdir has unrecorded changes; actual apply will record them first"
-                        .to_string(),
-                ],
-                suggestions: vec![StatusSuggestion {
-                    command: format!("trail agent land {lane}"),
-                    reason: "record the lane workdir and apply the agent task".to_string(),
-                }],
-            });
-        }
+        // A layered workdir must be mounted while Trail inspects or records it,
+        // but the merge-readiness check below must run after that lease is
+        // released. Otherwise agent apply sees its own temporary mount as an
+        // external active writer and rejects an otherwise ready task.
+        let (would_record, recorded) = {
+            let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
+            let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
+            let would_record = self.lane_workdir_dirty(&lane)?;
+            if dry_run && would_record {
+                let git_state = self.tracked_git_state(&git_identity)?;
+                validate_git_publication_state(&git_identity.head, &git_state)?;
+                let view = self.agent_task_view(&lane)?;
+                let plan = AgentGitApplyPlan {
+                    crab_branch,
+                    git_branch,
+                    base_change: target_ref.change_id,
+                    result_change: None,
+                    range: None,
+                    would_record: true,
+                    would_create_git_commit: false,
+                    would_fast_forward: false,
+                };
+                return Ok(AgentApplyReport {
+                    task: view.task,
+                    status: "would_record".to_string(),
+                    dry_run,
+                    git_apply_plan: plan,
+                    recorded: None,
+                    merge: None,
+                    git_export: None,
+                    fast_forwarded: false,
+                    performance: self.git_handoff_metrics_report(),
+                    warnings: vec![
+                        "lane workdir has unrecorded changes; actual apply will record them first"
+                            .to_string(),
+                    ],
+                    suggestions: vec![StatusSuggestion {
+                        command: format!("trail agent land {lane}"),
+                        reason: "record the lane workdir and apply the agent task".to_string(),
+                    }],
+                });
+            }
 
-        let recorded = if would_record {
-            Some(self.record_lane_workdir(&lane, Some(format!("Agent task `{lane}` checkpoint")))?)
-        } else {
-            None
+            let recorded =
+                if would_record {
+                    Some(self.record_lane_workdir(
+                        &lane,
+                        Some(format!("Agent task `{lane}` checkpoint")),
+                    )?)
+                } else {
+                    None
+                };
+            (would_record, recorded)
         };
         self.ensure_agent_checkpoint_reviewed(&lane)?;
 

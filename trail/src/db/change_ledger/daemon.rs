@@ -208,12 +208,44 @@ pub(crate) fn prepare_workspace_daemon_launch(
     launch: WorkspaceDaemonLaunchIdentity,
     verified_stale_owner: Option<VerifiedStaleWorkspaceOwner>,
 ) -> Result<WorkspaceDaemonProof> {
+    let restored_unbound_scope =
+        verified_stale_owner.is_none() && workspace_scope_needs_restore_rebind(db)?;
     prepare_workspace_daemon_inner(
         db,
-        verified_stale_owner.is_some(),
+        verified_stale_owner.is_some() || restored_unbound_scope,
         verified_stale_owner,
         Some(launch),
     )
+}
+
+fn workspace_scope_needs_restore_rebind(db: &Trail) -> Result<bool> {
+    let scope_id = workspace_daemon_target(db)?.identity.scope_id;
+    db.conn
+        .query_row(
+            "SELECT provider_id,provider_identity,trust_state,trust_reason
+             FROM changed_path_scopes WHERE scope_id=?1",
+            [scope_id.to_text()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map(|row| {
+            row.is_some_and(
+                |(provider_id, provider_identity, trust_state, trust_reason)| {
+                    provider_id.is_none()
+                        && provider_identity.is_none()
+                        && trust_state == "untrusted_gap"
+                        && trust_reason == "restored_filesystem_identity_rotated"
+                },
+            )
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn verified_stale_workspace_owner_for_launch(
@@ -3308,9 +3340,19 @@ fn load_existing_scope(db: &Trail, scope_id: ScopeId) -> Result<Option<ExistingS
             owner_daemon_pid,
             owner_daemon_process_start_identity,
         )| {
-            let provider_identity_text = provider_identity_text.ok_or_else(|| {
-                Error::Corrupt("daemon scope is missing provider identity".into())
-            })?;
+            let provider_identity = match (&provider_id_text, provider_identity_text.as_deref()) {
+                // Backup restore deliberately clears the provider binding so
+                // the next daemon startup can bind the restored scope to the
+                // current host and perform a fresh reconciliation.
+                (None, None) => Vec::new(),
+                (Some(_), Some(identity)) => hex::decode(identity)
+                    .map_err(|_| Error::Corrupt("invalid changed-path provider identity".into()))?,
+                (None, Some(_)) | (Some(_), None) => {
+                    return Err(Error::Corrupt(
+                        "partial daemon provider identity binding".into(),
+                    ));
+                }
+            };
             let observer_owner = match (
                 owner_epoch,
                 owner_token,
@@ -3377,10 +3419,9 @@ fn load_existing_scope(db: &Trail, scope_id: ScopeId) -> Result<Option<ExistingS
                 filesystem_identity: hex::decode(filesystem_identity).map_err(|_| {
                     Error::Corrupt("invalid changed-path filesystem identity".into())
                 })?,
-                provider_identity: hex::decode(&provider_identity_text)
-                    .map_err(|_| Error::Corrupt("invalid changed-path provider identity".into()))?,
+                provider_identity,
                 provider_id_text,
-                provider_identity_text: Some(provider_identity_text),
+                provider_identity_text,
                 provider_cursor,
                 provider_fence,
                 capabilities,
