@@ -4598,7 +4598,11 @@ pub(crate) fn run_startup_cancellation() -> std::result::Result<(), String> {
             timeout: Duration::from_millis(20),
             authority_override: None,
             post_start_database_uuid_override: None,
-            delay_after_native_start: Duration::from_millis(200),
+            // Keep enough separation between the cancellation timeout and the
+            // delayed readiness marker for a cold CoreServices/FSEvents start
+            // on a shared CI runner without accepting the full late-start
+            // delay as a successful timeout return.
+            delay_after_native_start: Duration::from_secs(1),
             cleanup_observed: Some(Arc::clone(&cleanup)),
         };
         let started = Instant::now();
@@ -4609,7 +4613,7 @@ pub(crate) fn run_startup_cancellation() -> std::result::Result<(), String> {
             &[],
             options,
         );
-        if result.is_ok() || started.elapsed() >= Duration::from_millis(150) {
+        if result.is_ok() || started.elapsed() >= Duration::from_millis(500) {
             return Err(Error::Corrupt(
                 "startup timeout waited for a deliberately late native start".into(),
             ));

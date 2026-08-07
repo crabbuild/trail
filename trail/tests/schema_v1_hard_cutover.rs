@@ -759,22 +759,25 @@ fn schema_v1_backup_restore_preserves_completed_retirement_provenance() {
 
     let restored_db = Trail::open(restored.path()).unwrap();
     assert_eq!(restored_db.schema_user_version_for_test(), 1);
-    assert_eq!(
-        fs::metadata(restored.path().join(".trail"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        fs::metadata(restored.path().join(".trail/index"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(restored.path().join(".trail"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(restored.path().join(".trail/index"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
     let retirement = restored_db
         .lane_retirement(&spawned.lane_id)
         .unwrap()
