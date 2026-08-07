@@ -5,6 +5,12 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** Trail's SQLite database is now schema v1. The former v18–v21
+  migration chain and compatibility fixtures are removed; existing non-v1
+  workspaces must be backed up and reinitialized with `trail init --force`.
+
 ### Fixed
 
 - Terminal-agent `--workdir-mode auto` now selects a supported transparent COW

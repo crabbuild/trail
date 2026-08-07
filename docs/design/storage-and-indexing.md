@@ -88,7 +88,11 @@ Schema versioning has two layers:
 - SQLite `PRAGMA user_version`.
 - Rows in `schema_meta`, including schema and app version metadata.
 
-Opening a workspace with `user_version` greater than the supported `TRAIL_SCHEMA_VERSION` fails. Initialization and opening call schema setup/validation, and schema setup also uses `ensure_column` for additive compatibility columns.
+Trail currently ships one database schema, v1. Opening a workspace whose
+`user_version` or `schema_meta.schema.version` is not `1` fails closed with
+backup and `trail init --force` guidance. Fresh creation installs the complete
+schema atomically; Trail intentionally has no database migration or additive
+compatibility path while the product is pre-user.
 
 ## Object Storage
 
@@ -209,7 +213,7 @@ Backups include SQLite data and worktree-related state. Restore can rewrite mate
 
 ## Failure Modes
 
-- Future schema version: refuse to open.
+- Any schema version other than v1: refuse to open.
 - Missing operation object referenced by a ref: index rebuild reports an error.
 - Corrupt operation/message object bytes: index rebuild reports decode errors.
 - Missing worktree index baseline: status may fall back to a fuller scan.

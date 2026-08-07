@@ -3811,7 +3811,7 @@ mod harness {
             )
             .unwrap();
         assert_eq!(incomplete, 0);
-        Trail::validate_schema_v21(&fixture.db.conn).unwrap();
+        Trail::validate_schema(&fixture.db.conn).unwrap();
     }
 
     #[test]
@@ -3887,7 +3887,7 @@ mod harness {
             .unwrap();
         assert_eq!(owner_state, ("revoked".into(), 32));
         remove_retired_segments(&reopened.conn, &tokens).unwrap();
-        Trail::validate_schema_v21(&reopened.conn).unwrap();
+        Trail::validate_schema(&reopened.conn).unwrap();
         drop(root);
     }
 

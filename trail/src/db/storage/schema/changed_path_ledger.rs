@@ -5,7 +5,7 @@ const CHANGED_PATH_OBSERVER_LOG_FORMAT_VERSION: i64 = 1;
 type ForeignKeyShape<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 type TableForeignKeys<'a> = (&'a str, &'a [ForeignKeyShape<'a>]);
 
-pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
+pub(super) const CHANGED_PATH_LEDGER_SCHEMA: &str =
         "CREATE TABLE changed_path_scopes (
              scope_id TEXT NOT NULL PRIMARY KEY CHECK (length(scope_id) > 0),
              schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
@@ -398,7 +398,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              ON changed_path_segment_deletions(scope_id, epoch, state);";
 
 pub(super) fn create_changed_path_ledger_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(CHANGED_PATH_LEDGER_SCHEMA_V18)
+    conn.execute_batch(CHANGED_PATH_LEDGER_SCHEMA)
         .map_err(Into::into)
 }
 
@@ -444,7 +444,7 @@ pub(super) fn changed_path_ledger_schema_complete(
 
 fn ledger_master_matches(conn: &Connection) -> Result<bool> {
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(CHANGED_PATH_LEDGER_SCHEMA_V18)?;
+    expected.execute_batch(CHANGED_PATH_LEDGER_SCHEMA)?;
     Ok(ledger_schema_objects(conn)? == ledger_schema_objects(&expected)?)
 }
 

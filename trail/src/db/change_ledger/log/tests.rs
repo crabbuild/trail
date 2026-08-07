@@ -116,7 +116,7 @@ impl Fixture {
         )
     }
 
-    fn full_v18() -> Self {
+    fn full_schema() -> Self {
         let temp = tempfile::tempdir().unwrap();
         Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
         let db = Trail::open(temp.path()).unwrap();
@@ -263,7 +263,7 @@ fn event(sequence: u64) -> ObserverRecord {
 
 #[test]
 fn header_only_post_rotation_flush_keeps_database_last_sequence_null() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let mut writer = fixture.acquire_epoch(1, [0xa1; 32]).unwrap();
     writer.append(&[event(1)]).unwrap();
     let sealed = writer.flush_durable().unwrap();
@@ -315,7 +315,7 @@ fn header_only_post_rotation_flush_keeps_database_last_sequence_null() {
 
 #[test]
 fn append_flush_and_rotate_seals_the_boundary_and_opens_its_linked_anchor() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let mut writer = fixture.acquire_epoch(1, [0xa2; 32]).unwrap();
 
     let (sealed, anchor) = writer.append_flush_and_rotate(&[event(1)]).unwrap();
@@ -367,7 +367,7 @@ fn append_flush_and_rotate_seals_the_boundary_and_opens_its_linked_anchor() {
 
 #[test]
 fn non_daemon_owner_replacement_clears_prior_daemon_launch_binding() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let old_launch_nonce = "ab".repeat(32);
     let old_pid = 4242;
     let old_start = "old-daemon-start";
@@ -443,7 +443,7 @@ fn non_daemon_owner_replacement_clears_prior_daemon_launch_binding() {
 
 #[test]
 fn dropping_an_unbound_short_lived_writer_only_closes_its_file() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let token = [0xb3; 32];
     let writer = fixture.acquire_epoch(1, token).unwrap();
     drop(writer);
@@ -464,7 +464,7 @@ fn dropping_an_unbound_short_lived_writer_only_closes_its_file() {
 
 #[test]
 fn dropping_a_native_bound_writer_revokes_its_exact_owner() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let token = [0xb4; 32];
     let connection = Connection::open(&fixture.database).unwrap();
     let (provider_id, provider_identity): (String, String) = connection
@@ -507,7 +507,7 @@ fn dropping_a_native_bound_writer_revokes_its_exact_owner() {
 
 #[test]
 fn append_and_flush_keeps_command_lock_out_until_sqlite_publication() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let mut writer = fixture.acquire_epoch(1, [0xc5; 32]).unwrap();
     let boundary_observed = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&boundary_observed);
@@ -558,7 +558,7 @@ fn append_and_flush_keeps_command_lock_out_until_sqlite_publication() {
 
 #[test]
 fn heartbeat_remains_live_while_a_command_holds_the_workspace_lock() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let token = [0xc6; 32];
     let mut writer = fixture.acquire_epoch(1, token).unwrap();
     let database_parent = fixture.database.parent().unwrap();
@@ -593,7 +593,7 @@ fn heartbeat_remains_live_while_a_command_holds_the_workspace_lock() {
 
 #[test]
 fn dropping_a_daemon_owned_writer_revokes_its_exact_owner() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let token = [0xb5; 32];
     let provider_id: String = Connection::open(&fixture.database)
         .unwrap()
@@ -686,7 +686,7 @@ fn recovery_rejects_wrong_identity_non_monotonic_sequences_and_count_caps() {
 
 #[test]
 fn global_epoch_fences_same_epoch_replacement_without_any_mutation() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let mut first = fixture.acquire_epoch(1, [1; 32]).unwrap();
     assert!(SegmentWriter::acquire(
         &fixture.database,
@@ -790,7 +790,7 @@ fn segment_id_is_exactly_derived_from_epoch_sequence_and_full_owner_token() {
 
 #[test]
 fn epoch_advance_makes_filesystem_name_unique_even_with_the_same_full_token() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let token = [0x12; 32];
     drop(fixture.acquire_epoch(1, token).unwrap());
     Connection::open(&fixture.database)
@@ -1053,7 +1053,7 @@ fn every_rotation_publication_fault_retires_the_writer() {
         FaultPoint::SecondDirectorySync,
         FaultPoint::NextMetadataPublication,
     ] {
-        let fixture = Fixture::full_v18();
+        let fixture = Fixture::full_schema();
         let faults = Arc::new(FaultScript::new([point]));
         let mut writer = SegmentWriter::acquire_with_faults(
             &fixture.database,
@@ -1104,7 +1104,7 @@ fn every_rotation_publication_fault_retires_the_writer() {
 
 #[test]
 fn writer_retirement_advances_scope_continuity_generation() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let faults = Arc::new(FaultScript::new([FaultPoint::FileSync]));
     let mut writer = SegmentWriter::acquire_with_faults(
         &fixture.database,
@@ -1145,7 +1145,7 @@ fn writer_retirement_advances_scope_continuity_generation() {
 
 #[test]
 fn owner_terminal_transition_preserves_existing_stronger_fail_closed_state() {
-    let fixture = Fixture::full_v18();
+    let fixture = Fixture::full_schema();
     let _writer = fixture.acquire_epoch(1, [0x5b; 32]).unwrap();
     let connection = Connection::open(&fixture.database).unwrap();
     connection
@@ -1708,7 +1708,7 @@ fn append_enforces_persisted_total_log_byte_cap() {
 }
 
 #[test]
-fn writer_sql_matches_the_fresh_v18_schema() {
+fn writer_sql_matches_the_fresh_schema() {
     let workspace = tempfile::tempdir().unwrap();
     Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
     let db = Trail::open(workspace.path()).unwrap();

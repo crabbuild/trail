@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_scope_matches_the_fresh_v18_schema() {
+    fn begin_scope_matches_the_fresh_schema() {
         let workspace = tempfile::tempdir().unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
         let db = Trail::open(workspace.path()).unwrap();

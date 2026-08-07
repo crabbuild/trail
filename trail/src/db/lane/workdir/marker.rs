@@ -335,36 +335,6 @@ impl Trail {
     }
 }
 
-pub(crate) fn read_materialized_lane_marker_v2(
-    workdir: &Path,
-) -> Result<Option<MaterializedLaneMarkerV2>> {
-    let Some(metadata) = secure_marker_directory_read_only(workdir)? else {
-        return Ok(None);
-    };
-    let Some(bytes) = metadata.read_regular_optional_bounded(MARKER_FILE, MAX_MARKER_BYTES)? else {
-        return Ok(None);
-    };
-    let marker = serde_json::from_slice::<MaterializedLaneMarkerV2>(&bytes)
-        .map_err(|error| Error::Corrupt(format!("invalid materialized lane marker: {error}")))?;
-    if marker.version != MATERIALIZED_LANE_MARKER_VERSION {
-        return Err(Error::Corrupt(format!(
-            "unsupported materialized lane marker version {}",
-            marker.version
-        )));
-    }
-    Ok(Some(marker))
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn write_materialized_lane_marker_v2_for_test(
-    workdir: &Path,
-    marker: &MaterializedLaneMarkerV2,
-) -> Result<()> {
-    let metadata = secure_marker_directory(workdir, true)?
-        .ok_or_else(|| Error::Corrupt("lane marker directory disappeared".into()))?;
-    metadata.write_atomic_regular(MARKER_FILE, &serde_json::to_vec(marker)?)
-}
-
 pub(crate) fn materialized_lane_root_identity(workdir: &Path) -> Result<Vec<u8>> {
     #[cfg(unix)]
     {
@@ -394,28 +364,6 @@ fn actual_sparse_selection_fingerprint(workdir: &Path) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"trail-sparse-selection-v2\0");
     let bytes = secure_marker_directory(workdir, false)?
-        .map(|metadata| {
-            metadata
-                .read_regular_optional_bounded(SPARSE_SELECTION_FILE, MAX_SPARSE_SELECTION_BYTES)
-        })
-        .transpose()?
-        .flatten();
-    match bytes {
-        Some(bytes) => {
-            for path in parse_sparse_selection_paths(&bytes)? {
-                digest.update(path.as_bytes());
-                digest.update([0]);
-            }
-        }
-        None => digest.update(b"full"),
-    }
-    Ok(digest.finalize().into())
-}
-
-pub(crate) fn actual_sparse_selection_fingerprint_read_only(workdir: &Path) -> Result<[u8; 32]> {
-    let mut digest = Sha256::new();
-    digest.update(b"trail-sparse-selection-v2\0");
-    let bytes = secure_marker_directory_read_only(workdir)?
         .map(|metadata| {
             metadata
                 .read_regular_optional_bounded(SPARSE_SELECTION_FILE, MAX_SPARSE_SELECTION_BYTES)
@@ -477,18 +425,6 @@ fn secure_marker_directory(workdir: &Path, create: bool) -> Result<Option<Secure
         }
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound && create => {
             root.create_private_dir(".trail").map(Some)
-        }
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn secure_marker_directory_read_only(workdir: &Path) -> Result<Option<SecureDirectory>> {
-    let root = SecureDirectory::open_absolute(workdir)?;
-    match root.open_dir(".trail") {
-        Ok(directory) => {
-            directory.verify_private()?;
-            Ok(Some(directory))
         }
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),

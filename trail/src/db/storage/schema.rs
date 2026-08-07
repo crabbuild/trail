@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(any(test, debug_assertions))]
-use std::sync::{Mutex, OnceLock};
 
 mod agent_capture;
 mod changed_path_ledger;
@@ -27,8 +25,8 @@ CREATE TABLE IF NOT EXISTS prolly_roots (
 ) WITHOUT ROWID;";
 
 impl Trail {
-    pub(crate) fn validate_schema_v21(conn: &Connection) -> Result<()> {
-        validate_schema_v21(conn)
+    pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
+        validate_schema(conn)
     }
 
     #[cfg(debug_assertions)]
@@ -40,378 +38,40 @@ impl Trail {
     }
 }
 
-pub(crate) fn validate_schema_v18_for_migration(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, SCHEMA_V18_VERSION, false, false, false)
-}
-
-pub(crate) fn validate_schema_v19_for_migration(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, SCHEMA_V19_VERSION, true, false, false)
-}
-
-pub(crate) fn validate_schema_v20_for_migration(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, SCHEMA_V20_VERSION, true, true, false)
-}
-
-pub(crate) fn validate_schema_v21(conn: &Connection) -> Result<()> {
-    validate_schema_version(conn, TRAIL_SCHEMA_VERSION, true, true, true)
-}
-
-fn validate_schema_version(
-    conn: &Connection,
-    expected_version: i64,
-    require_lane_initializations: bool,
-    require_lane_initialization_owners: bool,
-    require_lane_retirements: bool,
-) -> Result<()> {
+pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
     let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != expected_version {
+    if user_version != TRAIL_SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
-            "found version {user_version}; expected version {expected_version}"
+            "found version {user_version}; expected version {TRAIL_SCHEMA_VERSION}"
         )));
     }
-    if !ddl::base_schema_complete_for_version(conn, expected_version)? {
-        return Err(Error::Corrupt("base schema v18 shape is incomplete".into()));
+    if !ddl::base_schema_complete(conn, TRAIL_SCHEMA_VERSION)? {
+        return Err(Error::Corrupt("base schema v1 shape is incomplete".into()));
     }
     if !agent_capture::agent_capture_schema_complete(conn)? {
         return Err(Error::Corrupt(
-            "agent capture schema v18 shape is incomplete".into(),
+            "agent capture schema v1 shape is incomplete".into(),
         ));
     }
-    if !changed_path_ledger::changed_path_ledger_schema_complete(conn, expected_version)? {
+    if !changed_path_ledger::changed_path_ledger_schema_complete(conn, TRAIL_SCHEMA_VERSION)? {
         return Err(Error::Corrupt(
-            "changed-path ledger schema v18 shape is incomplete".into(),
+            "changed-path ledger schema v1 shape is incomplete".into(),
         ));
     }
-    if require_lane_initializations {
-        ddl::validate_lane_initializations_v19_shape(conn)?;
-    } else if !ddl::lane_initialization_objects_absent(conn)? {
-        return Err(Error::Corrupt(
-            "schema v18 contains schema v19 lane initialization objects".into(),
-        ));
-    }
-    if require_lane_initialization_owners {
-        ddl::validate_lane_initialization_owners_v20_shape(conn)?;
-    } else if !ddl::lane_initialization_owner_objects_absent(conn)? {
-        return Err(Error::Corrupt(
-            "pre-v20 schema contains lane initialization owner objects".into(),
-        ));
-    }
-    if require_lane_retirements {
-        ddl::validate_lane_retirements_v21_shape(conn)?;
-    } else if !ddl::lane_retirement_objects_absent(conn)? {
-        return Err(Error::Corrupt(
-            "pre-v21 schema contains lane retirement objects".into(),
-        ));
-    }
+    ddl::validate_lane_initializations_shape(conn)?;
+    ddl::validate_lane_initialization_owners_shape(conn)?;
+    ddl::validate_lane_retirements_shape(conn)?;
     Ok(())
 }
 
-pub(crate) fn migrate_schema_v18_to_v19(conn: &mut Connection) -> Result<()> {
-    validate_schema_v18_for_migration(conn)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch(ddl::LANE_INITIALIZATIONS_V19)?;
-    fail_schema_v19_migration_if_installed(&tx)?;
-    crate::db::lane::backfill_lane_initializations_v19(&tx)?;
-    update_schema_version_metadata(&tx, SCHEMA_V19_VERSION)?;
-    tx.pragma_update(None, "user_version", SCHEMA_V19_VERSION)?;
-    validate_schema_v19_for_migration(&tx)?;
-    tx.commit()?;
-    Ok(())
-}
-
-pub(crate) fn migrate_schema_v19_to_v20(conn: &mut Connection) -> Result<()> {
-    validate_schema_v19_for_migration(conn)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch(ddl::LANE_INITIALIZATION_OWNERS_V20)?;
-    fail_schema_v20_migration_if_installed(&tx)?;
-    update_schema_version_metadata(&tx, SCHEMA_V20_VERSION)?;
-    tx.pragma_update(None, "user_version", SCHEMA_V20_VERSION)?;
-    validate_schema_v20_for_migration(&tx)?;
-    tx.commit()?;
-    Ok(())
-}
-
-pub(crate) fn migrate_schema_v20_to_v21(conn: &mut Connection) -> Result<()> {
-    validate_schema_v20_for_migration(conn)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch(ddl::LANE_RETIREMENTS_V21)?;
-    fail_schema_v21_migration_if_installed(&tx)?;
-    update_schema_version_metadata(&tx, TRAIL_SCHEMA_VERSION)?;
-    tx.pragma_update(None, "user_version", TRAIL_SCHEMA_VERSION)?;
-    validate_schema_v21(&tx)?;
-    tx.commit()?;
-    Ok(())
-}
-
-pub(crate) fn update_schema_version_metadata(
-    tx: &rusqlite::Transaction<'_>,
-    version: i64,
-) -> Result<()> {
-    let now = now_ts();
-    tx.execute(
-        "UPDATE schema_meta SET value=?1,updated_at=?2 WHERE key=?3",
-        params![version.to_string(), now, SCHEMA_META_VERSION_KEY],
-    )?;
-    tx.execute(
-        "UPDATE schema_meta SET value=?1,updated_at=?2 WHERE key=?3",
-        params![env!("CARGO_PKG_VERSION"), now, SCHEMA_META_APP_VERSION_KEY],
-    )?;
-    Ok(())
-}
-
-#[cfg(any(test, debug_assertions))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchemaV19MigrationBoundary {
-    AfterDdlBeforeUserVersion,
-}
-
-#[cfg(any(test, debug_assertions))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchemaV20MigrationBoundary {
-    AfterDdlBeforeUserVersion,
-}
-
-#[cfg(any(test, debug_assertions))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchemaV21MigrationBoundary {
-    AfterDdlBeforeUserVersion,
-}
-
-#[cfg(any(test, debug_assertions))]
-static SCHEMA_V19_MIGRATION_FAILURES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-    OnceLock::new();
-
-#[cfg(any(test, debug_assertions))]
-static SCHEMA_V20_MIGRATION_FAILURES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-    OnceLock::new();
-
-#[cfg(any(test, debug_assertions))]
-static SCHEMA_V21_MIGRATION_FAILURES: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-    OnceLock::new();
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn install_schema_v19_migration_failure(
-    db_path: &Path,
-    _boundary: SchemaV19MigrationBoundary,
-) {
-    SCHEMA_V19_MIGRATION_FAILURES
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn clear_schema_v19_migration_failure(db_path: &Path) {
-    if let Some(failures) = SCHEMA_V19_MIGRATION_FAILURES.get() {
-        failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn install_schema_v20_migration_failure(
-    db_path: &Path,
-    _boundary: SchemaV20MigrationBoundary,
-) {
-    SCHEMA_V20_MIGRATION_FAILURES
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn install_schema_v21_migration_failure(
-    db_path: &Path,
-    _boundary: SchemaV21MigrationBoundary,
-) {
-    SCHEMA_V21_MIGRATION_FAILURES
-        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn clear_schema_v20_migration_failure(db_path: &Path) {
-    if let Some(failures) = SCHEMA_V20_MIGRATION_FAILURES.get() {
-        failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn clear_schema_v21_migration_failure(db_path: &Path) {
-    if let Some(failures) = SCHEMA_V21_MIGRATION_FAILURES.get() {
-        failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&canonicalize_lossless(db_path).unwrap_or_else(|_| db_path.to_path_buf()));
-    }
-}
-
-fn fail_schema_v19_migration_if_installed(conn: &Connection) -> Result<()> {
-    #[cfg(any(test, debug_assertions))]
-    {
-        let path: String = conn.query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'",
-            [],
-            |row| row.get(0),
-        )?;
-        let path = PathBuf::from(path);
-        let path = canonicalize_lossless(&path).unwrap_or(path);
-        if SCHEMA_V19_MIGRATION_FAILURES
-            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&path)
-        {
-            return Err(Error::Corrupt(
-                "injected schema v19 migration failure after DDL".into(),
-            ));
-        }
-    }
-    #[cfg(not(any(test, debug_assertions)))]
-    let _ = conn;
-    Ok(())
-}
-
-fn fail_schema_v20_migration_if_installed(conn: &Connection) -> Result<()> {
-    #[cfg(any(test, debug_assertions))]
-    {
-        let path: String = conn.query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'",
-            [],
-            |row| row.get(0),
-        )?;
-        let path = PathBuf::from(path);
-        let path = canonicalize_lossless(&path).unwrap_or(path);
-        if SCHEMA_V20_MIGRATION_FAILURES
-            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&path)
-        {
-            return Err(Error::Corrupt(
-                "injected schema v20 migration failure after DDL".into(),
-            ));
-        }
-    }
-    #[cfg(not(any(test, debug_assertions)))]
-    let _ = conn;
-    Ok(())
-}
-
-fn fail_schema_v21_migration_if_installed(conn: &Connection) -> Result<()> {
-    #[cfg(any(test, debug_assertions))]
-    {
-        let path: String = conn.query_row(
-            "SELECT file FROM pragma_database_list WHERE name='main'",
-            [],
-            |row| row.get(0),
-        )?;
-        let path = PathBuf::from(path);
-        let path = canonicalize_lossless(&path).unwrap_or(path);
-        if SCHEMA_V21_MIGRATION_FAILURES
-            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&path)
-        {
-            return Err(Error::Corrupt(
-                "injected schema v21 migration failure after DDL".into(),
-            ));
-        }
-    }
-    #[cfg(not(any(test, debug_assertions)))]
-    let _ = conn;
-    Ok(())
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn create_schema_v18_fixture_for_test(workspace: &Path) -> Result<()> {
-    create_schema_fixture_for_test(workspace, SCHEMA_V18_VERSION)
-}
-
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn create_schema_v20_fixture_for_test(workspace: &Path) -> Result<()> {
-    create_schema_fixture_for_test(workspace, SCHEMA_V20_VERSION)
-}
-
-#[cfg(any(test, debug_assertions))]
-fn create_schema_fixture_for_test(workspace: &Path, version: i64) -> Result<()> {
-    Trail::init(workspace, "main", InitImportMode::Empty, false)?;
-    let workspace = canonicalize_lossless(workspace)?;
-    let db_path = workspace.join(DB_RELATIVE_PATH_WITH_TRAIL_PREFIX);
-    let seed_path = workspace.join(".trail/index/trail-schema-fixture-seed.sqlite");
-    {
-        let conn = Connection::open(&db_path)?;
-        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-        if busy != 0 {
-            return Err(Error::Conflict(
-                "schema-18 fixture seed checkpoint remained busy".into(),
-            ));
-        }
-    }
-    fs::rename(&db_path, &seed_path)?;
-    let conn = Connection::open(&db_path)?;
-    conn.execute_batch(PROLLY_SQLITE_SCHEMA)?;
-    match version {
-        SCHEMA_V18_VERSION => ddl::create_schema_v18_for_test(&conn)?,
-        SCHEMA_V20_VERSION => ddl::create_schema_v20_for_test(&conn)?,
-        _ => {
-            return Err(Error::InvalidInput(format!(
-                "unsupported schema fixture version {version}"
-            )));
-        }
-    }
-    conn.execute(
-        "ATTACH DATABASE ?1 AS seed",
-        [seed_path.to_string_lossy().as_ref()],
-    )?;
-    let tables = conn
-        .prepare(
-            "SELECT name FROM seed.sqlite_master
-             WHERE type='table' AND name NOT LIKE 'sqlite_%'
-               AND name<>'schema_meta'
-               AND name IN (SELECT name FROM main.sqlite_master WHERE type='table')
-             ORDER BY name",
-        )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for table in tables {
-        let quoted = table.replace('"', "\"\"");
-        conn.execute_batch(&format!(
-            "INSERT INTO main.\"{quoted}\" SELECT * FROM seed.\"{quoted}\";"
-        ))?;
-    }
-    conn.execute_batch("DETACH DATABASE seed;")?;
-    match version {
-        SCHEMA_V18_VERSION => validate_schema_v18_for_migration(&conn)?,
-        SCHEMA_V20_VERSION => validate_schema_v20_for_migration(&conn)?,
-        _ => unreachable!(),
-    }
-    drop(conn);
-    fs::remove_file(seed_path)?;
-    Ok(())
-}
-
-#[cfg(any(test, debug_assertions))]
-const DB_RELATIVE_PATH_WITH_TRAIL_PREFIX: &str = ".trail/index/trail.sqlite";
-
-pub(crate) fn validate_prolly_sqlite_schema_v18(conn: &Connection) -> Result<()> {
+pub(crate) fn validate_prolly_sqlite_schema(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(PROLLY_SQLITE_SCHEMA)?;
     if prolly_sqlite_objects(conn)? != prolly_sqlite_objects(&expected)?
         || prolly_sqlite_structure(conn)? != prolly_sqlite_structure(&expected)?
     {
         return Err(Error::Corrupt(
-            "SQLite Prolly schema v18 shape is incomplete".into(),
+            "SQLite Prolly schema v1 shape is incomplete".into(),
         ));
     }
     Ok(())
