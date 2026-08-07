@@ -2397,7 +2397,10 @@ fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
 fn platform_agent_workdir_mode() -> Option<LaneWorkdirMode> {
     #[cfg(target_os = "linux")]
     {
-        if Path::new("/dev/fuse").is_char_device() {
+        let is_fuse_device = std::fs::metadata("/dev/fuse")
+            .map(|metadata| std::os::unix::fs::FileTypeExt::is_char_device(&metadata.file_type()))
+            .unwrap_or(false);
+        if is_fuse_device {
             return Some(LaneWorkdirMode::FuseCow);
         }
     }
