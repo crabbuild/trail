@@ -83,32 +83,37 @@ pub(super) fn handle_upgrade_command(ctx: &RuntimeContext, args: &UpgradeArgs) -
     }
 }
 
-pub(super) fn maybe_notify_about_update(ctx: &RuntimeContext) {
+pub(super) fn maybe_notify_about_update(ctx: &RuntimeContext) -> Result<()> {
     if update_checks_disabled()
         || !ctx.render.progress_allowed()
         || ctx.json
         || !matches!(ctx.format, OutputFormat::Human | OutputFormat::Plain)
         || std::env::var_os("CI").is_some()
     {
-        return;
+        return Ok(());
     }
 
     let Some(cache_path) = update_cache_path() else {
-        return;
+        return Ok(());
     };
     let cache = read_update_cache(&cache_path);
     if cache.as_ref().is_some_and(cache_is_fresh) {
         if let Some(cache) = cache.filter(|cache| update_available(&cache.latest_version)) {
-            eprintln!(
-                "Trail {} is available (running {}). Run `trail upgrade`.",
-                cache.latest_version,
-                env!("CARGO_PKG_VERSION")
-            );
+            render_document(
+                &TerminalDocument::new("Trail update available", UiTone::Attention)
+                    .block(UiBlock::Metadata(vec![
+                        ("Current".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+                        ("Latest".to_string(), cache.latest_version),
+                    ]))
+                    .next("trail upgrade", "install the latest stable release"),
+                &ctx.render,
+            )?;
         }
-        return;
+        return Ok(());
     }
 
     spawn_background_update_check();
+    Ok(())
 }
 
 pub(super) fn handle_background_update_check() {
