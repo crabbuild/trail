@@ -1,6 +1,7 @@
 use super::*;
 use crate::db::core::backup::publication::{
-    atomic_exchange, publish_staged_tree, remove_any, sync_directory_strict,
+    atomic_exchange, publish_staged_tree, remove_any, rename_publication_entry,
+    sync_directory_strict,
 };
 use std::fs::File;
 
@@ -228,7 +229,7 @@ fn restore_old_entry(
         if target.exists() {
             exchange_required(&stage, &target, "restore policy rollback")?;
         } else {
-            fs::rename(&stage, &target)?;
+            rename_publication_entry(&stage, &target)?;
             sync_directory_strict(workspace_root)?;
         }
     } else if digest_optional(&target)?.as_deref() == Some(new_digest) {
@@ -247,7 +248,7 @@ fn publish_policy_entry(stage: &Path, target: &Path) -> Result<()> {
     if target.exists() {
         exchange_required(stage, target, "restore policy publication")?;
     } else {
-        fs::rename(stage, target)?;
+        rename_publication_entry(stage, target)?;
         sync_directory_strict(parent)?;
     }
     Ok(())
@@ -278,7 +279,7 @@ fn write_marker(workspace_root: &Path, marker: &RestoreMarker) -> Result<()> {
     let temporary = workspace_root.join(format!(".{RESTORE_MARKER}.tmp-{}", now_nanos()));
     fs::write(&temporary, serde_json::to_vec(marker)?)?;
     OpenOptions::new().read(true).open(&temporary)?.sync_all()?;
-    fs::rename(&temporary, &marker_path)?;
+    rename_publication_entry(&temporary, &marker_path)?;
     sync_directory_strict(workspace_root)
 }
 
