@@ -3,6 +3,18 @@
 All notable changes to Trail are documented in this file. Trail follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/crabbuild/trail/compare/v0.1.1...v0.2.0) (2026-08-08)
+
+
+### Features
+
+* start Trail at schema v1 and harden agent lanes ([#11](https://github.com/crabbuild/trail/issues/11)) ([733fbaa](https://github.com/crabbuild/trail/commit/733fbaaa6416f33a175f07a1196f75af308d67f6))
+
+
+### Bug Fixes
+
+* complete schema-v1 agent verification ([#13](https://github.com/crabbuild/trail/issues/13)) ([ea75f97](https://github.com/crabbuild/trail/commit/ea75f976d75edde62b8d842293a3696519967801))
+
 ## [Unreleased]
 
 ### Changed
