@@ -3,6 +3,13 @@
 All notable changes to Trail are documented in this file. Trail follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/crabbuild/trail/compare/v0.2.0...v0.2.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* harden daemon cleanup and Windows backup publication ([#17](https://github.com/crabbuild/trail/issues/17)) ([89f1f14](https://github.com/crabbuild/trail/commit/89f1f146deac79bcfb6e92bcf30118e54453e249))
+
 ## [Unreleased]
 
 ### Fixed
