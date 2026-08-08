@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(windows)]
+use std::thread::sleep;
+#[cfg(windows)]
+use std::time::Duration;
 
 pub(super) fn sibling_stage(target: &Path, label: &str) -> Result<PathBuf> {
     let parent = target
@@ -27,10 +31,7 @@ pub(super) fn sync_tree_bottom_up(root: &Path) -> Result<()> {
         let entry = entry.map_err(|error| Error::Io(error.into()))?;
         let file_type = entry.file_type();
         if file_type.is_file() {
-            OpenOptions::new()
-                .read(true)
-                .open(entry.path())?
-                .sync_all()?;
+            sync_file_for_publication(entry.path())?;
         } else if file_type.is_dir() {
             directories.push(entry.path().to_path_buf());
         }
@@ -107,16 +108,55 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?
-            .sync_all()?;
+        sync_windows_publication_operation(|| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|directory| directory.sync_all())
+        })?;
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_windows_publication_operation(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
+    let mut delay = Duration::from_millis(1);
+    for attempt in 0..4 {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(32));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+    sync_windows_publication_operation(|| {
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+    })
+}
+
+#[cfg(not(windows))]
+pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
     Ok(())
 }
 

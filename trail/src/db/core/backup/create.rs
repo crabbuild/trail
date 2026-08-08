@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::change_ledger::mark_backup_scopes_untrusted;
 use crate::db::core::backup::publication::{
-    publish_staged_tree, remove_any, remove_retained_tree, sibling_stage,
+    publish_staged_tree, remove_any, remove_retained_tree, sibling_stage, sync_file_for_publication,
 };
 
 impl Trail {
@@ -75,10 +75,7 @@ impl Trail {
             ));
         }
         drop(backup_conn);
-        OpenOptions::new()
-            .read(true)
-            .open(&sqlite_path)?
-            .sync_all()?;
+        sync_file_for_publication(&sqlite_path)?;
         let (sqlite_bytes, sqlite_sha256) = file_digest(&sqlite_path)?;
 
         let worktree_bytes =
@@ -109,10 +106,7 @@ impl Trail {
         };
         let manifest_path = backup_manifest_path(output);
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-        OpenOptions::new()
-            .read(true)
-            .open(&manifest_path)?
-            .sync_all()?;
+        sync_file_for_publication(&manifest_path)?;
 
         Ok(BackupCreateReport {
             path: output.to_string_lossy().to_string(),

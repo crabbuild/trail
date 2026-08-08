@@ -82,7 +82,7 @@ impl Trail {
                 fs::copy(path.join(CONFIG_FILE), verify_dir.join(CONFIG_FILE))?;
                 fs::copy(path.join(HEAD_FILE), verify_dir.join(HEAD_FILE))?;
                 fs::copy(&sqlite_path, verify_dir.join(DB_RELATIVE_PATH))?;
-                Trail::open_without_recovering_derived_paths(&verify_dir, &verify_dir)
+                super::open_staged_copy(&verify_dir, &verify_dir)
             })();
             match verify_open {
                 Ok(db) => match db.fsck() {

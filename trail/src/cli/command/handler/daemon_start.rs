@@ -41,6 +41,10 @@ pub(super) struct WorkspaceDaemonEndpoint {
     pub(super) socket_path: PathBuf,
     pub(super) socket_device: u64,
     pub(super) socket_inode: u64,
+    #[serde(default)]
+    pub(super) socket_ctime_sec: Option<i64>,
+    #[serde(default)]
+    pub(super) socket_ctime_nsec: Option<i64>,
     pub(super) url: String,
     pub(super) observer_ready: bool,
     pub(super) recovery_complete: bool,
@@ -65,6 +69,10 @@ struct WorkspaceDaemonStarting {
     socket_device: u64,
     socket_inode: u64,
     #[serde(default)]
+    socket_ctime_sec: Option<i64>,
+    #[serde(default)]
+    socket_ctime_nsec: Option<i64>,
+    #[serde(default)]
     scope_id: Option<String>,
     #[serde(default)]
     epoch: Option<u64>,
@@ -76,6 +84,14 @@ struct VerifiedStaleOwnerHandoff {
     stale_pid: u32,
     process_start_identity: String,
     daemon_launch_nonce: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketLeafIdentity {
+    device: u64,
+    inode: u64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -356,11 +372,14 @@ fn classify_endpoint(
             "workspace daemon token publication does not match the endpoint".into(),
         ));
     }
+    let expected_socket_ctime =
+        socket_ctime_identity(endpoint.socket_ctime_sec, endpoint.socket_ctime_nsec)?;
     verify_secure_socket_leaf_identity(
         &authority.trail_directory,
         SOCKET_FILE,
         endpoint.socket_device,
         endpoint.socket_inode,
+        expected_socket_ctime,
     )?;
     let proof = match daemon_rpc::authenticated_ledger_fence(endpoint) {
         Ok(proof) => proof,
@@ -711,15 +730,16 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     let mut unpublished_socket = BoundSocketGuard {
         authority: authority.try_clone()?,
         leaf: socket_tmp_leaf.clone(),
-        device: socket_identity.0,
-        inode: socket_identity.1,
+        device: socket_identity.device,
+        inode: socket_identity.inode,
         armed: true,
     };
     verify_secure_socket_leaf_identity(
         &authority.trail_directory,
         &socket_tmp_leaf,
-        socket_identity.0,
-        socket_identity.1,
+        socket_identity.device,
+        socket_identity.inode,
+        Some((socket_identity.ctime_sec, socket_identity.ctime_nsec)),
     )?;
     authority.verify_trail_identity(db.db_dir())?;
     renameat_noreplace(&authority.trail_directory, &socket_tmp_leaf, SOCKET_FILE).map_err(
@@ -738,8 +758,9 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     let socket_metadata = verify_secure_socket_leaf_identity(
         &authority.trail_directory,
         SOCKET_FILE,
-        socket_identity.0,
-        socket_identity.1,
+        socket_identity.device,
+        socket_identity.inode,
+        None,
     )?;
     let mut starting = WorkspaceDaemonStarting {
         protocol_version: PROTOCOL_VERSION,
@@ -751,8 +772,10 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         workspace_identity: workspace_identity(&workspace)?,
         owner_nonce: owner_nonce.clone(),
         socket_path: socket_path.clone(),
-        socket_device: socket_metadata.0,
-        socket_inode: socket_metadata.1,
+        socket_device: socket_metadata.device,
+        socket_inode: socket_metadata.inode,
+        socket_ctime_sec: Some(socket_metadata.ctime_sec),
+        socket_ctime_nsec: Some(socket_metadata.ctime_nsec),
         scope_id: None,
         epoch: None,
         daemon_launch_nonce: daemon_launch_nonce.clone(),
@@ -806,8 +829,10 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         owner_nonce,
         auth_token: token.clone(),
         socket_path: socket_path.clone(),
-        socket_device: socket_metadata.0,
-        socket_inode: socket_metadata.1,
+        socket_device: socket_metadata.device,
+        socket_inode: socket_metadata.inode,
+        socket_ctime_sec: Some(socket_metadata.ctime_sec),
+        socket_ctime_nsec: Some(socket_metadata.ctime_nsec),
         url: format!("unix://{}", socket_path.display()),
         observer_ready: true,
         recovery_complete: true,
@@ -835,6 +860,8 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         authority: authority.try_clone()?,
         socket_device: endpoint.socket_device,
         socket_inode: endpoint.socket_inode,
+        socket_ctime_sec: endpoint.socket_ctime_sec,
+        socket_ctime_nsec: endpoint.socket_ctime_nsec,
         endpoint: endpoint.clone(),
         preserve_stale_identity: false,
     };
@@ -870,6 +897,8 @@ struct PublicationGuard {
     authority: SecureAuthority,
     socket_device: u64,
     socket_inode: u64,
+    socket_ctime_sec: Option<i64>,
+    socket_ctime_nsec: Option<i64>,
     endpoint: WorkspaceDaemonEndpoint,
     preserve_stale_identity: bool,
 }
@@ -906,6 +935,7 @@ impl Drop for BoundSocketGuard {
                 &self.leaf,
                 self.device,
                 self.inode,
+                None,
                 true,
                 false,
             );
@@ -918,6 +948,11 @@ impl Drop for PublicationGuard {
         if self.preserve_stale_identity {
             return;
         }
+        let Ok(expected_socket_ctime) =
+            socket_ctime_identity(self.socket_ctime_sec, self.socket_ctime_nsec)
+        else {
+            return;
+        };
         if read_secure_endpoint(&self.authority)
             .ok()
             .flatten()
@@ -928,6 +963,7 @@ impl Drop for PublicationGuard {
                 SOCKET_FILE,
                 self.socket_device,
                 self.socket_inode,
+                expected_socket_ctime,
                 true,
                 false,
             )
@@ -1250,11 +1286,14 @@ fn recover_stale_starting_publication(
         process_start_identity: starting.process_start_identity.clone(),
         daemon_launch_nonce: starting.daemon_launch_nonce.clone(),
     };
+    let expected_socket_ctime =
+        socket_ctime_identity(starting.socket_ctime_sec, starting.socket_ctime_nsec)?;
     remove_socket_leaf_if_identity(
         authority,
         SOCKET_FILE,
         starting.socket_device,
         starting.socket_inode,
+        expected_socket_ctime,
         true,
         false,
     )?;
@@ -1315,11 +1354,28 @@ fn socket_leaf_stat(parent: &File, leaf: &str) -> std::io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
+fn socket_leaf_creation_timestamp(metadata: &libc::stat) -> (i64, i64) {
+    (metadata.st_ctime, metadata.st_ctime_nsec)
+}
+
+fn socket_ctime_identity(
+    socket_ctime_sec: Option<i64>,
+    socket_ctime_nsec: Option<i64>,
+) -> Result<Option<(i64, i64)>> {
+    match (socket_ctime_sec, socket_ctime_nsec) {
+        (None, None) => Ok(None),
+        (Some(sec), Some(nsec)) => Ok(Some((sec, nsec))),
+        _ => Err(Error::DaemonUnavailable(
+            "workspace daemon socket creation-time identity is malformed".into(),
+        )),
+    }
+}
+
 fn verify_socket_leaf_owner(
     parent: &File,
     leaf: &str,
     required_mode: Option<u32>,
-) -> Result<(u64, u64)> {
+) -> Result<SocketLeafIdentity> {
     let metadata = socket_leaf_stat(parent, leaf).map_err(|error| {
         Error::DaemonUnavailable(format!(
             "could not inspect workspace daemon socket leaf {leaf}: {error}"
@@ -1333,7 +1389,13 @@ fn verify_socket_leaf_owner(
             "workspace daemon socket has unsafe type, owner, or mode".into(),
         ));
     }
-    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+    let (ctime_sec, ctime_nsec) = socket_leaf_creation_timestamp(&metadata);
+    Ok(SocketLeafIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino as u64,
+        ctime_sec,
+        ctime_nsec,
+    })
 }
 
 fn verify_secure_socket_leaf_identity(
@@ -1341,11 +1403,19 @@ fn verify_secure_socket_leaf_identity(
     leaf: &str,
     expected_device: u64,
     expected_inode: u64,
-) -> Result<(u64, u64)> {
+    expected_socket_ctime: Option<(i64, i64)>,
+) -> Result<SocketLeafIdentity> {
     let identity = verify_socket_leaf_owner(parent, leaf, Some(0o600))?;
-    if identity != (expected_device, expected_inode) {
+    if identity.device != expected_device || identity.inode != expected_inode {
         return Err(Error::DaemonUnavailable(
             "workspace daemon socket identity changed; refusing pathname authority".into(),
+        ));
+    }
+    if let Some((expected_sec, expected_nsec)) = expected_socket_ctime
+        && (identity.ctime_sec != expected_sec || identity.ctime_nsec != expected_nsec)
+    {
+        return Err(Error::DaemonUnavailable(
+            "workspace daemon socket creation-time changed; refusing pathname authority".into(),
         ));
     }
     Ok(identity)
@@ -1370,11 +1440,14 @@ fn remove_stale_publication(
     authority: &SecureAuthority,
     endpoint: &WorkspaceDaemonEndpoint,
 ) -> Result<()> {
+    let expected_socket_ctime =
+        socket_ctime_identity(endpoint.socket_ctime_sec, endpoint.socket_ctime_nsec)?;
     remove_socket_leaf_if_identity(
         authority,
         SOCKET_FILE,
         endpoint.socket_device,
         endpoint.socket_inode,
+        expected_socket_ctime,
         true,
         true,
     )?;
@@ -1471,21 +1544,21 @@ fn remove_socket_leaf_if_identity(
     leaf: &str,
     expected_device: u64,
     expected_inode: u64,
+    expected_socket_ctime: Option<(i64, i64)>,
     missing_ok: bool,
     run_test_boundary: bool,
 ) -> Result<()> {
-    match socket_leaf_stat(&authority.trail_directory, leaf) {
-        Ok(_) => {
-            verify_secure_socket_leaf_identity(
-                &authority.trail_directory,
-                leaf,
-                expected_device,
-                expected_inode,
-            )?;
-        }
+    let expected = match socket_leaf_stat(&authority.trail_directory, leaf) {
+        Ok(_) => verify_secure_socket_leaf_identity(
+            &authority.trail_directory,
+            leaf,
+            expected_device,
+            expected_inode,
+            expected_socket_ctime,
+        )?,
         Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Error::Io(error)),
-    }
+    };
 
     #[cfg(debug_assertions)]
     if run_test_boundary {
@@ -1508,8 +1581,8 @@ fn remove_socket_leaf_if_identity(
     }
     authority.trail_directory.sync_all()?;
 
-    let captured = verify_socket_leaf_owner(&authority.trail_directory, &quarantine, Some(0o600));
-    if captured.as_ref().ok() != Some(&(expected_device, expected_inode)) {
+    let captured = verify_socket_leaf_owner(&authority.trail_directory, &quarantine, Some(0o600))?;
+    if captured.device != expected.device || captured.inode != expected.inode {
         let restore = renameat_noreplace(&authority.trail_directory, &quarantine, leaf);
         let _ = authority.trail_directory.sync_all();
         return match restore {

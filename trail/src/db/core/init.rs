@@ -514,6 +514,7 @@ impl Trail {
         Ok(db)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_without_recovering_derived_paths(
         workspace_root: impl AsRef<Path>,
         db_dir: impl AsRef<Path>,
@@ -543,8 +544,9 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
         let config = read_config(&db_dir)?;
-        // The caller owns the workspace write lock and already holds a Trail handle whose
-        // mutable handoff completed schema validation under that same exclusion.
+        // The caller owns the workspace write lock and has validated the staged database
+        // under that same exclusion. This is used for private backup/restore staging trees
+        // whose SQLite runtime may create WAL/SHM files during the handoff.
         Self::open_at_without_recovery(
             workspace_root,
             db_dir,

@@ -1327,11 +1327,23 @@ fn rejected_patch_audit_does_not_retire_daemon_and_explicit_empty_patch_is_route
         "--workdir-mode",
         "native-cow",
     ]);
-    assert!(
-        cow.status.success(),
-        "COW spawn failed: {}",
-        String::from_utf8_lossy(&cow.stderr)
-    );
+    if !cow.status.success() {
+        let error_code = serde_json::from_slice::<serde_json::Value>(&cow.stderr)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(|code| code.as_str().map(str::to_owned))
+            });
+        if matches!(
+            error_code.as_deref(),
+            Some("CLONE_UNSUPPORTED") | Some("CLONE_CROSS_DEVICE")
+        ) {
+            return;
+        }
+        panic!("COW spawn failed: {}", String::from_utf8_lossy(&cow.stderr));
+    }
     assert!(
         !fixture.endpoint_path().exists(),
         "materialized COW spawn must complete the local daemon handoff"
