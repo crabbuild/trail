@@ -67,6 +67,17 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO environment_generation_outputs(
+             generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+             publication_trigger,publication_gate,storage_identity,layer_id,
+             manifest_object_id,publication_id,mount_path,layer_subpath)
+         SELECT 'env_parent','node','dependencies','immutable_seed_private','exact','workspace',
+                'on_sync',NULL,?1,?2,manifest_object_id,NULL,'node_modules',''
+         FROM workspace_layers WHERE layer_id=?2",
+        params![&layer.cache_key, &layer.layer_id],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
          VALUES(?1,'env_parent',1)",
         [&parent_view.view_id],
@@ -77,6 +88,17 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
              generation_id,component_id,adapter_identity,kind,component_key,layer_id,mount_path)
          VALUES('env_parent','corrupt-cache','trail/cache@1','dependency',
                 'corrupt-key','layer_missing','vendor/cache')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO environment_generation_outputs(
+             generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+             publication_trigger,publication_gate,storage_identity,layer_id,
+             manifest_object_id,publication_id,mount_path,layer_subpath)
+         VALUES('env_parent','corrupt-cache','dependencies','immutable_seed_private','exact',
+                'workspace','on_sync',NULL,'corrupt-key','layer_missing','object_missing',NULL,
+                'vendor/cache','')",
         [],
     )
     .unwrap();
@@ -161,17 +183,17 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         .into_iter()
         .next()
         .expect("fork must report inherited and rejected components");
-    let components = inheritance_event.payload.unwrap()["components"]
+    let outputs = inheritance_event.payload.unwrap()["outputs"]
         .as_array()
         .unwrap()
         .clone();
-    assert!(components.iter().any(|component| {
-        component["component_id"] == "node" && component["status"] == "inherited"
-    }));
-    assert!(components.iter().any(|component| {
-        component["component_id"] == "corrupt-cache"
-            && component["status"] == "rejected"
-            && component["reason"] == "layer_verification_failed"
+    assert!(outputs
+        .iter()
+        .any(|output| { output["component_id"] == "node" && output["decision"] == "reused" }));
+    assert!(outputs.iter().any(|output| {
+        output["component_id"] == "corrupt-cache"
+            && output["decision"] == "rejected"
+            && output["reason"] == "layer_verification_failed"
     }));
 
     let fork_names = (0..4)

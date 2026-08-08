@@ -234,6 +234,15 @@ pub(crate) struct EnvironmentSyncArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentPromoteArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    pub(crate) component: String,
+    pub(crate) output: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentExplainArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,

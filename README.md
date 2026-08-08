@@ -142,10 +142,13 @@ happened while making that change?”
 
 A lane is not a paired Git branch. Spawning `fix-login` creates the Trail ref
 `refs/lanes/fix-login`; it does not create or switch to a Git branch with that
-name. A lane can also be virtual, so it has no filesystem workdir until a tool
-needs real files. Git branches are already lightweight refs; lanes are lighter
-to start only when virtual, and intentionally carry more metadata once work
-begins.
+name. By default a lane records a lazy transparent layered view: spawning it
+copies no repository bytes and runs no package manager or compiler. The first
+managed command converges its environment, reusing verified immutable layers
+and creating fresh private writable uppers. If the host has no qualified native
+backend, Trail fails with remediation rather than silently copying a large
+repository. Virtual, sparse, native-clone, and portable-copy lanes remain
+explicit modes for compatible workflows.
 
 The usual workflow is:
 
@@ -161,7 +164,8 @@ For example:
 
 ```sh
 # `main` is the long-lived Trail branch.
-trail lane spawn fix-login --from main --materialize=true
+trail lane spawn fix-login --from main
+trail env sync all fix-login       # optional prewarm; first managed execution also converges
 
 # Work is isolated in the lane until it is reviewed and validated.
 trail lane record fix-login -m "Fix login validation"

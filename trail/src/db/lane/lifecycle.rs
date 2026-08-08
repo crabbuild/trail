@@ -566,7 +566,7 @@ impl Trail {
             ),
             resumed,
             completed_deferred_initialization: false,
-            lane_id: details.branch.lane_id,
+            lane_id: details.branch.lane_id.clone(),
             ref_name: details.branch.ref_name,
             base_change: details.branch.base_change,
             workdir: details.branch.workdir,
@@ -576,7 +576,35 @@ impl Trail {
             materialization,
             sparse_paths,
             transparent_cow_available: workdir_mode.is_transparent_cow(),
+            backend_prerequisites: self.layered_backend_prerequisite_report(),
+            environment_inheritance: self
+                .lane_environment_inheritance_report(&details.branch.lane_id)?,
         })
+    }
+
+    fn lane_environment_inheritance_report(
+        &self,
+        lane_id: &str,
+    ) -> Result<Option<EnvironmentInheritanceReport>> {
+        let payload = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM lane_events
+                 WHERE lane_id=?1 AND event_type='lane_environment_inheritance'
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![lane_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&payload)?;
+        if value.get("parent_generation_id").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(value)?))
     }
 
     pub fn default_lane_materialize(&self) -> bool {
@@ -597,7 +625,7 @@ impl Trail {
 
     pub fn resolve_lane_spawn_workdir_mode(
         &self,
-        from: Option<&str>,
+        _from: Option<&str>,
         requested_mode: Option<&str>,
         materialize: Option<bool>,
         no_materialize: bool,
@@ -612,13 +640,16 @@ impl Trail {
             LaneWorkdirMode::Virtual
         } else if !sparse_paths.is_empty() {
             LaneWorkdirMode::Sparse
-        } else if custom_workdir
-            || materialize == Some(true)
-            || self.default_lane_materialize_for_ref(from)?
-        {
-            LaneWorkdirMode::Auto
+        } else if materialize == Some(true) {
+            // `--materialize` remains the explicit eager portable-copy path.
+            // Only an omitted mode/materialization choice opts into the lazy
+            // qualified layered default.
+            LaneWorkdirMode::PortableCopy
         } else {
-            LaneWorkdirMode::Virtual
+            // Omitted mode is the lazy layered default. The spawn path admits
+            // only a platform-qualified transparent backend and never falls
+            // back to an eager clone/copy materialization.
+            LaneWorkdirMode::Auto
         };
 
         if no_materialize && mode != LaneWorkdirMode::Virtual {
@@ -638,6 +669,48 @@ impl Trail {
         }
         validate_lane_workdir_mode_request(&mode, custom_workdir, sparse_paths)?;
         Ok(mode)
+    }
+
+    pub fn layered_backend_prerequisite_report(&self) -> LayeredBackendPrerequisiteReport {
+        let mode = platform_agent_workdir_mode();
+        let (backend, required_service, mount_root) = match mode {
+            Some(LaneWorkdirMode::FuseCow) => (
+                Some("fuse".to_string()),
+                "FUSE device and userspace mount support".to_string(),
+                None,
+            ),
+            Some(LaneWorkdirMode::NfsCow) => (
+                Some("nfs".to_string()),
+                "macOS NFS mount helper and loopback service".to_string(),
+                Some(
+                    self.db_dir
+                        .join("workspace-views")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ),
+            Some(LaneWorkdirMode::DokanCow) => (
+                Some("dokan".to_string()),
+                "Dokany x86_64 driver and runtime".to_string(),
+                None,
+            ),
+            _ => (
+                None,
+                "a native transparent workspace backend".to_string(),
+                None,
+            ),
+        };
+        LayeredBackendPrerequisiteReport {
+            platform: std::env::consts::OS.to_string(),
+            qualified: backend.is_some(),
+            backend,
+            required_service,
+            mount_root,
+            remediation: mode.is_none().then(|| {
+                "install/enable FUSE on Linux, NFS support on macOS, or Dokany on x86_64 Windows; otherwise request an explicit source-only lane mode"
+                    .to_string()
+            }),
+        }
     }
 
     /// Resolve the workdir mode used by a terminal agent task.
@@ -727,7 +800,7 @@ impl Trail {
     ) -> Result<LaneSpawnReport> {
         let workdir_mode = if materialize {
             if sparse_paths.is_empty() {
-                LaneWorkdirMode::Auto
+                LaneWorkdirMode::PortableCopy
             } else {
                 LaneWorkdirMode::Sparse
             }
@@ -954,7 +1027,6 @@ impl Trail {
                 &initialization.initialization_id,
                 &fence,
             )?;
-            let transparent_cow_available = request.requested_workdir_mode.is_transparent_cow();
             let mut sparse_policy_paths = None;
             let mut resolved_workdir_mode = request.requested_workdir_mode.clone();
             let mut workdir_backend = request
@@ -978,75 +1050,115 @@ impl Trail {
                 workdir_backend = report.backend();
             }
             fail_lane_initialization_io_if_requested("workdir_write")?;
-            let materialized_workdir =
-                if initialization.phase == LaneInitializationPhase::Materialized {
-                    initialization
-                        .workdir
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned())
-                } else if let Some(dir) = &request.workdir {
-                    #[cfg(debug_assertions)]
-                    wait_at_lane_initialization_materialization_barrier()?;
-                    match &request.requested_workdir_mode {
-                        LaneWorkdirMode::FuseCow => {
-                            self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
-                        }
-                        LaneWorkdirMode::DokanCow => {
-                            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-                            self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
-                            #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-                            return Err(Error::InvalidInput(
-                                "dokan-cow workdirs require an x86_64 Windows build".to_string(),
-                            ));
-                        }
-                        LaneWorkdirMode::NfsCow => {
-                            self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
-                        }
-                        LaneWorkdirMode::Sparse => {
-                            let (report, operation_id) = self
-                                .materialize_lane_workdir_at_paths_with_neighbors(
-                                    &request.source_root,
-                                    dir,
-                                    workdir.is_some(),
-                                    &request.sparse_paths,
-                                    request.include_neighbors,
-                                )?;
-                            materialization_operation_id = operation_id;
-                            if let Some(report) = report {
-                                workdir_backend = report.backend();
-                                materialization_report = Some(report);
+            let materialized_workdir = if initialization.phase
+                == LaneInitializationPhase::Materialized
+            {
+                initialization
+                    .workdir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+            } else if let Some(dir) = &request.workdir {
+                #[cfg(debug_assertions)]
+                wait_at_lane_initialization_materialization_barrier()?;
+                match &request.requested_workdir_mode {
+                    LaneWorkdirMode::FuseCow => {
+                        self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
+                    }
+                    LaneWorkdirMode::DokanCow => {
+                        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                        self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
+                        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+                        return Err(Error::InvalidInput(
+                            "dokan-cow workdirs require an x86_64 Windows build".to_string(),
+                        ));
+                    }
+                    LaneWorkdirMode::NfsCow => {
+                        self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
+                    }
+                    LaneWorkdirMode::Auto => {
+                        let qualified = platform_agent_workdir_mode().ok_or_else(|| {
+                                Error::InvalidInput(
+                                    "automatic layered lanes require a qualified transparent workspace backend; install/enable FUSE on Linux, NFS support on macOS, or Dokany on x86_64 Windows, or request an explicit source-only mode such as `virtual` or `portable-copy`"
+                                        .to_string(),
+                                )
+                            })?;
+                        match qualified {
+                            LaneWorkdirMode::FuseCow => {
+                                self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
+                                workdir_backend = WorkdirBackend::Fuse;
                             }
-                            if !request.sparse_paths.is_empty() {
-                                sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+                            LaneWorkdirMode::NfsCow => {
+                                self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
+                                workdir_backend = WorkdirBackend::Nfs;
+                            }
+                            LaneWorkdirMode::DokanCow => {
+                                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                                {
+                                    self.prepare_dokan_cow_lane_workdir(
+                                        name,
+                                        dir,
+                                        workdir.is_some(),
+                                    )?;
+                                    workdir_backend = WorkdirBackend::Dokan;
+                                }
+                                #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+                                return Err(Error::InvalidInput(
+                                    "automatic Dokany lanes require an x86_64 Windows build"
+                                        .to_string(),
+                                ));
+                            }
+                            _ => {
+                                return Err(Error::Corrupt(
+                                        "automatic layered backend resolver returned a non-transparent mode"
+                                            .to_string(),
+                                    ));
                             }
                         }
-                        LaneWorkdirMode::NativeCow
-                        | LaneWorkdirMode::PortableCopy
-                        | LaneWorkdirMode::Auto => {
-                            let policy = match request.requested_workdir_mode {
-                                LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
-                                LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
-                                LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
-                                _ => unreachable!(),
-                            };
-                            let outcome = self.materialize_lane_root_staged(
+                        resolved_workdir_mode = qualified;
+                    }
+                    LaneWorkdirMode::Sparse => {
+                        let (report, operation_id) = self
+                            .materialize_lane_workdir_at_paths_with_neighbors(
                                 &request.source_root,
                                 dir,
                                 workdir.is_some(),
-                                policy,
+                                &request.sparse_paths,
+                                request.include_neighbors,
                             )?;
-                            resolved_workdir_mode = outcome.resolved_mode;
-                            workdir_backend = outcome.backend;
-                            materialization_operation_id =
-                                Some(outcome.materialization_operation_id.clone());
-                            materialization_report = Some(outcome.report);
+                        materialization_operation_id = operation_id;
+                        if let Some(report) = report {
+                            workdir_backend = report.backend();
+                            materialization_report = Some(report);
                         }
-                        LaneWorkdirMode::Virtual => {}
+                        if !request.sparse_paths.is_empty() {
+                            sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+                        }
                     }
-                    Some(dir.to_string_lossy().to_string())
-                } else {
-                    None
-                };
+                    LaneWorkdirMode::NativeCow | LaneWorkdirMode::PortableCopy => {
+                        let policy = match request.requested_workdir_mode {
+                            LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
+                            LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
+                            _ => unreachable!(),
+                        };
+                        let outcome = self.materialize_lane_root_staged(
+                            &request.source_root,
+                            dir,
+                            workdir.is_some(),
+                            policy,
+                        )?;
+                        resolved_workdir_mode = outcome.resolved_mode;
+                        workdir_backend = outcome.backend;
+                        materialization_operation_id =
+                            Some(outcome.materialization_operation_id.clone());
+                        materialization_report = Some(outcome.report);
+                    }
+                    LaneWorkdirMode::Virtual => {}
+                }
+                Some(dir.to_string_lossy().to_string())
+            } else {
+                None
+            };
+            let transparent_cow_available = resolved_workdir_mode.is_transparent_cow();
             let initialization_operation = materialization_operation_id
                 .as_ref()
                 .map(|operation_id| ObjectId(operation_id.clone()))
@@ -1236,7 +1348,7 @@ impl Trail {
             if defer_initial_ledger
                 && ledger_authority
                 && materialized_workdir.is_some()
-                && !request.requested_workdir_mode.is_transparent_cow()
+                && !resolved_workdir_mode.is_transparent_cow()
             {
                 let report = LaneSpawnReport {
                     initialization_id: initialization.initialization_id.clone(),
@@ -1255,6 +1367,8 @@ impl Trail {
                     materialization: materialization_report,
                     sparse_paths: sparse_policy_paths.unwrap_or_default(),
                     transparent_cow_available,
+                    backend_prerequisites: self.layered_backend_prerequisite_report(),
+                    environment_inheritance: None,
                 };
                 let release = self
                     .release_lane_initialization_fence(&initialization.initialization_id, &fence)
@@ -1272,7 +1386,7 @@ impl Trail {
             }
             if ledger_authority
                 && materialized_workdir.is_some()
-                && !request.requested_workdir_mode.is_transparent_cow()
+                && !resolved_workdir_mode.is_transparent_cow()
             {
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
                 let expected_result =
@@ -1338,7 +1452,7 @@ impl Trail {
             }
             let crash_cut = lane_initialization_crash_cut("after_marker");
             self.committed_lane_initialization_step(&initialization, &fence, crash_cut)?;
-            if request.requested_workdir_mode.is_transparent_cow() {
+            if resolved_workdir_mode.is_transparent_cow() {
                 self.committed_lane_initialization_heartbeat(&initialization, &fence)?;
                 let workspace_view = (|| {
                     fail_lane_association_if_requested("spawn_workspace_view")?;
@@ -1349,7 +1463,7 @@ impl Trail {
                         &lane_id,
                         &request.source_change,
                         &request.source_root,
-                        platform_workspace_backend(&request.requested_workdir_mode),
+                        platform_workspace_backend(&resolved_workdir_mode),
                         Path::new(mountpoint),
                     )?;
                     if let Some(parent_lane_id) = source_lane_id.as_deref() {
@@ -1394,7 +1508,7 @@ impl Trail {
                 committed: true,
                 resumed,
                 completed_deferred_initialization: false,
-                lane_id,
+                lane_id: lane_id.clone(),
                 ref_name,
                 base_change: request.source_change,
                 workdir: materialized_workdir,
@@ -1404,6 +1518,8 @@ impl Trail {
                 materialization: materialization_report,
                 sparse_paths: sparse_policy_paths.unwrap_or_default(),
                 transparent_cow_available,
+                backend_prerequisites: self.layered_backend_prerequisite_report(),
+                environment_inheritance: self.lane_environment_inheritance_report(&lane_id)?,
             };
             Ok(report)
         })();
@@ -1591,7 +1707,7 @@ impl Trail {
             committed: true,
             resumed: true,
             completed_deferred_initialization: true,
-            lane_id: details.branch.lane_id,
+            lane_id: details.branch.lane_id.clone(),
             ref_name: details.branch.ref_name,
             base_change: details.branch.base_change,
             workdir: details.branch.workdir,
@@ -1601,6 +1717,9 @@ impl Trail {
             materialization,
             sparse_paths,
             transparent_cow_available,
+            backend_prerequisites: self.layered_backend_prerequisite_report(),
+            environment_inheritance: self
+                .lane_environment_inheritance_report(&details.branch.lane_id)?,
         })
     }
 

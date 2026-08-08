@@ -44,6 +44,12 @@ impl Trail {
                 )),
             }
         }
+        report
+            .errors
+            .extend(self.validate_workspace_layer_publications_integrity()?);
+        report
+            .errors
+            .extend(self.validate_workspace_cache_authorities_integrity()?);
         Ok(report)
     }
 }

@@ -124,7 +124,7 @@ paths.
 Create a lane for one task:
 
 ```sh
-trail lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main
 trail lane status docs-lane
 ```
 

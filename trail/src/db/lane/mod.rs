@@ -17,6 +17,7 @@ pub(crate) use initialization_owner::{
 };
 #[cfg(debug_assertions)]
 pub(crate) use lifecycle::set_lane_initialization_wait_timeout_for_current_thread;
+pub(crate) use managed_execution::HotAccessCapture;
 mod patch_diff;
 mod patch_edits;
 mod patch_policy;

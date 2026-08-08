@@ -122,6 +122,8 @@ pub(crate) struct ViewCore {
     next_ino: u64,
     journal: ViewMutationJournal,
     generation_lease: ViewGenerationLease,
+    hot_access: Option<HotAccessCapture>,
+    hot_entries: BTreeMap<(String, String), EnvironmentHotPathEntry>,
 }
 
 struct CachedImmutableReadFile {
@@ -225,6 +227,7 @@ impl ViewCore {
         )?;
         let generation_lease =
             ViewGenerationLease::acquire(&layout.source_upper, journal.generation())?;
+        let hot_access = db.hot_access_capture_for_source_upper(&layout.source_upper)?;
         let ephemeral = ephemeral_layers.is_some();
         let layers = match ephemeral_layers {
             Some(layers) => layers,
@@ -249,6 +252,8 @@ impl ViewCore {
             next_ino: VIEW_ROOT_INO + 1,
             journal,
             generation_lease,
+            hot_access,
+            hot_entries: BTreeMap::new(),
         };
         core.whiteouts = core.journal.whiteouts().clone();
         if !recovered_resets.is_empty() {
@@ -410,7 +415,10 @@ impl ViewCore {
         }
     }
 
-    fn layer_path(&self, path: &str) -> std::result::Result<Option<PathBuf>, i32> {
+    fn layer_resolution(
+        &self,
+        path: &str,
+    ) -> std::result::Result<Option<(PathBuf, Option<String>, String)>, i32> {
         for binding in &self.layers {
             let Some(storage_path) = &binding.storage_path else {
                 continue;
@@ -441,9 +449,43 @@ impl ViewCore {
                     return Err(EPERM);
                 }
             }
-            return Ok(Some(candidate));
+            return Ok(Some((
+                candidate,
+                binding.layer_id.clone(),
+                suffix.to_string(),
+            )));
         }
         Ok(None)
+    }
+
+    fn layer_path(&self, path: &str) -> std::result::Result<Option<PathBuf>, i32> {
+        Ok(self
+            .layer_resolution(path)?
+            .map(|(candidate, _, _)| candidate))
+    }
+
+    fn record_hot_layer_access(&mut self, layer_id: &str, path: &str, size_bytes: u64) {
+        let Some(capture) = &self.hot_access else {
+            return;
+        };
+        if self.hot_entries.len() as u64 >= capture.entry_limit {
+            return;
+        }
+        let current_bytes = self
+            .hot_entries
+            .values()
+            .map(|entry| entry.size_bytes)
+            .sum::<u64>();
+        if current_bytes.saturating_add(size_bytes) > capture.byte_limit {
+            return;
+        }
+        self.hot_entries
+            .entry((layer_id.to_string(), path.to_string()))
+            .or_insert_with(|| EnvironmentHotPathEntry {
+                layer_id: layer_id.to_string(),
+                path: path.to_string(),
+                size_bytes,
+            });
     }
 
     fn layer_directory_exists(&self, path: &str) -> std::result::Result<bool, i32> {
@@ -791,7 +833,9 @@ impl ViewCore {
             let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
             bytes.truncate(read);
             Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
-        } else if let Some(layer_path) = self.layer_path(&path)? {
+        } else if let Some((layer_path, layer_id, layer_relative_path)) =
+            self.layer_resolution(&path)?
+        {
             let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
             if !metadata.is_file() {
                 return Err(EISDIR);
@@ -800,6 +844,9 @@ impl ViewCore {
             let mut bytes = vec![0; count as usize];
             let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
             bytes.truncate(read);
+            if let Some(layer_id) = layer_id {
+                self.record_hot_layer_access(&layer_id, &layer_relative_path, metadata.len());
+            }
             self.immutable_read_files.insert(
                 ino,
                 CachedImmutableReadFile {
@@ -1892,6 +1939,16 @@ impl ViewCore {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for ViewCore {
+    fn drop(&mut self) {
+        let Some(capture) = self.hot_access.take() else {
+            return;
+        };
+        let entries = self.hot_entries.values().cloned().collect::<Vec<_>>();
+        let _ = self.db.publish_environment_hot_accesses(&capture, &entries);
     }
 }
 

@@ -127,20 +127,38 @@ pub(crate) struct WorkspaceEnvironmentSecretReference {
 /// content-addressed lower layer, while writable-private outputs live only in
 /// the owning lane's generated upper. Every output binding still activates as
 /// part of one environment generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum WorkspaceEnvironmentOutputPolicy {
-    ImmutableSeedPrivate,
-    WritablePrivate,
+pub(crate) type WorkspaceEnvironmentOutputPolicy = EnvironmentOutputPolicy;
+
+macro_rules! impl_environment_sql_text_enum {
+    ($type:ty) => {
+        impl rusqlite::types::ToSql for $type {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                Ok(rusqlite::types::ToSqlOutput::Owned(
+                    rusqlite::types::Value::Text(self.as_str().to_string()),
+                ))
+            }
+        }
+
+        impl rusqlite::types::FromSql for $type {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                let value = value.as_str()?;
+                Self::parse(value).ok_or_else(|| {
+                    rusqlite::types::FromSqlError::Other(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown environment contract value `{value}`"),
+                    )))
+                })
+            }
+        }
+    };
 }
 
-impl WorkspaceEnvironmentOutputPolicy {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::ImmutableSeedPrivate => "immutable_seed_private",
-            Self::WritablePrivate => "writable_private",
-        }
-    }
-}
+impl_environment_sql_text_enum!(EnvironmentOutputPolicy);
+impl_environment_sql_text_enum!(EnvironmentReuseMode);
+impl_environment_sql_text_enum!(EnvironmentSharingScope);
+impl_environment_sql_text_enum!(EnvironmentPublicationTrigger);
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceEnvironmentOutput {
@@ -148,7 +166,84 @@ pub(crate) struct WorkspaceEnvironmentOutput {
     pub(crate) output_path: String,
     pub(crate) mount_path: String,
     pub(crate) policy: WorkspaceEnvironmentOutputPolicy,
+    pub(crate) reuse: EnvironmentReuseMode,
+    pub(crate) scope: EnvironmentSharingScope,
+    pub(crate) publish: EnvironmentPublicationTrigger,
+    pub(crate) gate: Option<String>,
     pub(crate) create_if_missing: bool,
+}
+
+pub(crate) fn validate_environment_output_contract(
+    policy: WorkspaceEnvironmentOutputPolicy,
+    reuse: EnvironmentReuseMode,
+    scope: EnvironmentSharingScope,
+    publish: EnvironmentPublicationTrigger,
+    gate: Option<&str>,
+    compatible_reuse_certified: bool,
+) -> Result<()> {
+    if reuse == EnvironmentReuseMode::Compatible && !compatible_reuse_certified {
+        return Err(Error::InvalidInput(
+            "compatible environment output reuse requires a certified adapter contract".to_string(),
+        ));
+    }
+    if publish == EnvironmentPublicationTrigger::SuccessfulGate {
+        let gate = gate.unwrap_or_default();
+        if gate.is_empty()
+            || gate.len() > 128
+            || !gate
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(Error::InvalidInput(
+                "successful_gate environment output publication requires a valid gate name"
+                    .to_string(),
+            ));
+        }
+    } else if gate.is_some() {
+        return Err(Error::InvalidInput(
+            "an environment output gate is valid only with publish = \"successful_gate\""
+                .to_string(),
+        ));
+    }
+    match policy {
+        WorkspaceEnvironmentOutputPolicy::ImmutableShared
+        | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => {
+            if reuse == EnvironmentReuseMode::None
+                || scope == EnvironmentSharingScope::Lane
+                || publish != EnvironmentPublicationTrigger::OnSync
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{} outputs require exact or certified-compatible reuse, workspace or host scope, and publish = \"on_sync\"",
+                    policy.as_str()
+                )));
+            }
+        }
+        WorkspaceEnvironmentOutputPolicy::WritablePrivate => {
+            if reuse != EnvironmentReuseMode::None || scope != EnvironmentSharingScope::Lane {
+                return Err(Error::InvalidInput(
+                    "writable_private outputs require reuse = \"none\" and scope = \"lane\""
+                        .to_string(),
+                ));
+            }
+            if publish == EnvironmentPublicationTrigger::OnSync {
+                return Err(Error::InvalidInput(
+                    "writable_private outputs cannot publish during synchronization".to_string(),
+                ));
+            }
+        }
+        WorkspaceEnvironmentOutputPolicy::Disposable => {
+            if reuse != EnvironmentReuseMode::None
+                || scope != EnvironmentSharingScope::Lane
+                || publish != EnvironmentPublicationTrigger::Never
+            {
+                return Err(Error::InvalidInput(
+                    "disposable outputs require reuse = \"none\", scope = \"lane\", and publish = \"never\""
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Host-owned semantics for one directed component relationship.
@@ -868,7 +963,11 @@ impl Trail {
                         name: output.name,
                         output_path: output.output_path,
                         mount_path: output.mount_path,
-                        policy: output.policy.as_str().to_string(),
+                        policy: output.policy,
+                        reuse: output.reuse,
+                        scope: output.scope,
+                        publish: output.publish,
+                        gate: output.gate,
                     })
                     .collect(),
             });
@@ -1119,7 +1218,11 @@ impl Trail {
                     name: output.name.clone(),
                     output_path: output.output_path.clone(),
                     mount_path: output.mount_path.clone(),
-                    policy: output.policy.as_str().to_string(),
+                    policy: output.policy,
+                    reuse: output.reuse,
+                    scope: output.scope,
+                    publish: output.publish,
+                    gate: output.gate.clone(),
                 })
                 .collect(),
             output_path,
@@ -1139,76 +1242,81 @@ impl Trail {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
         let command_metadata = &super::workspace_recipe::COMMAND_RECIPE_ADAPTER_METADATA;
-        let (plan, builtin_adapter, plugin_adapter, expected_component_id, resolved_component_root) =
-            if adapter_selector == "auto" {
-                let discovery_root = (!component_root.is_empty() || component_id.is_none())
-                    .then_some(component_root);
-                let discovery = self.discover_workspace_environment(lane, discovery_root)?;
-                if !discovery.conflicts.is_empty() {
-                    return Err(Error::InvalidInput(format!(
-                        "environment discovery found {} unresolved component conflict(s) at `{}`",
-                        discovery.conflicts.len(),
-                        if component_root.is_empty() {
-                            "."
-                        } else {
-                            component_root
-                        }
-                    )));
+        let (
+            mut plan,
+            builtin_adapter,
+            plugin_adapter,
+            expected_component_id,
+            resolved_component_root,
+        ) = if adapter_selector == "auto" {
+            let discovery_root =
+                (!component_root.is_empty() || component_id.is_none()).then_some(component_root);
+            let discovery = self.discover_workspace_environment(lane, discovery_root)?;
+            if !discovery.conflicts.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "environment discovery found {} unresolved component conflict(s) at `{}`",
+                    discovery.conflicts.len(),
+                    if component_root.is_empty() {
+                        "."
+                    } else {
+                        component_root
+                    }
+                )));
+            }
+            let candidates = discovery
+                .components
+                .iter()
+                .filter(|component| component_id.is_none_or(|id| component.component_id == id))
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [component]
+                    if component.adapter_identity == command_metadata.canonical_identity =>
+                {
+                    (
+                        self.command_recipe_plan(&head.root_id, &component.component_id)?,
+                        None,
+                        None,
+                        component.component_id.clone(),
+                        component.component_root.clone(),
+                    )
                 }
-                let candidates = discovery
-                    .components
-                    .iter()
-                    .filter(|component| component_id.is_none_or(|id| component.component_id == id))
-                    .collect::<Vec<_>>();
-                match candidates.as_slice() {
-                    [component]
-                        if component.adapter_identity == command_metadata.canonical_identity =>
+                [component] => {
+                    if let Some(adapter) =
+                        builtin_environment_adapter_for_selector(&component.adapter_identity)
                     {
                         (
-                            self.command_recipe_plan(&head.root_id, &component.component_id)?,
-                            None,
+                            adapter.plan(self, &head.root_id, &component.component_root)?,
+                            Some(adapter),
                             None,
                             component.component_id.clone(),
                             component.component_root.clone(),
                         )
+                    } else {
+                        let plugin = self
+                            .environment_plugin_for_selector(&component.adapter_identity)?
+                            .ok_or_else(|| {
+                                Error::Corrupt(format!(
+                                    "discovered adapter `{}` is no longer installed",
+                                    component.adapter_identity
+                                ))
+                            })?;
+                        let plan = self.plan_environment_plugin_component(
+                            &plugin,
+                            &head.root_id,
+                            &component.component_root,
+                            &component.component_id,
+                        )?;
+                        (
+                            plan,
+                            None,
+                            Some(plugin),
+                            component.component_id.clone(),
+                            component.component_root.clone(),
+                        )
                     }
-                    [component] => {
-                        if let Some(adapter) =
-                            builtin_environment_adapter_for_selector(&component.adapter_identity)
-                        {
-                            (
-                                adapter.plan(self, &head.root_id, &component.component_root)?,
-                                Some(adapter),
-                                None,
-                                component.component_id.clone(),
-                                component.component_root.clone(),
-                            )
-                        } else {
-                            let plugin = self
-                                .environment_plugin_for_selector(&component.adapter_identity)?
-                                .ok_or_else(|| {
-                                    Error::Corrupt(format!(
-                                        "discovered adapter `{}` is no longer installed",
-                                        component.adapter_identity
-                                    ))
-                                })?;
-                            let plan = self.plan_environment_plugin_component(
-                                &plugin,
-                                &head.root_id,
-                                &component.component_root,
-                                &component.component_id,
-                            )?;
-                            (
-                                plan,
-                                None,
-                                Some(plugin),
-                                component.component_id.clone(),
-                                component.component_root.clone(),
-                            )
-                        }
-                    }
-                    [] => {
-                        return Err(Error::InvalidInput(format!(
+                }
+                [] => {
+                    return Err(Error::InvalidInput(format!(
                         "no workspace environment adapter detected at `{}`; specify --adapter explicitly",
                         if component_root.is_empty() {
                             "."
@@ -1216,9 +1324,9 @@ impl Trail {
                             component_root
                         }
                     )));
-                    }
-                    components => {
-                        return Err(Error::InvalidInput(format!(
+                }
+                components => {
+                    return Err(Error::InvalidInput(format!(
                         "multiple workspace environment adapters or components detected at `{}`: {}; specify --adapter explicitly",
                         if component_root.is_empty() {
                             "."
@@ -1231,82 +1339,81 @@ impl Trail {
                             .collect::<Vec<_>>()
                             .join(", ")
                     )));
-                    }
                 }
-            } else if command_metadata.selectors.contains(&adapter_selector) {
-                let plan = if let Some(component_id) = component_id {
-                    self.command_recipe_plan(&head.root_id, component_id)?
-                } else {
-                    self.command_recipe_plan_for_root(&head.root_id, component_root)?
-                };
-                let expected = plan.component_id.clone();
-                (plan, None, None, expected, component_root.to_string())
-            } else if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector)
-            {
-                let expected = adapter.component_id(component_root)?;
-                if component_id.is_some_and(|component_id| component_id != expected) {
-                    return Err(Error::InvalidInput(format!(
-                        "adapter `{}` proposes component `{expected}`, not requested component `{}`",
-                        adapter.identity(),
-                        component_id.unwrap_or_default()
-                    )));
-                }
-                (
-                    adapter.plan(self, &head.root_id, component_root)?,
-                    Some(adapter),
-                    None,
-                    expected,
-                    component_root.to_string(),
-                )
-            } else if let Some(plugin) = self.environment_plugin_for_selector(adapter_selector)? {
-                let discovered = self
-                    .discover_environment_plugin_component(&plugin, &head.root_id, component_root)?
-                    .ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "adapter `{}` did not detect a component at `{}`",
-                            plugin.manifest.adapter.canonical_identity,
-                            if component_root.is_empty() {
-                                "."
-                            } else {
-                                component_root
-                            }
-                        ))
-                    })?;
-                if component_id.is_some_and(|component_id| component_id != discovered.component_id)
-                {
-                    return Err(Error::InvalidInput(format!(
-                        "adapter `{}` proposes component `{}`, not requested component `{}`",
-                        plugin.manifest.adapter.canonical_identity,
-                        discovered.component_id,
-                        component_id.unwrap_or_default()
-                    )));
-                }
-                let expected = discovered.component_id;
-                let plan = self.plan_environment_plugin_component(
-                    &plugin,
-                    &head.root_id,
-                    component_root,
-                    &expected,
-                )?;
-                (
-                    plan,
-                    None,
-                    Some(plugin),
-                    expected,
-                    component_root.to_string(),
-                )
+            }
+        } else if command_metadata.selectors.contains(&adapter_selector) {
+            let plan = if let Some(component_id) = component_id {
+                self.command_recipe_plan(&head.root_id, component_id)?
             } else {
-                let available = self
-                    .workspace_environment_adapters()?
-                    .adapters
-                    .into_iter()
-                    .map(|adapter| adapter.canonical_identity)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                self.command_recipe_plan_for_root(&head.root_id, component_root)?
+            };
+            let expected = plan.component_id.clone();
+            (plan, None, None, expected, component_root.to_string())
+        } else if let Some(adapter) = builtin_environment_adapter_for_selector(adapter_selector) {
+            let expected = adapter.component_id(component_root)?;
+            if component_id.is_some_and(|component_id| component_id != expected) {
                 return Err(Error::InvalidInput(format!(
+                    "adapter `{}` proposes component `{expected}`, not requested component `{}`",
+                    adapter.identity(),
+                    component_id.unwrap_or_default()
+                )));
+            }
+            (
+                adapter.plan(self, &head.root_id, component_root)?,
+                Some(adapter),
+                None,
+                expected,
+                component_root.to_string(),
+            )
+        } else if let Some(plugin) = self.environment_plugin_for_selector(adapter_selector)? {
+            let discovered = self
+                .discover_environment_plugin_component(&plugin, &head.root_id, component_root)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "adapter `{}` did not detect a component at `{}`",
+                        plugin.manifest.adapter.canonical_identity,
+                        if component_root.is_empty() {
+                            "."
+                        } else {
+                            component_root
+                        }
+                    ))
+                })?;
+            if component_id.is_some_and(|component_id| component_id != discovered.component_id) {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` proposes component `{}`, not requested component `{}`",
+                    plugin.manifest.adapter.canonical_identity,
+                    discovered.component_id,
+                    component_id.unwrap_or_default()
+                )));
+            }
+            let expected = discovered.component_id;
+            let plan = self.plan_environment_plugin_component(
+                &plugin,
+                &head.root_id,
+                component_root,
+                &expected,
+            )?;
+            (
+                plan,
+                None,
+                Some(plugin),
+                expected,
+                component_root.to_string(),
+            )
+        } else {
+            let available = self
+                .workspace_environment_adapters()?
+                .adapters
+                .into_iter()
+                .map(|adapter| adapter.canonical_identity)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidInput(format!(
                     "unknown workspace environment adapter `{adapter_selector}`; available adapters: {available}"
                 )));
-            };
+        };
+        add_host_canonical_environment_identity(&mut plan)?;
         if let Some(adapter) = builtin_adapter {
             self.validate_workspace_environment_plan(adapter, &resolved_component_root, &plan)?;
         } else if let Some(plugin) = &plugin_adapter {
@@ -1385,13 +1492,14 @@ impl Trail {
 
     /// Resolve one component against the dependency keys that are actually
     /// active in this lane. A single-component sync must never silently build
-    /// against a missing or stale predecessor; callers can use `sync-all` to
+    /// against a missing or stale predecessor; callers can use `env sync all` to
     /// construct and activate the complete graph atomically.
     fn finalize_single_workspace_environment_plan(
         &self,
         lane: &str,
         mut plan: WorkspaceEnvironmentPlan,
     ) -> Result<WorkspaceEnvironmentPlan> {
+        add_host_canonical_environment_identity(&mut plan)?;
         let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
             Error::InvalidInput(format!(
                 "lane `{lane}` does not have a layered workspace view"
@@ -1411,13 +1519,13 @@ impl Trail {
                 .optional()?;
             let Some((Some(component_key), status)) = state else {
                 return Err(Error::InvalidInput(format!(
-                    "environment component `{}` requires `{}`, which is not attached; run `trail env sync-all {lane}`",
+                    "environment component `{}` requires `{}`, which is not attached; run `trail env sync all {lane}`",
                     plan.component_id, dependency.component_id
                 )));
             };
             if status != "ready" {
                 return Err(Error::InvalidInput(format!(
-                    "environment component `{}` requires `{}`, which is `{status}`; run `trail env sync-all {lane}`",
+                    "environment component `{}` requires `{}`, which is `{status}`; run `trail env sync all {lane}`",
                     plan.component_id, dependency.component_id
                 )));
             }
@@ -1448,6 +1556,7 @@ impl Trail {
     ) -> Result<Vec<(WorkspaceEnvironmentPlan, String)>> {
         let mut by_id = BTreeMap::new();
         for mut plan in plans {
+            add_host_canonical_environment_identity(&mut plan)?;
             normalize_workspace_environment_dependencies(
                 &plan.component_id,
                 &mut plan.dependencies,
@@ -1725,7 +1834,15 @@ impl Trail {
                 PreparedEnvironmentArtifacts::WritablePrivate(_) => Vec::new(),
                 PreparedEnvironmentArtifacts::MetadataOnly => Vec::new(),
             };
-            Ok(EnvironmentSyncReport { generation, layers })
+            let decisions = self.environment_cache_decisions_for_components(
+                &view.view_id,
+                &[(plan.component_id.clone(), cache_key.clone())],
+            )?;
+            Ok(EnvironmentSyncReport {
+                generation,
+                layers,
+                decisions,
+            })
         })();
         match result {
             Ok(report) => {
@@ -1862,32 +1979,27 @@ impl Trail {
                     None,
                 )?;
             }
-            let mut prepared = Vec::with_capacity(planned.len());
-            for (plan, expected_key, _) in &planned {
-                match self.prepare_workspace_environment_artifacts(
-                    &view.view_id,
-                    plan,
-                    expected_key,
-                ) {
-                    Ok(artifacts) => prepared.push(artifacts),
-                    Err(err) => {
-                        let reason = format!(
-                            "atomic environment synchronization aborted before activation: {err}"
+            let mut prepared = match self
+                .prepare_workspace_environment_artifacts_parallel(&view.view_id, &planned)
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let reason = format!(
+                        "atomic environment synchronization aborted before activation: {err}"
+                    );
+                    for (plan, expected_key, predecessor) in &planned {
+                        let _ = self.set_workspace_environment_state(
+                            lane,
+                            plan,
+                            expected_key,
+                            predecessor.as_deref(),
+                            "failed",
+                            Some(&reason),
                         );
-                        for (plan, expected_key, predecessor) in &planned {
-                            let _ = self.set_workspace_environment_state(
-                                lane,
-                                plan,
-                                expected_key,
-                                predecessor.as_deref(),
-                                "failed",
-                                Some(&reason),
-                            );
-                        }
-                        return Err(err);
                     }
+                    return Err(err);
                 }
-            }
+            };
             let planned_refs = planned
                 .iter()
                 .map(|(plan, expected_key, _)| (plan, expected_key.as_str()))
@@ -1983,7 +2095,17 @@ impl Trail {
                     PreparedEnvironmentArtifacts::MetadataOnly => None,
                 })
                 .collect();
-            Ok(EnvironmentSyncReport { generation, layers })
+            let decision_keys = planned
+                .iter()
+                .map(|(plan, key, _)| (plan.component_id.clone(), key.clone()))
+                .collect::<Vec<_>>();
+            let decisions =
+                self.environment_cache_decisions_for_components(&view.view_id, &decision_keys)?;
+            Ok(EnvironmentSyncReport {
+                generation,
+                layers,
+                decisions,
+            })
         })();
         match result {
             Ok(report) => {
@@ -2560,6 +2682,19 @@ impl Trail {
     ) -> Result<PreparedEnvironmentArtifacts> {
         let Some(policy) = plan.outputs.first().map(|output| output.policy) else {
             if !plan.external_artifacts.is_empty() {
+                self.record_environment_cache_decision(
+                    view_id,
+                    &plan.component_id,
+                    component_key,
+                    plan.external_artifacts
+                        .first()
+                        .map(|artifact| artifact.digest.as_str()),
+                    EnvironmentComponentDecision::Reused,
+                    "pinned_external_metadata",
+                    None,
+                    Some(0),
+                    Some(0),
+                )?;
                 return Ok(PreparedEnvironmentArtifacts::MetadataOnly);
             }
             return Err(Error::Corrupt(format!(
@@ -2568,19 +2703,358 @@ impl Trail {
             )));
         };
         match policy {
-            WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => self
-                .build_workspace_layer_singleflight(&plan.layer_key, |build_dir| {
-                    self.execute_workspace_environment_plan(plan, build_dir)
-                })
-                .map(PreparedEnvironmentArtifacts::Immutable),
+            WorkspaceEnvironmentOutputPolicy::ImmutableShared
+            | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => {
+                let prior = self.workspace_layer_by_cache_key(component_key)?;
+                let layer = self
+                    .build_workspace_layer_singleflight(&plan.layer_key, |build_dir| {
+                        self.execute_workspace_environment_plan(plan, build_dir)
+                    })?;
+                let hit = prior
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.state == "ready");
+                self.record_environment_cache_decision(
+                    view_id,
+                    &plan.component_id,
+                    component_key,
+                    Some(&layer.layer_id),
+                    if hit {
+                        EnvironmentComponentDecision::Reused
+                    } else {
+                        EnvironmentComponentDecision::Built
+                    },
+                    if hit {
+                        "exact_layer"
+                    } else {
+                        "singleflight_builder"
+                    },
+                    (!hit).then_some(EnvironmentRebuildReason::Missing),
+                    hit.then_some(layer.logical_bytes),
+                    (!hit).then_some(layer.logical_bytes),
+                )?;
+                Ok(PreparedEnvironmentArtifacts::Immutable(layer))
+            }
             WorkspaceEnvironmentOutputPolicy::WritablePrivate => {
                 if self.writable_private_outputs_are_compatible(view_id, plan, component_key)? {
+                    self.record_environment_cache_decision(
+                        view_id,
+                        &plan.component_id,
+                        component_key,
+                        None,
+                        EnvironmentComponentDecision::Private,
+                        "compatible_private_upper",
+                        None,
+                        None,
+                        None,
+                    )?;
                     return Ok(PreparedEnvironmentArtifacts::WritablePrivate(None));
                 }
                 let outputs = self.execute_writable_private_environment_plan(plan)?;
+                self.record_environment_cache_decision(
+                    view_id,
+                    &plan.component_id,
+                    component_key,
+                    None,
+                    EnvironmentComponentDecision::Built,
+                    "fresh_private_upper",
+                    Some(EnvironmentRebuildReason::Missing),
+                    None,
+                    None,
+                )?;
+                Ok(PreparedEnvironmentArtifacts::WritablePrivate(Some(outputs)))
+            }
+            WorkspaceEnvironmentOutputPolicy::Disposable => {
+                let outputs = self.execute_writable_private_environment_plan(plan)?;
+                self.record_environment_cache_decision(
+                    view_id,
+                    &plan.component_id,
+                    component_key,
+                    None,
+                    EnvironmentComponentDecision::Private,
+                    "disposable_private_output",
+                    Some(EnvironmentRebuildReason::PolicyChanged),
+                    None,
+                    None,
+                )?;
                 Ok(PreparedEnvironmentArtifacts::WritablePrivate(Some(outputs)))
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_environment_cache_decision(
+        &self,
+        view_id: &str,
+        component_id: &str,
+        desired_key: &str,
+        storage_identity: Option<&str>,
+        decision: EnvironmentComponentDecision,
+        source: &str,
+        rebuild_reason: Option<EnvironmentRebuildReason>,
+        bytes_avoided: Option<u64>,
+        bytes_written: Option<u64>,
+    ) -> Result<()> {
+        let previous_key = self
+            .conn
+            .query_row(
+                "SELECT attached_key FROM environment_component_states
+                 WHERE view_id=?1 AND component_id=?2",
+                params![view_id, component_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let identity_edges = if let Some(previous_key) = previous_key
+            && previous_key != desired_key
+        {
+            match (
+                self.workspace_layer_key_by_cache_key(&previous_key)?,
+                self.workspace_layer_key_by_cache_key(desired_key)?,
+            ) {
+                (Some(previous), Some(current)) => diff_workspace_layer_keys(&previous, &current),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let rebuild_reason = if identity_edges.is_empty() {
+            rebuild_reason
+        } else if identity_edges.iter().any(|edge| edge.dimension == "tool") {
+            Some(EnvironmentRebuildReason::ToolChanged)
+        } else if identity_edges.iter().any(|edge| {
+            edge.dimension == "policy" && matches!(edge.name.as_str(), "platform" | "architecture")
+        }) {
+            Some(EnvironmentRebuildReason::PlatformChanged)
+        } else if identity_edges.iter().any(|edge| {
+            edge.dimension == "input"
+                && (edge.name.starts_with("dependency:") || edge.name.starts_with("upstream:"))
+        }) {
+            Some(EnvironmentRebuildReason::UpstreamChanged)
+        } else if identity_edges.iter().any(|edge| edge.dimension == "input") {
+            Some(EnvironmentRebuildReason::InputChanged)
+        } else {
+            Some(EnvironmentRebuildReason::PolicyChanged)
+        };
+        let decision_id = format!(
+            "envdecision_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{view_id}:{component_id}:{desired_key}:{}:{:?}",
+                    now_nanos(),
+                    thread::current().id()
+                )
+                .as_bytes(),
+                24,
+            )
+        );
+        self.conn.execute(
+            "INSERT INTO environment_cache_decisions(
+                 decision_id,attempt_id,view_id,component_id,desired_key,storage_identity,
+                 decision,decision_source,rebuild_reason,identity_edges_json,
+                 bytes_avoided,bytes_written,created_at)
+             VALUES(?1,NULL,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                decision_id,
+                view_id,
+                component_id,
+                desired_key,
+                storage_identity,
+                decision.as_str(),
+                source,
+                rebuild_reason.as_ref().map(environment_rebuild_reason_str),
+                serde_json::to_vec(&identity_edges)?,
+                bytes_avoided,
+                bytes_written,
+                now_ts()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn environment_cache_decisions_for_components(
+        &self,
+        view_id: &str,
+        components: &[(String, String)],
+    ) -> Result<Vec<EnvironmentCacheDecisionReport>> {
+        let mut reports = Vec::with_capacity(components.len());
+        for (component_id, desired_key) in components {
+            reports.push(self.conn.query_row(
+                "SELECT storage_identity,decision,decision_source,rebuild_reason,
+                        identity_edges_json,bytes_avoided,bytes_written
+                 FROM environment_cache_decisions
+                 WHERE view_id=?1 AND component_id=?2 AND desired_key=?3
+                 ORDER BY created_at DESC,decision_id DESC LIMIT 1",
+                params![view_id, component_id, desired_key],
+                |row| {
+                    let decision = row.get::<_, String>(1)?;
+                    let rebuild_reason = row.get::<_, Option<String>>(3)?;
+                    Ok(EnvironmentCacheDecisionReport {
+                        component_id: component_id.clone(),
+                        desired_key: desired_key.clone(),
+                        storage_identity: row.get(0)?,
+                        decision: parse_environment_component_decision(&decision)?,
+                        decision_source: row.get(2)?,
+                        rebuild_reason: rebuild_reason
+                            .as_deref()
+                            .map(parse_environment_rebuild_reason)
+                            .transpose()?,
+                        identity_edges: serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            })?,
+                        bytes_avoided: row
+                            .get::<_, Option<i64>>(5)?
+                            .map(|value| value.max(0) as u64),
+                        bytes_written: row
+                            .get::<_, Option<i64>>(6)?
+                            .map(|value| value.max(0) as u64),
+                    })
+                },
+            )?);
+        }
+        Ok(reports)
+    }
+
+    fn prepare_workspace_environment_artifacts_parallel(
+        &self,
+        view_id: &str,
+        planned: &[(WorkspaceEnvironmentPlan, String, Option<String>)],
+    ) -> Result<Vec<PreparedEnvironmentArtifacts>> {
+        let concurrency = usize::try_from(
+            self.config()
+                .workspace_views
+                .concurrent_cache_builders
+                .max(1),
+        )
+        .unwrap_or(usize::MAX)
+        .min(planned.len().max(1));
+        if concurrency == 1 || planned.len() < 2 {
+            return planned
+                .iter()
+                .map(|(plan, key, _)| {
+                    self.prepare_workspace_environment_artifacts(view_id, plan, key)
+                })
+                .collect();
+        }
+
+        let mut completed = BTreeSet::<String>::new();
+        let mut failed_or_blocked = BTreeSet::<String>::new();
+        let mut first_error: Option<(usize, Error)> = None;
+        let mut remaining = planned
+            .iter()
+            .enumerate()
+            .map(|(index, (plan, _, _))| (plan.component_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut results = (0..planned.len())
+            .map(|_| None)
+            .collect::<Vec<Option<PreparedEnvironmentArtifacts>>>();
+        while !remaining.is_empty() {
+            let ready = remaining
+                .iter()
+                .filter_map(|(component_id, index)| {
+                    planned[*index]
+                        .0
+                        .resolved_dependencies
+                        .iter()
+                        .all(|dependency| completed.contains(&dependency.component_id))
+                        .then_some((component_id.clone(), *index))
+                })
+                .take(concurrency)
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                return Err(Error::Corrupt(
+                    "environment ready queue stalled after DAG validation".to_string(),
+                ));
+            }
+            let workspace = self.workspace_root().to_path_buf();
+            let view_id = view_id.to_string();
+            let wave = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(ready.len());
+                for (component_id, index) in &ready {
+                    let component_id = component_id.clone();
+                    let plan = planned[*index].0.clone();
+                    let key = planned[*index].1.clone();
+                    let workspace = workspace.clone();
+                    let view_id = view_id.clone();
+                    handles.push((
+                        *index,
+                        component_id,
+                        scope.spawn(move || {
+                            let db = Trail::open(&workspace)?;
+                            db.prepare_workspace_environment_artifacts(&view_id, &plan, &key)
+                        }),
+                    ));
+                }
+                handles
+                    .into_iter()
+                    .map(|(index, component_id, handle)| {
+                        let result = match handle.join() {
+                            Ok(result) => result,
+                            Err(_) => Err(Error::Corrupt(format!(
+                                "environment builder for `{component_id}` panicked"
+                            ))),
+                        };
+                        (index, component_id, result)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (index, component_id, result) in wave {
+                remaining.remove(&component_id);
+                match result {
+                    Ok(artifacts) => {
+                        results[index] = Some(artifacts);
+                        completed.insert(component_id);
+                    }
+                    Err(error) => {
+                        failed_or_blocked.insert(component_id);
+                        if first_error
+                            .as_ref()
+                            .is_none_or(|(first_index, _)| index < *first_index)
+                        {
+                            first_error = Some((index, error));
+                        }
+                    }
+                }
+            }
+            loop {
+                let blocked = remaining
+                    .iter()
+                    .filter_map(|(component_id, index)| {
+                        planned[*index]
+                            .0
+                            .resolved_dependencies
+                            .iter()
+                            .any(|dependency| failed_or_blocked.contains(&dependency.component_id))
+                            .then_some(component_id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if blocked.is_empty() {
+                    break;
+                }
+                for component_id in blocked {
+                    remaining.remove(&component_id);
+                    failed_or_blocked.insert(component_id);
+                }
+            }
+        }
+        if let Some((_, error)) = first_error {
+            return Err(error);
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "environment scheduler omitted topological component {index}"
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Run path-sensitive initializers at the lane's final mountpoint without
@@ -4023,7 +4497,9 @@ impl Trail {
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut output_stmt = self.conn.prepare(
-                "SELECT output_name, policy, storage_identity, layer_id, mount_path, layer_subpath
+                "SELECT output_name, policy, reuse_mode, sharing_scope, publication_trigger,
+                        publication_gate, storage_identity, layer_id, manifest_object_id,
+                        publication_id, mount_path, layer_subpath
                  FROM environment_generation_outputs
                  WHERE generation_id = ?1 AND component_id = ?2
                  ORDER BY output_name",
@@ -4033,10 +4509,16 @@ impl Trail {
                     Ok(EnvironmentGenerationOutputReport {
                         name: row.get(0)?,
                         policy: row.get(1)?,
-                        storage_identity: row.get(2)?,
-                        layer_id: row.get(3)?,
-                        mount_path: row.get(4)?,
-                        layer_subpath: row.get(5)?,
+                        reuse: row.get(2)?,
+                        scope: row.get(3)?,
+                        publish: row.get(4)?,
+                        gate: row.get(5)?,
+                        storage_identity: row.get(6)?,
+                        layer_id: row.get(7)?,
+                        manifest_object_id: row.get(8)?,
+                        publication_id: row.get(9)?,
+                        mount_path: row.get(10)?,
+                        layer_subpath: row.get(11)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4454,7 +4936,7 @@ impl Trail {
         let mut tool_identities = BTreeMap::new();
         let mut plans = Vec::with_capacity(components.len());
         for component in components {
-            let plan = if component.adapter_identity == recipe_identity {
+            let mut plan = if component.adapter_identity == recipe_identity {
                 let plan = recipe_plans
                     .remove(&component.component_id)
                     .ok_or_else(|| {
@@ -4472,6 +4954,7 @@ impl Trail {
             } else {
                 self.plan_discovered_environment_component(source_root, component)?
             };
+            add_host_canonical_environment_identity(&mut plan)?;
             plans.push(plan);
         }
         Ok(plans)
@@ -4755,6 +5238,98 @@ fn split_adapter_identity(identity: &str, fallback_major: u32) -> (String, Strin
     )
 }
 
+fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) -> Result<()> {
+    #[derive(Serialize)]
+    struct CanonicalOutput<'a> {
+        name: &'a str,
+        output_path: &'a str,
+        mount_path: &'a str,
+        policy: &'a str,
+        reuse: &'a str,
+        scope: &'a str,
+        publish: &'a str,
+        gate: Option<&'a str>,
+    }
+    #[derive(Serialize)]
+    struct CanonicalCommand<'a> {
+        phase: &'a str,
+        program: &'a str,
+        executable_identity: &'a str,
+        args: &'a [String],
+        working_directory: &'a str,
+        environment: &'a BTreeMap<String, String>,
+    }
+    for command in plan
+        .pre_commands
+        .iter()
+        .chain(plan.command.iter())
+        .chain(plan.mounted_commands.iter())
+    {
+        if command.environment.iter().any(|(name, value)| {
+            let lowered = name.to_ascii_lowercase();
+            lowered.contains("token")
+                || lowered.contains("password")
+                || lowered.contains("secret")
+                || lowered.contains("private_key")
+                || contains_sensitive_text(value)
+        }) {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` canonical identity environment contains secret-bearing data",
+                plan.component_id
+            )));
+        }
+    }
+    let outputs = plan
+        .outputs
+        .iter()
+        .map(|output| CanonicalOutput {
+            name: &output.name,
+            output_path: &output.output_path,
+            mount_path: &output.mount_path,
+            policy: output.policy.as_str(),
+            reuse: output.reuse.as_str(),
+            scope: output.scope.as_str(),
+            publish: output.publish.as_str(),
+            gate: output.gate.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let commands = plan
+        .pre_commands
+        .iter()
+        .map(|command| ("staging_pre", command))
+        .chain(plan.command.iter().map(|command| ("staging", command)))
+        .chain(
+            plan.mounted_commands
+                .iter()
+                .map(|command| ("mounted", command)),
+        )
+        .map(|(phase, command)| CanonicalCommand {
+            phase,
+            program: &command.program,
+            executable_identity: &command.executable_identity,
+            args: &command.args,
+            working_directory: &command.working_directory,
+            environment: &command.environment,
+        })
+        .collect::<Vec<_>>();
+    plan.layer_key.inputs.insert(
+        "host:artifact_contract_v1".to_string(),
+        sha256_hex(&serde_json::to_vec(&serde_json::json!({
+            "contract_version": 1,
+            "adapter_identity": plan.adapter_identity,
+            "implementation_version": plan.implementation_version,
+            "distribution_digest": plan.distribution_digest,
+            "outputs": outputs,
+            "commands": commands,
+            "validation": format!("sandbox:{:?}", plan.sandbox_policy),
+            "platform": plan.layer_key.platform,
+            "architecture": plan.layer_key.architecture,
+            "portability_scope": plan.layer_key.portability_scope,
+        }))?),
+    );
+    Ok(())
+}
+
 fn parse_canonical_adapter_identity(identity: &str) -> Option<(String, String, u32)> {
     let (namespace, remainder) = identity.split_once('/')?;
     let (name, major) = remainder.rsplit_once('@')?;
@@ -4875,6 +5450,60 @@ fn diff_workspace_layer_keys(
     changes
 }
 
+fn environment_rebuild_reason_str(reason: &EnvironmentRebuildReason) -> &'static str {
+    match reason {
+        EnvironmentRebuildReason::Missing => "missing",
+        EnvironmentRebuildReason::InputChanged => "input_changed",
+        EnvironmentRebuildReason::UpstreamChanged => "upstream_changed",
+        EnvironmentRebuildReason::ToolChanged => "tool_changed",
+        EnvironmentRebuildReason::PolicyChanged => "policy_changed",
+        EnvironmentRebuildReason::PlatformChanged => "platform_changed",
+        EnvironmentRebuildReason::Corrupt => "corrupt",
+        EnvironmentRebuildReason::Revoked => "revoked",
+    }
+}
+
+fn parse_environment_component_decision(
+    value: &str,
+) -> rusqlite::Result<EnvironmentComponentDecision> {
+    match value {
+        "reused" => Ok(EnvironmentComponentDecision::Reused),
+        "built" => Ok(EnvironmentComponentDecision::Built),
+        "private" => Ok(EnvironmentComponentDecision::Private),
+        "rejected" => Ok(EnvironmentComponentDecision::Rejected),
+        "failed" => Ok(EnvironmentComponentDecision::Failed),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown environment component decision `{value}`"),
+            )),
+        )),
+    }
+}
+
+fn parse_environment_rebuild_reason(value: &str) -> rusqlite::Result<EnvironmentRebuildReason> {
+    match value {
+        "missing" => Ok(EnvironmentRebuildReason::Missing),
+        "input_changed" => Ok(EnvironmentRebuildReason::InputChanged),
+        "upstream_changed" => Ok(EnvironmentRebuildReason::UpstreamChanged),
+        "tool_changed" => Ok(EnvironmentRebuildReason::ToolChanged),
+        "policy_changed" => Ok(EnvironmentRebuildReason::PolicyChanged),
+        "platform_changed" => Ok(EnvironmentRebuildReason::PlatformChanged),
+        "corrupt" => Ok(EnvironmentRebuildReason::Corrupt),
+        "revoked" => Ok(EnvironmentRebuildReason::Revoked),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown environment rebuild reason `{value}`"),
+            )),
+        )),
+    }
+}
+
 fn diff_layer_key_map(
     dimension: &str,
     previous: &BTreeMap<String, String>,
@@ -4972,7 +5601,8 @@ fn environment_output_activations(
         .enumerate()
         .map(|(index, output)| {
             let binding_identity = match output.policy {
-                WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => layer_id
+                WorkspaceEnvironmentOutputPolicy::ImmutableShared
+                | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => layer_id
                     .ok_or_else(|| {
                         Error::Corrupt(format!(
                             "component `{}` immutable output `{}` has no prepared layer",
@@ -4980,7 +5610,8 @@ fn environment_output_activations(
                         ))
                     })?
                     .to_string(),
-                WorkspaceEnvironmentOutputPolicy::WritablePrivate => {
+                WorkspaceEnvironmentOutputPolicy::WritablePrivate
+                | WorkspaceEnvironmentOutputPolicy::Disposable => {
                     if layer_id.is_some() {
                         return Err(Error::Corrupt(format!(
                             "component `{}` writable-private output `{}` unexpectedly has a layer",
@@ -4997,8 +5628,14 @@ fn environment_output_activations(
             Ok(EnvironmentLayerOutputActivation {
                 name: output.name.clone(),
                 mount_path: output.mount_path.clone(),
-                policy: output.policy.as_str().to_string(),
+                policy: output.policy,
+                reuse: output.reuse,
+                scope: output.scope,
+                publish: output.publish,
+                gate: output.gate.clone(),
                 binding_identity,
+                manifest_object_id: None,
+                publication_id: None,
                 private_seed: private_paths.map(|paths| paths[index].clone()),
                 layer_subpath: if package_outputs {
                     format!("outputs/{index:04}")
@@ -5992,6 +6629,10 @@ mod tests {
                 output_path: "project/output".to_string(),
                 mount_path: "output".to_string(),
                 policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                reuse: EnvironmentReuseMode::None,
+                scope: EnvironmentSharingScope::Lane,
+                publish: EnvironmentPublicationTrigger::Never,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason: "test".to_string(),
@@ -6198,12 +6839,18 @@ mod tests {
                 outputs: vec![EnvironmentLayerOutputActivation {
                     name: "output".to_string(),
                     mount_path: mount_path.clone(),
-                    policy: "writable_private".to_string(),
+                    policy: EnvironmentOutputPolicy::WritablePrivate,
+                    reuse: EnvironmentReuseMode::None,
+                    scope: EnvironmentSharingScope::Lane,
+                    publish: EnvironmentPublicationTrigger::Never,
+                    gate: None,
                     binding_identity: writable_private_binding_identity(
                         &component_id,
                         "output",
                         &baseline_cache_key,
                     ),
+                    manifest_object_id: None,
+                    publication_id: None,
                     private_seed: Some(baseline_seed.path().to_path_buf()),
                     layer_subpath: String::new(),
                 }],
@@ -6280,6 +6927,10 @@ mod tests {
                 output_path: "private/output".to_string(),
                 mount_path: mount_path.clone(),
                 policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                reuse: EnvironmentReuseMode::None,
+                scope: EnvironmentSharingScope::Lane,
+                publish: EnvironmentPublicationTrigger::Never,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason: "test mounted initializer changed".to_string(),
@@ -6611,6 +7262,10 @@ mod tests {
                         output_path: format!("staging/{component_id}"),
                         mount_path: format!("generated/{component_id}"),
                         policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                        reuse: EnvironmentReuseMode::None,
+                        scope: EnvironmentSharingScope::Lane,
+                        publish: EnvironmentPublicationTrigger::Never,
+                        gate: None,
                         create_if_missing: true,
                     }],
                     stale_reason: "dependency changed".to_string(),
@@ -6670,6 +7325,10 @@ mod tests {
                     output_path: format!("staging/{component_id}"),
                     mount_path: format!("generated/{component_id}"),
                     policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                    reuse: EnvironmentReuseMode::None,
+                    scope: EnvironmentSharingScope::Lane,
+                    publish: EnvironmentPublicationTrigger::Never,
+                    gate: None,
                     create_if_missing: true,
                 }],
                 stale_reason: "typed edge changed".to_string(),
@@ -6785,6 +7444,10 @@ mod tests {
                 output_path: "project/output".to_string(),
                 mount_path: "output".to_string(),
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: false,
             }],
             stale_reason: "test".to_string(),
@@ -6951,6 +7614,10 @@ mod tests {
                 output_path: "project/generated".to_string(),
                 mount_path: "GENERATED".to_string(),
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason: "test".to_string(),
@@ -7030,6 +7697,10 @@ mod tests {
                 output_path: "project/output".to_string(),
                 mount_path: "output".to_string(),
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason: "test".to_string(),

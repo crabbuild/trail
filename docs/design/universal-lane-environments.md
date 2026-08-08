@@ -300,7 +300,7 @@ A generation records:
 
 ### Atomic sync protocol
 
-`trail env sync <lane>` performs the following operation:
+`trail env sync all <lane>` performs the following operation:
 
 1. Acquire a lane environment lease and prove the lane is quiescent, or request an
    explicit stop/restart policy for managed processes.
@@ -662,7 +662,7 @@ the existing dependency workflow.
 trail env discover [--lane <lane>]
 trail env graph [--lane <lane>] [--format table|json|dot]
 trail env plan <lane>
-trail env sync <lane> [--offline] [--frozen] [--restart-services]
+trail env sync all <lane>
 trail env status <lane> [--verify attach|sample|full]
 trail env explain <lane> [component-or-path]
 trail env verify <lane> [--full]

@@ -350,14 +350,14 @@ fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
             );
             assert_eq!(
                 guidance,
-                "back up this workspace, then run `trail init --force` to create schema v1"
+                "back up this workspace, then run `trail init --force --from-git` to create a fresh schema-v1 workspace from Git-tracked files"
             );
         }
         other => panic!("unexpected error: {other}"),
     }
     assert_eq!(
         err.to_string(),
-        "workspace schema database corrupt: found version 17; expected version 1 cannot be opened; back up this workspace, then run `trail init --force` to create schema v1"
+        "workspace schema database corrupt: found version 17; expected version 1 cannot be opened; back up this workspace, then run `trail init --force --from-git` to create a fresh schema-v1 workspace from Git-tracked files"
     );
     assert_tree_unchanged(&fixture, &before);
 }

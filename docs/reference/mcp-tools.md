@@ -1,5 +1,10 @@
 # MCP Tools Reference
 
+`trail.env_promote` promotes a declared manual private output. Environment sync
+tools return the same cache decisions and identity edges as Rust, CLI, and HTTP.
+`trail.lane_spawn` includes the same typed backend prerequisite report used by
+doctor and the HTTP API.
+
 Trail MCP tool names are stable strings under the `trail.` prefix.
 The stdio transport expects one UTF-8 JSON-RPC object per line. Each input line
 is limited to 16 MiB; oversized or non-UTF-8 lines return JSON-RPC parse errors,

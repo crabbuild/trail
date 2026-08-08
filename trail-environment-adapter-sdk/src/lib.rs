@@ -1435,6 +1435,14 @@ pub struct AdapterOutput {
     pub target: String,
     #[serde(default)]
     pub policy: AdapterOutputPolicy,
+    #[serde(default)]
+    pub reuse: AdapterReuseMode,
+    #[serde(default)]
+    pub scope: AdapterSharingScope,
+    #[serde(default)]
+    pub publish: AdapterPublicationTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     #[serde(default = "default_create_if_missing")]
     pub create_if_missing: bool,
 }
@@ -1461,6 +1469,38 @@ impl AdapterOutput {
         Self::new(name, source, target, AdapterOutputPolicy::WritablePrivate)
     }
 
+    pub fn immutable_shared(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self::new(name, source, target, AdapterOutputPolicy::ImmutableShared)
+    }
+
+    pub fn disposable(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self::new(name, source, target, AdapterOutputPolicy::Disposable)
+    }
+
+    pub fn with_reuse(mut self, reuse: AdapterReuseMode, scope: AdapterSharingScope) -> Self {
+        self.reuse = reuse;
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_publication(
+        mut self,
+        publish: AdapterPublicationTrigger,
+        gate: Option<String>,
+    ) -> Self {
+        self.publish = publish;
+        self.gate = gate;
+        self
+    }
+
     pub fn with_create_if_missing(mut self, create_if_missing: bool) -> Self {
         self.create_if_missing = create_if_missing;
         self
@@ -1472,11 +1512,31 @@ impl AdapterOutput {
         target: impl Into<String>,
         policy: AdapterOutputPolicy,
     ) -> Self {
+        let reusable = matches!(
+            policy,
+            AdapterOutputPolicy::ImmutableShared | AdapterOutputPolicy::ImmutableSeedPrivate
+        );
         Self {
             name: name.into(),
             source: source.into(),
             target: target.into(),
             policy,
+            reuse: if reusable {
+                AdapterReuseMode::Exact
+            } else {
+                AdapterReuseMode::None
+            },
+            scope: if reusable {
+                AdapterSharingScope::Workspace
+            } else {
+                AdapterSharingScope::Lane
+            },
+            publish: if reusable {
+                AdapterPublicationTrigger::OnSync
+            } else {
+                AdapterPublicationTrigger::Never
+            },
+            gate: None,
             create_if_missing: true,
         }
     }
@@ -1485,9 +1545,39 @@ impl AdapterOutput {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterOutputPolicy {
+    ImmutableShared,
     #[default]
     ImmutableSeedPrivate,
     WritablePrivate,
+    Disposable,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterReuseMode {
+    None,
+    #[default]
+    Exact,
+    Compatible,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterSharingScope {
+    Lane,
+    #[default]
+    Workspace,
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterPublicationTrigger {
+    Never,
+    Manual,
+    #[default]
+    OnSync,
+    SuccessfulGate,
 }
 
 fn default_create_if_missing() -> bool {
@@ -1612,34 +1702,33 @@ mod tests {
     }
 
     #[test]
-    fn output_policy_is_backward_compatible_and_round_trips_writable_private() {
-        #[derive(Serialize)]
-        struct LegacyOutput<'a> {
-            name: &'a str,
-            source: &'a str,
-            target: &'a str,
-            create_if_missing: bool,
+    fn output_contract_round_trips_every_v2_policy_and_rejects_unknown_values() {
+        for output in [
+            AdapterOutput::immutable_shared("sdk", "sdk", "sdk"),
+            AdapterOutput::immutable_seed_private("dependencies", "deps", "deps"),
+            AdapterOutput::writable_private("build-tree", "build", "build"),
+            AdapterOutput::disposable("scratch", "scratch", ".scratch"),
+        ] {
+            let decoded: AdapterOutput =
+                serde_cbor::from_slice(&serde_cbor::to_vec(&output).unwrap()).unwrap();
+            assert_eq!(decoded, output);
         }
-        let legacy = serde_cbor::to_vec(&LegacyOutput {
-            name: "generated",
-            source: "generated",
-            target: "build",
-            create_if_missing: true,
-        })
-        .unwrap();
-        let legacy: AdapterOutput = serde_cbor::from_slice(&legacy).unwrap();
-        assert_eq!(legacy.policy, AdapterOutputPolicy::ImmutableSeedPrivate);
-
-        let private = AdapterOutput {
-            name: "build-tree".to_string(),
-            source: "build".to_string(),
-            target: "build".to_string(),
-            policy: AdapterOutputPolicy::WritablePrivate,
-            create_if_missing: true,
-        };
-        let private: AdapterOutput =
-            serde_cbor::from_slice(&serde_cbor::to_vec(&private).unwrap()).unwrap();
-        assert_eq!(private.policy, AdapterOutputPolicy::WritablePrivate);
+        assert!(serde_cbor::from_slice::<AdapterOutputPolicy>(
+            &serde_cbor::to_vec(&"shared_mutable").unwrap()
+        )
+        .is_err());
+        assert!(serde_cbor::from_slice::<AdapterReuseMode>(
+            &serde_cbor::to_vec(&"unsafe").unwrap()
+        )
+        .is_err());
+        assert!(serde_cbor::from_slice::<AdapterSharingScope>(
+            &serde_cbor::to_vec(&"organization").unwrap()
+        )
+        .is_err());
+        assert!(serde_cbor::from_slice::<AdapterPublicationTrigger>(
+            &serde_cbor::to_vec(&"always").unwrap()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1671,6 +1760,10 @@ mod tests {
                 source: "generated".to_string(),
                 target: "generated".to_string(),
                 policy: AdapterOutputPolicy::ImmutableSeedPrivate,
+                reuse: AdapterReuseMode::Exact,
+                scope: AdapterSharingScope::Workspace,
+                publish: AdapterPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: true,
             }],
             portability: AdapterPortability::Host,

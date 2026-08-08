@@ -193,6 +193,10 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
                 output_path: format!("{working_directory}/vendor"),
                 mount_path,
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason:

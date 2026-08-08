@@ -10,14 +10,16 @@ use trail_environment_adapter_sdk::{
     read_frame, write_frame, AdapterAction, AdapterCache, AdapterCacheAccess, AdapterCacheProtocol,
     AdapterCommand, AdapterDependencyType, AdapterExternalArtifact, AdapterHost, AdapterOperation,
     AdapterOutput, AdapterOutputPolicy, AdapterPackageManifest, AdapterPackageSignature,
-    AdapterPermissions, AdapterPlan, AdapterPlanV2, AdapterPortability, AdapterPublisherKey,
-    AdapterRequest, AdapterResponse, AdapterResult, AdapterRuntimeResource, DiscoveredComponent,
-    PinnedFile, MAX_FRAME_BYTES, PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1,
-    PROTOCOL_V2, TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
+    AdapterPermissions, AdapterPlan, AdapterPlanV2, AdapterPortability, AdapterPublicationTrigger,
+    AdapterPublisherKey, AdapterRequest, AdapterResponse, AdapterResult, AdapterReuseMode,
+    AdapterRuntimeResource, AdapterSharingScope, DiscoveredComponent, PinnedFile, MAX_FRAME_BYTES,
+    PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1, PROTOCOL_V2,
+    TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
 };
 
 use super::workspace_environment::{
-    WorkspaceEnvironmentCache, WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
+    validate_environment_output_contract, WorkspaceEnvironmentCache,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
     WorkspaceEnvironmentCommand, WorkspaceEnvironmentDependency, WorkspaceEnvironmentEdgeType,
     WorkspaceEnvironmentExternalArtifact, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
     WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
@@ -1695,25 +1697,64 @@ impl Trail {
             }
             output_paths.push((output.name.clone(), output_repository_path.clone()));
             mount_paths.push((output.name.clone(), mount_path.clone()));
+            let policy = match output.policy {
+                AdapterOutputPolicy::ImmutableShared => {
+                    WorkspaceEnvironmentOutputPolicy::ImmutableShared
+                }
+                AdapterOutputPolicy::ImmutableSeedPrivate => {
+                    WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+                }
+                AdapterOutputPolicy::WritablePrivate => {
+                    WorkspaceEnvironmentOutputPolicy::WritablePrivate
+                }
+                AdapterOutputPolicy::Disposable => WorkspaceEnvironmentOutputPolicy::Disposable,
+            };
+            let reuse = match output.reuse {
+                AdapterReuseMode::None => EnvironmentReuseMode::None,
+                AdapterReuseMode::Exact => EnvironmentReuseMode::Exact,
+                AdapterReuseMode::Compatible => EnvironmentReuseMode::Compatible,
+            };
+            let scope = match output.scope {
+                AdapterSharingScope::Lane => EnvironmentSharingScope::Lane,
+                AdapterSharingScope::Workspace => EnvironmentSharingScope::Workspace,
+                AdapterSharingScope::Host => EnvironmentSharingScope::Host,
+            };
+            let publish = match output.publish {
+                AdapterPublicationTrigger::Never => EnvironmentPublicationTrigger::Never,
+                AdapterPublicationTrigger::Manual => EnvironmentPublicationTrigger::Manual,
+                AdapterPublicationTrigger::OnSync => EnvironmentPublicationTrigger::OnSync,
+                AdapterPublicationTrigger::SuccessfulGate => {
+                    EnvironmentPublicationTrigger::SuccessfulGate
+                }
+            };
+            validate_environment_output_contract(
+                policy,
+                reuse,
+                scope,
+                publish,
+                output.gate.as_deref(),
+                false,
+            )?;
             outputs.push(WorkspaceEnvironmentOutput {
                 name: output.name.clone(),
                 output_path: format!("project/{output_repository_path}"),
                 mount_path,
-                policy: match output.policy {
-                    AdapterOutputPolicy::ImmutableSeedPrivate => {
-                        WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
-                    }
-                    AdapterOutputPolicy::WritablePrivate => {
-                        WorkspaceEnvironmentOutputPolicy::WritablePrivate
-                    }
-                },
+                policy,
+                reuse,
+                scope,
+                publish,
+                gate: output.gate.clone(),
                 create_if_missing: output.create_if_missing,
             });
         }
         if !normalized_mounted_commands.is_empty()
-            && outputs
-                .iter()
-                .any(|output| output.policy != WorkspaceEnvironmentOutputPolicy::WritablePrivate)
+            && outputs.iter().any(|output| {
+                !matches!(
+                    output.policy,
+                    WorkspaceEnvironmentOutputPolicy::WritablePrivate
+                        | WorkspaceEnvironmentOutputPolicy::Disposable
+                )
+            })
         {
             return Err(Error::InvalidInput(format!(
                 "adapter `{}` may use mounted initialization only with writable-private outputs",
@@ -1729,6 +1770,10 @@ impl Trail {
                         &output.output_path,
                         &output.mount_path,
                         output.policy.as_str(),
+                        output.reuse.as_str(),
+                        output.scope.as_str(),
+                        output.publish.as_str(),
+                        &output.gate,
                     )
                 })
                 .collect::<Vec<_>>(),

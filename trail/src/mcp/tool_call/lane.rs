@@ -206,6 +206,15 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
                 db.sync_all_workspace_environments_with_runtime(&lane, args.path.as_deref())?,
             )
         }
+        "trail.env_promote" => {
+            let args: EnvironmentPromoteArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.promote_workspace_environment_output(
+                &lane,
+                &args.component,
+                &args.output,
+            )?)
+        }
         "trail.env_runtime_status" => {
             let args: LaneHandleArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;

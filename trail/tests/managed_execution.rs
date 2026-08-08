@@ -141,6 +141,7 @@ fn lane_test_uses_managed_lifecycle_and_checkpoints_after_command_failure() {
             "resolve",
             "discover_plan",
             "sync_all",
+            "prefetch",
             "reconcile",
             "mount",
             "execute",

@@ -724,6 +724,8 @@ impl Trail {
         self.recover_materialization_stages()?;
         self.recover_workspace_views()?;
         self.recover_workspace_environment_sync_attempts()?;
+        self.recover_environment_hot_access_sessions()?;
+        self.recover_workspace_layer_publications()?;
         self.recover_workspace_runtime_leases()?;
         Ok(())
     }

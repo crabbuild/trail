@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use crate::model::{LaneGateOptions, LaneInitializationPhase};
 use crate::server::request_types::{
-    DependencySyncRequest, EnvironmentSyncRequest, LaneClaimRequest, LaneReadFileRequest,
-    LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest,
-    SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
+    DependencySyncRequest, EnvironmentPromoteRequest, EnvironmentSyncRequest, LaneClaimRequest,
+    LaneReadFileRequest, LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest,
+    SpawnLaneRequest, SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -231,6 +231,20 @@ pub(super) fn handle_lane_resources(
             query_usize(query, "offset", 0)? as u64,
             query_usize(query, "limit", 256)? as u64,
         )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "promote"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: EnvironmentPromoteRequest = serde_json::from_slice(&request.body)?;
+        let report =
+            db.promote_workspace_environment_output(&lane, &body.component, &body.output)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

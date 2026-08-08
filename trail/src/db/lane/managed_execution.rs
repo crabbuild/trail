@@ -1,5 +1,14 @@
 use super::*;
 use std::any::Any;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+#[derive(Clone, Debug)]
+pub(crate) struct HotAccessCapture {
+    pub(crate) session_id: String,
+    pub(crate) entry_limit: u64,
+    pub(crate) byte_limit: u64,
+}
 
 #[doc(hidden)]
 pub struct ManagedExecutionContext {
@@ -156,21 +165,33 @@ impl Trail {
             )?;
             return Err(error);
         }
-        let graph = match self.workspace_environment_graph(lane, None) {
-            Ok(graph) => graph,
-            Err(error) => {
-                self.push_managed_execution_phase(
-                    &mut phases,
-                    &branch.lane_id,
-                    &execution_id,
-                    surface,
-                    &command_fingerprint,
-                    "discover_plan",
-                    "failed",
-                    Some(&error.to_string()),
-                    None,
-                )?;
-                return Err(error);
+        let graph = if view.is_none() && discovered.components.is_empty() {
+            EnvironmentGraphReport {
+                source_root: discovered.source_root.clone(),
+                total_nodes: 0,
+                total_edges: 0,
+                offset: 0,
+                next_offset: None,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }
+        } else {
+            match self.workspace_environment_graph(lane, None) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    self.push_managed_execution_phase(
+                        &mut phases,
+                        &branch.lane_id,
+                        &execution_id,
+                        surface,
+                        &command_fingerprint,
+                        "discover_plan",
+                        "failed",
+                        Some(&error.to_string()),
+                        None,
+                    )?;
+                    return Err(error);
+                }
             }
         };
         self.push_managed_execution_phase(
@@ -264,6 +285,44 @@ impl Trail {
         } else {
             None
         };
+        if let (Some(view), Some(generation)) = (&view, &active_generation) {
+            let cancelled = AtomicBool::new(false);
+            let prefetch =
+                self.prefetch_environment_hot_set(generation, &command_fingerprint, &cancelled)?;
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "prefetch",
+                if prefetch.matched {
+                    "succeeded"
+                } else {
+                    "skipped"
+                },
+                None,
+                Some(serde_json::to_value(&prefetch)?),
+            )?;
+            self.begin_environment_hot_access_session(
+                &view.view_id,
+                &execution_id,
+                &command_fingerprint,
+                generation,
+            )?;
+        } else {
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "prefetch",
+                "skipped",
+                None,
+                Some(serde_json::json!({"reason": "no_active_environment_generation"})),
+            )?;
+        }
         let has_runtime = active_generation.as_ref().is_some_and(|generation| {
             generation
                 .components
@@ -348,6 +407,7 @@ impl Trail {
             match mount {
                 Ok(mount) => Some(mount),
                 Err(error) => {
+                    let _ = self.finish_environment_hot_access_session(&execution_id, false);
                     self.push_managed_execution_phase(
                         &mut phases,
                         &branch.lane_id,
@@ -488,7 +548,8 @@ impl Trail {
             status,
             error,
             Some(serde_json::json!({"exit_code": exit_code})),
-        )
+        )?;
+        self.finish_environment_hot_access_session(&execution_id, status == "succeeded")
     }
 
     #[doc(hidden)]
@@ -721,12 +782,13 @@ impl Trail {
             phase,
             status,
             error,
-            details,
+            details.clone(),
         )?;
         phases.push(ManagedExecutionPhaseReceipt {
             phase: phase.to_string(),
             status: status.to_string(),
             error: error.map(str::to_string),
+            details,
         });
         Ok(())
     }
@@ -762,6 +824,327 @@ impl Trail {
             }),
         )?;
         Ok(())
+    }
+
+    fn environment_hot_identities(
+        generation: &EnvironmentGenerationReport,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let components = generation
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    component.component_id.clone(),
+                    component.component_key.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let manifests = generation
+            .components
+            .iter()
+            .flat_map(|component| {
+                component.outputs.iter().filter_map(move |output| {
+                    output.manifest_object_id.as_ref().map(|manifest| {
+                        (
+                            format!("{}:{}", component.component_id, output.name),
+                            manifest.clone(),
+                        )
+                    })
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok((
+            serde_json::to_vec(&components)?,
+            serde_json::to_vec(&manifests)?,
+        ))
+    }
+
+    fn begin_environment_hot_access_session(
+        &self,
+        view_id: &str,
+        execution_id: &str,
+        command_fingerprint: &str,
+        generation: &EnvironmentGenerationReport,
+    ) -> Result<()> {
+        let (components, manifests) = Self::environment_hot_identities(generation)?;
+        let mut random = [0_u8; 24];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+        let session_id = format!("hot_{}", hex::encode(random));
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO environment_hot_access_sessions
+             (session_id,execution_id,view_id,command_fingerprint,generation_id,
+              component_identities_json,manifest_identities_json,owner_pid,owner_start_token,
+              status,entries_json,entry_count,total_bytes,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'recording','[]',0,0,?10,?10)",
+            params![
+                session_id,
+                execution_id,
+                view_id,
+                command_fingerprint,
+                generation.generation_id,
+                components,
+                manifests,
+                std::process::id(),
+                current_process_start_token(),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn finish_environment_hot_access_session(
+        &self,
+        execution_id: &str,
+        succeeded: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE environment_hot_access_sessions
+             SET status=?1,updated_at=?2
+             WHERE execution_id=?3 AND owner_pid=?4 AND owner_start_token=?5 AND status='recording'",
+            params![
+                if succeeded { "succeeded" } else { "failed" },
+                now_ts(),
+                execution_id,
+                std::process::id(),
+                current_process_start_token(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_environment_hot_access_sessions(&self) -> Result<()> {
+        let sessions = {
+            let mut statement = self.conn.prepare(
+                "SELECT session_id,owner_pid,owner_start_token
+                 FROM environment_hot_access_sessions
+                 WHERE status IN ('recording','succeeded') ORDER BY session_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let now = now_ts();
+        for (session_id, pid, token) in sessions {
+            if !process_matches_start_token(pid, &token) {
+                self.conn.execute(
+                    "UPDATE environment_hot_access_sessions
+                     SET status='failed',updated_at=?1
+                     WHERE session_id=?2 AND status IN ('recording','succeeded')",
+                    params![now, session_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hot_access_capture_for_source_upper(
+        &self,
+        source_upper: &Path,
+    ) -> Result<Option<HotAccessCapture>> {
+        let capture = self
+            .conn
+            .query_row(
+                "SELECT s.session_id,s.owner_pid,s.owner_start_token
+                 FROM environment_hot_access_sessions s
+                 JOIN workspace_views v ON v.view_id=s.view_id
+                 WHERE v.source_upper=?1 AND s.status IN ('recording','succeeded')
+                 ORDER BY s.created_at DESC,s.session_id DESC LIMIT 1",
+                params![source_upper.to_string_lossy()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, owner_pid, owner_token)) = capture else {
+            return Ok(None);
+        };
+        if owner_pid != std::process::id() || owner_token != current_process_start_token() {
+            return Ok(None);
+        }
+        let config = &self.config().workspace_views;
+        Ok(Some(HotAccessCapture {
+            session_id,
+            entry_limit: config.prefetch_max_entries,
+            byte_limit: config.prefetch_max_bytes,
+        }))
+    }
+
+    pub(crate) fn publish_environment_hot_accesses(
+        &self,
+        capture: &HotAccessCapture,
+        entries: &[EnvironmentHotPathEntry],
+    ) -> Result<()> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT command_fingerprint,generation_id,component_identities_json,
+                        manifest_identities_json,status,owner_pid,owner_start_token
+                 FROM environment_hot_access_sessions WHERE session_id=?1",
+                params![capture.session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((fingerprint, generation_id, components, manifests, status, pid, token)) = row
+        else {
+            return Ok(());
+        };
+        if status != "succeeded"
+            || pid != std::process::id()
+            || token != current_process_start_token()
+        {
+            return Ok(());
+        }
+        let mut bounded = entries.to_vec();
+        bounded.sort_by(|left, right| {
+            (&left.layer_id, &left.path).cmp(&(&right.layer_id, &right.path))
+        });
+        bounded.dedup_by(|left, right| left.layer_id == right.layer_id && left.path == right.path);
+        let mut bytes = 0_u64;
+        bounded.retain(|entry| {
+            if bytes.saturating_add(entry.size_bytes) > capture.byte_limit {
+                return false;
+            }
+            bytes = bytes.saturating_add(entry.size_bytes);
+            true
+        });
+        bounded.truncate(usize::try_from(capture.entry_limit).unwrap_or(usize::MAX));
+        bytes = bounded.iter().map(|entry| entry.size_bytes).sum();
+        let entries_json = serde_json::to_vec(&bounded)?;
+        let hot_set_id = format!(
+            "hotset_{}",
+            crate::ids::short_hash(format!("{fingerprint}:{generation_id}").as_bytes(), 24,)
+        );
+        let now = now_ts();
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO environment_hot_sets
+             (hot_set_id,command_fingerprint,generation_id,component_identities_json,
+              manifest_identities_json,entries_json,entry_count,total_bytes,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
+             ON CONFLICT(command_fingerprint,generation_id) DO UPDATE SET
+              component_identities_json=excluded.component_identities_json,
+              manifest_identities_json=excluded.manifest_identities_json,
+              entries_json=excluded.entries_json,entry_count=excluded.entry_count,
+              total_bytes=excluded.total_bytes,updated_at=excluded.updated_at",
+            params![
+                hot_set_id,
+                fingerprint,
+                generation_id,
+                components,
+                manifests,
+                entries_json,
+                bounded.len() as u64,
+                bytes,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE environment_hot_access_sessions SET status='published',entries_json=?1,
+             entry_count=?2,total_bytes=?3,updated_at=?4 WHERE session_id=?5 AND status='succeeded'",
+            params![entries_json, bounded.len() as u64, bytes, now, capture.session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn prefetch_environment_hot_set(
+        &self,
+        generation: &EnvironmentGenerationReport,
+        command_fingerprint: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<EnvironmentPrefetchReport> {
+        let config = &self.config().workspace_views;
+        let mut report = EnvironmentPrefetchReport {
+            entry_limit: config.prefetch_max_entries,
+            byte_limit: config.prefetch_max_bytes,
+            ..EnvironmentPrefetchReport::default()
+        };
+        let (components, manifests) = Self::environment_hot_identities(generation)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT component_identities_json,manifest_identities_json,entries_json
+                 FROM environment_hot_sets WHERE command_fingerprint=?1 AND generation_id=?2",
+                params![command_fingerprint, generation.generation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_components, stored_manifests, entries_json)) = row else {
+            return Ok(report);
+        };
+        if stored_components != components || stored_manifests != manifests {
+            return Ok(report);
+        }
+        report.matched = true;
+        let entries: Vec<EnvironmentHotPathEntry> = serde_json::from_slice(&entries_json)?;
+        for entry in entries {
+            if cancelled.load(AtomicOrdering::Acquire) {
+                report.cancelled = true;
+                break;
+            }
+            report.entries_considered = report.entries_considered.saturating_add(1);
+            if report.entries_prefetched >= report.entry_limit
+                || report.bytes_prefetched >= report.byte_limit
+            {
+                break;
+            }
+            let storage_path = self
+                .conn
+                .query_row(
+                    "SELECT storage_path FROM workspace_layers WHERE layer_id=?1 AND state='ready'",
+                    params![entry.layer_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(storage_path) = storage_path else {
+                continue;
+            };
+            let path = safe_join(Path::new(&storage_path), &entry.path)?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    metadata
+                }
+                _ => continue,
+            };
+            let remaining = report.byte_limit.saturating_sub(report.bytes_prefetched);
+            let amount = metadata.len().min(entry.size_bytes).min(remaining);
+            let mut file = File::open(&path)?;
+            let copied = std::io::copy(
+                &mut std::io::Read::by_ref(&mut file).take(amount),
+                &mut std::io::sink(),
+            )?;
+            report.bytes_prefetched = report.bytes_prefetched.saturating_add(copied);
+            report.entries_prefetched = report.entries_prefetched.saturating_add(1);
+        }
+        Ok(report)
     }
 }
 
@@ -814,6 +1197,130 @@ fn workspace_checkpoint_from_lane_record(record: LaneRecordReport) -> WorkspaceC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hot_generation(manifest: &str) -> EnvironmentGenerationReport {
+        EnvironmentGenerationReport {
+            generation_id: "generation-hot".to_string(),
+            view_id: "view-hot".to_string(),
+            generation_sequence: 1,
+            source_root: ObjectId("object_source".to_string()),
+            specification_digest: "specification".to_string(),
+            predecessor_generation_id: None,
+            state: "active".to_string(),
+            components: vec![EnvironmentGenerationComponentReport {
+                component_id: "component".to_string(),
+                adapter_identity: "recipe".to_string(),
+                kind: "command".to_string(),
+                component_key: "component-key".to_string(),
+                layer_id: Some("layer-hot".to_string()),
+                mount_path: Some("generated".to_string()),
+                dependencies: Vec::new(),
+                outputs: vec![EnvironmentGenerationOutputReport {
+                    name: "output".to_string(),
+                    policy: EnvironmentOutputPolicy::ImmutableShared,
+                    reuse: EnvironmentReuseMode::Exact,
+                    scope: EnvironmentSharingScope::Workspace,
+                    publish: EnvironmentPublicationTrigger::OnSync,
+                    gate: None,
+                    storage_identity: "storage".to_string(),
+                    layer_id: Some("layer-hot".to_string()),
+                    manifest_object_id: Some(manifest.to_string()),
+                    publication_id: None,
+                    mount_path: "generated".to_string(),
+                    layer_subpath: String::new(),
+                }],
+                caches: Vec::new(),
+                external_artifacts: Vec::new(),
+                runtime_resources: Vec::new(),
+            }],
+            created_at: 1,
+            activated_at: Some(1),
+            retired_at: None,
+        }
+    }
+
+    #[test]
+    fn hot_sets_are_authenticated_bounded_exact_and_cancellable() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "root\n").unwrap();
+        Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(root.path()).unwrap();
+        let layer = tempfile::tempdir().unwrap();
+        std::fs::write(layer.path().join("hot.bin"), vec![7_u8; 32]).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO workspace_layers
+                 (layer_id,kind,cache_key,adapter,adapter_version,manifest_object_id,storage_path,
+                  state,logical_bytes,physical_bytes,entry_count,portability_scope,builder_id,
+                  lease_expires_at,last_used_at,created_at)
+                 VALUES('layer-hot','generated','cache-hot','recipe',1,'manifest-hot',?1,
+                        'ready',32,32,1,'workspace',NULL,NULL,1,1)",
+                params![layer.path().to_string_lossy()],
+            )
+            .unwrap();
+        let generation = hot_generation("manifest-hot");
+        db.begin_environment_hot_access_session(
+            "view-hot",
+            "execution-hot",
+            "command-hot",
+            &generation,
+        )
+        .unwrap();
+        db.finish_environment_hot_access_session("execution-hot", true)
+            .unwrap();
+        let session_id: String = db
+            .conn
+            .query_row(
+                "SELECT session_id FROM environment_hot_access_sessions WHERE execution_id='execution-hot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.publish_environment_hot_accesses(
+            &HotAccessCapture {
+                session_id,
+                entry_limit: 1,
+                byte_limit: 32,
+            },
+            &[
+                EnvironmentHotPathEntry {
+                    layer_id: "layer-hot".to_string(),
+                    path: "hot.bin".to_string(),
+                    size_bytes: 32,
+                },
+                EnvironmentHotPathEntry {
+                    layer_id: "layer-hot".to_string(),
+                    path: "ignored.bin".to_string(),
+                    size_bytes: 32,
+                },
+            ],
+        )
+        .unwrap();
+
+        let report = db
+            .prefetch_environment_hot_set(&generation, "command-hot", &AtomicBool::new(false))
+            .unwrap();
+        assert!(report.matched);
+        assert_eq!(report.entries_prefetched, 1);
+        assert_eq!(report.bytes_prefetched, 32);
+
+        let cancelled = AtomicBool::new(true);
+        let report = db
+            .prefetch_environment_hot_set(&generation, "command-hot", &cancelled)
+            .unwrap();
+        assert!(report.matched);
+        assert!(report.cancelled);
+        assert_eq!(report.bytes_prefetched, 0);
+
+        let changed = db
+            .prefetch_environment_hot_set(
+                &hot_generation("manifest-changed"),
+                "command-hot",
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!changed.matched);
+    }
 
     #[test]
     fn managed_environment_sync_is_skipped_only_for_exact_ready_bindings() {

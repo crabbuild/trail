@@ -72,9 +72,10 @@ pub(super) fn lane_schemas() -> Value {
             "required": ["phase", "status"],
             "additionalProperties": false,
             "properties": {
-                "phase": { "type": "string", "enum": ["resolve", "discover_plan", "sync_all", "reconcile", "mount", "execute", "checkpoint", "dispose", "unmount"] },
+                "phase": { "type": "string", "enum": ["resolve", "discover_plan", "sync_all", "prefetch", "reconcile", "mount", "execute", "checkpoint", "dispose", "unmount"] },
                 "status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
-                "error": { "type": "string" }
+                "error": { "type": "string" },
+                "details": { "$ref": "#/components/schemas/JsonValue" }
             }
         },
         "ManagedExecutionLifecycleReport": {
@@ -142,7 +143,7 @@ pub(super) fn lane_schemas() -> Value {
         },
         "LaneSpawnReport": {
             "type": "object",
-            "required": ["initialization_id", "request_fingerprint", "phase", "committed", "resumed", "lane_id", "ref_name", "base_change", "requested_workdir_mode", "workdir_mode", "sparse_paths", "transparent_cow_available"],
+            "required": ["initialization_id", "request_fingerprint", "phase", "committed", "resumed", "lane_id", "ref_name", "base_change", "requested_workdir_mode", "workdir_mode", "sparse_paths", "transparent_cow_available", "backend_prerequisites"],
             "properties": {
                 "initialization_id": { "type": "string" },
                 "request_fingerprint": { "type": "string" },
@@ -158,7 +159,49 @@ pub(super) fn lane_schemas() -> Value {
                 "workdir_backend": { "type": ["string", "null"] },
                 "materialization": { "$ref": "#/components/schemas/JsonValue" },
                 "sparse_paths": { "type": "array", "items": { "type": "string" } },
-                "transparent_cow_available": { "type": "boolean" }
+                "transparent_cow_available": { "type": "boolean" },
+                "backend_prerequisites": { "$ref": "#/components/schemas/LayeredBackendPrerequisiteReport" },
+                "environment_inheritance": { "$ref": "#/components/schemas/EnvironmentInheritanceReport" }
+            }
+        },
+        "EnvironmentOutputInheritanceDecisionReport": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["component_id", "output_name", "policy", "decision", "storage_identity"],
+            "properties": {
+                "component_id": { "type": "string" },
+                "output_name": { "type": "string" },
+                "policy": { "type": "string", "enum": ["immutable_shared", "immutable_seed_private", "writable_private", "disposable"] },
+                "decision": { "type": "string", "enum": ["reused", "built", "private", "rejected", "failed"] },
+                "reason": { "type": "string" },
+                "layer_id": { "type": "string" },
+                "storage_identity": { "type": "string" }
+            }
+        },
+        "EnvironmentInheritanceReport": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["parent_lane_id", "parent_generation_id", "status", "outputs"],
+            "properties": {
+                "parent_lane_id": { "type": "string" },
+                "parent_generation_id": { "type": "string" },
+                "child_generation_id": { "type": "string" },
+                "status": { "type": "string", "enum": ["inherited", "skipped"] },
+                "reason": { "type": "string" },
+                "outputs": { "type": "array", "items": { "$ref": "#/components/schemas/EnvironmentOutputInheritanceDecisionReport" } }
+            }
+        },
+        "LayeredBackendPrerequisiteReport": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["platform", "qualified", "backend", "required_service", "mount_root", "remediation"],
+            "properties": {
+                "platform": { "type": "string" },
+                "qualified": { "type": "boolean" },
+                "backend": { "type": ["string", "null"] },
+                "required_service": { "type": "string" },
+                "mount_root": { "type": ["string", "null"] },
+                "remediation": { "type": ["string", "null"] }
             }
         },
         "LaneReviewEvidenceSummary": {
@@ -546,6 +589,15 @@ pub(super) fn lane_schemas() -> Value {
                 "path": { "type": "string" }
             }
         },
+        "EnvironmentPromoteRequest": {
+            "type": "object",
+            "required": ["component", "output"],
+            "additionalProperties": false,
+            "properties": {
+                "component": { "type": "string" },
+                "output": { "type": "string" }
+            }
+        },
         "EnvironmentAdapterIdentityReport": {
             "type": "object",
             "required": ["namespace", "name", "contract_major", "implementation_version"],
@@ -818,24 +870,34 @@ pub(super) fn lane_schemas() -> Value {
         },
         "EnvironmentPlanOutputReport": {
             "type": "object",
-            "required": ["name", "output_path", "mount_path", "policy"],
+            "required": ["name", "output_path", "mount_path", "policy", "reuse", "scope", "publish"],
             "additionalProperties": false,
             "properties": {
                 "name": { "type": "string" },
                 "output_path": { "type": "string" },
                 "mount_path": { "type": "string" },
-                "policy": { "type": "string", "enum": ["immutable_seed_private", "writable_private"] }
+                "policy": { "type": "string", "enum": ["immutable_shared", "immutable_seed_private", "writable_private", "disposable"] },
+                "reuse": { "type": "string", "enum": ["none", "exact", "compatible"] },
+                "scope": { "type": "string", "enum": ["lane", "workspace", "host"] },
+                "publish": { "type": "string", "enum": ["never", "manual", "on_sync", "successful_gate"] },
+                "gate": { "type": "string" }
             }
         },
         "EnvironmentGenerationOutputReport": {
             "type": "object",
-            "required": ["name", "policy", "storage_identity", "layer_id", "mount_path", "layer_subpath"],
+            "required": ["name", "policy", "reuse", "scope", "publish", "storage_identity", "layer_id", "mount_path", "layer_subpath"],
             "additionalProperties": false,
             "properties": {
                 "name": { "type": "string" },
-                "policy": { "type": "string", "enum": ["immutable_seed_private", "writable_private"] },
+                "policy": { "type": "string", "enum": ["immutable_shared", "immutable_seed_private", "writable_private", "disposable"] },
+                "reuse": { "type": "string", "enum": ["none", "exact", "compatible"] },
+                "scope": { "type": "string", "enum": ["lane", "workspace", "host"] },
+                "publish": { "type": "string", "enum": ["never", "manual", "on_sync", "successful_gate"] },
+                "gate": { "type": "string" },
                 "storage_identity": { "type": "string" },
                 "layer_id": { "type": ["string", "null"] },
+                "manifest_object_id": { "type": "string" },
+                "publication_id": { "type": "string" },
                 "mount_path": { "type": "string" },
                 "layer_subpath": { "type": "string" }
             }
@@ -1016,14 +1078,54 @@ pub(super) fn lane_schemas() -> Value {
         },
         "EnvironmentSyncReport": {
             "type": "object",
-            "required": ["generation", "layers"],
+            "required": ["generation", "layers", "decisions"],
             "additionalProperties": false,
             "properties": {
                 "generation": { "$ref": "#/components/schemas/EnvironmentGenerationReport" },
                 "layers": {
                     "type": "array",
                     "items": { "$ref": "#/components/schemas/WorkspaceLayerReport" }
+                },
+                "decisions": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/EnvironmentCacheDecisionReport" }
                 }
+            }
+        },
+        "EnvironmentCacheDecisionReport": {
+            "type": "object",
+            "required": ["component_id", "desired_key", "decision", "decision_source", "identity_edges"],
+            "additionalProperties": false,
+            "properties": {
+                "component_id": { "type": "string" },
+                "desired_key": { "type": "string" },
+                "storage_identity": { "type": ["string", "null"] },
+                "decision": { "type": "string", "enum": ["reused", "built", "private", "rejected", "failed"] },
+                "decision_source": { "type": "string" },
+                "rebuild_reason": { "type": ["string", "null"], "enum": ["missing", "input_changed", "upstream_changed", "tool_changed", "policy_changed", "platform_changed", "corrupt", "revoked", null] },
+                "identity_edges": { "type": "array", "items": { "$ref": "#/components/schemas/EnvironmentStaleChangeReport" } },
+                "bytes_avoided": { "type": ["integer", "null"], "minimum": 0 },
+                "bytes_written": { "type": ["integer", "null"], "minimum": 0 }
+            }
+        },
+        "EnvironmentPromotionReport": {
+            "type": "object",
+            "required": ["publication_id", "lane_id", "view_id", "component_id", "output_name", "trigger", "phase", "predecessor_generation_id", "successor_generation_id", "source_root", "output_identity", "manifest_object_id", "layer"],
+            "additionalProperties": false,
+            "properties": {
+                "publication_id": { "type": "string" },
+                "lane_id": { "type": "string" },
+                "view_id": { "type": "string" },
+                "component_id": { "type": "string" },
+                "output_name": { "type": "string" },
+                "trigger": { "type": "string", "enum": ["manual", "successful_gate"] },
+                "phase": { "type": "string", "enum": ["activated"] },
+                "predecessor_generation_id": { "type": "string" },
+                "successor_generation_id": { "type": "string" },
+                "source_root": { "type": "string" },
+                "output_identity": { "type": "string" },
+                "manifest_object_id": { "type": "string" },
+                "layer": { "$ref": "#/components/schemas/WorkspaceLayerReport" }
             }
         },
         "CacheGcRequest": {

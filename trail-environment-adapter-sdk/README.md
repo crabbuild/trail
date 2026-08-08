@@ -308,7 +308,7 @@ implementation versions, semantic inputs, tool identity, command, output contrac
 platform, architecture, and capability contract.
 
 Dependencies are `build_requires` edges in protocol v1; they do not grant the
-plugin access to another component's staged or mounted files. Use `trail env sync-all`
+plugin access to another component's staged or mounted files. Use `trail env sync all`
 to construct the whole graph atomically. A single-component sync fails with an
 actionable error unless every declared dependency is already ready in that lane.
 

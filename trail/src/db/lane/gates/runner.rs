@@ -340,6 +340,22 @@ impl Trail {
             (stdout_object, stderr_object, finished_event_id)
         };
 
+        if gate_success {
+            let gate_name = suite.as_deref().unwrap_or(kind);
+            self.promote_successful_gate_environment_outputs(
+                lane,
+                gate_name,
+                &serde_json::json!({
+                    "event_id": finished_event_id,
+                    "turn_id": turn_id,
+                    "source_root": source_root.0,
+                    "environment_keys": environment_keys,
+                    "command": command,
+                    "success": true
+                }),
+            )?;
+        }
+
         Ok(LaneTestReport {
             lane_id,
             turn_id,

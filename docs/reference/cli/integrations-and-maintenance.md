@@ -168,15 +168,30 @@ creates a fresh task lane for each ACP session.
 
 Use `agent start` when launching an agent directly from the terminal. It creates
 a task workdir, runs the agent there, and records a checkpoint when the command
-exits. The default `auto` mode first requires native cloning for every file and
-restarts portably if native COW is unavailable. Explicit `native-cow` never
-copies bytes, while `portable-copy` reports the actual clone/copy mix.
+exits. The default `auto` mode selects only the host's qualified transparent
+layered backend and reports actionable prerequisites when none is available.
+Explicit `native-cow` never copies bytes, while `portable-copy` reports the
+actual clone/copy mix.
 `fuse-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.
 On macOS, `nfs-cow` provides the same write-time copy-up behavior through the
 built-in loopback NFS client and requires no kernel extension.
 On Windows, `dokan-cow` exposes the same layered semantics through Dokan 2.x.
+
+### Prewarm or promote a lane environment
+
+```sh
+trail env sync all <LANE>
+trail env sync component <COMPONENT> --lane <LANE>
+trail env promote <LANE> <COMPONENT> <OUTPUT>
+```
+
+Inside exactly one mounted or managed lane, the lane argument to `sync all`
+and `--lane` for `sync component` may be omitted. Trail never guesses from the
+most recently used lane. Managed execution performs the same convergence
+automatically and records a skipped phase when the active generation is
+already current.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.

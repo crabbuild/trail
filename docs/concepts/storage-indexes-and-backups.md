@@ -1,5 +1,12 @@
 # Storage, Indexes, and Backups
 
+Backups include cache decisions and private-output publication journals, but
+not mounted views, active environment generations, or performance-cache layer
+bytes. Restore retains publication attempts as `recovered` provenance, removes
+their attachable layer/generation authority, and requires the lane to prepare a
+fresh view and generation. A restored workspace validates that closed state
+before reporting healthy.
+
 Trail stores durable workspace state under `.trail` and maintains derived indexes for fast history and provenance queries.
 
 ## SQLite and Prolly Storage

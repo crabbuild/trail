@@ -1,5 +1,11 @@
 # HTTP API Reference
 
+Environment sync reports include per-component cache decisions, storage
+identity, rebuild reason, exact changed identity edges, and byte accounting.
+`POST /v1/lanes/{lane_or_id}/environment/promote` accepts `component` and
+`output` and returns the durable publication and successor-generation report.
+Lane spawn reports include the shared layered-backend prerequisite report.
+
 The daemon serves JSON HTTP routes under `/v1`.
 Accepted HTTP connections use 30-second read/write timeouts; slow requests
 receive `408 Request Timeout` without stopping the listener. Total

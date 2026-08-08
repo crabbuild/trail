@@ -1,5 +1,11 @@
 # Layered Lane Workspaces for Large-Repository Multi-Agent Development
 
+Omitting `--workdir-mode` selects `auto`, which accepts only the host's
+qualified transparent FUSE, NFS, or Dokan backend. Spawn creates metadata and
+private uppers without cloning the repository. Immutable environment layers
+use sorted 4,096-entry manifest pages; ordinary attach validates a durable root
+stamp and loads content on demand instead of hashing or copying the full layer.
+
 Status: implemented behind platform acceptance gates; native Windows Dokan CI
 evidence remains required before declaring the rollout complete.
 

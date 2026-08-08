@@ -107,6 +107,12 @@ pub struct WorkspaceViewsConfig {
     pub concurrent_cache_builders: u64,
     pub cache_retention_secs: u64,
     pub cache_max_bytes: u64,
+    #[serde(default)]
+    pub cache_min_free_bytes: u64,
+    #[serde(default = "default_prefetch_bytes")]
+    pub prefetch_max_bytes: u64,
+    #[serde(default = "default_prefetch_entries")]
+    pub prefetch_max_entries: u64,
 }
 
 fn default_storage_config() -> StorageConfig {
@@ -135,7 +141,18 @@ fn default_workspace_views_config() -> WorkspaceViewsConfig {
         concurrent_cache_builders: 4,
         cache_retention_secs: 7 * 24 * 60 * 60,
         cache_max_bytes: 0,
+        cache_min_free_bytes: 0,
+        prefetch_max_bytes: default_prefetch_bytes(),
+        prefetch_max_entries: default_prefetch_entries(),
     }
+}
+
+fn default_prefetch_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_prefetch_entries() -> u64 {
+    4096
 }
 
 fn default_lane_claim_enforcement() -> String {

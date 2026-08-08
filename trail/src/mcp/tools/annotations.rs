@@ -240,6 +240,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.deps_sync"
         | "trail.env_sync"
         | "trail.env_sync_all"
+        | "trail.env_promote"
         | "trail.env_runtime_reconcile" => Some(ToolRiskClass::OpenWorldWrite),
         "trail.env_runtime_stop" => Some(ToolRiskClass::OpenWorldDestructiveWrite),
         _ => None,

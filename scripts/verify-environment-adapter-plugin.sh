@@ -3,11 +3,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
+: "${CARGO_TARGET_DIR:?set a unique CARGO_TARGET_DIR beneath /Volumes/Workspace/crabbuild-target}"
+case "${CARGO_TARGET_DIR}" in
+  /Volumes/Workspace/crabbuild-target/*) ;;
+  *) printf 'CARGO_TARGET_DIR must be beneath /Volumes/Workspace/crabbuild-target\n' >&2; exit 2 ;;
+esac
 
-cargo build -p trail
-cargo build -p trail-environment-adapter-sdk --example generated-copy-adapter --example mounted-initializer-adapter --example mounted-fixture-tool --example cache-adapter --example cache-fixture-tool --example adversarial-adapter --example fixture-sign-adapter
-trail="${CARGO_TARGET_DIR:-${repo_root}/target}/debug/trail"
-example_dir="${CARGO_TARGET_DIR:-${repo_root}/target}/debug/examples"
+cargo build -p trail --locked
+cargo build -p trail-environment-adapter-sdk --locked --example generated-copy-adapter --example mounted-initializer-adapter --example mounted-fixture-tool --example cache-adapter --example cache-fixture-tool --example adversarial-adapter --example fixture-sign-adapter
+trail="${CARGO_TARGET_DIR}/debug/trail"
+example_dir="${CARGO_TARGET_DIR}/debug/examples"
 
 root="$(mktemp -d)"
 packages="$(mktemp -d)"
@@ -196,8 +201,8 @@ grep -q '"component_id": "plugin.copy"' <<<"${discovery}"
 plan="$("${trail}" --workspace "${root}" --json env plan plugin-a --adapter example/copy@1)"
 grep -q '"sandbox": "' <<<"${plan}"
 grep -q '"network": "deny"' <<<"${plan}"
-first="$("${trail}" --workspace "${root}" --json env sync plugin-a --adapter example/copy@1)"
-second="$("${trail}" --workspace "${root}" --json env sync plugin-b --adapter example/copy@1)"
+first="$("${trail}" --workspace "${root}" --json env sync all plugin-a)"
+second="$("${trail}" --workspace "${root}" --json env sync all plugin-b)"
 first_layer="$(sync_layer_field layer_id <<<"${first}")"
 second_layer="$(sync_layer_field layer_id <<<"${second}")"
 storage="$(sync_layer_field storage_path <<<"${first}")"
@@ -206,7 +211,7 @@ cmp "${root}/input.txt" "${storage}/copied.txt"
 "${trail}" --workspace "${root}" lane exec plugin-private -- \
   sh -c 'printf writable_private >copy.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-private -m "select private plugin output" >/dev/null
-private_sync="$("${trail}" --workspace "${root}" --json env sync plugin-private --adapter example/copy@1)"
+private_sync="$("${trail}" --workspace "${root}" --json env sync all plugin-private)"
 python3 -c '
 import json, sys
 report = json.load(sys.stdin)
@@ -217,7 +222,7 @@ assert output["layer_id"] is None, output
 ' <<<"${private_sync}"
 "${trail}" --workspace "${root}" lane exec plugin-private -- \
   sh -c 'printf private-plugin-mutation >.trail-generated/plugin-copy/copied.txt'
-"${trail}" --workspace "${root}" env sync plugin-private --adapter example/copy@1 >/dev/null
+"${trail}" --workspace "${root}" env sync all plugin-private >/dev/null
 "${trail}" --workspace "${root}" lane exec plugin-private -- \
   sh -c 'grep -q private-plugin-mutation .trail-generated/plugin-copy/copied.txt'
 "${trail}" --workspace "${root}" lane exec plugin-a -- \
@@ -239,8 +244,8 @@ cache_plan="$("${trail}" --workspace "${root}" --json env plan plugin-a --adapte
 grep -q '"name": "fixture-store"' <<<"${cache_plan}"
 grep -q '"protocol": "content_store"' <<<"${cache_plan}"
 grep -q '"access": "host_exclusive"' <<<"${cache_plan}"
-cache_a="$("${trail}" --workspace "${root}" --json env sync plugin-a --adapter example/cache@1)"
-cache_b="$("${trail}" --workspace "${root}" --json env sync plugin-b --adapter example/cache@1)"
+cache_a="$("${trail}" --workspace "${root}" --json env sync all plugin-a)"
+cache_b="$("${trail}" --workspace "${root}" --json env sync all plugin-b)"
 cache_a_namespace="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"]["components"][0]["caches"][0]["namespace_id"])' <<<"${cache_a}")"
 cache_b_namespace="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"]["components"][0]["caches"][0]["namespace_id"])' <<<"${cache_b}")"
 test "${cache_a_namespace}" = "${cache_b_namespace}"
@@ -252,7 +257,7 @@ test "$(tr -d '\r\n' <"${root}/.trail/cache/namespaces/${cache_a_namespace}/coun
 "${trail}" --workspace "${root}" lane exec plugin-a -- sh -c 'printf escape >cache.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-a -m "attempt plugin cache namespace escape" >/dev/null
 assert_fails "plugin cache write unexpectedly escaped its namespace" \
-  "${trail}" --workspace "${root}" env sync plugin-a --adapter example/cache@1
+  "${trail}" --workspace "${root}" env sync all plugin-a
 test ! -e "${root}/.trail/cache/namespaces/plugin-cache-escape"
 "${trail}" --workspace "${root}" lane exec plugin-a -- \
   sh -c 'grep -q "|1$" .trail-generated/plugin-cache/cache-observation.txt'
@@ -266,8 +271,8 @@ if grep -q '"phase": "staging"' <<<"${mounted_plan}"; then
   printf '%s\n' "mounted-only plugin unexpectedly gained a staging action" >&2
   exit 1
 fi
-mounted_a="$("${trail}" --workspace "${root}" --json env sync plugin-mounted-a --adapter example/mounted@1)"
-mounted_b="$("${trail}" --workspace "${root}" --json env sync plugin-mounted-b --adapter example/mounted@1)"
+mounted_a="$("${trail}" --workspace "${root}" --json env sync all plugin-mounted-a)"
+mounted_b="$("${trail}" --workspace "${root}" --json env sync all plugin-mounted-b)"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["layers"] == []' <<<"${mounted_a}"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["layers"] == []' <<<"${mounted_b}"
 mounted_a_pwd="$("${trail}" --workspace "${root}" lane exec plugin-mounted-a -- pwd | first_line | tr -d '\r')"
@@ -281,7 +286,7 @@ test "${mounted_b_recorded}" = "${mounted_b_pwd}"
 test "${mounted_a_recorded}" != "${mounted_b_recorded}"
 "${trail}" --workspace "${root}" lane exec plugin-mounted-a -- \
   sh -c 'printf lane-a-private >.trail-generated/plugin-mounted/initialized.txt'
-"${trail}" --workspace "${root}" env sync plugin-mounted-a --adapter example/mounted@1 >/dev/null
+"${trail}" --workspace "${root}" env sync all plugin-mounted-a >/dev/null
 "${trail}" --workspace "${root}" lane exec plugin-mounted-a -- \
   sh -c 'grep -q lane-a-private .trail-generated/plugin-mounted/initialized.txt'
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
@@ -289,26 +294,26 @@ test "${mounted_a_recorded}" != "${mounted_b_recorded}"
 "${trail}" --workspace "${root}" lane exec plugin-mounted-a -- sh -c 'printf fail >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-a -m "fail mounted plugin action" >/dev/null
 assert_fails "failed mounted plugin action unexpectedly activated" \
-  "${trail}" --workspace "${root}" env sync plugin-mounted-a --adapter example/mounted@1
+  "${trail}" --workspace "${root}" env sync all plugin-mounted-a
 "${trail}" --workspace "${root}" lane exec plugin-mounted-a -- \
   sh -c 'grep -q lane-a-private .trail-generated/plugin-mounted/initialized.txt && test ! -e .trail-generated/plugin-mounted/partial.txt'
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- sh -c 'printf source_write >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-b -m "attempt mounted source write" >/dev/null
 assert_fails "mounted plugin source write unexpectedly escaped its declared output" \
-  "${trail}" --workspace "${root}" env sync plugin-mounted-b --adapter example/mounted@1
+  "${trail}" --workspace "${root}" env sync all plugin-mounted-b
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
   sh -c 'test ! -e source-leak.txt && test -f .trail-generated/plugin-mounted/initialized.txt'
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- sh -c 'printf source_read >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-b -m "attempt undeclared mounted source read" >/dev/null
 assert_fails "mounted plugin undeclared source read unexpectedly succeeded" \
-  "${trail}" --workspace "${root}" env sync plugin-mounted-b --adapter example/mounted@1
+  "${trail}" --workspace "${root}" env sync all plugin-mounted-b
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
   sh -c 'test ! -e .trail-generated/plugin-mounted/leaked.txt && test -f .trail-generated/plugin-mounted/initialized.txt'
-"${trail}" --workspace "${root}" env sync plugin-mounted-kill --adapter example/mounted@1 >/dev/null
+"${trail}" --workspace "${root}" env sync all plugin-mounted-kill >/dev/null
 "${trail}" --workspace "${root}" lane exec plugin-mounted-kill -- \
   sh -c 'printf kill-predecessor >.trail-generated/plugin-mounted/initialized.txt; printf hang >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-kill -m "kill active mounted plugin action" >/dev/null
-"${trail}" --workspace "${root}" env sync plugin-mounted-kill --adapter example/mounted@1 \
+"${trail}" --workspace "${root}" env sync all plugin-mounted-kill \
   >"${packages}/mounted-kill.stdout" 2>"${packages}/mounted-kill.stderr" &
 mounted_sync_pid=$!
 mounted_ready=""

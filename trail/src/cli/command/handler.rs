@@ -328,20 +328,33 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
                 args.component.as_deref(),
             )?,
         ),
-        EnvironmentSubcommand::Sync(args) => render_specialist(
+        EnvironmentSubcommand::Sync(sync) => match sync.command {
+            EnvironmentSyncSubcommand::All(args) => {
+                let lane = resolve_environment_sync_lane(&db, args.lane.as_deref())?;
+                render_specialist(
+                    ctx,
+                    "Synchronized environments",
+                    &db.sync_all_workspace_environments_with_runtime(&lane, args.path.as_deref())?,
+                )
+            }
+            EnvironmentSyncSubcommand::Component(args) => {
+                let lane = resolve_environment_sync_lane(&db, args.lane.as_deref())?;
+                render_specialist(
+                    ctx,
+                    "Synchronized environment",
+                    &db.sync_workspace_environment_component_with_runtime(
+                        &lane,
+                        &args.adapter,
+                        args.path.as_deref(),
+                        Some(&args.component),
+                    )?,
+                )
+            }
+        },
+        EnvironmentSubcommand::Promote(args) => render_specialist(
             ctx,
-            "Synchronized environment",
-            &db.sync_workspace_environment_component_with_runtime(
-                &args.lane,
-                &args.adapter,
-                args.path.as_deref(),
-                args.component.as_deref(),
-            )?,
-        ),
-        EnvironmentSubcommand::SyncAll(args) => render_specialist(
-            ctx,
-            "Synchronized environments",
-            &db.sync_all_workspace_environments_with_runtime(&args.lane, args.path.as_deref())?,
+            "Promoted environment output",
+            &db.promote_workspace_environment_output(&args.lane, &args.component, &args.output)?,
         ),
         EnvironmentSubcommand::Runtime(runtime) => {
             let generation = match runtime.command {
@@ -363,6 +376,18 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
             render_specialist(ctx, "Environment runtime", &generation)
         }
     }
+}
+
+fn resolve_environment_sync_lane(db: &Trail, explicit: Option<&str>) -> Result<String> {
+    if let Some(lane) = explicit {
+        return Ok(lane.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(Error::from)?;
+    db.infer_environment_lane_context(
+        &cwd,
+        std::env::var("TRAIL_LANE").ok().as_deref(),
+        std::env::var("TRAIL_VIEW").ok().as_deref(),
+    )
 }
 
 fn handle_deps_command(ctx: &RuntimeContext, deps: DepsCommand) -> Result<()> {

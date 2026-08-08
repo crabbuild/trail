@@ -208,6 +208,24 @@ pub(crate) fn config_entries_from(config: &TrailConfig) -> Vec<ConfigEntry> {
             "u64",
             false,
         ),
+        config_entry(
+            "workspace_views.cache_min_free_bytes",
+            config.workspace_views.cache_min_free_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.prefetch_max_bytes",
+            config.workspace_views.prefetch_max_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.prefetch_max_entries",
+            config.workspace_views.prefetch_max_entries,
+            "u64",
+            false,
+        ),
     ]
 }
 
