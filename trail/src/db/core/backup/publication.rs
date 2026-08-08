@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(windows)]
+use std::thread::sleep;
+#[cfg(windows)]
+use std::time::Duration;
 
 pub(super) fn sibling_stage(target: &Path, label: &str) -> Result<PathBuf> {
     let parent = target
@@ -27,10 +31,7 @@ pub(super) fn sync_tree_bottom_up(root: &Path) -> Result<()> {
         let entry = entry.map_err(|error| Error::Io(error.into()))?;
         let file_type = entry.file_type();
         if file_type.is_file() {
-            OpenOptions::new()
-                .read(true)
-                .open(entry.path())?
-                .sync_all()?;
+            sync_file_for_publication(entry.path())?;
         } else if file_type.is_dir() {
             directories.push(entry.path().to_path_buf());
         }
@@ -117,6 +118,31 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
     {
         let _ = path;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+    let mut delay = Duration::from_millis(1);
+    for attempt in 0..4 {
+        match OpenOptions::new().read(true).open(path) {
+            Ok(file) => return file.sync_all().map_err(Error::from),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(32));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
     Ok(())
 }
 
