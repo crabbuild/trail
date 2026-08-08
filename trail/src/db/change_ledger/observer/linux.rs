@@ -44,7 +44,10 @@ const READ_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_RETAINED_EVENTS: usize = 65_536;
 const MAX_PENDING_RECORDS: usize = 8_192;
 const COOKIE_EXPIRY: Duration = Duration::from_millis(75);
-const FENCE_TIMEOUT: Duration = Duration::from_secs(10);
+// Native lane startup can create many independent observers at once. Their
+// SQLite publication locks are intentionally serialized, so allow the inotify
+// worker enough time to deliver a sentinel while unrelated observers drain.
+const FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOP_PAUSE: Duration = Duration::from_millis(2);
 
 const WATCH_MASK: WatchMask = WatchMask::CREATE

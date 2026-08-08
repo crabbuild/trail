@@ -1355,7 +1355,7 @@ fn socket_leaf_stat(parent: &File, leaf: &str) -> std::io::Result<libc::stat> {
 }
 
 fn socket_leaf_creation_timestamp(metadata: &libc::stat) -> (i64, i64) {
-    (metadata.st_ctime as i64, metadata.st_ctime_nsec as i64)
+    (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
 fn socket_ctime_identity(
@@ -1411,12 +1411,12 @@ fn verify_secure_socket_leaf_identity(
             "workspace daemon socket identity changed; refusing pathname authority".into(),
         ));
     }
-    if let Some((expected_sec, expected_nsec)) = expected_socket_ctime {
-        if identity.ctime_sec != expected_sec || identity.ctime_nsec != expected_nsec {
-            return Err(Error::DaemonUnavailable(
-                "workspace daemon socket creation-time changed; refusing pathname authority".into(),
-            ));
-        }
+    if let Some((expected_sec, expected_nsec)) = expected_socket_ctime
+        && (identity.ctime_sec != expected_sec || identity.ctime_nsec != expected_nsec)
+    {
+        return Err(Error::DaemonUnavailable(
+            "workspace daemon socket creation-time changed; refusing pathname authority".into(),
+        ));
     }
     Ok(identity)
 }

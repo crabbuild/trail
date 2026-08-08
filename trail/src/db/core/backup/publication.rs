@@ -108,11 +108,13 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?
-            .sync_all()?;
+        sync_windows_publication_operation(|| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|directory| directory.sync_all())
+        })?;
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -122,11 +124,13 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+fn sync_windows_publication_operation(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
     let mut delay = Duration::from_millis(1);
     for attempt in 0..4 {
-        match OpenOptions::new().read(true).open(path) {
-            Ok(file) => return file.sync_all().map_err(Error::from),
+        match operation() {
+            Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
                 sleep(delay);
                 delay = (delay * 2).min(Duration::from_millis(32));
@@ -138,6 +142,16 @@ pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn sync_file_for_publication(path: &Path) -> Result<()> {
+    sync_windows_publication_operation(|| {
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+    })
 }
 
 #[cfg(not(windows))]

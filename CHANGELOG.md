@@ -5,6 +5,15 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrent materialized-lane initialization now retries short SQLite WAL
+  checkpoint contention and allows native Linux observer fences enough delivery
+  time under high startup fan-out.
+- Windows backup publication retries permission-denied file and directory syncs
+  across both handle opening and `sync_all`, preventing transient sharing-state
+  failures from aborting an otherwise complete backup.
+
 ## [0.2.0] - 2026-08-07
 
 ### Changed

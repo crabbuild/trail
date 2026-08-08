@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use getrandom::getrandom;
@@ -1058,14 +1059,35 @@ pub(super) fn db_u64(value: i64, label: &str) -> Result<u64> {
         .map_err(|_| Error::Corrupt(format!("{label} is negative")))
 }
 
+const DURABLE_INTENT_BARRIER_ATTEMPTS: usize = 32;
+const DURABLE_INTENT_BARRIER_MAX_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+static DURABLE_INTENT_BARRIER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 pub(super) fn durable_intent_barrier(conn: &rusqlite::Connection) -> Result<()> {
-    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| row.get(0))?;
-    if busy != 0 {
-        return Err(Error::Conflict(
-            "changed-path intent durability checkpoint remained busy".into(),
-        ));
+    // A full checkpoint is a process-wide SQLite operation. Serialize local
+    // callers so unrelated lane initializations do not all race the same WAL
+    // boundary, then retry the short reader/writer handoff window. A nonzero
+    // result remains an explicit conflict after the bounded budget; it is not
+    // silently treated as durable.
+    let _barrier = DURABLE_INTENT_BARRIER_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut delay = Duration::from_millis(2);
+    for attempt in 0..DURABLE_INTENT_BARRIER_ATTEMPTS {
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| row.get(0))?;
+        if busy == 0 {
+            return Ok(());
+        }
+        if attempt + 1 < DURABLE_INTENT_BARRIER_ATTEMPTS {
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(DURABLE_INTENT_BARRIER_MAX_RETRY_DELAY);
+        }
     }
-    Ok(())
+    Err(Error::Conflict(
+        "changed-path intent durability checkpoint remained busy".into(),
+    ))
 }
 
 #[cfg(test)]
