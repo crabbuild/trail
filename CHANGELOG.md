@@ -13,6 +13,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Windows backup publication retries permission-denied file and directory syncs
   across both handle opening and `sync_all`, preventing transient sharing-state
   failures from aborting an otherwise complete backup.
+- Backup verification and restore now validate private staged SQLite copies under
+  their own write lock, allowing Windows WAL/SHM initialization during handoff
+  without rejecting a valid schema generation.
 
 ## [0.2.0] - 2026-08-07
 

@@ -72,7 +72,7 @@ impl Trail {
             drop(restored_conn);
             test_crash_point("restore_after_ledger_rotation");
 
-            let mut db = Trail::open_without_recovering_derived_paths(&workspace_root, &temp_dir)?;
+            let mut db = super::open_staged_copy(&workspace_root, &temp_dir)?;
             let rewritten_workdirs = {
                 let _lock = db.acquire_write_lock()?;
                 let rewritten = db.rewrite_restored_lane_workdir_paths()?;
