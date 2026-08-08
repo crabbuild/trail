@@ -516,8 +516,30 @@ impl Trail {
                     )
                 })
         } else if context.view.is_some() {
-            self.checkpoint_lane_workspace(&context.lane, checkpoint_message)
-                .map(|checkpoint| (checkpoint, None))
+            self.record_lane_workdir(&context.lane, checkpoint_message)
+                .and_then(|record| {
+                    let view = self.lane_workspace_view(&context.lane)?.ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "lane `{}` does not have a layered workspace view",
+                            context.lane
+                        ))
+                    })?;
+                    let checkpoint = WorkspaceCheckpointReport {
+                        view_id: view.view_id,
+                        operation: record.operation.clone(),
+                        root_id: record.root_id.clone(),
+                        journal_sequence: view.checkpoint_seq,
+                        source_paths: record
+                            .changed_paths
+                            .iter()
+                            .map(|change| change.path.clone())
+                            .collect(),
+                        generated_dirty_paths: record.generated_dirty_paths,
+                        generated_path_accounting: "journal_interval".to_string(),
+                        upper_recovery_walks: record.upper_recovery_walks,
+                    };
+                    Ok((checkpoint, Some(record)))
+                })
         } else {
             self.record_lane_workdir(&context.lane, checkpoint_message)
                 .map(|record| {

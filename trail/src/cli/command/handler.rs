@@ -128,7 +128,9 @@ fn run(cli: Cli) -> Result<()> {
             upgrade::handle_background_update_check();
             return Ok(());
         }
-        _ => upgrade::maybe_notify_about_update(&ctx),
+        _ => {
+            let _ = upgrade::maybe_notify_about_update(&ctx);
+        }
     }
     if let Some(daemon_url) = daemon_url {
         if daemon_rpc::try_handle_daemon_command(

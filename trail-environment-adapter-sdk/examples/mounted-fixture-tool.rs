@@ -11,11 +11,11 @@ fn main() {
     }
     let path = Path::new(&path);
     let current_directory = std::env::current_dir().unwrap_or_default();
-    if let Some(parent) = path.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            eprintln!("cannot create fixture output parent: {error}");
-            std::process::exit(3);
-        }
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("cannot create fixture output parent: {error}");
+        std::process::exit(3);
     }
     let result = match behavior.as_str() {
         "success" => std::env::current_dir()

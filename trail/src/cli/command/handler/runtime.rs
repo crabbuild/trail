@@ -76,6 +76,20 @@ fn retryable_open_db_handoff(error: &Error) -> bool {
     }
 }
 
+fn open_db_once(ctx: &RuntimeContext) -> Result<Trail> {
+    match (&ctx.workspace, &ctx.db_dir) {
+        (Some(workspace), Some(db_dir)) => Trail::open_with_db_dir(workspace, db_dir),
+        (Some(workspace), None) => Trail::open(workspace),
+        (None, Some(db_dir)) => {
+            let workspace = db_dir
+                .parent()
+                .ok_or_else(|| Error::WorkspaceNotFound(db_dir.clone()))?;
+            Trail::open_with_db_dir(workspace, db_dir)
+        }
+        (None, None) => Trail::discover(std::env::current_dir().map_err(Error::from)?),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{retryable_open_db_handoff, Error};
@@ -88,19 +102,5 @@ mod tests {
         assert!(!retryable_open_db_handoff(&Error::WorkspaceLocked(
             "another writer owns a user operation".into()
         )));
-    }
-}
-
-fn open_db_once(ctx: &RuntimeContext) -> Result<Trail> {
-    match (&ctx.workspace, &ctx.db_dir) {
-        (Some(workspace), Some(db_dir)) => Trail::open_with_db_dir(workspace, db_dir),
-        (Some(workspace), None) => Trail::open(workspace),
-        (None, Some(db_dir)) => {
-            let workspace = db_dir
-                .parent()
-                .ok_or_else(|| Error::WorkspaceNotFound(db_dir.clone()))?;
-            Trail::open_with_db_dir(workspace, db_dir)
-        }
-        (None, None) => Trail::discover(std::env::current_dir().map_err(Error::from)?),
     }
 }

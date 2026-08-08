@@ -129,6 +129,7 @@ reviewed|db/core/backup/restore_transaction.rs|write_marker|fs::write|1
 reviewed|db/core/backup/restore.rs|restore_backup|fs::copy|3
 reviewed|db/core/backup/restore.rs|restore_backup|fs::create_dir_all|4
 reviewed|db/core/backup/restore.rs|restore_backup|fs::write|2
+reviewed|db/core/backup/restore.rs|secure_restored_db_dir|fs::set_permissions|2
 reviewed|db/core/backup/verify.rs|verify_backup|fs::copy|3
 reviewed|db/core/backup/verify.rs|verify_backup|fs::create_dir_all|1
 reviewed|db/core/backup/verify.rs|verify_backup|fs::remove_dir_all|1

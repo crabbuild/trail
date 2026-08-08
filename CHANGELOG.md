@@ -5,6 +5,8 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-07
+
 ### Changed
 
 - **Breaking:** Trail's SQLite database is now schema v1. The former v18–v21
@@ -22,6 +24,10 @@ All notable changes to Trail are documented in this file. Trail follows
 - Backup restore re-secures private `.trail` directories and permits the
   restored changed-path scope to rebind to the current host on its next daemon
   startup.
+- Terminal-agent starts now return the recorded checkpoint operation for
+  layered COW workdirs, matching the materialized-workdir report contract.
+- Automatic update notices use the shared terminal renderer while preserving
+  structured-output silence for JSON commands.
 - Lane archive and unarchive daemon requests no longer send an unexpected JSON
   body, and interrupted observer retirement with a failed owner can be reopened
   and resumed instead of being reported as a corrupt schema.
@@ -68,6 +74,7 @@ All notable changes to Trail are documented in this file. Trail follows
 - CLI, HTTP daemon, MCP stdio server, ACP relay, and Rust API integration surfaces.
 - Backup, restore, filesystem checks, index rebuilding, and maintenance commands.
 
-[Unreleased]: https://github.com/crabbuild/trail/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/crabbuild/trail/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/crabbuild/trail/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/crabbuild/trail/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/crabbuild/trail/releases/tag/v0.1.0
