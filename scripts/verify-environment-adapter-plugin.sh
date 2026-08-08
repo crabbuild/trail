@@ -3,11 +3,21 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
-: "${CARGO_TARGET_DIR:?set a unique CARGO_TARGET_DIR beneath /Volumes/Workspace/crabbuild-target}"
-case "${CARGO_TARGET_DIR}" in
-  /Volumes/Workspace/crabbuild-target/*) ;;
-  *) printf 'CARGO_TARGET_DIR must be beneath /Volumes/Workspace/crabbuild-target\n' >&2; exit 2 ;;
-esac
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP}/trail-adapter-plugin-target}"
+  export CARGO_TARGET_DIR
+  case "${CARGO_TARGET_DIR}" in
+    "${RUNNER_TEMP}"/*) ;;
+    *) printf 'GitHub Actions CARGO_TARGET_DIR must be beneath RUNNER_TEMP\n' >&2; exit 2 ;;
+  esac
+else
+  : "${CARGO_TARGET_DIR:?set a unique CARGO_TARGET_DIR beneath /Volumes/Workspace/crabbuild-target}"
+  case "${CARGO_TARGET_DIR}" in
+    /Volumes/Workspace/crabbuild-target/*) ;;
+    *) printf 'CARGO_TARGET_DIR must be beneath /Volumes/Workspace/crabbuild-target\n' >&2; exit 2 ;;
+  esac
+fi
 
 cargo build -p trail --locked
 cargo build -p trail-environment-adapter-sdk --locked --example generated-copy-adapter --example mounted-initializer-adapter --example mounted-fixture-tool --example cache-adapter --example cache-fixture-tool --example adversarial-adapter --example fixture-sign-adapter

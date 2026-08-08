@@ -195,7 +195,7 @@ fn fresh_restored_filesystem_identity(workspace_root: &Path) -> Result<Vec<u8>> 
     }
     #[cfg(windows)]
     {
-        let platform = windows_file_identity(workspace_root)?;
+        let platform = windows_directory_identity(workspace_root)?;
         identity.extend_from_slice(&platform.volume_serial_number.to_be_bytes());
         identity.extend_from_slice(&platform.file_index.to_be_bytes());
     }

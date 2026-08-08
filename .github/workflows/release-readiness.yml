@@ -63,7 +63,15 @@ jobs:
           "${binary}" --help >/dev/null
 
           smoke_dir="$(mktemp -d)"
-          trap 'rm -rf "${smoke_dir}"' EXIT
+          cleanup_smoke_dir() {
+            cd /
+            for attempt in 1 2 3 4 5; do
+              rm -rf "${smoke_dir}" && return 0
+              sleep "0.${attempt}"
+            done
+            rm -rf "${smoke_dir}"
+          }
+          trap cleanup_smoke_dir EXIT
           cd "${smoke_dir}"
           printf 'release smoke test\n' > README.md
           "${binary}" init --working-tree

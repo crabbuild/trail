@@ -20,6 +20,20 @@ pub(crate) struct WindowsFileIdentity {
 }
 
 pub(crate) fn windows_file_identity(path: &Path) -> Result<WindowsFileIdentity> {
+    windows_file_identity_with_flags(
+        path,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
+pub(crate) fn windows_directory_identity(path: &Path) -> Result<WindowsFileIdentity> {
+    // `FILE_FLAG_OPEN_REPARSE_POINT` can be rejected for ordinary directory
+    // handles by Windows filesystem filters. Restore has already canonicalized
+    // the workspace root and needs the followed directory's volume/file ID.
+    windows_file_identity_with_flags(path, FILE_FLAG_BACKUP_SEMANTICS)
+}
+
+fn windows_file_identity_with_flags(path: &Path, flags: u32) -> Result<WindowsFileIdentity> {
     let wide = path
         .as_os_str()
         .encode_wide()
@@ -32,7 +46,7 @@ pub(crate) fn windows_file_identity(path: &Path) -> Result<WindowsFileIdentity> 
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            flags,
             std::ptr::null_mut(),
         )
     };
