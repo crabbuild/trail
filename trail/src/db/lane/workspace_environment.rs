@@ -6424,7 +6424,7 @@ pub(super) fn validate_environment_component_identity(component_id: &str) -> Res
     Ok(())
 }
 
-fn workspace_tool_identity_for_path(path: &Path) -> Result<String> {
+pub(crate) fn workspace_tool_identity_for_path(path: &Path) -> Result<String> {
     let canonical = fs::canonicalize(path)?;
     if !canonical.is_file() {
         return Err(Error::InvalidInput(format!(

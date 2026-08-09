@@ -1,7 +1,7 @@
 use super::*;
 use crate::ids::{
-    ArtifactBlobId, ArtifactChunkId, ArtifactChunkListId, ArtifactDesiredKeyV2, ArtifactEnvelopeId,
-    ArtifactFileId, ArtifactQuarantineId, ArtifactTreeId,
+    ArtifactAttemptId, ArtifactBlobId, ArtifactChunkId, ArtifactChunkListId, ArtifactDesiredKeyV2,
+    ArtifactEnvelopeId, ArtifactFileId, ArtifactQuarantineId, ArtifactTreeId,
 };
 
 const MAX_RESOLUTION_INPUTS: usize = 16_384;
@@ -21,6 +21,24 @@ const MAX_ARTIFACT_TREE_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_DEPTH: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactResolutionAttemptFence {
+    pub(crate) attempt_id: ArtifactAttemptId,
+    pub(crate) owner_generation: u64,
+    pub(crate) owner_pid: u32,
+    pub(crate) owner_start_token: String,
+}
+
+pub(crate) struct ArtifactResolutionAttemptFailure<'a> {
+    pub(crate) code: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) contacted_authorities: Vec<String>,
+    pub(crate) stdout: &'a [u8],
+    pub(crate) stderr: &'a [u8],
+    pub(crate) redactions: &'a [Vec<u8>],
+    pub(crate) cancelled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ArtifactFlatEntry {
     pub(crate) kind: &'static str,
     pub(crate) mode: u32,
@@ -30,6 +48,581 @@ pub(crate) struct ArtifactFlatEntry {
 }
 
 impl Trail {
+    pub(crate) fn begin_artifact_resolution_attempt(
+        &self,
+        mut plan: ArtifactResolutionPlanV1,
+    ) -> Result<(
+        ArtifactResolutionAttemptFence,
+        ArtifactResolutionAttemptReportV1,
+    )> {
+        let _lock = self.acquire_write_lock()?;
+        normalize_artifact_resolution_plan(&mut plan)?;
+        self.validate_artifact_resolution_plan_pins(&plan)?;
+        self.recover_artifact_resolution_attempts_under_write_lock()?;
+
+        if let Some((attempt_id, owner_pid)) = self
+            .conn
+            .query_row(
+                "SELECT attempt_id, owner_pid FROM artifact_resolution_attempts
+                 WHERE proposal_key=?1 AND status='running'",
+                params![plan.proposal_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            return Err(Error::InvalidInput(format!(
+                "artifact proposal `{}` is already resolving in attempt `{attempt_id}` owned by process {owner_pid}",
+                plan.proposal_key
+            )));
+        }
+
+        let plan_object_id = self.put_object(
+            ARTIFACT_RESOLUTION_PLAN_KIND,
+            ARTIFACT_RESOLUTION_PLAN_VERSION,
+            &plan,
+        )?;
+        let owner_generation = self.conn.query_row(
+            "SELECT COALESCE(MAX(owner_generation), 0) + 1
+             FROM artifact_resolution_attempts WHERE proposal_key=?1",
+            params![plan.proposal_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let owner_generation = u64::try_from(owner_generation).map_err(|_| {
+            Error::Corrupt(
+                "artifact resolution owner generation is outside the supported range".into(),
+            )
+        })?;
+        let owner_pid = std::process::id();
+        let owner_start_token = current_process_start_token();
+        let attempt_id = ArtifactAttemptId::new(
+            format!(
+                "resolution\0{}\0{}\0{owner_generation}\0{owner_pid}\0{owner_start_token}\0{}",
+                plan.proposal_key,
+                plan.source_root,
+                now_nanos()
+            )
+            .as_bytes(),
+        );
+        let authority_evidence = ArtifactResolutionAuthorityEvidenceV1 {
+            allowed_authorities: plan.allowed_authorities.clone(),
+            contacted_authorities: Vec::new(),
+            credential_handles: plan.credential_handles.clone(),
+            credential_values_redacted: true,
+        };
+        let authority_evidence_json = serde_json::to_vec(&authority_evidence)?;
+        self.conn.execute(
+            "INSERT INTO artifact_resolution_attempts(
+                attempt_id, proposal_key, source_root, plan_object_id,
+                owner_generation, owner_pid, owner_start_token, status,
+                cancel_requested, authority_evidence_json, stdout_object_id,
+                stderr_object_id, snapshot_id, failure_receipt_object_id,
+                failure_code, failure_message, started_at, heartbeat_at, finished_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', 0, ?8,
+                      NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9, NULL)",
+            params![
+                attempt_id.0,
+                plan.proposal_key,
+                plan.source_root.0,
+                plan_object_id.0,
+                i64::try_from(owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact resolution owner generation exceeds SQLite range".into()
+                ))?,
+                i64::from(owner_pid),
+                owner_start_token,
+                authority_evidence_json,
+                now_ts(),
+            ],
+        )?;
+        let fence = ArtifactResolutionAttemptFence {
+            attempt_id: attempt_id.clone(),
+            owner_generation,
+            owner_pid,
+            owner_start_token,
+        };
+        let report = self.artifact_resolution_attempt(&attempt_id)?;
+        Ok((fence, report))
+    }
+
+    pub(crate) fn heartbeat_artifact_resolution_attempt(
+        &self,
+        fence: &ArtifactResolutionAttemptFence,
+    ) -> Result<bool> {
+        let _lock = self.acquire_write_lock()?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_resolution_attempts SET heartbeat_at=?1
+             WHERE attempt_id=?2 AND owner_generation=?3 AND owner_pid=?4
+               AND owner_start_token=?5 AND status='running' AND cancel_requested=0",
+            params![
+                now_ts(),
+                fence.attempt_id.0,
+                i64::try_from(fence.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact resolution owner generation exceeds SQLite range".into()
+                ))?,
+                i64::from(fence.owner_pid),
+                fence.owner_start_token,
+            ],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn cancel_artifact_resolution_attempt(
+        &self,
+        attempt_id: &ArtifactAttemptId,
+    ) -> Result<ArtifactResolutionAttemptReportV1> {
+        let _lock = self.acquire_write_lock()?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_resolution_attempts
+             SET cancel_requested=1, heartbeat_at=?1
+             WHERE attempt_id=?2 AND status='running'",
+            params![now_ts(), attempt_id.0],
+        )?;
+        if updated == 0 {
+            let existing = self.artifact_resolution_attempt(attempt_id)?;
+            if existing.status == ArtifactResolutionAttemptStatusV1::Running {
+                return Err(Error::Corrupt(format!(
+                    "artifact resolution attempt `{attempt_id}` could not be cancelled"
+                )));
+            }
+            return Ok(existing);
+        }
+        self.artifact_resolution_attempt(attempt_id)
+    }
+
+    pub(crate) fn finish_artifact_resolution_attempt_success(
+        &self,
+        fence: &ArtifactResolutionAttemptFence,
+        snapshot_id: &ObjectId,
+        contacted_authorities: Vec<String>,
+        stdout: &[u8],
+        stderr: &[u8],
+        redactions: &[Vec<u8>],
+    ) -> Result<ArtifactResolutionAttemptReportV1> {
+        let _lock = self.acquire_write_lock()?;
+        let plan = self.artifact_resolution_plan_for_fence(fence)?;
+        self.validate_artifact_resolution_plan_pins(&plan)?;
+        let snapshot = self.get_object::<ArtifactResolutionSnapshotV1>(
+            ARTIFACT_RESOLUTION_SNAPSHOT_KIND,
+            snapshot_id,
+        )?;
+        validate_artifact_resolution_snapshot(&snapshot)?;
+        if snapshot.proposal_key != plan.proposal_key || snapshot.source_root != plan.source_root {
+            return Err(Error::InvalidInput(
+                "artifact resolution snapshot does not match the fenced proposal/source pins"
+                    .into(),
+            ));
+        }
+        let authority_evidence =
+            normalized_resolution_authority_evidence(&plan, contacted_authorities)?;
+        let (stdout_object_id, stdout_truncated) =
+            self.put_artifact_resolution_capture(stdout, plan.limits.stdout_bytes, redactions)?;
+        let (stderr_object_id, stderr_truncated) =
+            self.put_artifact_resolution_capture(stderr, plan.limits.stderr_bytes, redactions)?;
+        if stdout_truncated || stderr_truncated {
+            return self.finish_artifact_resolution_attempt_failure_under_write_lock(
+                fence,
+                "captured_output_limit_exceeded",
+                "resolver output exceeded its declared capture limit",
+                authority_evidence,
+                stdout_object_id,
+                stderr_object_id,
+                ArtifactResolutionAttemptStatusV1::Failed,
+            );
+        }
+        let updated = self.conn.execute(
+            "UPDATE artifact_resolution_attempts
+             SET status='succeeded', authority_evidence_json=?1,
+                 stdout_object_id=?2, stderr_object_id=?3, snapshot_id=?4,
+                 heartbeat_at=?5, finished_at=?5
+             WHERE attempt_id=?6 AND owner_generation=?7 AND owner_pid=?8
+               AND owner_start_token=?9 AND status='running' AND cancel_requested=0",
+            params![
+                serde_json::to_vec(&authority_evidence)?,
+                stdout_object_id.as_ref().map(|id| id.0.as_str()),
+                stderr_object_id.as_ref().map(|id| id.0.as_str()),
+                snapshot_id.0,
+                now_ts(),
+                fence.attempt_id.0,
+                i64::try_from(fence.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact resolution owner generation exceeds SQLite range".into()
+                ))?,
+                i64::from(fence.owner_pid),
+                fence.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` lost its owner fence or was cancelled",
+                fence.attempt_id
+            )));
+        }
+        self.artifact_resolution_attempt(&fence.attempt_id)
+    }
+
+    pub(crate) fn finish_artifact_resolution_attempt_failure(
+        &self,
+        fence: &ArtifactResolutionAttemptFence,
+        failure: ArtifactResolutionAttemptFailure<'_>,
+    ) -> Result<ArtifactResolutionAttemptReportV1> {
+        let _lock = self.acquire_write_lock()?;
+        let plan = self.artifact_resolution_plan_for_fence(fence)?;
+        validate_resolution_text(failure.code, "failure code")?;
+        validate_resolution_text(failure.message, "failure message")?;
+        let authority_evidence =
+            normalized_resolution_authority_evidence(&plan, failure.contacted_authorities)?;
+        let (stdout_object_id, _) = self.put_artifact_resolution_capture(
+            failure.stdout,
+            plan.limits.stdout_bytes,
+            failure.redactions,
+        )?;
+        let (stderr_object_id, _) = self.put_artifact_resolution_capture(
+            failure.stderr,
+            plan.limits.stderr_bytes,
+            failure.redactions,
+        )?;
+        let redacted_message = String::from_utf8_lossy(&redact_resolution_bytes(
+            failure.message.as_bytes(),
+            failure.redactions,
+        ))
+        .into_owned();
+        self.finish_artifact_resolution_attempt_failure_under_write_lock(
+            fence,
+            failure.code,
+            &redacted_message,
+            authority_evidence,
+            stdout_object_id,
+            stderr_object_id,
+            if failure.cancelled {
+                ArtifactResolutionAttemptStatusV1::Cancelled
+            } else {
+                ArtifactResolutionAttemptStatusV1::Failed
+            },
+        )
+    }
+
+    pub(crate) fn artifact_resolution_attempt(
+        &self,
+        attempt_id: &ArtifactAttemptId,
+    ) -> Result<ArtifactResolutionAttemptReportV1> {
+        let row = self.conn.query_row(
+            "SELECT proposal_key, source_root, plan_object_id, owner_generation,
+                    owner_pid, status, cancel_requested, authority_evidence_json,
+                    stdout_object_id, stderr_object_id, snapshot_id,
+                    failure_receipt_object_id, failure_code, failure_message,
+                    started_at, heartbeat_at, finished_at
+             FROM artifact_resolution_attempts WHERE attempt_id=?1",
+            params![attempt_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                ))
+            },
+        )?;
+        let plan: ArtifactResolutionPlanV1 =
+            self.get_object(ARTIFACT_RESOLUTION_PLAN_KIND, &ObjectId(row.2.clone()))?;
+        Ok(ArtifactResolutionAttemptReportV1 {
+            attempt_id: attempt_id.clone(),
+            proposal_key: row.0,
+            source_root: ObjectId(row.1),
+            plan_object_id: ObjectId(row.2),
+            owner_generation: u64::try_from(row.3).map_err(|_| {
+                Error::Corrupt("artifact resolution owner generation is invalid".into())
+            })?,
+            owner_pid: u32::try_from(row.4)
+                .map_err(|_| Error::Corrupt("artifact resolution owner PID is invalid".into()))?,
+            status: parse_artifact_resolution_attempt_status(&row.5)?,
+            cancel_requested: row.6,
+            authority_evidence: serde_json::from_slice(&row.7).map_err(|error| {
+                Error::Corrupt(format!(
+                    "invalid artifact resolution authority evidence: {error}"
+                ))
+            })?,
+            stdout_object_id: row.8.map(ObjectId),
+            stderr_object_id: row.9.map(ObjectId),
+            snapshot_id: row.10.map(ObjectId),
+            failure_receipt_object_id: row.11.map(ObjectId),
+            failure_code: row.12,
+            failure_message: row.13,
+            started_at: row.14,
+            heartbeat_at: row.15,
+            finished_at: row.16,
+            recovery_command: vec![
+                "trail".into(),
+                "env".into(),
+                "resolve".into(),
+                "component".into(),
+                plan.component_id,
+            ],
+        })
+    }
+
+    pub(crate) fn artifact_resolution_attempts(
+        &self,
+    ) -> Result<Vec<ArtifactResolutionAttemptReportV1>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attempt_id FROM artifact_resolution_attempts
+             ORDER BY started_at, attempt_id",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                ArtifactAttemptId::parse(id)
+                    .map_err(Error::Corrupt)
+                    .and_then(|id| self.artifact_resolution_attempt(&id))
+            })
+            .collect()
+    }
+
+    pub(crate) fn recover_artifact_resolution_attempts_under_write_lock(&self) -> Result<()> {
+        let running = {
+            let mut stmt = self.conn.prepare(
+                "SELECT attempt_id, owner_generation, owner_pid, owner_start_token,
+                        cancel_requested
+                 FROM artifact_resolution_attempts WHERE status='running'
+                 ORDER BY started_at, attempt_id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (attempt_id, owner_generation, owner_pid, owner_start_token, cancel_requested) in
+            running
+        {
+            let Ok(owner_pid_u32) = u32::try_from(owner_pid) else {
+                continue;
+            };
+            if process_start_token_match(owner_pid_u32, &owner_start_token)
+                != ProcessIdentityMatch::DeadOrMismatch
+            {
+                continue;
+            }
+            let fence = ArtifactResolutionAttemptFence {
+                attempt_id: ArtifactAttemptId::parse(attempt_id).map_err(Error::Corrupt)?,
+                owner_generation: u64::try_from(owner_generation).map_err(|_| {
+                    Error::Corrupt("artifact resolution owner generation is invalid".into())
+                })?,
+                owner_pid: owner_pid_u32,
+                owner_start_token,
+            };
+            let plan = self.artifact_resolution_plan_for_fence(&fence)?;
+            let evidence = normalized_resolution_authority_evidence(&plan, Vec::new())?;
+            self.finish_artifact_resolution_attempt_failure_under_write_lock(
+                &fence,
+                if cancel_requested {
+                    "resolver_cancelled"
+                } else {
+                    "resolver_owner_lost"
+                },
+                if cancel_requested {
+                    "resolver cancellation was recovered after its owner process exited"
+                } else {
+                    "resolver owner process exited before publishing a snapshot; retry the reported resolution command"
+                },
+                evidence,
+                None,
+                None,
+                if cancel_requested {
+                    ArtifactResolutionAttemptStatusV1::Cancelled
+                } else {
+                    ArtifactResolutionAttemptStatusV1::Abandoned
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_resolution_plan_pins(
+        &self,
+        plan: &ArtifactResolutionPlanV1,
+    ) -> Result<()> {
+        let _: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &plan.source_root)?;
+        let resolved_program = Path::new(&plan.resolved_program);
+        if !resolved_program.is_absolute() {
+            return Err(Error::InvalidInput(
+                "artifact resolver resolved program must be an absolute host path".into(),
+            ));
+        }
+        let actual_identity =
+            super::workspace_environment::workspace_tool_identity_for_path(resolved_program)?;
+        if actual_identity != plan.executable_identity {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolver executable `{}` changed after planning",
+                plan.program
+            )));
+        }
+        for input in &plan.readable_inputs {
+            let entry = self
+                .root_file_entry(&plan.source_root, &input.source_path)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "artifact resolver input `{}` is absent from pinned source root {}",
+                        input.source_path, plan.source_root
+                    ))
+                })?;
+            if entry.content_hash != input.content_hash || entry.size_bytes != input.size_bytes {
+                return Err(Error::InvalidInput(format!(
+                    "artifact resolver input `{}` changed after planning",
+                    input.source_path
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn artifact_resolution_plan_for_fence(
+        &self,
+        fence: &ArtifactResolutionAttemptFence,
+    ) -> Result<ArtifactResolutionPlanV1> {
+        let plan_object_id = self
+            .conn
+            .query_row(
+                "SELECT plan_object_id FROM artifact_resolution_attempts
+                 WHERE attempt_id=?1 AND owner_generation=?2 AND owner_pid=?3
+                   AND owner_start_token=?4 AND status='running'",
+                params![
+                    fence.attempt_id.0,
+                    i64::try_from(fence.owner_generation).map_err(|_| Error::InvalidInput(
+                        "artifact resolution owner generation exceeds SQLite range".into()
+                    ))?,
+                    i64::from(fence.owner_pid),
+                    fence.owner_start_token,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "artifact resolution attempt `{}` lost its exact owner fence",
+                    fence.attempt_id
+                ))
+            })?;
+        self.get_object(ARTIFACT_RESOLUTION_PLAN_KIND, &ObjectId(plan_object_id))
+    }
+
+    fn put_artifact_resolution_capture(
+        &self,
+        bytes: &[u8],
+        limit: u64,
+        redactions: &[Vec<u8>],
+    ) -> Result<(Option<ObjectId>, bool)> {
+        if bytes.is_empty() {
+            return Ok((None, false));
+        }
+        let redacted = redact_resolution_bytes(bytes, redactions);
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let truncated = redacted.len() > limit;
+        let capture = ArtifactResolutionCaptureV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            original_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            truncated,
+            bytes: redacted[..redacted.len().min(limit)].to_vec(),
+        };
+        Ok((
+            Some(self.put_object(
+                ARTIFACT_RESOLUTION_CAPTURE_KIND,
+                ARTIFACT_RESOLUTION_PLAN_VERSION,
+                &capture,
+            )?),
+            truncated,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_artifact_resolution_attempt_failure_under_write_lock(
+        &self,
+        fence: &ArtifactResolutionAttemptFence,
+        code: &str,
+        message: &str,
+        authority_evidence: ArtifactResolutionAuthorityEvidenceV1,
+        stdout_object_id: Option<ObjectId>,
+        stderr_object_id: Option<ObjectId>,
+        status: ArtifactResolutionAttemptStatusV1,
+    ) -> Result<ArtifactResolutionAttemptReportV1> {
+        if !matches!(
+            status,
+            ArtifactResolutionAttemptStatusV1::Failed
+                | ArtifactResolutionAttemptStatusV1::Cancelled
+                | ArtifactResolutionAttemptStatusV1::Abandoned
+        ) {
+            return Err(Error::InvalidInput(
+                "artifact resolution failure must use a terminal failure status".into(),
+            ));
+        }
+        let plan = self.artifact_resolution_plan_for_fence(fence)?;
+        let receipt = ArtifactResolutionFailureReceiptV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            attempt_id: fence.attempt_id.clone(),
+            proposal_key: plan.proposal_key,
+            source_root: plan.source_root,
+            code: code.to_string(),
+            message: message.to_string(),
+            authority_evidence: authority_evidence.clone(),
+            stdout_object_id: stdout_object_id.clone(),
+            stderr_object_id: stderr_object_id.clone(),
+        };
+        let receipt_id = self.put_object(
+            ARTIFACT_RESOLUTION_FAILURE_KIND,
+            ARTIFACT_RESOLUTION_PLAN_VERSION,
+            &receipt,
+        )?;
+        let status_text = artifact_resolution_attempt_status_str(status);
+        let updated = self.conn.execute(
+            "UPDATE artifact_resolution_attempts
+             SET status=?1, authority_evidence_json=?2, stdout_object_id=?3,
+                 stderr_object_id=?4, failure_receipt_object_id=?5,
+                 failure_code=?6, failure_message=?7, heartbeat_at=?8, finished_at=?8
+             WHERE attempt_id=?9 AND owner_generation=?10 AND owner_pid=?11
+               AND owner_start_token=?12 AND status='running'",
+            params![
+                status_text,
+                serde_json::to_vec(&authority_evidence)?,
+                stdout_object_id.as_ref().map(|id| id.0.as_str()),
+                stderr_object_id.as_ref().map(|id| id.0.as_str()),
+                receipt_id.0,
+                code,
+                message,
+                now_ts(),
+                fence.attempt_id.0,
+                i64::try_from(fence.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact resolution owner generation exceeds SQLite range".into()
+                ))?,
+                i64::from(fence.owner_pid),
+                fence.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` lost its exact owner fence",
+                fence.attempt_id
+            )));
+        }
+        self.artifact_resolution_attempt(&fence.attempt_id)
+    }
+
     fn get_artifact_cas_object<T: serde::de::DeserializeOwned>(
         &self,
         artifact_id: &str,
@@ -1351,6 +1944,78 @@ impl Trail {
     }
 }
 
+fn normalized_resolution_authority_evidence(
+    plan: &ArtifactResolutionPlanV1,
+    mut contacted_authorities: Vec<String>,
+) -> Result<ArtifactResolutionAuthorityEvidenceV1> {
+    normalize_string_set(
+        &mut contacted_authorities,
+        MAX_RESOLUTION_AUTHORITIES,
+        "contacted authority",
+    )?;
+    if contacted_authorities
+        .iter()
+        .any(|authority| !plan.allowed_authorities.contains(authority))
+    {
+        return Err(Error::InvalidInput(
+            "resolver contacted an undeclared network authority".into(),
+        ));
+    }
+    Ok(ArtifactResolutionAuthorityEvidenceV1 {
+        allowed_authorities: plan.allowed_authorities.clone(),
+        contacted_authorities,
+        credential_handles: plan.credential_handles.clone(),
+        credential_values_redacted: true,
+    })
+}
+
+fn redact_resolution_bytes(bytes: &[u8], redactions: &[Vec<u8>]) -> Vec<u8> {
+    const REDACTED: &[u8] = b"[REDACTED]";
+    let mut output = bytes.to_vec();
+    for secret in redactions.iter().filter(|secret| !secret.is_empty()) {
+        let mut cursor = 0usize;
+        while cursor.saturating_add(secret.len()) <= output.len() {
+            let Some(offset) = output[cursor..]
+                .windows(secret.len())
+                .position(|window| window == secret)
+            else {
+                break;
+            };
+            let start = cursor + offset;
+            output.splice(start..start + secret.len(), REDACTED.iter().copied());
+            cursor = start + REDACTED.len();
+        }
+    }
+    output
+}
+
+fn artifact_resolution_attempt_status_str(
+    status: ArtifactResolutionAttemptStatusV1,
+) -> &'static str {
+    match status {
+        ArtifactResolutionAttemptStatusV1::Running => "running",
+        ArtifactResolutionAttemptStatusV1::Succeeded => "succeeded",
+        ArtifactResolutionAttemptStatusV1::Failed => "failed",
+        ArtifactResolutionAttemptStatusV1::Cancelled => "cancelled",
+        ArtifactResolutionAttemptStatusV1::Abandoned => "abandoned",
+    }
+}
+
+fn parse_artifact_resolution_attempt_status(
+    status: &str,
+) -> Result<ArtifactResolutionAttemptStatusV1> {
+    match status {
+        "running" => Ok(ArtifactResolutionAttemptStatusV1::Running),
+        "succeeded" => Ok(ArtifactResolutionAttemptStatusV1::Succeeded),
+        "failed" => Ok(ArtifactResolutionAttemptStatusV1::Failed),
+        "cancelled" => Ok(ArtifactResolutionAttemptStatusV1::Cancelled),
+        "abandoned" => Ok(ArtifactResolutionAttemptStatusV1::Abandoned),
+        other => Err(Error::Corrupt(format!(
+            "invalid artifact resolution attempt status `{other}`"
+        ))),
+    }
+}
+
 pub(crate) fn normalize_artifact_resolution_plan(
     plan: &mut ArtifactResolutionPlanV1,
 ) -> Result<()> {
@@ -2438,6 +3103,39 @@ mod tests {
                 parameters: BTreeMap::new(),
             }],
         }
+    }
+
+    fn executable_fixture_plan(db: &Trail, source_root: ObjectId) -> ArtifactResolutionPlanV1 {
+        let executable = std::env::current_exe().unwrap();
+        let entry = db
+            .root_file_entry(&source_root, "Cargo.toml")
+            .unwrap()
+            .unwrap();
+        let mut plan = fixture_plan(source_root);
+        plan.program = "trail-test-resolver".into();
+        plan.resolved_program = executable.to_string_lossy().into_owned();
+        plan.executable_identity =
+            super::super::workspace_environment::workspace_tool_identity_for_path(&executable)
+                .unwrap();
+        plan.readable_inputs = vec![ArtifactResolutionInputV1 {
+            source_path: "Cargo.toml".into(),
+            content_hash: entry.content_hash,
+            size_bytes: entry.size_bytes,
+        }];
+        plan
+    }
+
+    fn initialized_resolution_fixture() -> (tempfile::TempDir, Trail, ObjectId) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        (temp, db, source_root)
     }
 
     fn fixture_desired_material(source_root: ObjectId) -> ArtifactDesiredKeyMaterialV2 {
@@ -3616,5 +4314,201 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("explicit refresh"));
+    }
+
+    #[test]
+    fn resolution_attempt_is_fenced_cancelled_and_redacts_credentials() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let mut plan = executable_fixture_plan(&db, source_root);
+        plan.credential_handles = vec!["registry_credentials".into()];
+        let (fence, started) = db.begin_artifact_resolution_attempt(plan).unwrap();
+        assert_eq!(started.status, ArtifactResolutionAttemptStatusV1::Running);
+        assert!(db.heartbeat_artifact_resolution_attempt(&fence).unwrap());
+
+        let cancelling = db
+            .cancel_artifact_resolution_attempt(&fence.attempt_id)
+            .unwrap();
+        assert!(cancelling.cancel_requested);
+        assert!(!db.heartbeat_artifact_resolution_attempt(&fence).unwrap());
+        let secret = b"credential-value-never-store".to_vec();
+        let finished = db
+            .finish_artifact_resolution_attempt_failure(
+                &fence,
+                ArtifactResolutionAttemptFailure {
+                    code: "cancelled_by_user",
+                    message: "credential-value-never-store was cancelled",
+                    contacted_authorities: vec!["index.crates.io:443".into()],
+                    stdout: b"stdout credential-value-never-store",
+                    stderr: b"stderr credential-value-never-store",
+                    redactions: std::slice::from_ref(&secret),
+                    cancelled: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            finished.status,
+            ArtifactResolutionAttemptStatusV1::Cancelled
+        );
+        assert!(finished
+            .failure_message
+            .as_ref()
+            .unwrap()
+            .contains("[REDACTED]"));
+        let stdout: ArtifactResolutionCaptureV1 = db
+            .get_object(
+                ARTIFACT_RESOLUTION_CAPTURE_KIND,
+                finished.stdout_object_id.as_ref().unwrap(),
+            )
+            .unwrap();
+        assert!(!stdout
+            .bytes
+            .windows(secret.len())
+            .any(|bytes| bytes == secret));
+        let receipt: ArtifactResolutionFailureReceiptV1 = db
+            .get_object(
+                ARTIFACT_RESOLUTION_FAILURE_KIND,
+                finished.failure_receipt_object_id.as_ref().unwrap(),
+            )
+            .unwrap();
+        assert!(receipt.message.contains("[REDACTED]"));
+        assert_eq!(
+            receipt.authority_evidence.credential_handles,
+            vec!["registry_credentials"]
+        );
+        assert!(receipt.authority_evidence.credential_values_redacted);
+        assert!(!serde_json::to_vec(&finished)
+            .unwrap()
+            .windows(secret.len())
+            .any(|bytes| bytes == secret));
+    }
+
+    #[test]
+    fn resolution_attempt_rejects_stale_fence_and_bounds_capture() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let mut plan = executable_fixture_plan(&db, source_root);
+        plan.limits.stdout_bytes = 8;
+        let (fence, _) = db.begin_artifact_resolution_attempt(plan).unwrap();
+        let mut stale = fence.clone();
+        stale.owner_generation += 1;
+        assert!(!db.heartbeat_artifact_resolution_attempt(&stale).unwrap());
+        assert!(db
+            .finish_artifact_resolution_attempt_failure(
+                &stale,
+                ArtifactResolutionAttemptFailure {
+                    code: "failed",
+                    message: "failure",
+                    contacted_authorities: vec![],
+                    stdout: b"output",
+                    stderr: b"",
+                    redactions: &[],
+                    cancelled: false,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exact owner fence"));
+
+        let finished = db
+            .finish_artifact_resolution_attempt_failure(
+                &fence,
+                ArtifactResolutionAttemptFailure {
+                    code: "resolver_failed",
+                    message: "resolver failed",
+                    contacted_authorities: vec![],
+                    stdout: b"0123456789abcdef",
+                    stderr: b"",
+                    redactions: &[],
+                    cancelled: false,
+                },
+            )
+            .unwrap();
+        let capture: ArtifactResolutionCaptureV1 = db
+            .get_object(
+                ARTIFACT_RESOLUTION_CAPTURE_KIND,
+                finished.stdout_object_id.as_ref().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(capture.bytes, b"01234567");
+        assert_eq!(capture.original_bytes, 16);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn resolution_attempt_singleflight_and_open_recovery_are_durable() {
+        let (temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let (fence, _) = db.begin_artifact_resolution_attempt(plan.clone()).unwrap();
+        let error = db.begin_artifact_resolution_attempt(plan).unwrap_err();
+        assert!(error.to_string().contains("already resolving"));
+        db.conn
+            .execute(
+                "UPDATE artifact_resolution_attempts
+                 SET owner_pid=?1, owner_start_token='dead-owner'
+                 WHERE attempt_id=?2",
+                params![i64::from(u32::MAX), fence.attempt_id.0],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Trail::open(temp.path()).unwrap();
+        let recovered = reopened
+            .artifact_resolution_attempt(&fence.attempt_id)
+            .unwrap();
+        assert_eq!(
+            recovered.status,
+            ArtifactResolutionAttemptStatusV1::Abandoned
+        );
+        assert_eq!(
+            recovered.failure_code.as_deref(),
+            Some("resolver_owner_lost")
+        );
+        assert!(recovered.failure_receipt_object_id.is_some());
+
+        let plan = executable_fixture_plan(&reopened, recovered.source_root.clone());
+        let (_, successor) = reopened.begin_artifact_resolution_attempt(plan).unwrap();
+        assert_eq!(successor.owner_generation, recovered.owner_generation + 1);
+    }
+
+    #[test]
+    fn resolution_attempt_success_requires_matching_snapshot_and_authority() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let (fence, _) = db.begin_artifact_resolution_attempt(plan.clone()).unwrap();
+        let (snapshot_id, _) = db
+            .put_artifact_resolution_snapshot(
+                plan,
+                b"version = 4\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec!["index.crates.io:443".into()],
+                false,
+            )
+            .unwrap();
+        let error = db
+            .finish_artifact_resolution_attempt_success(
+                &fence,
+                &snapshot_id,
+                vec!["undeclared.example:443".into()],
+                b"",
+                b"",
+                &[],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("undeclared"));
+        let finished = db
+            .finish_artifact_resolution_attempt_success(
+                &fence,
+                &snapshot_id,
+                vec!["index.crates.io:443".into()],
+                b"resolved",
+                b"",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            finished.status,
+            ArtifactResolutionAttemptStatusV1::Succeeded
+        );
+        assert_eq!(finished.snapshot_id, Some(snapshot_id));
     }
 }

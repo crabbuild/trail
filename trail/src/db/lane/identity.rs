@@ -72,6 +72,8 @@ impl Trail {
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
                  DELETE FROM environment_generation_components
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 DELETE FROM artifact_generation_bindings
+                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
                  DELETE FROM environment_view_generations;
                  DELETE FROM environment_generations;
                  DELETE FROM environment_sync_attempts;
@@ -85,6 +87,7 @@ impl Trail {
                  DELETE FROM environment_component_states;
                  DELETE FROM workspace_environment_states;
                  DELETE FROM workspace_view_layers;
+                 DELETE FROM workspace_layer_artifact_shadows;
                  DELETE FROM workspace_layers;
                  DELETE FROM workspace_git_shadows;
                  DELETE FROM workspace_views;",

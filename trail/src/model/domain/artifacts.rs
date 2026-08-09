@@ -4,6 +4,9 @@ pub const ARTIFACT_RESOLUTION_PLAN_VERSION: u16 = 1;
 pub const ARTIFACT_RESOLUTION_SNAPSHOT_VERSION: u16 = 1;
 pub const ARTIFACT_RESOLUTION_SNAPSHOT_KIND: &str = "ArtifactResolutionSnapshot";
 pub const ARTIFACT_RESOLUTION_CONTENT_KIND: &str = "ArtifactResolutionContent";
+pub const ARTIFACT_RESOLUTION_PLAN_KIND: &str = "ArtifactResolutionPlan";
+pub const ARTIFACT_RESOLUTION_CAPTURE_KIND: &str = "ArtifactResolutionCapture";
+pub const ARTIFACT_RESOLUTION_FAILURE_KIND: &str = "ArtifactResolutionFailure";
 pub const ARTIFACT_DIRECTORY_NODE_VERSION: u16 = 1;
 pub const ARTIFACT_FILE_NODE_VERSION: u16 = 1;
 pub const ARTIFACT_BLOB_VERSION: u16 = 1;
@@ -264,6 +267,83 @@ pub struct ArtifactResolutionSnapshotV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_snapshot_id: Option<ObjectId>,
     pub verification_state: ArtifactResolutionVerificationStateV1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactResolutionAttemptStatusV1 {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Abandoned,
+}
+
+/// Durable non-secret evidence describing the authority boundary of one
+/// resolver attempt. Credential handles are names only; their values are
+/// supplied late and never enter this object or an attempt row.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionAuthorityEvidenceV1 {
+    pub allowed_authorities: Vec<String>,
+    pub contacted_authorities: Vec<String>,
+    pub credential_handles: Vec<String>,
+    pub credential_values_redacted: bool,
+}
+
+/// One bounded stream captured from a resolver. `original_bytes` allows the
+/// failure receipt to explain a limit violation without retaining excess data.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionCaptureV1 {
+    pub version: u16,
+    pub original_bytes: u64,
+    pub truncated: bool,
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionFailureReceiptV1 {
+    pub version: u16,
+    pub attempt_id: ArtifactAttemptId,
+    pub proposal_key: String,
+    pub source_root: ObjectId,
+    pub code: String,
+    pub message: String,
+    pub authority_evidence: ArtifactResolutionAuthorityEvidenceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_object_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_object_id: Option<ObjectId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionAttemptReportV1 {
+    pub attempt_id: ArtifactAttemptId,
+    pub proposal_key: String,
+    pub source_root: ObjectId,
+    pub plan_object_id: ObjectId,
+    pub owner_generation: u64,
+    pub owner_pid: u32,
+    pub status: ArtifactResolutionAttemptStatusV1,
+    pub cancel_requested: bool,
+    pub authority_evidence: ArtifactResolutionAuthorityEvidenceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_object_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_object_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_receipt_object_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    pub started_at: i64,
+    pub heartbeat_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    pub recovery_command: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

@@ -197,6 +197,7 @@ CREATE TABLE artifact_resolution_attempts (
                 stdout_object_id TEXT REFERENCES objects(object_id),
                 stderr_object_id TEXT REFERENCES objects(object_id),
                 snapshot_id TEXT REFERENCES artifact_resolution_snapshots(snapshot_id),
+                failure_receipt_object_id TEXT REFERENCES objects(object_id),
                 failure_code TEXT,
                 failure_message TEXT,
                 started_at INTEGER NOT NULL,
