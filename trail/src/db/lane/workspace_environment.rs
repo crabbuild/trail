@@ -2707,10 +2707,16 @@ impl Trail {
                 plan.component_id
             )));
         }
-        let mut external_names = BTreeSet::new();
+        let mut external_names = BTreeMap::new();
         for artifact in &plan.external_artifacts {
             validate_workspace_environment_external_artifact(artifact)?;
-            if !external_names.insert(&artifact.name) {
+            if external_names
+                .insert(
+                    artifact.name.as_str(),
+                    artifact.artifact_type == "oci_image" && artifact.provider == "oci",
+                )
+                .is_some()
+            {
                 return Err(Error::InvalidInput(format!(
                     "component `{}` repeats external artifact `{}`",
                     plan.component_id, artifact.name
@@ -2741,9 +2747,12 @@ impl Trail {
                     plan.component_id, resource.name
                 )));
             }
-            if !external_names.contains(&resource.artifact_name) {
+            if !external_names
+                .get(resource.artifact_name.as_str())
+                .is_some_and(|is_oci_image| *is_oci_image)
+            {
                 return Err(Error::InvalidInput(format!(
-                    "component `{}` runtime resource `{}` references missing external artifact `{}`",
+                    "component `{}` runtime resource `{}` references missing or non-OCI external artifact `{}`",
                     plan.component_id, resource.name, resource.artifact_name
                 )));
             }
@@ -6601,8 +6610,6 @@ pub(super) fn validate_environment_external_artifact_report(
         || !artifact.name.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
         })
-        || artifact.artifact_type != "oci_image"
-        || artifact.provider != "oci"
         || artifact.cleanup_owner != "external"
     {
         return Err(Error::InvalidInput(format!(
@@ -6626,42 +6633,92 @@ pub(super) fn validate_environment_external_artifact_report(
             artifact.name
         )));
     }
-    let (repository, reference_digest) = artifact.reference.rsplit_once('@').ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "external OCI artifact `{}` must use a digest-pinned reference",
+    match artifact.artifact_type.as_str() {
+        "oci_image" if artifact.provider == "oci" => {
+            let (repository, reference_digest) =
+                artifact.reference.rsplit_once('@').ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "external OCI artifact `{}` must use a digest-pinned reference",
+                        artifact.name
+                    ))
+                })?;
+            if repository.is_empty()
+                || repository.len() > 2048
+                || repository.contains('@')
+                || repository.starts_with('/')
+                || repository.ends_with('/')
+                || !repository
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
+                || reference_digest != artifact.digest
+            {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` has an invalid or mismatched reference",
+                    artifact.name
+                )));
+            }
+            let Some((operating_system, architecture)) = artifact.platform.split_once('/') else {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` requires an os/architecture platform",
+                    artifact.name
+                )));
+            };
+            if !matches!(operating_system, "linux" | "windows")
+                || !matches!(architecture, "amd64" | "arm64")
+            {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` uses unsupported platform `{}`",
+                    artifact.name, artifact.platform
+                )));
+            }
+            Ok(())
+        }
+        "verified_external"
+            if valid_external_identity_token(&artifact.provider)
+                && valid_external_reference(&artifact.reference)
+                && valid_external_platform(&artifact.platform) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::InvalidInput(format!(
+            "external artifact `{}` has an unsupported type, provider, reference, or platform contract",
             artifact.name
-        ))
-    })?;
-    if repository.is_empty()
-        || repository.len() > 2048
-        || repository.contains('@')
-        || repository.starts_with('/')
-        || repository.ends_with('/')
-        || !repository
+        ))),
+    }
+}
+
+fn valid_external_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+}
+
+fn valid_external_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && !may_contain_sensitive_text(value)
+        && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
-        || reference_digest != artifact.digest
-    {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` has an invalid or mismatched reference",
-            artifact.name
-        )));
-    }
-    let Some((operating_system, architecture)) = artifact.platform.split_once('/') else {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` requires an os/architecture platform",
-            artifact.name
-        )));
-    };
-    if !matches!(operating_system, "linux" | "windows")
-        || !matches!(architecture, "amd64" | "arm64")
-    {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` uses unsupported platform `{}`",
-            artifact.name, artifact.platform
-        )));
-    }
-    Ok(())
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:+@=".contains(&byte))
+}
+
+fn valid_external_platform(value: &str) -> bool {
+    value == "any"
+        || (!value.is_empty()
+            && value.len() <= 128
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && value.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "."
+                    && segment != ".."
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+            }))
 }
 
 struct WorkspaceEnvironmentCacheUseGuard {

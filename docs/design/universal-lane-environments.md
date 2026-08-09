@@ -608,6 +608,13 @@ an immutable seed backed by performance caches; CMake remains a layer-free priva
 tree; OCI remains provider-owned metadata with lane-private runtime allocation; and
 repository-v2 commands keep their independent desired-key v2 contract.
 
+Conformance fixtures also cover ecosystems that have no built-in adapter. A
+Maven/Gradle-like checksum graph plus private build state and an unknown custom generator
+compile through repository v2. Bazel/Nix-like content stores compile through the generic
+plugin `verified_external` identity: Trail records provider/reference/digest/platform
+metadata but creates no layer, cache, runtime, or cleanup claim. These are compositions
+of common contracts, not framework switches in the lane backend.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own

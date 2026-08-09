@@ -383,6 +383,27 @@ impl AdapterExternalArtifact {
             cleanup_owner: "external".to_string(),
         }
     }
+
+    /// A provider-owned immutable store entry that Trail records by exact
+    /// reference and SHA-256 digest without manufacturing a filesystem layer.
+    /// The provider remains responsible for storage and cleanup.
+    pub fn verified_external(
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        reference: impl Into<String>,
+        digest: impl Into<String>,
+        platform: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            artifact_type: "verified_external".to_string(),
+            provider: provider.into(),
+            reference: reference.into(),
+            digest: digest.into(),
+            platform: platform.into(),
+            cleanup_owner: "external".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1141,8 +1162,9 @@ fn validate_adapter_external_artifacts(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         });
-        let valid_reference =
-            artifact
+        let valid_oci = artifact.artifact_type == "oci_image"
+            && artifact.provider == "oci"
+            && artifact
                 .reference
                 .rsplit_once('@')
                 .is_some_and(|(repository, digest)| {
@@ -1152,22 +1174,24 @@ fn validate_adapter_external_artifacts(
                         && repository
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
-                });
+                })
+            && matches!(
+                artifact.platform.as_str(),
+                "linux/amd64" | "linux/arm64" | "windows/amd64" | "windows/arm64"
+            );
+        let valid_verified_external = artifact.artifact_type == "verified_external"
+            && valid_external_identity_token(&artifact.provider)
+            && valid_external_reference(&artifact.reference)
+            && valid_external_platform(&artifact.platform);
         if artifact.name.is_empty()
             || artifact.name.len() > 128
             || !artifact.name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
             })
             || index > 0 && artifacts[index - 1].name == artifact.name
-            || artifact.artifact_type != "oci_image"
-            || artifact.provider != "oci"
             || artifact.cleanup_owner != "external"
             || !valid_digest
-            || !valid_reference
-            || !matches!(
-                artifact.platform.as_str(),
-                "linux/amd64" | "linux/arm64" | "windows/amd64" | "windows/arm64"
-            )
+            || !(valid_oci || valid_verified_external)
         {
             return Err(AdapterPlanBuildError::InvalidExternalArtifact {
                 artifact: artifact.name.clone(),
@@ -1175,6 +1199,55 @@ fn validate_adapter_external_artifacts(
         }
     }
     Ok(())
+}
+
+fn valid_external_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+}
+
+fn valid_external_reference(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && ![
+            "authorization",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "api-key",
+            "apikey",
+            "private_key",
+            "private-key",
+            "bearer",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:+@=".contains(&byte))
+}
+
+fn valid_external_platform(value: &str) -> bool {
+    value == "any"
+        || (!value.is_empty()
+            && value.len() <= 128
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && value.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "."
+                    && segment != ".."
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+            }))
 }
 
 fn validate_adapter_runtime_resources(
@@ -1188,8 +1261,13 @@ fn validate_adapter_runtime_resources(
     }
     let artifact_names = artifacts
         .iter()
-        .map(|artifact| artifact.name.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|artifact| {
+            (
+                artifact.name.as_str(),
+                artifact.artifact_type == "oci_image" && artifact.provider == "oci",
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     resources.sort_by(|left, right| left.name.cmp(&right.name));
     for resource in resources.iter_mut() {
         resource
@@ -1220,7 +1298,9 @@ fn validate_adapter_runtime_resources(
             || index > 0 && resources[index - 1].name == resource.name
             || resource.runtime_type != "container"
             || resource.provider != "oci"
-            || !artifact_names.contains(resource.artifact_name.as_str())
+            || !artifact_names
+                .get(resource.artifact_name.as_str())
+                .is_some_and(|is_oci_image| *is_oci_image)
             || resource.container_port == 0
             || resource.protocol != "tcp"
             || resource.health_type != "tcp"
@@ -1965,6 +2045,62 @@ mod tests {
             mixed,
             Err(AdapterPlanBuildError::ExternalArtifactPlanConflict)
         );
+    }
+
+    #[test]
+    fn v2_builder_supports_bazel_nix_like_external_stores_without_framework_modes() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plan = AdapterPlanV2::builder("external-stores", "external")
+            .identity_input("stores.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "content-addressed-store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "remote-action-cache",
+                "remote-cas",
+                "cas://objects/example-action",
+                digest,
+                "any",
+            ))
+            .stale_reason("verified external store identities changed")
+            .build()
+            .unwrap();
+
+        assert!(plan.actions.is_empty());
+        assert!(plan.outputs.is_empty());
+        assert!(plan.caches.is_empty());
+        assert_eq!(plan.external_artifacts.len(), 2);
+        assert!(plan
+            .external_artifacts
+            .iter()
+            .all(|artifact| artifact.artifact_type == "verified_external"));
+        let decoded: AdapterPlanV2 =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+
+        let runtime = AdapterPlanV2::builder("invalid-runtime", "external")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .runtime_resource(AdapterRuntimeResource::oci_container(
+                "invalid-container",
+                "store",
+                8080,
+            ))
+            .stale_reason("invalid external runtime")
+            .build();
+        assert!(matches!(
+            runtime,
+            Err(AdapterPlanBuildError::InvalidRuntimeResource { .. })
+        ));
     }
 
     #[test]

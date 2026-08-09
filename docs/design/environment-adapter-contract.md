@@ -1184,6 +1184,20 @@ CMake adapters must account for absolute paths in `CMakeCache.txt`. A private bu
 cannot be promoted to a portable immutable artifact merely because compilation
 succeeded.
 
+### Framework-neutral conformance shapes
+
+Executable fixtures intentionally avoid adding Maven, Gradle, Bazel, Nix, or arbitrary
+custom framework modes to Trail core. Maven/Gradle-like dependency checksum output and
+lane-private build/daemon state are separate `trail.environment/v2` command components.
+An unknown custom generator uses the same component, validation, desired-key v2, and
+explicit source-export contracts.
+
+Bazel/Nix-like provider stores use a protocol-v2 plugin metadata component containing
+sorted `verified_external` entries. Each entry binds a provider token, opaque bounded
+reference, SHA-256 digest, and platform identity. It has no action, cache, output,
+runtime allocation, or Trail-owned cleanup. OCI runtime declarations remain restricted
+to `oci_image`, so a generic store reference cannot be relabeled as a container image.
+
 The implemented `trail/cmake-build@1` adapter covers the safe first slice: discovery,
 deterministic host/tool compatibility identity, atomic lane-private build-directory
 ownership, generation provenance, mounted-view classification, and crash recovery.

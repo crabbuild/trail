@@ -3774,6 +3774,70 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v2_bazel_nix_like_stores_remain_metadata_only_after_host_normalization() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plan = AdapterPlanV2::builder("verified-stores", "external")
+            .identity_input("stores.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "content-addressed-store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "remote-action-cache",
+                "remote-cas",
+                "cas://objects/example-action",
+                digest,
+                "any",
+            ))
+            .stale_reason("verified external store identities changed")
+            .build()
+            .unwrap();
+
+        let normalized = ProposedPluginPlan::from_v2(plan).unwrap();
+        assert_eq!(normalized.component_id, "verified-stores");
+        assert!(normalized.outputs.is_empty());
+        assert!(normalized.caches.is_empty());
+        assert!(normalized.runtime_resources.is_empty());
+        assert_eq!(normalized.external_artifacts.len(), 2);
+        assert!(normalized.external_artifacts.iter().all(|artifact| {
+            artifact.artifact_type == "verified_external" && artifact.cleanup_owner == "external"
+        }));
+        for artifact in &normalized.external_artifacts {
+            super::workspace_environment::validate_environment_external_artifact_report(
+                &EnvironmentExternalArtifactReport {
+                    name: artifact.name.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
+                    provider: artifact.provider.clone(),
+                    reference: artifact.reference.clone(),
+                    digest: artifact.digest.clone(),
+                    platform: artifact.platform.clone(),
+                    cleanup_owner: artifact.cleanup_owner.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let mut secret_like = normalized.external_artifacts[0].clone();
+        secret_like.reference = "store://objects/token=credential".to_string();
+        assert!(
+            super::workspace_environment::validate_environment_external_artifact_report(
+                &EnvironmentExternalArtifactReport {
+                    name: secret_like.name,
+                    artifact_type: secret_like.artifact_type,
+                    provider: secret_like.provider,
+                    reference: secret_like.reference,
+                    digest: secret_like.digest,
+                    platform: secret_like.platform,
+                    cleanup_owner: secret_like.cleanup_owner,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn protocol_v2_plugin_caches_are_host_scoped_and_fail_closed() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("README.md"), "root\n").unwrap();

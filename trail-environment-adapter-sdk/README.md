@@ -278,6 +278,33 @@ contract in the component key, persists it with each generation, and treats clea
 provider-owned. Registry access, tag resolution, credentials, and runtime allocation
 are deliberately outside the planner.
 
+The same metadata-only contract represents an already verified provider store without
+copying it into a Trail layer. This is suitable for content-addressed build stores,
+remote action caches, and other immutable provider objects; it is not a request for
+Trail to fetch or execute against the reference:
+
+```rust
+use trail_environment_adapter_sdk::{AdapterExternalArtifact, AdapterPlanV2};
+
+let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+let plan = AdapterPlanV2::builder("external-stores", "external")
+    .identity_input("stores.lock")
+    .external_artifact(AdapterExternalArtifact::verified_external(
+        "dependency-store",
+        "local-store",
+        "store://objects/example-package",
+        digest,
+        "linux/x86_64",
+    ))
+    .stale_reason("verified provider identity changed")
+    .build()?;
+# Ok::<(), trail_environment_adapter_sdk::AdapterPlanBuildError>(())
+```
+
+`verified_external` accepts a bounded provider token, opaque safe reference, SHA-256
+digest, and exact platform identity (or `any`). It cannot back an OCI runtime resource;
+container declarations still require a digest-pinned `oci_image` in the same plan.
+
 An external plan may bind a pinned image to a lane-private service declaration. The
 adapter still performs no provider calls and receives no Docker socket, network, port,
 volume, or cleanup authority:

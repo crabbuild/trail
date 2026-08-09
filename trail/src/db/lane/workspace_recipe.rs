@@ -3826,6 +3826,121 @@ scripts = "deny"
     }
 
     #[test]
+    fn maven_gradle_like_and_unknown_custom_shapes_use_repository_v2_components() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "jvm.dependencies"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "dependencies", source = "dependencies", target = ".trail-generated/jvm-dependencies", policy = "immutable_seed_private", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "dependencies/checksums.lock"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dependency-checksum-graph"
+kind = "path_contract"
+path = "dependencies"
+required = true
+parameters = { maximum_entries = "10000" }
+
+[[component]]
+id = "jvm.private-build-state"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["jvm.dependencies"]
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "build-state", source = "build-state", target = ".trail-generated/jvm-build", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "build-state/task-state.bin"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "custom.codegen"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "generated-api", source = "generated-api", target = ".trail-generated/custom-api", policy = "immutable_seed_private", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "generated-api/client.txt"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "generated-api-contract"
+kind = "path_contract"
+path = "generated-api"
+required = true
+
+[[component.source_export]]
+from_output = "generated-api"
+source = "client.txt"
+target = "src/generated/client.txt"
+mode = "explicit"
+collision = "fail"
+validation = "generated-api-contract"
+"#;
+        let (_workspace, db) = open_recipe_graph(specification);
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let dependencies = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "jvm.dependencies")
+            .unwrap();
+        let build_state = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "jvm.private-build-state")
+            .unwrap();
+        let custom = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "custom.codegen")
+            .unwrap();
+
+        for compiled in [&dependencies, &build_state, &custom] {
+            assert_eq!(
+                compiled.graph_plan.adapter_identity,
+                RECIPE_ADAPTER_IDENTITY
+            );
+            assert_eq!(compiled.desired_material.adapter_protocol, RECIPE_SCHEMA_V2);
+            assert_eq!(compiled.desired_material.trust_scope, "repository");
+            assert_eq!(compiled.desired_material.network_policy, "deny");
+        }
+        assert_eq!(
+            dependencies.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableSeedPrivate
+        );
+        assert_eq!(
+            dependencies.validations[0].name,
+            "dependency-checksum-graph"
+        );
+        assert_eq!(
+            build_state.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert_eq!(build_state.outputs[0].reuse, EnvironmentReuseMode::None);
+        assert_eq!(
+            build_state.graph_plan.dependencies,
+            [WorkspaceEnvironmentDependency::build_requires(
+                "jvm.dependencies"
+            )]
+        );
+        assert_eq!(custom.source_exports.len(), 1);
+        assert_eq!(
+            custom.source_exports[0].destination,
+            "src/generated/client.txt"
+        );
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
     fn component_dependencies_finalize_in_topological_order_and_fail_closed() {
         let chain = r#"schema = "trail.environment/v1"
 

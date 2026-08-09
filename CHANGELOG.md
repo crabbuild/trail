@@ -7,6 +7,10 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Protocol-v2 plugins can now declare framework-neutral `verified_external` store
+  identities by provider, safe reference, SHA-256 digest, and platform without creating
+  layers or cleanup ownership; repository-v2 conformance fixtures cover JVM-like
+  dependency/private-state and unknown custom pipelines without new core framework modes.
 - Normalized environment plans now carry a host-owned protocol-v3 identity-contract
   digest alongside the exact legacy workspace-layer key. Go cache contracts exclude
   machine-local cache paths, CMake remains layer-free and lane-private, OCI/runtime
