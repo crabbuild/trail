@@ -677,6 +677,12 @@ authority, complete source projection, or host cache writes. Plugin plans remain
 the local-plugin ceiling until a future durable certification record says otherwise.
 Reviewed built-ins retain an explicitly identified managed-network compatibility ceiling
 while their ecosystem actions migrate to separate resolver and offline-constructor phases.
+Repository v2 documents are rejected during side-effect-free loading when fixed argv
+contains a shell, interpolation/control token, indirect launcher, absolute host path,
+secret-bearing value, or provider socket. Their exact resolver authorities and input
+expansion are finite and canonical, and their outputs cannot claim compatible or
+host-wide reuse. Native enforcement remains mandatory later; early validation is not a
+substitute for the execution sandbox.
 
 Secret consumption is a one-way trust transition. The host represents it with a typed
 `clear` or `tainted` result containing canonical, non-secret channel classes only. A

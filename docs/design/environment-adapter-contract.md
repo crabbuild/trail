@@ -217,6 +217,18 @@ and a v1 document cannot gain any of these authorities by spelling a v2-only sec
 Compilation and execution still pass through the host-owned normalized models and
 capability checks; parsing a declaration never grants authority by itself.
 
+Before discovery returns a v2 proposal, Trail also applies the repository-declaration
+ceiling without resolving a tool or running repository code. Every command is a bounded
+fixed argv vector naming one direct non-shell executable. Shell interpolation and control
+operators, indirect process launchers, absolute host paths, raw secret-bearing values,
+and provider-socket references are rejected. Resolver authorities are exact, bounded,
+sorted, and deduplicated; construction and validation remain offline. Mounted-execution
+and executable source-export phases are unavailable to repository declarations. Input
+declarations and their deterministic expansion are separately bounded, and repository
+outputs may request only exact workspace reuse or lane-private non-reuse—not compatible
+or host-wide reuse. These checks narrow authoring early; the host repeats its normal
+sandbox, plan, sealing, and output-contract checks at execution boundaries.
+
 The v2 compiler does not create a second repository execution graph. It projects one
 validated document into the existing `EnvironmentDiscoveredComponentReport`, optional
 `ArtifactResolutionPlanV1`, `WorkspaceEnvironmentPlan`, `ArtifactDesiredKeyMaterialV2`

@@ -73,6 +73,10 @@ All notable changes to Trail are documented in this file. Trail follows
 - Repository v2 pipelines now compile into Trail's shared discovery, resolution,
   component-graph, desired-key v2, output, validation, and source-export models instead
   of introducing a parallel framework-specific execution representation.
+- Repository v2 loading now bounds and canonicalizes argv, inputs, authorities, actions,
+  validations, and exports, and rejects shells/control flow, indirect child launchers,
+  absolute host paths, raw secrets, provider sockets, forbidden executable phases,
+  capability escalation, compatible reuse, and host-wide reuse before tool resolution.
 
 ### Changed
 

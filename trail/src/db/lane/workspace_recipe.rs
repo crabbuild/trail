@@ -19,8 +19,18 @@ const MAX_RECIPE_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_RECIPE_TOTAL_SPEC_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECIPE_INCLUDE_FILES: usize = 32;
 const MAX_RECIPE_INCLUDE_DEPTH: usize = 8;
+const MAX_RECIPE_INPUT_DECLARATIONS: usize = 4_096;
 const MAX_RECIPE_INPUT_FILES: usize = 100_000;
 const MAX_RECIPE_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_RECIPE_ACTIONS: usize = 64;
+const MAX_RECIPE_VALIDATIONS: usize = 64;
+const MAX_RECIPE_SOURCE_EXPORTS: usize = 32;
+const MAX_RECIPE_COMMAND_ARGUMENTS: usize = 1_024;
+const MAX_RECIPE_ARGUMENT_BYTES: usize = 128 * 1024;
+const MAX_RECIPE_NETWORK_AUTHORITIES: usize = 256;
+const MAX_RECIPE_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_RECIPE_VALIDATION_PARAMETERS: usize = 256;
+const MAX_RECIPE_CHILD_PROCESSES: u32 = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -506,14 +516,25 @@ fn compile_recipe_validations(
 }
 
 fn recipe_network_authorities(network: Option<&RecipeNetwork>) -> Result<Vec<String>> {
-    match network {
-        None => Ok(Vec::new()),
-        Some(RecipeNetwork::Policy(policy)) if policy == "deny" => Ok(Vec::new()),
+    let mut authorities = match network {
+        None => Vec::new(),
+        Some(RecipeNetwork::Policy(policy)) if policy == "deny" => Vec::new(),
         Some(RecipeNetwork::Policy(policy)) => Err(Error::InvalidInput(format!(
             "repository resolver network policy `{policy}` must be `deny` or an exact authority list"
-        ))),
-        Some(RecipeNetwork::Authorities(authorities)) => Ok(authorities.authorities.clone()),
+        )))?,
+        Some(RecipeNetwork::Authorities(authorities)) => authorities.authorities.clone(),
+    };
+    if authorities.len() > MAX_RECIPE_NETWORK_AUTHORITIES {
+        return Err(Error::InvalidInput(format!(
+            "repository resolver declares more than {MAX_RECIPE_NETWORK_AUTHORITIES} network authorities"
+        )));
     }
+    for authority in &authorities {
+        validate_recipe_network_authority(authority)?;
+    }
+    authorities.sort();
+    authorities.dedup();
+    Ok(authorities)
 }
 
 fn recipe_network_policy_identity(network: Option<&RecipeNetwork>) -> Result<String> {
@@ -541,6 +562,530 @@ fn merge_recipe_identity_environment(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RecipeCapabilityPhase {
+    Resolve,
+    Construct,
+    Validate,
+}
+
+impl RecipeCapabilityPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Construct => "construct",
+            Self::Validate => "validate",
+        }
+    }
+}
+
+fn validate_recipe_v2_component(
+    component: &RecipeComponent,
+    defaults: &RecipeEnvironment,
+) -> Result<()> {
+    if component.inputs.len() > MAX_RECIPE_INPUT_DECLARATIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_INPUT_DECLARATIONS} inputs",
+            component.id
+        )));
+    }
+    if component.actions.len() > MAX_RECIPE_ACTIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_ACTIONS} actions",
+            component.id
+        )));
+    }
+    if component.validations.len() > MAX_RECIPE_VALIDATIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_VALIDATIONS} validations",
+            component.id
+        )));
+    }
+    if component.source_exports.len() > MAX_RECIPE_SOURCE_EXPORTS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_SOURCE_EXPORTS} source exports",
+            component.id
+        )));
+    }
+
+    validate_recipe_fixed_argv(
+        &component.build.command,
+        &component.id,
+        "build.command",
+        false,
+    )?;
+    validate_recipe_phase_cwd(
+        component.build.cwd.as_deref().unwrap_or(&component.root),
+        &component.root,
+        &component.id,
+        "build.cwd",
+    )?;
+    validate_recipe_environment_map(&component.build.environment, &component.id, "build")?;
+    if component
+        .build
+        .network
+        .as_deref()
+        .unwrap_or(&defaults.default_network)
+        != "deny"
+        || component
+            .build
+            .scripts
+            .as_deref()
+            .unwrap_or(&defaults.default_scripts)
+            != "deny"
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` build requires network = \"deny\" and scripts = \"deny\"",
+            component.id
+        )));
+    }
+    if let Some(capabilities) = &component.capabilities {
+        validate_recipe_capabilities(
+            capabilities,
+            RecipeCapabilityPhase::Construct,
+            &component.id,
+        )?;
+    }
+
+    if let Some(resolution) = &component.resolution {
+        validate_recipe_fixed_argv(&resolution.command, &component.id, "resolve.command", false)?;
+        validate_recipe_phase_cwd(
+            resolution.cwd.as_deref().unwrap_or(&component.root),
+            &component.root,
+            &component.id,
+            "resolve.cwd",
+        )?;
+        normalize_relative_path(&resolution.snapshot)?;
+        if resolution.format.is_empty()
+            || resolution.format.len() > 512
+            || resolution.format.contains(char::is_control)
+            || contains_sensitive_text(&resolution.format)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` has an invalid resolution snapshot format",
+                component.id
+            )));
+        }
+        recipe_network_authorities(resolution.network.as_ref())?;
+        validate_recipe_environment_map(&resolution.environment, &component.id, "resolver")?;
+        if let Some(capabilities) = &resolution.capabilities {
+            validate_recipe_capabilities(
+                capabilities,
+                RecipeCapabilityPhase::Resolve,
+                &component.id,
+            )?;
+        }
+    }
+
+    let mut action_names = BTreeSet::new();
+    for (index, action) in component.actions.iter().enumerate() {
+        if matches!(
+            action.phase,
+            RecipeActionPhase::MountedExecution | RecipeActionPhase::SourceExport
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action {} requests forbidden phase `{:?}`; mounted execution and source export cannot execute repository commands",
+                component.id, index, action.phase
+            )));
+        }
+        let action_name = action
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("action-{index}"));
+        validate_recipe_output_name(&action_name, &component.id)?;
+        if !action_names.insert(action_name.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` declares action name `{action_name}` more than once",
+                component.id
+            )));
+        }
+        validate_recipe_fixed_argv(
+            &action.command,
+            &component.id,
+            &format!("action `{action_name}` command"),
+            false,
+        )?;
+        validate_recipe_phase_cwd(
+            action.cwd.as_deref().unwrap_or(&component.root),
+            &component.root,
+            &component.id,
+            &format!("action `{action_name}` cwd"),
+        )?;
+        if !recipe_network_authorities(action.network.as_ref())?.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action `{action_name}` must be offline",
+                component.id
+            )));
+        }
+        if action
+            .scripts
+            .as_deref()
+            .is_some_and(|policy| policy != "deny")
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action `{action_name}` must deny scripts",
+                component.id
+            )));
+        }
+        validate_recipe_environment_map(
+            &action.environment,
+            &component.id,
+            &format!("action `{action_name}`"),
+        )?;
+        if let Some(capabilities) = &action.capabilities {
+            let phase = if action.phase == RecipeActionPhase::Validate {
+                RecipeCapabilityPhase::Validate
+            } else {
+                RecipeCapabilityPhase::Construct
+            };
+            validate_recipe_capabilities(capabilities, phase, &component.id)?;
+        }
+    }
+
+    for (index, validation) in component.validations.iter().enumerate() {
+        if let Some(name) = &validation.name {
+            validate_recipe_output_name(name, &component.id)?;
+        }
+        if let Some(path) = &validation.path {
+            normalize_relative_path(path)?;
+        }
+        validate_recipe_fixed_argv(
+            &validation.command,
+            &component.id,
+            &format!("validation {index} command"),
+            true,
+        )?;
+        if validation.parameters.len() > MAX_RECIPE_VALIDATION_PARAMETERS {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` validation {index} declares too many parameters",
+                component.id
+            )));
+        }
+        for (name, value) in &validation.parameters {
+            if name.is_empty()
+                || name.len() > 128
+                || value.len() > MAX_RECIPE_ARGUMENT_BYTES
+                || name.contains(char::is_control)
+                || value.contains(char::is_control)
+                || contains_sensitive_text(name)
+                || contains_sensitive_text(value)
+                || contains_provider_socket_reference(value)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "repository component `{}` validation {index} has an unsafe parameter `{name}`",
+                    component.id
+                )));
+            }
+        }
+    }
+
+    for output in &component.outputs {
+        if output.reuse == Some(EnvironmentReuseMode::Compatible)
+            || output.scope == Some(EnvironmentSharingScope::Host)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` cannot request compatible or host-wide artifact reuse",
+                component.id
+            )));
+        }
+    }
+    let output_names = component
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            output
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("output-{index}"))
+        })
+        .collect::<BTreeSet<_>>();
+    for export in &component.source_exports {
+        validate_recipe_output_name(&export.from_output, &component.id)?;
+        if !output_names.contains(&export.from_output) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export references unknown output `{}`",
+                component.id, export.from_output
+            )));
+        }
+        normalize_relative_path(&export.source)?;
+        normalize_relative_path(&export.target)?;
+        if export.mode != "explicit" {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export mode must be `explicit`",
+                component.id
+            )));
+        }
+        if let Some(validation) = &export.validation {
+            validate_recipe_output_name(validation, &component.id)?;
+        }
+        if let Some(gate) = &export.gate {
+            validate_recipe_output_name(gate, &component.id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipe_fixed_argv(
+    command: &[String],
+    component_id: &str,
+    field: &str,
+    allow_empty: bool,
+) -> Result<()> {
+    if command.is_empty() {
+        if allow_empty {
+            return Ok(());
+        }
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` has an empty {field}"
+        )));
+    }
+    if command.len() > MAX_RECIPE_COMMAND_ARGUMENTS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} exceeds {MAX_RECIPE_COMMAND_ARGUMENTS} argv entries"
+        )));
+    }
+    let program = &command[0];
+    if program.contains('/')
+        || program.contains('\\')
+        || is_shell_program(program)
+        || is_indirect_process_launcher(program)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} must name one non-shell, non-launcher executable from PATH, not `{program}`"
+        )));
+    }
+    for argument in command {
+        if argument.is_empty()
+            || argument.len() > MAX_RECIPE_ARGUMENT_BYTES
+            || argument.contains('\0')
+            || argument.contains('\n')
+            || argument.contains('\r')
+            || contains_sensitive_text(argument)
+            || contains_shell_interpolation(argument)
+            || contains_provider_socket_reference(argument)
+            || is_absolute_host_path(argument)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` {field} contains an unsafe or excessive argv entry"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipe_phase_cwd(
+    cwd: &str,
+    component_root: &str,
+    component_id: &str,
+    field: &str,
+) -> Result<()> {
+    let cwd = normalize_recipe_path_allow_root(cwd)?;
+    if !component_root.is_empty()
+        && cwd != component_root
+        && !cwd.starts_with(&format!("{component_root}/"))
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} `{cwd}` escapes component root `{component_root}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_environment_map(
+    environment: &BTreeMap<String, String>,
+    component_id: &str,
+    phase: &str,
+) -> Result<()> {
+    if environment.len() > MAX_RECIPE_ENVIRONMENT_ENTRIES {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {phase} environment exceeds {MAX_RECIPE_ENVIRONMENT_ENTRIES} entries"
+        )));
+    }
+    for (name, value) in environment {
+        validate_recipe_environment(name, value, component_id)?;
+        if contains_provider_socket_reference(name) || contains_provider_socket_reference(value) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` {phase} environment entry `{name}` requests a provider socket"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipe_capabilities(
+    capabilities: &RecipeCapabilities,
+    phase: RecipeCapabilityPhase,
+    component_id: &str,
+) -> Result<()> {
+    let allowed_network = match phase {
+        RecipeCapabilityPhase::Resolve => &["deny", "exact_authorities"][..],
+        RecipeCapabilityPhase::Construct | RecipeCapabilityPhase::Validate => &["deny"][..],
+    };
+    let allowed_read = match phase {
+        RecipeCapabilityPhase::Resolve | RecipeCapabilityPhase::Construct => {
+            &["declared_inputs"][..]
+        }
+        RecipeCapabilityPhase::Validate => &["artifact_candidate"][..],
+    };
+    let allowed_write = match phase {
+        RecipeCapabilityPhase::Resolve | RecipeCapabilityPhase::Construct => {
+            &["isolated_candidate"][..]
+        }
+        RecipeCapabilityPhase::Validate => &["validation_receipt"][..],
+    };
+    validate_recipe_capability_value(
+        capabilities.network.as_deref(),
+        allowed_network,
+        component_id,
+        phase,
+        "network",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.filesystem_read.as_deref(),
+        allowed_read,
+        component_id,
+        phase,
+        "filesystem_read",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.filesystem_write.as_deref(),
+        allowed_write,
+        component_id,
+        phase,
+        "filesystem_write",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.process.as_deref(),
+        &["declared_executable"],
+        component_id,
+        phase,
+        "process",
+    )?;
+    let allowed_secrets = if matches!(phase, RecipeCapabilityPhase::Resolve) {
+        &["deny", "opaque_handles"][..]
+    } else {
+        &["deny"][..]
+    };
+    validate_recipe_capability_value(
+        capabilities.secrets.as_deref(),
+        allowed_secrets,
+        component_id,
+        phase,
+        "secrets",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.publication.as_deref(),
+        &["deny"],
+        component_id,
+        phase,
+        "publication",
+    )?;
+    if capabilities
+        .child_processes
+        .is_some_and(|limit| limit == 0 || limit > MAX_RECIPE_CHILD_PROCESSES)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {} child-process limit must be between 1 and {MAX_RECIPE_CHILD_PROCESSES}",
+            phase.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_capability_value(
+    value: Option<&str>,
+    allowed: &[&str],
+    component_id: &str,
+    phase: RecipeCapabilityPhase,
+    field: &str,
+) -> Result<()> {
+    if let Some(value) = value
+        && !allowed.contains(&value)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {} capability `{field} = {value}` exceeds the repository-declaration ceiling",
+            phase.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_network_authority(authority: &str) -> Result<()> {
+    if authority.is_empty()
+        || authority.len() > 512
+        || authority.contains(char::is_whitespace)
+        || authority.contains(char::is_control)
+        || authority.contains('/')
+        || authority.contains('\\')
+        || authority.contains('@')
+        || authority.contains("//")
+        || contains_sensitive_text(authority)
+        || contains_shell_interpolation(authority)
+        || contains_provider_socket_reference(authority)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository resolver authority `{authority}` is not an exact non-secret network authority"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_shell_interpolation(argument: &str) -> bool {
+    argument.contains("$(")
+        || argument.contains("${")
+        || argument.contains('`')
+        || matches!(
+            argument,
+            "&&" | "||" | ";" | "|" | "&" | ">" | ">>" | "<" | "<<"
+        )
+}
+
+fn is_indirect_process_launcher(program: &str) -> bool {
+    matches!(
+        program.to_ascii_lowercase().as_str(),
+        "env"
+            | "xargs"
+            | "parallel"
+            | "nohup"
+            | "nice"
+            | "setsid"
+            | "sudo"
+            | "su"
+            | "doas"
+            | "command"
+            | "exec"
+    )
+}
+
+fn is_absolute_host_path(argument: &str) -> bool {
+    argument.starts_with('/')
+        || argument.starts_with("\\\\")
+        || argument.starts_with("file://")
+        || argument.as_bytes().get(1) == Some(&b':')
+            && argument
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            && argument
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+}
+
+fn contains_provider_socket_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("unix://")
+        || lower.contains("npipe://")
+        || lower.contains("/var/run/docker.sock")
+        || lower.contains("/run/docker.sock")
+        || lower.contains("/run/containerd/")
+        || lower.contains("ssh_auth_sock")
+        || lower.contains("docker_host")
+        || lower.contains("container_host")
+        || lower.contains("buildkit_host")
 }
 
 impl Trail {
@@ -724,17 +1269,15 @@ impl Trail {
                     ArtifactActionPhaseV2::Finalize
                 }
             };
+            let action_name = action
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("action-{index}"));
             actions.push(self.compile_recipe_action_identity(
-                action.name.as_deref().unwrap_or({
-                    if index == 0 {
-                        "action"
-                    } else {
-                        "action-step"
-                    }
-                }),
+                &action_name,
                 phase,
                 &action.command,
-                action.cwd.as_deref().unwrap_or("."),
+                action.cwd.as_deref().unwrap_or(&component.root),
                 &action.environment,
             )?);
         }
@@ -862,7 +1405,10 @@ impl Trail {
             ))
         })?;
         let tool = resolve_workspace_tool_executable(program)?;
-        let working_directory = resolution.cwd.clone().unwrap_or_else(|| ".".into());
+        let working_directory = resolution
+            .cwd
+            .clone()
+            .unwrap_or_else(|| recipe.component.root.clone());
         let mut plan = ArtifactResolutionPlanV1 {
             version: ARTIFACT_RESOLUTION_PLAN_VERSION,
             proposal_key: format!("repository_v2_{}", recipe.specification_digest),
@@ -1135,6 +1681,9 @@ impl Trail {
             let schema = documents.schema.ok_or_else(|| {
                 Error::Corrupt("environment specification graph lost its schema version".into())
             })?;
+            if schema == RecipeSchemaVersion::V2 {
+                validate_recipe_v2_component(&component, &documents.defaults)?;
+            }
             let canonical = serde_json::to_vec(&(schema.as_str(), &component, &profile_versions))?;
             recipes.push(CommandRecipe {
                 schema,
@@ -2578,6 +3127,283 @@ validation = "path-contract"
                 "unexpected strict-v2 parser error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn v2_repository_pipeline_rejects_unsafe_authority_and_reuse_requests() {
+        struct Case {
+            name: &'static str,
+            command: &'static [&'static str],
+            before_output: &'static str,
+            reuse: &'static str,
+            scope: &'static str,
+            after_output: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "shell interpolation",
+                command: &["cp", "$(read-secret)", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "shell control flow",
+                command: &["cp", "input.txt", "&&", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "absolute host path",
+                command: &["cp", "/etc/passwd", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "indirect child launcher",
+                command: &["env", "cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "non-shell, non-launcher executable",
+            },
+            Case {
+                name: "raw secret environment",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.build.environment]\nAPI_TOKEN = \"sk-live-secret\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "forbidden environment entry",
+            },
+            Case {
+                name: "provider socket",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.build.environment]\nDOCKER_HOST = \"unix:///var/run/docker.sock\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "requests a provider socket",
+            },
+            Case {
+                name: "forbidden process graph",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nprocess = \"reviewed_builtin_graph\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "exceeds the repository-declaration ceiling",
+            },
+            Case {
+                name: "excessive child processes",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nchild_processes = 257\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "child-process limit",
+            },
+            Case {
+                name: "host-wide reuse",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "host",
+                after_output: "",
+                expected: "host-wide artifact reuse",
+            },
+            Case {
+                name: "compatible reuse",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "compatible",
+                scope: "workspace",
+                after_output: "",
+                expected: "compatible or host-wide artifact reuse",
+            },
+            Case {
+                name: "mounted repository action",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "[[component.action]]\nphase = \"mounted_execution\"\ncommand = [\"cp\", \"input.txt\", \"generated/mounted.txt\"]\n",
+                expected: "requests forbidden phase",
+            },
+            Case {
+                name: "online constructor",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "[[component.action]]\nphase = \"construct\"\ncommand = [\"cp\", \"input.txt\", \"generated/online.txt\"]\nnetwork = { authorities = [\"registry.example:443\"] }\n",
+                expected: "must be offline",
+            },
+        ];
+
+        for case in cases {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("input.txt"), "strict\n").unwrap();
+            let command = serde_json::to_string(case.command).unwrap();
+            fs::write(
+                workspace.path().join("trail.environment.toml"),
+                format!(
+                    r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "unsafe.pipeline"
+adapter = "trail/command@1"
+inputs = [{{ path = "input.txt" }}]
+
+[component.build]
+command = {command}
+cwd = "."
+{before_output}
+[[component.output]]
+name = "generated"
+source = "generated"
+target = ".trail-generated/unsafe"
+policy = "immutable_seed_private"
+reuse = "{reuse}"
+scope = "{scope}"
+publish = "on_sync"
+{after_output}"#,
+                    before_output = case.before_output,
+                    reuse = case.reuse,
+                    scope = case.scope,
+                    after_output = case.after_output,
+                ),
+            )
+            .unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+            let error = db.load_command_recipes(&source_root).unwrap_err();
+            assert!(
+                error.to_string().contains(case.expected),
+                "{} produced unexpected error: {error}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn v2_repository_authorities_are_bounded_sorted_and_deduplicated() {
+        let network = RecipeNetwork::Authorities(RecipeNetworkAuthorities {
+            authorities: vec![
+                "registry.z.example:443".into(),
+                "registry.a.example:443".into(),
+                "registry.z.example:443".into(),
+            ],
+        });
+        assert_eq!(
+            recipe_network_authorities(Some(&network)).unwrap(),
+            vec!["registry.a.example:443", "registry.z.example:443"]
+        );
+
+        let excessive = RecipeNetwork::Authorities(RecipeNetworkAuthorities {
+            authorities: (0..=MAX_RECIPE_NETWORK_AUTHORITIES)
+                .map(|index| format!("registry-{index}.example:443"))
+                .collect(),
+        });
+        let error = recipe_network_authorities(Some(&excessive)).unwrap_err();
+        assert!(error.to_string().contains("more than"));
+    }
+
+    #[test]
+    fn v2_repository_input_declarations_are_bounded_and_expansion_is_sorted() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("z.txt"), "z\n").unwrap();
+        fs::write(workspace.path().join("a.txt"), "a\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[[component]]
+id = "sorted.inputs"
+adapter = "trail/command@1"
+inputs = [{ path = "*.txt" }]
+
+[component.build]
+command = ["cp", "a.txt", "generated/result.txt"]
+
+[[component.output]]
+name = "generated"
+source = "generated"
+target = ".trail-generated/sorted"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        let selected = db
+            .expand_recipe_inputs(&source_root, &recipes[0].component)
+            .unwrap();
+        assert_eq!(
+            selected.keys().cloned().collect::<Vec<_>>(),
+            vec!["a.txt", "z.txt"]
+        );
+
+        let excessive_workspace = tempfile::tempdir().unwrap();
+        let inputs = (0..=MAX_RECIPE_INPUT_DECLARATIONS)
+            .map(|index| format!("{{ path = \"missing/{index}.txt\", optional = true }}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            excessive_workspace.path().join("trail.environment.toml"),
+            format!(
+                r#"schema = "trail.environment/v2"
+[[component]]
+id = "excessive.inputs"
+adapter = "trail/command@1"
+inputs = [{inputs}]
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+[[component.output]]
+source = "generated"
+target = ".trail-generated/excessive"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#
+            ),
+        )
+        .unwrap();
+        Trail::init(
+            excessive_workspace.path(),
+            "main",
+            InitImportMode::WorkingTree,
+            false,
+        )
+        .unwrap();
+        let excessive_db = Trail::open(excessive_workspace.path()).unwrap();
+        let excessive_root = excessive_db.resolve_branch_ref("main").unwrap().root_id;
+        let error = excessive_db
+            .load_command_recipes(&excessive_root)
+            .unwrap_err();
+        assert!(error.to_string().contains("declares more than"));
     }
 
     #[test]
