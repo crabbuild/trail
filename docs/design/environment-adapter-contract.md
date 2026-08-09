@@ -742,7 +742,10 @@ expansion, and `trail/command@1` components. Each command component currently re
 and grants before execution. On macOS the command runs under `sandbox-exec`. On Linux a
 fresh Trail helper applies a hard-requirement Landlock filesystem allowlist and a
 seccomp filter that denies socket, namespace, kernel-module, ptrace, BPF, io_uring, and
-related escape syscalls before executing the selected program. On Windows the helper
+related escape syscalls before executing the selected program. Dynamically linked Linux
+programs receive an additional exact read/execute grant for the bounded, canonical ELF
+interpreter declared by `PT_INTERP`; system library hierarchies remain read-only and
+non-executable. On Windows the helper
 creates an ephemeral capability-free AppContainer, grants its SID read/execute access to
 the staged root and modify access only to output/HOME/tmp, launches the exact executable
 suspended, assigns it to a kill-on-close Job Object with an active-process limit of one,
