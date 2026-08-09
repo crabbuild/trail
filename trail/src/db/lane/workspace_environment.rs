@@ -341,6 +341,40 @@ pub(crate) enum WorkspaceEnvironmentSandboxPolicy {
     RestrictedPluginMounted,
 }
 
+fn workspace_environment_capability_ceiling(
+    producer_trust: ArtifactProducerTrustTierV1,
+    phase: ArtifactExecutionPhaseV1,
+) -> ArtifactCapabilityCeilingV1 {
+    ArtifactCapabilityCeilingV1::for_phase(producer_trust, phase)
+}
+
+fn environment_plugin_producer_trust_tier(
+    plugin: &super::workspace_plugin::InstalledEnvironmentPlugin,
+) -> Result<ArtifactProducerTrustTierV1> {
+    match (
+        plugin.publisher.as_deref(),
+        plugin.publisher_key_id.as_deref(),
+        plugin.trust.as_str(),
+    ) {
+        (Some(_), Some(_), "publisher_signed")
+            if plugin.certification_tier.starts_with("certified-") =>
+        {
+            Ok(ArtifactProducerTrustTierV1::CertifiedSignedPlugin)
+        }
+        (Some(_), Some(_), "publisher_signed") | (None, None, "local_unsigned") => {
+            // Publisher authentication proves package origin but does not by
+            // itself certify the adapter's behavior. Until conformance
+            // certification is durable, both forms retain the local-plugin
+            // execution ceiling.
+            Ok(ArtifactProducerTrustTierV1::LocallyTrustedPlugin)
+        }
+        _ => Err(Error::Corrupt(format!(
+            "installed adapter `{}` has inconsistent producer trust evidence",
+            plugin.manifest.adapter.canonical_identity
+        ))),
+    }
+}
+
 /// Normalized plan emitted by every built-in environment adapter.
 ///
 /// The layer key and output contract are data so the host can validate and
@@ -2295,6 +2329,10 @@ impl Trail {
                 plan.component_id
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            ArtifactProducerTrustTierV1::ReviewedBuiltin,
+        )?;
         self.validate_workspace_environment_plan_common(plan)
     }
 
@@ -2331,6 +2369,10 @@ impl Trail {
                 "command recipe `{expected_component_id}` returned an inconsistent identity, policy, or action plan"
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            ArtifactProducerTrustTierV1::RepositoryDeclaration,
+        )?;
         self.validate_workspace_environment_plan_common_with_tool_cache(plan, tool_identities)
     }
 
@@ -2380,7 +2422,118 @@ impl Trail {
                 "plugin component `{expected_component_id}` returned an inconsistent identity, provenance, or policy plan"
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            environment_plugin_producer_trust_tier(plugin)?,
+        )?;
         self.validate_workspace_environment_plan_common(plan)
+    }
+
+    fn validate_workspace_environment_capability_ceilings(
+        &self,
+        plan: &WorkspaceEnvironmentPlan,
+        producer_trust: ArtifactProducerTrustTierV1,
+    ) -> Result<()> {
+        use ArtifactExecutionPhaseV1 as Phase;
+        use ArtifactFilesystemReadCapabilityV1 as Read;
+        use ArtifactFilesystemWriteCapabilityV1 as Write;
+        use ArtifactProcessCapabilityV1 as Process;
+        use ArtifactProducerTrustTierV1 as Trust;
+
+        let expected_sandbox = match producer_trust {
+            Trust::ReviewedBuiltin => {
+                plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+            }
+            Trust::RepositoryDeclaration => {
+                plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            }
+            Trust::CertifiedSignedPlugin | Trust::LocallyTrustedPlugin => matches!(
+                plan.sandbox_policy,
+                WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+                    | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                    | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
+            ),
+        };
+        if !expected_sandbox {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a sandbox policy above its {:?} producer ceiling",
+                plan.component_id, producer_trust
+            )));
+        }
+
+        let planning =
+            workspace_environment_capability_ceiling(producer_trust, Phase::DiscoveryPlanning);
+        let resolver = workspace_environment_capability_ceiling(producer_trust, Phase::Resolve);
+        let constructor =
+            workspace_environment_capability_ceiling(producer_trust, Phase::Construct);
+        let mounted =
+            workspace_environment_capability_ceiling(producer_trust, Phase::MountedExecution);
+        let validator = workspace_environment_capability_ceiling(producer_trust, Phase::Validate);
+        let exporter =
+            workspace_environment_capability_ceiling(producer_trust, Phase::SourceExport);
+        if [
+            &planning,
+            &resolver,
+            &constructor,
+            &mounted,
+            &validator,
+            &exporter,
+        ]
+        .into_iter()
+        .any(|ceiling| ceiling.publication_authority)
+        {
+            return Err(Error::Corrupt(
+                "artifact capability policy granted publication authority to executable code"
+                    .into(),
+            ));
+        }
+        if !plan.pre_commands.is_empty()
+            && (resolver.processes == Process::Deny || producer_trust != Trust::ReviewedBuiltin)
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a resolver command above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if plan.command.is_some() && constructor.processes == Process::Deny {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests constructor process execution above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if !plan.mounted_commands.is_empty()
+            && (mounted.processes == Process::Deny
+                || mounted.filesystem_read != Read::LaneView
+                || mounted.filesystem_write != Write::LaneBindings)
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests mounted execution above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if plan.source_projection.is_some()
+            && constructor.filesystem_read != Read::PinnedSourceClosure
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a complete source projection above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if !plan.caches.is_empty() && constructor.filesystem_write != Write::CandidateAndHostCache {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests host cache writes above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if producer_trust == Trust::RepositoryDeclaration
+            && (!plan.external_artifacts.is_empty() || !plan.runtime_resources.is_empty())
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests provider authority above the repository-declaration ceiling",
+                plan.component_id
+            )));
+        }
+        Ok(())
     }
 
     fn validate_workspace_environment_plan_common(
@@ -6688,6 +6841,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn phase_capability_ceilings_are_total_deny_publication_and_do_not_elevate_signatures() {
+        use ArtifactExecutionPhaseV1 as Phase;
+        use ArtifactNetworkCapabilityV1 as Network;
+        use ArtifactProcessCapabilityV1 as Process;
+        use ArtifactProducerTrustTierV1 as Trust;
+
+        let tiers = [
+            Trust::ReviewedBuiltin,
+            Trust::CertifiedSignedPlugin,
+            Trust::LocallyTrustedPlugin,
+            Trust::RepositoryDeclaration,
+        ];
+        let phases = [
+            Phase::DiscoveryPlanning,
+            Phase::Resolve,
+            Phase::Construct,
+            Phase::Validate,
+            Phase::MountedExecution,
+            Phase::SourceExport,
+        ];
+        for tier in tiers {
+            for phase in phases {
+                let ceiling = workspace_environment_capability_ceiling(tier, phase);
+                assert_eq!(ceiling.producer_trust, tier);
+                assert_eq!(ceiling.phase, phase);
+                assert!(!ceiling.publication_authority);
+            }
+        }
+        assert_eq!(
+            workspace_environment_capability_ceiling(Trust::ReviewedBuiltin, Phase::Construct,)
+                .network,
+            Network::ReviewedBuiltinManaged
+        );
+        for tier in [
+            Trust::CertifiedSignedPlugin,
+            Trust::LocallyTrustedPlugin,
+            Trust::RepositoryDeclaration,
+        ] {
+            assert_eq!(
+                workspace_environment_capability_ceiling(tier, Phase::Construct).network,
+                Network::Deny
+            );
+        }
+        assert_eq!(
+            workspace_environment_capability_ceiling(
+                Trust::RepositoryDeclaration,
+                Phase::MountedExecution,
+            )
+            .processes,
+            Process::Deny
+        );
+        let signed = workspace_environment_capability_ceiling(
+            Trust::CertifiedSignedPlugin,
+            Phase::Construct,
+        );
+        let mut local =
+            workspace_environment_capability_ceiling(Trust::LocallyTrustedPlugin, Phase::Construct);
+        local.producer_trust = Trust::CertifiedSignedPlugin;
+        assert_eq!(signed, local);
+    }
+
+    #[test]
     fn workspace_environment_staging_parent_is_trail_owned() {
         let workspace = tempfile::tempdir().unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -6860,6 +7075,49 @@ mod tests {
             stale_reason: "test".to_string(),
         };
         (plan, command)
+    }
+
+    #[test]
+    fn inferred_plan_authority_cannot_exceed_the_selected_producer_tier() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, command) =
+            cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::HostExclusive);
+        db.validate_workspace_environment_capability_ceilings(
+            &plan,
+            ArtifactProducerTrustTierV1::ReviewedBuiltin,
+        )
+        .unwrap();
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sandbox policy above"));
+
+        plan.sandbox_policy = WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe;
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("host cache writes above"));
+        plan.caches.clear();
+        plan.command = None;
+        plan.mounted_commands = vec![command];
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("mounted execution above"));
     }
 
     #[test]

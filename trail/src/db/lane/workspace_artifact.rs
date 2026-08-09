@@ -3983,6 +3983,7 @@ pub(crate) fn normalize_artifact_resolution_plan(
             plan.version
         )));
     }
+    validate_artifact_resolution_capability_ceiling(plan)?;
     for (value, field) in [
         (&plan.proposal_key, "proposal key"),
         (&plan.component_id, "component id"),
@@ -4081,6 +4082,28 @@ pub(crate) fn normalize_artifact_resolution_plan(
         return Err(Error::InvalidInput(
             "artifact resolution plan contains duplicate validation names".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_resolution_capability_ceiling(plan: &ArtifactResolutionPlanV1) -> Result<()> {
+    let ceiling = ArtifactCapabilityCeilingV1::for_phase(
+        ArtifactProducerTrustTierV1::RepositoryDeclaration,
+        ArtifactExecutionPhaseV1::Resolve,
+    );
+    if ceiling.publication_authority
+        || ceiling.processes != ArtifactProcessCapabilityV1::DeclaredExecutable
+        || ceiling.filesystem_read != ArtifactFilesystemReadCapabilityV1::DeclaredInputs
+        || ceiling.filesystem_write != ArtifactFilesystemWriteCapabilityV1::IsolatedCandidate
+        || (!plan.allowed_authorities.is_empty()
+            && ceiling.network != ArtifactNetworkCapabilityV1::ExactAuthorities)
+        || (!plan.credential_handles.is_empty()
+            && ceiling.secrets != ArtifactSecretCapabilityV1::OpaqueHandles)
+    {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolver plan `{}` exceeds the repository-declaration resolver capability ceiling",
+            plan.proposal_key
+        )));
     }
     Ok(())
 }

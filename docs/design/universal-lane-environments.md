@@ -636,14 +636,35 @@ accounting are reported separately so shared-space savings remain visible.
 
 ## Adapter trust model
 
-Trail supports three adapter tiers:
+Trail distinguishes four producer trust tiers:
 
 1. **Built-in adapters** run as reviewed Trail code with narrowly scoped host APIs.
-2. **Declarative recipes** describe probes, commands, inputs, outputs, and policies; the
+2. **Certified signed plugins** have both authenticated package provenance and a separate
+   durable conformance certification.
+3. **Locally trusted plugins** include unsigned local packages and publisher-authenticated
+   packages that have not completed conformance certification. A signature authenticates
+   origin; it does not certify behavior or widen execution authority.
+4. **Repository declarations** describe probes, commands, inputs, outputs, and policies; the
    Trail host executes them in a sandbox.
-3. **Capability-constrained plugins** use a versioned WASI/component interface or
-   equivalent isolated protocol. They request filesystem, process, network, secret, and
-   runtime capabilities explicitly.
+
+The host computes a ceiling from producer tier and phase before considering any adapter
+request. The current framework-neutral matrix is:
+
+| Phase | Reviewed built-in | Certified/local plugin | Repository declaration |
+| --- | --- | --- | --- |
+| Discovery/planning | no process, network, writes, or secrets | same | same |
+| Resolution | exact authorities, pinned inputs, opaque credential handles | exact authorities, declared inputs, isolated candidate | same plugin ceiling |
+| Construction | reviewed built-in process graph and managed legacy network; candidate plus host caches | declared executable, offline, declared inputs, candidate plus certified host caches | declared executable, offline, declared inputs, candidate only |
+| Validation | offline candidate read and receipt-only write | same, with declared executable | same |
+| Mounted execution | lane view and declared bindings; runtime injection is host-owned | deny-by-default native sandbox over the lane view and bindings | unavailable |
+| Source export | artifact candidate read and one confined destination | same | same |
+
+No executable tier or phase has publication authority. Adapters may request less than
+their ceiling, never more. Repository plans cannot request mounted execution, provider
+authority, complete source projection, or host cache writes. Plugin plans remain under
+the local-plugin ceiling until a future durable certification record says otherwise.
+Reviewed built-ins retain an explicitly identified managed-network compatibility ceiling
+while their ecosystem actions migrate to separate resolver and offline-constructor phases.
 
 Adapters never receive raw database access, shared artifact mutation, arbitrary host
 paths, or undeclared secrets. They return plans and observations. The host validates

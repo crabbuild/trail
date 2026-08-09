@@ -1654,6 +1654,57 @@ mod workdir_mode_tests {
         assert!(
             serde_json::from_value::<ArtifactValidationKindV1>("custom".into()).is_err()
         );
+        for (tier, wire) in [
+            (
+                ArtifactProducerTrustTierV1::ReviewedBuiltin,
+                "reviewed_builtin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::CertifiedSignedPlugin,
+                "certified_signed_plugin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+                "locally_trusted_plugin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+                "repository_declaration",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(tier).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactProducerTrustTierV1>(wire.into()).unwrap(),
+                tier
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactProducerTrustTierV1>("remote_trusted".into())
+                .is_err()
+        );
+        for (phase, wire) in [
+            (
+                ArtifactExecutionPhaseV1::DiscoveryPlanning,
+                "discovery_planning",
+            ),
+            (ArtifactExecutionPhaseV1::Resolve, "resolve"),
+            (ArtifactExecutionPhaseV1::Construct, "construct"),
+            (ArtifactExecutionPhaseV1::Validate, "validate"),
+            (
+                ArtifactExecutionPhaseV1::MountedExecution,
+                "mounted_execution",
+            ),
+            (ArtifactExecutionPhaseV1::SourceExport, "source_export"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactExecutionPhaseV1>(wire.into()).unwrap(),
+                phase
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactExecutionPhaseV1>("publish".into()).is_err()
+        );
 
         for (policy, wire) in [
             (EnvironmentOutputPolicy::ImmutableShared, "immutable_shared"),

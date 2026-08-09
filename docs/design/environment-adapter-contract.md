@@ -327,6 +327,14 @@ copy, while removal remains available for recovery. Trust revocation also fails 
 packages closed immediately. Unsigned packages are visibly `local-experimental`; a
 signature authenticates origin but does not grant stable certification.
 
+The host classifies current publisher-authenticated experimental packages and unsigned
+local packages as `locally_trusted_plugin` for execution. Only a separate durable
+conformance result may select `certified_signed_plugin`. That host-selected tier is
+combined with the action phase to produce `ArtifactCapabilityCeilingV1`; the normalized
+plan is rejected if its inferred reads, writes, caches, processes, provider use, mounted
+execution, network, or secret channels exceed that ceiling. No tier can request direct
+publication authority.
+
 The adapter catalog reports each package's planner protocols, supported operating systems,
 and architectures. Unsupported plugins remain inspectable but are not auto-discovered or
 executed on the current host. `lane readiness` replans every installed component from

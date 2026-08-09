@@ -50,6 +50,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Workspace-layer publication now rechecks exact construction pins, freezes and
   rescans Trail-owned candidate output, and requires structural and policy host-seal
   receipts before a ready artifact envelope can be published or attached.
+- Artifact producers now use a host-selected phase/trust-tier capability ceiling for
+  reviewed built-ins, certified signed plugins, locally trusted plugins, and repository
+  declarations; signatures authenticate origin without implicitly elevating authority.
 
 ### Changed
 

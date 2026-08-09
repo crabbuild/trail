@@ -176,6 +176,206 @@ pub enum ArtifactScriptPolicyV1 {
     AllowDeclared,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactProducerTrustTierV1 {
+    ReviewedBuiltin,
+    CertifiedSignedPlugin,
+    LocallyTrustedPlugin,
+    RepositoryDeclaration,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactExecutionPhaseV1 {
+    DiscoveryPlanning,
+    Resolve,
+    Construct,
+    Validate,
+    MountedExecution,
+    SourceExport,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactNetworkCapabilityV1 {
+    Deny,
+    ExactAuthorities,
+    ReviewedBuiltinManaged,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactFilesystemReadCapabilityV1 {
+    None,
+    DeclaredInputs,
+    PinnedSourceClosure,
+    ArtifactCandidate,
+    LaneView,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactFilesystemWriteCapabilityV1 {
+    None,
+    IsolatedCandidate,
+    CandidateAndHostCache,
+    ValidationReceipt,
+    LaneBindings,
+    SourceExportDestination,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactProcessCapabilityV1 {
+    Deny,
+    DeclaredExecutable,
+    ReviewedBuiltinGraph,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSecretCapabilityV1 {
+    Deny,
+    OpaqueHandles,
+    RuntimeInjection,
+}
+
+/// Maximum authority available to one producer tier in one execution phase.
+///
+/// This is a host policy result, not an adapter request. Repository and plugin
+/// declarations may narrow it but cannot widen it, and publication authority
+/// is intentionally absent from every executable phase.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactCapabilityCeilingV1 {
+    pub producer_trust: ArtifactProducerTrustTierV1,
+    pub phase: ArtifactExecutionPhaseV1,
+    pub network: ArtifactNetworkCapabilityV1,
+    pub filesystem_read: ArtifactFilesystemReadCapabilityV1,
+    pub filesystem_write: ArtifactFilesystemWriteCapabilityV1,
+    pub processes: ArtifactProcessCapabilityV1,
+    pub secrets: ArtifactSecretCapabilityV1,
+    pub publication_authority: bool,
+}
+
+impl ArtifactCapabilityCeilingV1 {
+    pub fn for_phase(
+        producer_trust: ArtifactProducerTrustTierV1,
+        phase: ArtifactExecutionPhaseV1,
+    ) -> Self {
+        use ArtifactExecutionPhaseV1 as Phase;
+        use ArtifactFilesystemReadCapabilityV1 as Read;
+        use ArtifactFilesystemWriteCapabilityV1 as Write;
+        use ArtifactNetworkCapabilityV1 as Network;
+        use ArtifactProcessCapabilityV1 as Process;
+        use ArtifactProducerTrustTierV1 as Trust;
+        use ArtifactSecretCapabilityV1 as Secrets;
+
+        let (network, filesystem_read, filesystem_write, processes, secrets) = match phase {
+            Phase::DiscoveryPlanning => (
+                Network::Deny,
+                Read::None,
+                Write::None,
+                Process::Deny,
+                Secrets::Deny,
+            ),
+            Phase::Resolve => (
+                Network::ExactAuthorities,
+                if producer_trust == Trust::ReviewedBuiltin {
+                    Read::PinnedSourceClosure
+                } else {
+                    Read::DeclaredInputs
+                },
+                if producer_trust == Trust::ReviewedBuiltin {
+                    Write::CandidateAndHostCache
+                } else {
+                    Write::IsolatedCandidate
+                },
+                if producer_trust == Trust::ReviewedBuiltin {
+                    Process::ReviewedBuiltinGraph
+                } else {
+                    Process::DeclaredExecutable
+                },
+                Secrets::OpaqueHandles,
+            ),
+            Phase::Construct => match producer_trust {
+                Trust::ReviewedBuiltin => (
+                    Network::ReviewedBuiltinManaged,
+                    Read::PinnedSourceClosure,
+                    Write::CandidateAndHostCache,
+                    Process::ReviewedBuiltinGraph,
+                    Secrets::Deny,
+                ),
+                Trust::CertifiedSignedPlugin | Trust::LocallyTrustedPlugin => (
+                    Network::Deny,
+                    Read::DeclaredInputs,
+                    Write::CandidateAndHostCache,
+                    Process::DeclaredExecutable,
+                    Secrets::Deny,
+                ),
+                Trust::RepositoryDeclaration => (
+                    Network::Deny,
+                    Read::DeclaredInputs,
+                    Write::IsolatedCandidate,
+                    Process::DeclaredExecutable,
+                    Secrets::Deny,
+                ),
+            },
+            Phase::Validate => (
+                Network::Deny,
+                Read::ArtifactCandidate,
+                Write::ValidationReceipt,
+                if producer_trust == Trust::ReviewedBuiltin {
+                    Process::ReviewedBuiltinGraph
+                } else {
+                    Process::DeclaredExecutable
+                },
+                Secrets::Deny,
+            ),
+            Phase::MountedExecution => match producer_trust {
+                Trust::RepositoryDeclaration => (
+                    Network::Deny,
+                    Read::None,
+                    Write::None,
+                    Process::Deny,
+                    Secrets::Deny,
+                ),
+                Trust::ReviewedBuiltin => (
+                    Network::Deny,
+                    Read::LaneView,
+                    Write::LaneBindings,
+                    Process::ReviewedBuiltinGraph,
+                    Secrets::RuntimeInjection,
+                ),
+                Trust::CertifiedSignedPlugin | Trust::LocallyTrustedPlugin => (
+                    Network::Deny,
+                    Read::LaneView,
+                    Write::LaneBindings,
+                    Process::DeclaredExecutable,
+                    Secrets::RuntimeInjection,
+                ),
+            },
+            Phase::SourceExport => (
+                Network::Deny,
+                Read::ArtifactCandidate,
+                Write::SourceExportDestination,
+                Process::Deny,
+                Secrets::Deny,
+            ),
+        };
+        Self {
+            producer_trust,
+            phase,
+            network,
+            filesystem_read,
+            filesystem_write,
+            processes,
+            secrets,
+            publication_authority: false,
+        }
+    }
+}
+
 /// Finite host-enforced ceilings for a resolver attempt.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactActionLimitsV1 {
