@@ -4559,11 +4559,15 @@ portability = "host"
         drop(mounted);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn manual_private_output_promotion_is_journaled_and_preserves_private_bytes() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("input.txt"), "promotion input\n").unwrap();
+        let build_command = if cfg!(target_os = "windows") {
+            r#"command = ["cmd.exe", "/D", "/S", "/C", "copy /Y input.txt out\\value.txt >NUL"]"#
+        } else {
+            r#"command = ["cp", "input.txt", "out/value.txt"]"#
+        };
         fs::write(
             workspace.path().join("trail.environment.toml"),
             r#"schema = "trail.environment/v1"
@@ -4580,18 +4584,26 @@ inputs = [{ path = "input.txt" }]
 outputs = [{ name = "result", source = "out", target = ".trail-generated/promotable", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual" }]
 
 [component.build]
-command = ["cp", "input.txt", "out/value.txt"]
+__BUILD_COMMAND__
 network = "deny"
 scripts = "deny"
-"#,
+"#
+            .replace("__BUILD_COMMAND__", build_command),
         )
         .unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "promotion",
             Some("main"),
-            LaneWorkdirMode::NfsCow,
+            mode,
             None,
             None,
             None,
