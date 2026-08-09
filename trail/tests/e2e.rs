@@ -12521,6 +12521,99 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
     );
 }
 
+#[test]
+fn manual_private_output_promotion_uses_native_cli_sandbox_and_preserves_private_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "promotion input\n").unwrap();
+    let build_command = if cfg!(target_os = "windows") {
+        r#"command = ["cmd.exe", "/D", "/S", "/C", "copy /Y input.txt out\\value.txt >NUL"]"#
+    } else {
+        r#"command = ["cp", "input.txt", "out/value.txt"]"#
+    };
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "generated.promotable"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt" }]
+outputs = [{ name = "result", source = "out", target = ".trail-generated/promotable", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual" }]
+
+[component.build]
+__BUILD_COMMAND__
+network = "deny"
+scripts = "deny"
+"#
+        .replace("__BUILD_COMMAND__", build_command),
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
+    } else {
+        LaneWorkdirMode::FuseCow
+    };
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "promotion",
+        Some("main"),
+        mode,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    drop(db);
+
+    let synchronized = run_trail_json(temp.path(), &["env", "sync", "all", "promotion"]);
+    let predecessor = synchronized["generation"]["generation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let db = Trail::open(temp.path()).unwrap();
+    let view = db.lane_workspace_view("promotion").unwrap().unwrap();
+    let private_file =
+        Path::new(&view.generated_upper).join(".trail-generated/promotable/value.txt");
+    fs::write(&private_file, "lane-private promoted bytes\n").unwrap();
+    drop(db);
+
+    let promoted = run_trail_json(
+        temp.path(),
+        &[
+            "env",
+            "promote",
+            "promotion",
+            "generated.promotable",
+            "result",
+        ],
+    );
+    assert_eq!(promoted["phase"], "activated");
+    assert_eq!(promoted["predecessor_generation_id"], predecessor);
+    assert_ne!(
+        promoted["successor_generation_id"],
+        promoted["predecessor_generation_id"]
+    );
+    assert_eq!(
+        fs::read_to_string(&private_file).unwrap(),
+        "lane-private promoted bytes\n"
+    );
+    let storage_path = promoted["layer"]["storage_path"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(Path::new(storage_path).join("value.txt")).unwrap(),
+        "lane-private promoted bytes\n"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn writable_private_environment_sync_has_cli_http_mcp_and_openapi_parity() {

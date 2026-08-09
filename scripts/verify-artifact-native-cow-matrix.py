@@ -47,9 +47,9 @@ COMMON_CHECKS = (
     ),
     (
         "promotion",
-        "lib",
-        "",
-        "manual_private_output_promotion_is_journaled_and_preserves_private_bytes",
+        "integration",
+        "e2e",
+        "manual_private_output_promotion_uses_native_cli_sandbox_and_preserves_private_bytes",
     ),
     (
         "source_export",
