@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::core::backup::publication::{
     atomic_exchange, publish_staged_tree, remove_any, rename_publication_entry,
-    sync_directory_strict,
+    sync_directory_strict, sync_file_for_publication,
 };
 use std::fs::File;
 
@@ -55,10 +55,7 @@ impl RestorePublication {
                 format!("{}\n", DEFAULT_CRABIGNORE_PATTERNS.join("\n")),
             )?;
         }
-        OpenOptions::new()
-            .read(true)
-            .open(&policy_stage)?
-            .sync_all()?;
+        sync_file_for_publication(&policy_stage)?;
         sync_directory_strict(workspace_root)?;
 
         let db_stage_leaf = confined_leaf(db_stage, workspace_root, "restore DB stage")?;
@@ -243,7 +240,7 @@ fn publish_policy_entry(stage: &Path, target: &Path) -> Result<()> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::InvalidInput("restore policy has no parent".into()))?;
-    OpenOptions::new().read(true).open(stage)?.sync_all()?;
+    sync_file_for_publication(stage)?;
     sync_directory_strict(parent)?;
     if target.exists() {
         exchange_required(stage, target, "restore policy publication")?;
@@ -278,7 +275,7 @@ fn write_marker(workspace_root: &Path, marker: &RestoreMarker) -> Result<()> {
     let marker_path = workspace_root.join(RESTORE_MARKER);
     let temporary = workspace_root.join(format!(".{RESTORE_MARKER}.tmp-{}", now_nanos()));
     fs::write(&temporary, serde_json::to_vec(marker)?)?;
-    OpenOptions::new().read(true).open(&temporary)?.sync_all()?;
+    sync_file_for_publication(&temporary)?;
     rename_publication_entry(&temporary, &marker_path)?;
     sync_directory_strict(workspace_root)
 }

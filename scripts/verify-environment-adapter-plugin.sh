@@ -5,6 +5,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
+  # Hosted Linux images mount /tmp with noexec. Trail intentionally executes
+  # a digest-verified staged adapter, so keep disposable workspaces on the
+  # runner's executable job-local volume.
+  TMPDIR="${RUNNER_TEMP}"
+  export TMPDIR
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP}/trail-adapter-plugin-target}"
   export CARGO_TARGET_DIR
   case "${CARGO_TARGET_DIR}" in
@@ -27,7 +32,24 @@ example_dir="${CARGO_TARGET_DIR}/debug/examples"
 root="$(mktemp -d)"
 packages="$(mktemp -d)"
 tool_bin="$(mktemp -d)"
+force_test_mount_cleanup() {
+  local mountpoint="${root}/.trail/worktrees/plugin-mounted-kill"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    /sbin/umount -f "${mountpoint}" >/dev/null 2>&1 || true
+  elif command -v fusermount3 >/dev/null 2>&1; then
+    fusermount3 -uz "${mountpoint}" >/dev/null 2>&1 || true
+  else
+    umount -l "${mountpoint}" >/dev/null 2>&1 || true
+  fi
+}
 cleanup() {
+  cd /
+  if [[ -x "${trail}" && -d "${root}/.trail" ]]; then
+    force_test_mount_cleanup
+    for lane in plugin-mounted-kill plugin-mounted-read plugin-mounted-b plugin-mounted-a plugin-private plugin-b plugin-a; do
+      "${trail}" --workspace "${root}" lane rm "${lane}" --force >/dev/null 2>&1 || true
+    done
+  fi
   chmod -R u+w "${root}" "${packages}" "${tool_bin}" 2>/dev/null || true
   rm -rf "${root}" "${packages}" "${tool_bin}"
 }
@@ -197,6 +219,7 @@ fi
 "${trail}" --workspace "${root}" lane spawn plugin-private --from main --workdir-mode "${mode}" >/dev/null
 "${trail}" --workspace "${root}" lane spawn plugin-mounted-a --from main --workdir-mode "${mode}" >/dev/null
 "${trail}" --workspace "${root}" lane spawn plugin-mounted-b --from main --workdir-mode "${mode}" >/dev/null
+"${trail}" --workspace "${root}" lane spawn plugin-mounted-read --from main --workdir-mode "${mode}" >/dev/null
 "${trail}" --workspace "${root}" lane spawn plugin-mounted-kill --from main --workdir-mode "${mode}" >/dev/null
 
 install_json="$("${trail}" --workspace "${root}" --json env plugin install "${packages}/copy")"
@@ -256,6 +279,7 @@ grep -q '"protocol": "content_store"' <<<"${cache_plan}"
 grep -q '"access": "host_exclusive"' <<<"${cache_plan}"
 cache_a="$("${trail}" --workspace "${root}" --json env sync all plugin-a)"
 cache_b="$("${trail}" --workspace "${root}" --json env sync all plugin-b)"
+cache_a_generation="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"]["generation_id"])' <<<"${cache_a}")"
 cache_a_namespace="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"]["components"][0]["caches"][0]["namespace_id"])' <<<"${cache_a}")"
 cache_b_namespace="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"]["components"][0]["caches"][0]["namespace_id"])' <<<"${cache_b}")"
 test "${cache_a_namespace}" = "${cache_b_namespace}"
@@ -269,8 +293,8 @@ test "$(tr -d '\r\n' <"${root}/.trail/cache/namespaces/${cache_a_namespace}/coun
 assert_fails "plugin cache write unexpectedly escaped its namespace" \
   "${trail}" --workspace "${root}" env sync all plugin-a
 test ! -e "${root}/.trail/cache/namespaces/plugin-cache-escape"
-"${trail}" --workspace "${root}" lane exec plugin-a -- \
-  sh -c 'grep -q "|1$" .trail-generated/plugin-cache/cache-observation.txt'
+cache_a_after_failure="$("${trail}" --workspace "${root}" --json env generation plugin-a)"
+test "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])' <<<"${cache_a_after_failure}")" = "${cache_a_generation}"
 
 "${trail}" --workspace "${root}" env plugin install "${packages}/mounted" >/dev/null
 mounted_catalog="$("${trail}" --workspace "${root}" --json env adapters)"
@@ -283,8 +307,9 @@ if grep -q '"phase": "staging"' <<<"${mounted_plan}"; then
 fi
 mounted_a="$("${trail}" --workspace "${root}" --json env sync all plugin-mounted-a)"
 mounted_b="$("${trail}" --workspace "${root}" --json env sync all plugin-mounted-b)"
-python3 -c 'import json,sys; assert json.load(sys.stdin)["layers"] == []' <<<"${mounted_a}"
-python3 -c 'import json,sys; assert json.load(sys.stdin)["layers"] == []' <<<"${mounted_b}"
+"${trail}" --workspace "${root}" env sync all plugin-mounted-read >/dev/null
+python3 -c 'import json,sys; components=json.load(sys.stdin)["generation"]["components"]; mounted=next(component for component in components if component["component_id"] == "plugin.mounted"); assert mounted["layer_id"] is None and all(output["layer_id"] is None for output in mounted["outputs"])' <<<"${mounted_a}"
+python3 -c 'import json,sys; components=json.load(sys.stdin)["generation"]["components"]; mounted=next(component for component in components if component["component_id"] == "plugin.mounted"); assert mounted["layer_id"] is None and all(output["layer_id"] is None for output in mounted["outputs"])' <<<"${mounted_b}"
 mounted_a_pwd="$("${trail}" --workspace "${root}" lane exec plugin-mounted-a -- pwd | first_line | tr -d '\r')"
 mounted_b_pwd="$("${trail}" --workspace "${root}" lane exec plugin-mounted-b -- pwd | first_line | tr -d '\r')"
 mounted_a_recorded="$("${trail}" --workspace "${root}" lane exec plugin-mounted-a -- sh -c 'cat .trail-generated/plugin-mounted/initialized.txt' | first_line | tr -d '\r')"
@@ -301,25 +326,28 @@ test "${mounted_a_recorded}" != "${mounted_b_recorded}"
   sh -c 'grep -q lane-a-private .trail-generated/plugin-mounted/initialized.txt'
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
   sh -c 'test "$(cat .trail-generated/plugin-mounted/initialized.txt)" != lane-a-private'
+mounted_a_generation="$("${trail}" --workspace "${root}" --json env generation plugin-mounted-a | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')"
 "${trail}" --workspace "${root}" lane exec plugin-mounted-a -- sh -c 'printf fail >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-a -m "fail mounted plugin action" >/dev/null
 assert_fails "failed mounted plugin action unexpectedly activated" \
   "${trail}" --workspace "${root}" env sync all plugin-mounted-a
-"${trail}" --workspace "${root}" lane exec plugin-mounted-a -- \
-  sh -c 'grep -q lane-a-private .trail-generated/plugin-mounted/initialized.txt && test ! -e .trail-generated/plugin-mounted/partial.txt'
+test "$("${trail}" --workspace "${root}" --json env generation plugin-mounted-a | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')" = "${mounted_a_generation}"
+mounted_b_generation="$("${trail}" --workspace "${root}" --json env generation plugin-mounted-b | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')"
 "${trail}" --workspace "${root}" lane exec plugin-mounted-b -- sh -c 'printf source_write >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-b -m "attempt mounted source write" >/dev/null
 assert_fails "mounted plugin source write unexpectedly escaped its declared output" \
   "${trail}" --workspace "${root}" env sync all plugin-mounted-b
-"${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
-  sh -c 'test ! -e source-leak.txt && test -f .trail-generated/plugin-mounted/initialized.txt'
-"${trail}" --workspace "${root}" lane exec plugin-mounted-b -- sh -c 'printf source_read >mounted.adapter'
-"${trail}" --workspace "${root}" lane checkpoint plugin-mounted-b -m "attempt undeclared mounted source read" >/dev/null
+test "$("${trail}" --workspace "${root}" --json env generation plugin-mounted-b | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')" = "${mounted_b_generation}"
+assert_fails "mounted plugin source write leaked into the lane source" \
+  "${trail}" --workspace "${root}" lane read plugin-mounted-b source-leak.txt
+mounted_read_generation="$("${trail}" --workspace "${root}" --json env generation plugin-mounted-read | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')"
+"${trail}" --workspace "${root}" lane exec plugin-mounted-read -- sh -c 'printf source_read >mounted.adapter'
+"${trail}" --workspace "${root}" lane checkpoint plugin-mounted-read -m "attempt undeclared mounted source read" >/dev/null
 assert_fails "mounted plugin undeclared source read unexpectedly succeeded" \
-  "${trail}" --workspace "${root}" env sync all plugin-mounted-b
-"${trail}" --workspace "${root}" lane exec plugin-mounted-b -- \
-  sh -c 'test ! -e .trail-generated/plugin-mounted/leaked.txt && test -f .trail-generated/plugin-mounted/initialized.txt'
+  "${trail}" --workspace "${root}" env sync all plugin-mounted-read
+test "$("${trail}" --workspace "${root}" --json env generation plugin-mounted-read | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')" = "${mounted_read_generation}"
 "${trail}" --workspace "${root}" env sync all plugin-mounted-kill >/dev/null
+mounted_kill_generation="$("${trail}" --workspace "${root}" --json env generation plugin-mounted-kill | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')"
 "${trail}" --workspace "${root}" lane exec plugin-mounted-kill -- \
   sh -c 'printf kill-predecessor >.trail-generated/plugin-mounted/initialized.txt; printf hang >mounted.adapter'
 "${trail}" --workspace "${root}" lane checkpoint plugin-mounted-kill -m "kill active mounted plugin action" >/dev/null
@@ -354,9 +382,9 @@ if kill -0 "${mounted_child_pid}" 2>/dev/null; then
   kill -9 "${mounted_child_pid}" 2>/dev/null || true
   exit 1
 fi
+force_test_mount_cleanup
 "${trail}" --workspace "${root}" env status plugin-mounted-kill >/dev/null
-"${trail}" --workspace "${root}" lane exec plugin-mounted-kill -- \
-  sh -c 'grep -q kill-predecessor .trail-generated/plugin-mounted/initialized.txt && test ! -e .trail-generated/plugin-mounted/partial.txt'
+test "$("${trail}" --workspace "${root}" --json env generation plugin-mounted-kill | python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')" = "${mounted_kill_generation}"
 if find "${root}/.trail/cache/staging" -maxdepth 1 -name 'mounted-environment-*' -print -quit | grep -q .; then
   printf '%s\n' "recovery left an abandoned mounted plugin candidate" >&2
   exit 1
