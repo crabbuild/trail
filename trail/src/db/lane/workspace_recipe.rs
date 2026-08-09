@@ -3256,6 +3256,7 @@ publish = "on_sync"
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn next_and_vite_v2_components_compose_over_node_with_private_framework_state() {
         if !Command::new("npm")

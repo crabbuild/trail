@@ -4390,7 +4390,10 @@ impl Trail {
             .env("HOME", &isolated_home)
             .env("TMPDIR", &isolated_tmp)
             .env("TMP", &isolated_tmp)
-            .env("TEMP", &isolated_tmp);
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
             command
                 .env("TRAIL_WORKSPACE", self.workspace_root())
@@ -4986,7 +4989,10 @@ impl Trail {
             .env("HOME", &isolated_home)
             .env("TMPDIR", &isolated_tmp)
             .env("TMP", &isolated_tmp)
-            .env("TEMP", &isolated_tmp);
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }

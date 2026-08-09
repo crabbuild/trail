@@ -46,7 +46,6 @@ tests=(
   db::lane::workspace_environment::tests::host_resolver_executes_cargo_in_isolated_staging_and_reuses_snapshot
   db::lane::workspace_node::tests::manifest_only_npm_uses_managed_lock_and_preserves_seed_cache_isolation
   db::lane::workspace_cargo::tests::cargo_adapter_builds_once_and_reuses_one_immutable_target_seed
-  db::lane::workspace_recipe::tests::next_and_vite_v2_components_compose_over_node_with_private_framework_state
   db::lane::workspace_python::tests::real_python_venvs_embed_lane_paths_and_remain_isolated
   db::lane::workspace_cmake::tests::real_cmake_configure_build_and_clean_stay_lane_private
   db::lane::workspace_plugin::tests::protocol_v2_bazel_nix_like_stores_remain_metadata_only_after_host_normalization
@@ -57,5 +56,9 @@ tests=(
 for test_name in "${tests[@]}"; do
   cargo test -p trail --lib "${test_name}" --locked -- --exact --nocapture
 done
+
+cargo test -p trail --test e2e \
+  next_and_vite_v2_components_compose_through_native_cli_sandbox \
+  --locked -- --exact --nocapture
 
 printf '%s\n' 'artifact real-tool gates: passed'
