@@ -425,6 +425,12 @@ review-data/review/changes/file/report/focus dashboards, lanes, lane
 review packets, sessions, turns, conflicts, approvals, run states, and trace
 spans.
 
+`completion/complete` supplies sorted, bounded candidates for `artifact_id`
+and `quarantine_id` on those two templates. Candidates come from durable local
+envelope/quarantine rows and use the same prefix-first, substring-second,
+100-value limit as other Trail resource completions. An empty workspace returns
+an empty completion, not an unknown-template error.
+
 ## Code Facts Used
 
 - Tools: `trail/src/mcp/tools`

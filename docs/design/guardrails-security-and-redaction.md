@@ -29,6 +29,27 @@ The safety model is layered:
 7. Redact sensitive metadata before storing trace/guardrail payloads.
 8. Require daemon auth by default.
 
+The common artifact pipeline adds four untrusted boundaries: repository and
+plugin declarations, resolver/constructor subprocesses, candidate filesystem
+trees, and imported attestation metadata. Environment adapters are planners,
+not executors. Trail repeats validation at the host boundary and controls the
+resolved executable, fixed argv, working directory, readable inputs, writable
+candidate/cache/temp roots, network authorities, environment roles, child and
+byte limits, cancellation, capture redaction, and publication decision.
+
+Discovery never runs repository code or tools. Resolver, constructor,
+validator, and mounted execution capabilities are separate and deny by default.
+Repository v2 and adapter v3 requests may narrow a certified profile but cannot
+widen it. V1/v2 adapters keep their legacy authority and cannot obtain v3
+resolution, source-export, or attestation privileges through omitted fields.
+
+Secret bytes are never key material. A phase that receives a secret is tainted;
+its output must remain lane private and cannot enter shared CAS, a reusable
+materialization, an attestation, or a source export. Candidate ingestion also
+rejects credential-like content, protected paths, escaping links, special
+files, unsafe modes/xattrs, case collisions, concurrent mutation, and declared
+entry/byte/depth limit violations before publishing an envelope.
+
 ```mermaid
 flowchart TB
     Input["User, agent, CLI, HTTP, or MCP request"]
@@ -266,6 +287,14 @@ CLI daemon routing can read the token from `--daemon-token`, `TRAIL_DAEMON_TOKEN
 - Guardrail blocked decision: returned in report; callers decide whether to proceed.
 - Unauthorized daemon request: HTTP 401 and daemon exit code category 11.
 - Patch rejected: `PATCH_REJECTED`, exit 7.
+- Missing capability enforcement rejects the action; it does not silently run
+  an untrusted resolver or constructor unsandboxed.
+- Secret-tainted output remains private and non-promotable even when its content
+  would otherwise match a shared desired key.
+- Divergent ready content for one desired key and trust scope quarantines both
+  claims and retains immutable evidence until explicit resolution.
+- Stale source, snapshot, desired, validation, destination, or authorization
+  pins reject promotion/source export before ordinary source mutation.
 
 ## Code Facts Used
 

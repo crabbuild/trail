@@ -101,6 +101,74 @@ Use a separate component for each ownership policy. A shared immutable SDK, a
 seeded consumer-mutable dependency tree, a persistent private build tree, and
 disposable test scratch must not be collapsed into one live mutable directory.
 
+## Next.js and Vite composition with repository v2
+
+Frameworks compose over dependency components; framework names do not receive
+special sharing authority. This tested `trail.environment/v2` shape keeps
+Next.js state private while allowing a validated Vite distribution to be
+shared. Built-in Node discovery supplies the `node` dependency component.
+
+```toml
+schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "web.next-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "next-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "next-state", source = "next-output", target = ".next", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "next-source.js", "next-output/server.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "web.vite-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "dist", source = "dist", target = "dist", policy = "immutable_shared", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "vite-source.js", "dist/app.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dist-path-contract"
+kind = "path_contract"
+path = "dist"
+required = true
+parameters = { maximum_entries = "1000" }
+```
+
+Create the two declared input files, record them, then verify the graph and
+execute the exact component closure:
+
+```sh
+trail lane spawn web-a --from main
+trail env discover web-a
+trail env graph web-a
+trail env plan web-a --component web.vite-build
+trail env sync component web.vite-build --lane web-a
+trail lane exec web-a -- test -f dist/app.js
+trail lane spawn web-b --from web-a
+trail lane exec web-b -- test -f dist/app.js
+```
+
+Both lanes can attach the Vite content root. Their `.next`, `.vite`, incremental
+compiler, and daemon state remains in fresh lane-private uppers. If generated
+client code must become source, add a `[[component.source_export]]` declaration
+and invoke `trail env source export`; do not point a shared output directly into
+the repository tree.
+
 Every key includes adapter provenance, declared byte/Merkle identities (or the
 complete source root when closure is not certified), identity-bearing upstream
 keys, argv/cwd, tools, identity environment, output policy, platform,

@@ -2415,6 +2415,16 @@ impl Trail {
         })
     }
 
+    pub(crate) fn artifact_envelope_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT envelope_id FROM artifact_envelopes ORDER BY envelope_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
     /// Traverse the durable object graph reachable from one artifact envelope.
     /// The report is a bounded summary; object identifiers remain private storage
     /// details and are not expanded into an unbounded public payload.
@@ -7392,6 +7402,10 @@ mod tests {
             .put_artifact_envelope_under_write_lock(envelope(first_tree.clone()))
             .unwrap();
         assert!(!first_quarantined);
+        assert_eq!(
+            db.artifact_envelope_ids().unwrap(),
+            vec![first_envelope.0.clone()]
+        );
         db.verify_ready_artifact_envelope_under_write_lock(&first_envelope, &first_tree)
             .unwrap();
         let inspection = db.inspect_artifact(&first_envelope).unwrap();

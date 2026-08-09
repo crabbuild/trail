@@ -112,10 +112,10 @@
 
 ## 12. Documentation, Compatibility, and Completion Gates
 
-- [ ] 12.1 Update README and first-lane workflow with source, resolution snapshot, desired key, content root, artifact envelope, materialization, private upper, promotion, and source-export semantics
-- [ ] 12.2 Update architecture, data model, universal environments, adapter contract, layered workspaces, storage/indexing, guardrail/security, cache/GC, and performance documents to match implementation
-- [ ] 12.3 Update `trail.environment/v2`, SDK v3, CLI, HTTP, MCP, troubleshooting, doctor/fsck/backup/restore, native prerequisites, and framework composition guidance with executable examples
-- [ ] 12.4 Update `CHANGELOG.md`, configuration/completions, protocol compatibility, schema-v1 backup/reinitialization, rollback, and release-evidence policy
+- [x] 12.1 Update README and first-lane workflow with source, resolution snapshot, desired key, content root, artifact envelope, materialization, private upper, promotion, and source-export semantics
+- [x] 12.2 Update architecture, data model, universal environments, adapter contract, layered workspaces, storage/indexing, guardrail/security, cache/GC, and performance documents to match implementation
+- [x] 12.3 Update `trail.environment/v2`, SDK v3, CLI, HTTP, MCP, troubleshooting, doctor/fsck/backup/restore, native prerequisites, and framework composition guidance with executable examples
+- [x] 12.4 Update `CHANGELOG.md`, configuration/completions, protocol compatibility, schema-v1 backup/reinitialization, rollback, and release-evidence policy
 - [ ] 12.5 Run `cargo fmt --all -- --check`, workspace check/test, and Clippy with `--locked`, applicable features, and the checkout-specific external `CARGO_TARGET_DIR`
 - [ ] 12.6 Run schema-v1, storage/rebuild/backup/restore, managed execution, environment/inheritance/retirement, CLI/terminal, HTTP/MCP, SDK, changed-path, and applicable native gates
 - [ ] 12.7 Run critical construction, quarantine, publication, activation, and GC tests with both `RUST_TEST_THREADS=1` and the default scheduler

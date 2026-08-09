@@ -31,6 +31,17 @@ Use `trail config list`, `get`, and `set` to inspect and edit workspace config.
 | `lane.max_trace_payload_bytes` | u64 | no | Unsigned integer, zero disables the limit. |
 | `lane.worktrees_dir` | path | no | Relative path normalized inside workspace. |
 | `lane.merge_strategy` | string | no | `conservative`. |
+| `workspace_views.upper_logical_bytes` | u64 | no | Per-view upper logical-byte limit; zero disables. |
+| `workspace_views.upper_file_count` | u64 | no | Per-view upper file-count limit; zero disables. |
+| `workspace_views.single_file_bytes` | u64 | no | Per-file upper limit; zero disables. |
+| `workspace_views.journal_bytes` | u64 | no | Mutation-journal byte limit; zero disables. |
+| `workspace_views.cache_build_bytes` | u64 | no | Per-construction candidate-byte limit; zero disables. |
+| `workspace_views.concurrent_cache_builders` | u64 | no | Maximum concurrent builders; must be greater than zero. |
+| `workspace_views.cache_retention_secs` | u64 | no | Minimum unreferenced materialization retention; zero allowed. |
+| `workspace_views.cache_max_bytes` | u64 | no | Cache pressure ceiling; zero disables. |
+| `workspace_views.cache_min_free_bytes` | u64 | no | Minimum filesystem free-space reserve; zero disables. |
+| `workspace_views.prefetch_max_bytes` | u64 | no | Authenticated hot-set read ceiling; zero disables. |
+| `workspace_views.prefetch_max_entries` | u64 | no | Authenticated hot-set entry ceiling; zero disables. |
 | `git.export_trailers` | bool | no | Boolean parser values. |
 | `guardrails.policy` | policy | no | `decision:scope:pattern` rules. |
 
@@ -101,6 +112,15 @@ trail config set lane.max_patch_file_bytes 262144
 trail config set lane.max_event_payload_bytes 65536
 trail config set lane.max_trace_payload_bytes 65536
 ```
+
+## Workspace Artifact Limits
+
+The `workspace_views.*` keys bound private uppers, mutation journals,
+construction candidates, verified materialization cache pressure, and advisory
+hot-set reads. They do not change desired keys or grant publication authority.
+Reaching a limit is an explicit error; it is not reported as an empty artifact
+or successful cache hit. Prefetch warms the operating-system page cache and
+does not create correctness-bearing bytes.
 
 ## Guardrail Policy Grammar
 

@@ -7,6 +7,14 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added deterministic 10k/100k/1M artifact and source scale matrices for
+  1/5/20 lanes, fail-closed JSON evidence validation, and compositional
+  owning-host NFS/FUSE/Dokan qualification that distinguishes mounted backend
+  behavior from shared CAS lifecycle checks and leaves unavailable platforms
+  explicitly unverified.
+- MCP resource completion now returns bounded artifact-envelope and quarantine
+  identities for the artifact resource templates.
+
 - Added one behavior-based artifact conformance fixture for reviewed built-ins, local
   protocol-v3 plugins, and repository-v2 producers, plus a deterministic evidence-only
   JSON certification report covering discovery through last-reference collection.

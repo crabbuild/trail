@@ -15052,6 +15052,32 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .iter()
         .any(|value| value.as_str() == Some("main")));
 
+    for (uri, argument) in [
+        ("trail://workspace/artifacts/{artifact_id}", "artifact_id"),
+        (
+            "trail://workspace/artifact-quarantines/{quarantine_id}",
+            "quarantine_id",
+        ),
+    ] {
+        let completion = trail::mcp::handle_json_rpc(
+            &mut db,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 180,
+                "method": "completion/complete",
+                "params": {
+                    "ref": { "type": "ref/resource", "uri": uri },
+                    "argument": { "name": argument, "value": "" }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            completion["result"]["completion"]["values"],
+            serde_json::json!([])
+        );
+    }
+
     let agent_selector_completion = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
