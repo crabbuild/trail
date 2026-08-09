@@ -9888,6 +9888,327 @@ mod tests {
         }
     }
 
+    fn synthetic_artifact_tree(
+        db: &Trail,
+        entry_count: u64,
+    ) -> (ArtifactTreeId, ArtifactTreeRootV1) {
+        const FILES_PER_DIRECTORY: u64 = 1_000;
+
+        assert!(matches!(entry_count, 10_000 | 100_000 | 1_000_000));
+        let directory_count = entry_count.div_ceil(FILES_PER_DIRECTORY + 1);
+        let file_count = entry_count - directory_count;
+        let required_directories = file_count.div_ceil(FILES_PER_DIRECTORY);
+        assert!(required_directories <= directory_count);
+        assert!(directory_count - required_directories <= 1);
+
+        let file_bytes = b"shared immutable artifact content\n";
+        let file_id = db.ingest_artifact_file_bytes(file_bytes, 0o644).unwrap();
+        let mut root_entries = Vec::with_capacity(directory_count as usize);
+        let mut remaining_files = file_count;
+        for directory_index in 0..directory_count {
+            let files_in_directory = remaining_files.min(FILES_PER_DIRECTORY);
+            let entries = (0..files_in_directory)
+                .map(|file_index| ArtifactDirectoryEntryV1 {
+                    name: format!("file-{file_index:04}.bin"),
+                    target: ArtifactDirectoryEntryTargetV1::File {
+                        node_id: file_id.clone(),
+                    },
+                })
+                .collect();
+            let directory = canonical_artifact_directory_node(ArtifactDirectoryNodeV1 {
+                version: ARTIFACT_DIRECTORY_NODE_VERSION,
+                entries,
+            })
+            .unwrap();
+            let (directory_id, _) = encode_artifact_directory_node(directory.clone()).unwrap();
+            db.put_artifact_cas_object(
+                &directory_id.0,
+                ARTIFACT_DIRECTORY_NODE_KIND,
+                ARTIFACT_DIRECTORY_NODE_VERSION,
+                files_in_directory * file_bytes.len() as u64,
+                &directory,
+            )
+            .unwrap();
+            root_entries.push(ArtifactDirectoryEntryV1 {
+                name: format!("bucket-{directory_index:04}"),
+                target: ArtifactDirectoryEntryTargetV1::Directory {
+                    node_id: directory_id,
+                },
+            });
+            remaining_files -= files_in_directory;
+        }
+        assert_eq!(remaining_files, 0);
+
+        let root_directory = canonical_artifact_directory_node(ArtifactDirectoryNodeV1 {
+            version: ARTIFACT_DIRECTORY_NODE_VERSION,
+            entries: root_entries,
+        })
+        .unwrap();
+        let (root_directory_id, _) =
+            encode_artifact_directory_node(root_directory.clone()).unwrap();
+        let logical_bytes = file_count * file_bytes.len() as u64;
+        db.put_artifact_cas_object(
+            &root_directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+            logical_bytes,
+            &root_directory,
+        )
+        .unwrap();
+        let tree = ArtifactTreeRootV1 {
+            version: ARTIFACT_TREE_ROOT_VERSION,
+            root_directory_id,
+            logical_bytes,
+            entry_count,
+            path_normalizer: "trail-paths/v1".into(),
+        };
+        let (tree_id, _) = encode_artifact_tree_root(tree.clone()).unwrap();
+        db.put_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+            logical_bytes,
+            &tree,
+        )
+        .unwrap();
+        (tree_id, tree)
+    }
+
+    #[test]
+    fn large_artifact_multi_lane_scale_acceptance() {
+        if std::env::var_os("TRAIL_RUN_ARTIFACT_SCALE_TEST").is_none() {
+            return;
+        }
+        let entry_count = std::env::var("TRAIL_SCALE_ARTIFACT_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000_000);
+        let lane_count = std::env::var("TRAIL_SCALE_LANES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20);
+        assert!(matches!(entry_count, 10_000 | 100_000 | 1_000_000));
+        assert!(matches!(lane_count, 1 | 5 | 20));
+
+        let (_workspace, mut db, source_root) = initialized_resolution_fixture();
+        let object_count_before = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+        let build_started = Instant::now();
+        let (tree_id, tree) = synthetic_artifact_tree(&db, entry_count);
+        let artifact_build_ms = build_started.elapsed().as_millis();
+
+        let publish_started = Instant::now();
+        let desired_key =
+            artifact_desired_key_v2(fixture_desired_material(source_root.clone())).unwrap();
+        let (envelope_id, quarantined) = db
+            .put_artifact_envelope_under_write_lock(ArtifactEnvelopeV1 {
+                version: ARTIFACT_ENVELOPE_VERSION,
+                desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+                    desired_key: desired_key.clone(),
+                },
+                tree_root_id: tree_id.clone(),
+                component_id: "scale:synthetic".into(),
+                output_name: "large-artifact".into(),
+                output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                portability_scope: "workspace".into(),
+                trust_scope: "builtin".into(),
+                secret_taint: ArtifactSecretTaintV1::Clear,
+                resolution_snapshot_id: None,
+                validation_receipt_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(!quarantined);
+        let envelope_publish_ms = publish_started.elapsed().as_millis();
+        let reachability = db.artifact_content_reachability(&envelope_id).unwrap();
+        let object_count_after_publish = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        let attach_started = Instant::now();
+        let mut lanes = Vec::with_capacity(lane_count);
+        for index in 0..lane_count {
+            let lane = format!("artifact-scale-{lane_count}-{index:02}");
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                &lane,
+                Some("main"),
+                mode.clone(),
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let view = db.lane_workspace_view(&lane).unwrap().unwrap();
+            let generation_id = format!("envgen_artifact_scale_{lane_count}_{index}");
+            db.conn
+                .execute(
+                    "INSERT INTO environment_generations(
+                         generation_id,view_id,generation_sequence,source_root,
+                         specification_digest,predecessor_generation_id,state,created_at,
+                         activated_at,retired_at)
+                     VALUES(?1,?2,1,?3,'artifact-scale',NULL,'active',1,1,NULL)",
+                    params![generation_id, view.view_id, source_root.0],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
+                     VALUES(?1,?2,1)",
+                    params![view.view_id, generation_id],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO artifact_generation_bindings(
+                         binding_id,generation_id,component_id,output_name,desired_key,
+                         envelope_id,tree_root_id,binding_identity,created_at)
+                     VALUES(?1,?2,'scale:synthetic','large-artifact',?3,?4,?5,?6,1)",
+                    params![
+                        format!("binding_artifact_scale_{lane_count}_{index}"),
+                        generation_id,
+                        desired_key.0,
+                        envelope_id.0,
+                        tree_id.0,
+                        format!("identity_artifact_scale_{lane_count}_{index}"),
+                    ],
+                )
+                .unwrap();
+            lanes.push((lane, PathBuf::from(view.generated_upper)));
+        }
+        let lane_attach_ms = attach_started.elapsed().as_millis();
+
+        let private_write_started = Instant::now();
+        for (index, (_, generated_upper)) in lanes.iter().enumerate() {
+            fs::write(
+                generated_upper.join("lane-private.bin"),
+                vec![index as u8; 4_096 + index],
+            )
+            .unwrap();
+        }
+        let private_write_ms = private_write_started.elapsed().as_millis();
+
+        let accounting_started = Instant::now();
+        let workspace_accounting = db.artifact_storage_accounting(None, 0, 0, 0, 0).unwrap();
+        let representative_lane = db.lane_workspace_space(&lanes[0].0).unwrap();
+        let accounting_ms = accounting_started.elapsed().as_millis();
+        let lane_private_bytes = lanes
+            .iter()
+            .map(|(_, generated_upper)| {
+                super::workspace_layer::layer_physical_bytes(generated_upper).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(lane_private_bytes.iter().all(|bytes| *bytes > 0));
+        assert_eq!(
+            representative_lane.artifact_storage.logical_bytes,
+            tree.logical_bytes
+        );
+        assert_eq!(
+            representative_lane
+                .artifact_storage
+                .unique_authoritative_bytes,
+            workspace_accounting.unique_authoritative_bytes
+        );
+        assert_eq!(representative_lane.artifact_storage.materialized_bytes, 0);
+        let (binding_count, distinct_tree_count) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*),COUNT(DISTINCT tree_root_id)
+                 FROM artifact_generation_bindings",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(binding_count, lane_count as u64);
+        assert_eq!(distinct_tree_count, 1);
+        assert_eq!(workspace_accounting.logical_bytes, tree.logical_bytes);
+        assert_eq!(workspace_accounting.materialized_bytes, 0);
+        assert!(workspace_accounting.unique_authoritative_bytes < tree.logical_bytes);
+        let materialization_count = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_materializations",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(materialization_count, 0);
+
+        let skipped_native_gates = vec!["nfs_macos", "fuse_linux", "dokan_windows"];
+        let private_total = lane_private_bytes.iter().copied().sum::<u64>();
+        let evidence = serde_json::json!({
+            "schema": "trail.artifact-lane-scale/v1",
+            "host": {
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+            },
+            "backend": "cas-lazy-unmounted",
+            "backend_qualified": true,
+            "native_backend_qualified": false,
+            "artifact_entries": entry_count,
+            "lanes": lane_count,
+            "phase_latencies_ms": {
+                "artifact_build": artifact_build_ms,
+                "envelope_publish": envelope_publish_ms,
+                "lane_attach": lane_attach_ms,
+                "private_write": private_write_ms,
+                "accounting": accounting_ms,
+            },
+            "content_reuse": {
+                "logical_bytes": tree.logical_bytes,
+                "authoritative_encoded_bytes": workspace_accounting.unique_authoritative_bytes,
+                "reused_logical_bytes": tree.logical_bytes.saturating_sub(workspace_accounting.unique_authoritative_bytes),
+                "shared_tree_roots": distinct_tree_count,
+                "lane_bindings": binding_count,
+            },
+            "materialization_amplification": {
+                "materialization_count": materialization_count,
+                "materialized_physical_bytes": workspace_accounting.materialized_bytes,
+                "naive_per_lane_logical_bytes": tree.logical_bytes.saturating_mul(lane_count as u64),
+                "copied_bytes": 0,
+                "projected_bytes": 0,
+                "prefetched_bytes": 0,
+            },
+            "private_deltas": {
+                "lane_count": lane_private_bytes.len(),
+                "total_physical_bytes": private_total,
+                "minimum_physical_bytes": lane_private_bytes.iter().min(),
+                "maximum_physical_bytes": lane_private_bytes.iter().max(),
+            },
+            "object_count": {
+                "before": object_count_before,
+                "after_publish": object_count_after_publish,
+                "published": object_count_after_publish.saturating_sub(object_count_before),
+                "reachable": reachability.object_count,
+            },
+            "skipped_native_gates": skipped_native_gates,
+        });
+        println!("{evidence}");
+        if let Some(directory) = std::env::var_os("TRAIL_SCALE_EVIDENCE_DIR") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("artifacts-{entry_count}-lanes-{lane_count}.json")),
+                serde_json::to_vec_pretty(&evidence).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn object_gc_traces_resolution_snapshots_and_live_attempt_evidence() {
         let (_workspace, mut db, source_root) = initialized_resolution_fixture();

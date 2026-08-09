@@ -231,8 +231,21 @@ jobs:
   million-path-scale:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_scale }}
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /Volumes/Workspace/crabbuild-target/trail-layered-scale
+      TRAIL_SCALE_EVIDENCE_DIR: /Volumes/Workspace/trail-layered-scale-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Prepare isolated scale storage
+        run: |
+          sudo mkdir -p "$CARGO_TARGET_DIR" "$TRAIL_SCALE_EVIDENCE_DIR"
+          sudo chown -R "$(id -u):$(id -g)" /Volumes/Workspace
       - run: scripts/verify-layered-lane-scale.sh
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: layered-lane-scale-evidence
+          path: /Volumes/Workspace/trail-layered-scale-evidence
+          if-no-files-found: error

@@ -20,7 +20,13 @@ for experiment in "10000 1" "100000 5" "1000000 20"; do
   TRAIL_SCALE_PATHS="$paths" \
   TRAIL_SCALE_LANES="$lanes" \
     cargo test -p trail --lib large_path_multi_view_scale_acceptance --locked -- --nocapture
+  TRAIL_RUN_ARTIFACT_SCALE_TEST=1 \
+  TRAIL_SCALE_ARTIFACT_ENTRIES="$paths" \
+  TRAIL_SCALE_LANES="$lanes" \
+    cargo test -p trail --lib large_artifact_multi_lane_scale_acceptance --locked -- --nocapture
 done
+
+python3 scripts/check-layered-lane-scale-evidence.py "$TRAIL_SCALE_EVIDENCE_DIR"
 
 # Complement the path/lane matrix with the correctness experiments whose
 # runtime is independent of synthetic path count. These cover reusable
