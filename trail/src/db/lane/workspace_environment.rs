@@ -7,6 +7,12 @@ use std::ffi::OsString;
 use std::process::Stdio;
 use std::thread;
 
+const MAX_ENVIRONMENT_PROPOSALS: usize = 100_000;
+const MAX_ENVIRONMENT_PROPOSAL_REASONS: usize = 16;
+const MAX_ENVIRONMENT_RECOVERY_ACTIONS: usize = 16;
+const MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES: usize = 4 * 1024;
+const MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS: usize = 64;
+
 /// One repository file that the host projects into an adapter-owned staging
 /// directory. Adapters describe the mapping; they never receive writable
 /// access to the lane source view.
@@ -416,6 +422,37 @@ pub(crate) struct WorkspaceEnvironmentAdapterMetadata {
     pub(crate) description: &'static str,
 }
 
+/// Side-effect-free adapter result for a recognized component root. Planning
+/// and resolution stay separate so discovery can report incomplete framework
+/// state without invoking ecosystem tooling.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceEnvironmentAdapterProposal {
+    pub(crate) status: EnvironmentComponentProposalStatus,
+    pub(crate) reasons: Vec<EnvironmentProposalReasonReport>,
+    pub(crate) recovery_actions: Vec<EnvironmentRecoveryActionReport>,
+}
+
+impl WorkspaceEnvironmentAdapterProposal {
+    pub(crate) fn ready() -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Ready,
+            reasons: Vec::new(),
+            recovery_actions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn blocked(
+        reason: EnvironmentProposalReasonReport,
+        recovery_action: EnvironmentRecoveryActionReport,
+    ) -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Blocked,
+            reasons: vec![reason],
+            recovery_actions: vec![recovery_action],
+        }
+    }
+}
+
 /// Ecosystem code is restricted to discovery and deterministic planning.
 /// Trail remains responsible for executing, validating, publishing, binding,
 /// persisting, and reporting the resulting environment.
@@ -444,6 +481,17 @@ pub(crate) trait WorkspaceEnvironmentAdapter: Sync {
     fn component_id(&self, component_root: &str) -> Result<String>;
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool>;
+
+    fn propose(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<WorkspaceEnvironmentAdapterProposal>> {
+        Ok(self
+            .detect(db, source_root, component_root)?
+            .then(WorkspaceEnvironmentAdapterProposal::ready))
+    }
 
     fn plan(
         &self,
@@ -831,12 +879,15 @@ impl Trail {
         let mut conflicts = Vec::new();
         for root in roots {
             for adapter in builtin_environment_adapters() {
-                if adapter.detect(self, &head.root_id, &root)? {
+                if let Some(proposal) = adapter.propose(self, &head.root_id, &root)? {
                     components.push(EnvironmentDiscoveredComponentReport {
                         component_id: adapter.component_id(&root)?,
                         component_root: root.clone(),
                         kind: adapter.kind().to_string(),
                         adapter_identity: adapter.identity().to_string(),
+                        status: proposal.status,
+                        reasons: proposal.reasons,
+                        recovery_actions: proposal.recovery_actions,
                     });
                 }
             }
@@ -852,6 +903,12 @@ impl Trail {
             }
         }
         components.extend(self.command_recipe_discovery(&head.root_id, component_root)?);
+        if components.len() > MAX_ENVIRONMENT_PROPOSALS {
+            return Err(Error::InvalidInput(format!(
+                "environment discovery produced {} component proposals; maximum is {MAX_ENVIRONMENT_PROPOSALS}",
+                components.len()
+            )));
+        }
         components.sort_by(|left, right| {
             (
                 &left.component_root,
@@ -864,6 +921,28 @@ impl Trail {
                     &right.adapter_identity,
                 ))
         });
+        let ambiguous_ids = components
+            .iter()
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, component| {
+                *counts.entry(component.component_id.clone()).or_default() += 1;
+                counts
+            })
+            .into_iter()
+            .filter_map(|(component_id, count)| (count > 1).then_some(component_id))
+            .collect::<BTreeSet<_>>();
+        for component in &mut components {
+            if ambiguous_ids.contains(&component.component_id) {
+                component.status = EnvironmentComponentProposalStatus::Ambiguous;
+                component.reasons.push(EnvironmentProposalReasonReport {
+                    code: "component_identity_conflict".to_string(),
+                    message: format!(
+                        "multiple adapters proposed logical component `{}`",
+                        component.component_id
+                    ),
+                });
+            }
+            normalize_environment_component_proposal(component)?;
+        }
         for duplicate in components.windows(2) {
             if duplicate[0].component_id == duplicate[1].component_id {
                 conflicts.push(EnvironmentDiscoveryConflictReport {
@@ -5073,6 +5152,81 @@ impl Trail {
     }
 }
 
+fn normalize_environment_component_proposal(
+    component: &mut EnvironmentDiscoveredComponentReport,
+) -> Result<()> {
+    if component.reasons.len() > MAX_ENVIRONMENT_PROPOSAL_REASONS {
+        return Err(Error::InvalidInput(format!(
+            "environment component `{}` has {} proposal reasons; maximum is {MAX_ENVIRONMENT_PROPOSAL_REASONS}",
+            component.component_id,
+            component.reasons.len()
+        )));
+    }
+    if component.recovery_actions.len() > MAX_ENVIRONMENT_RECOVERY_ACTIONS {
+        return Err(Error::InvalidInput(format!(
+            "environment component `{}` has {} recovery actions; maximum is {MAX_ENVIRONMENT_RECOVERY_ACTIONS}",
+            component.component_id,
+            component.recovery_actions.len()
+        )));
+    }
+    for reason in &component.reasons {
+        validate_environment_proposal_token(&reason.code, "reason code")?;
+        validate_environment_proposal_text(&reason.message, "reason message")?;
+    }
+    for action in &component.recovery_actions {
+        validate_environment_proposal_token(&action.code, "recovery action code")?;
+        validate_environment_proposal_text(&action.description, "recovery action description")?;
+        if let Some(command) = &action.command {
+            if command.is_empty() || command.len() > MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS {
+                return Err(Error::InvalidInput(format!(
+                    "environment recovery action `{}` command must contain between 1 and {MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS} arguments",
+                    action.code
+                )));
+            }
+            for argument in command {
+                validate_environment_proposal_text(argument, "recovery command argument")?;
+            }
+        }
+    }
+    component
+        .reasons
+        .sort_by(|left, right| (&left.code, &left.message).cmp(&(&right.code, &right.message)));
+    component.recovery_actions.sort_by(|left, right| {
+        (&left.code, &left.description, &left.command).cmp(&(
+            &right.code,
+            &right.description,
+            &right.command,
+        ))
+    });
+    Ok(())
+}
+
+fn validate_environment_proposal_token(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment proposal {field} `{value}` is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_environment_proposal_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES
+        || value.chars().any(|character| character == '\0')
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment proposal {field} is empty, oversized, or contains NUL"
+        )));
+    }
+    Ok(())
+}
+
 fn run_supervised_mounted_plugin_process(
     command: &mut Command,
 ) -> Result<std::process::ExitStatus> {
@@ -7457,6 +7611,102 @@ mod tests {
             .run_workspace_environment_command(&plan, &command, build.path())
             .unwrap_err();
         assert!(error.to_string().contains("changed after"));
+    }
+
+    #[test]
+    fn component_proposal_evidence_is_sorted_and_bounded() {
+        let mut proposal = EnvironmentDiscoveredComponentReport {
+            component_id: "component".to_string(),
+            component_root: String::new(),
+            kind: "dependency".to_string(),
+            adapter_identity: "test/adapter@1".to_string(),
+            status: EnvironmentComponentProposalStatus::Blocked,
+            reasons: vec![
+                EnvironmentProposalReasonReport {
+                    code: "z_reason".to_string(),
+                    message: "last".to_string(),
+                },
+                EnvironmentProposalReasonReport {
+                    code: "a_reason".to_string(),
+                    message: "first".to_string(),
+                },
+            ],
+            recovery_actions: vec![
+                EnvironmentRecoveryActionReport {
+                    code: "z_action".to_string(),
+                    description: "last".to_string(),
+                    command: None,
+                },
+                EnvironmentRecoveryActionReport {
+                    code: "a_action".to_string(),
+                    description: "first".to_string(),
+                    command: Some(vec!["trail".to_string(), "env".to_string()]),
+                },
+            ],
+        };
+        normalize_environment_component_proposal(&mut proposal).unwrap();
+        assert_eq!(proposal.reasons[0].code, "a_reason");
+        assert_eq!(proposal.recovery_actions[0].code, "a_action");
+
+        proposal.reasons[0].message = "x".repeat(MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES + 1);
+        let error = normalize_environment_component_proposal(&mut proposal).unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+    }
+
+    #[test]
+    fn manifest_only_cargo_and_node_components_are_reported_without_resolution_side_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"manifest-only\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"manifest-only","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "manifest-only",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let discovery = db
+            .discover_workspace_environment("manifest-only", None)
+            .unwrap();
+        assert!(discovery.conflicts.is_empty());
+        assert_eq!(discovery.components.len(), 2);
+        for component in &discovery.components {
+            assert_eq!(
+                component.status,
+                EnvironmentComponentProposalStatus::Blocked
+            );
+            assert_eq!(component.reasons.len(), 1);
+            assert_eq!(component.reasons[0].code, "resolution_snapshot_missing");
+            assert_eq!(component.recovery_actions.len(), 1);
+            assert!(component.recovery_actions[0].command.is_none());
+        }
+        assert!(!workspace.path().join("Cargo.lock").exists());
+        assert!(!workspace.path().join("package-lock.json").exists());
+        assert!(!workspace.path().join("pnpm-lock.yaml").exists());
+        assert!(!workspace.path().join("yarn.lock").exists());
+        assert!(!workspace.path().join("bun.lock").exists());
     }
 
     #[test]

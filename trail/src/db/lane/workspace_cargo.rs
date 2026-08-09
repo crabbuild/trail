@@ -1,8 +1,9 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
-    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCacheAccess,
-    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentOutput,
-    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
+    WorkspaceEnvironmentCommand, WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy,
+    WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
 };
 use super::*;
 
@@ -51,6 +52,38 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
             && db
                 .root_file_entry(source_root, &join_repo_path(&root, "Cargo.lock"))?
                 .is_some())
+    }
+
+    fn propose(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<WorkspaceEnvironmentAdapterProposal>> {
+        let root = normalize_component_root(component_root)?;
+        if db
+            .root_file_entry(source_root, &join_repo_path(&root, "Cargo.toml"))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if db
+            .root_file_entry(source_root, &join_repo_path(&root, "Cargo.lock"))?
+            .is_some()
+        {
+            return Ok(Some(WorkspaceEnvironmentAdapterProposal::ready()));
+        }
+        Ok(Some(WorkspaceEnvironmentAdapterProposal::blocked(
+            EnvironmentProposalReasonReport {
+                code: "resolution_snapshot_missing".to_string(),
+                message: "Cargo.toml is present but no Cargo.lock or Trail-managed resolution snapshot is available".to_string(),
+            },
+            EnvironmentRecoveryActionReport {
+                code: "record_cargo_lock".to_string(),
+                description: "Generate and record Cargo.lock, or resolve this component after resolver support is configured".to_string(),
+                command: None,
+            },
+        )))
     }
 
     fn plan(

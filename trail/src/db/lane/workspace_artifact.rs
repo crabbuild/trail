@@ -1,0 +1,3620 @@
+use super::*;
+use crate::ids::{
+    ArtifactBlobId, ArtifactChunkId, ArtifactChunkListId, ArtifactDesiredKeyV2, ArtifactEnvelopeId,
+    ArtifactFileId, ArtifactQuarantineId, ArtifactTreeId,
+};
+
+const MAX_RESOLUTION_INPUTS: usize = 16_384;
+const MAX_RESOLUTION_ARGV: usize = 1_024;
+const MAX_RESOLUTION_AUTHORITIES: usize = 256;
+const MAX_RESOLUTION_CREDENTIAL_HANDLES: usize = 64;
+const MAX_RESOLUTION_ENVIRONMENT_NAMES: usize = 256;
+const MAX_RESOLUTION_VALIDATIONS: usize = 256;
+const MAX_RESOLUTION_TEXT_BYTES: usize = 4 * 1024;
+const ARTIFACT_DESIRED_KEY_MATERIAL_VERSION: u16 = 2;
+const ARTIFACT_WHOLE_BLOB_MAX_BYTES: usize = 1024 * 1024;
+const ARTIFACT_CHUNK_MIN_BYTES: usize = 256 * 1024;
+const ARTIFACT_CHUNK_AVERAGE_BYTES: usize = 1024 * 1024;
+const ARTIFACT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARTIFACT_TREE_ENTRIES: u64 = 1_000_000;
+const MAX_ARTIFACT_TREE_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_ARTIFACT_TREE_DEPTH: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactFlatEntry {
+    pub(crate) kind: &'static str,
+    pub(crate) mode: u32,
+    pub(crate) size_bytes: u64,
+    pub(crate) content_hash: Option<String>,
+    pub(crate) symlink_target: Option<String>,
+}
+
+impl Trail {
+    fn get_artifact_cas_object<T: serde::de::DeserializeOwned>(
+        &self,
+        artifact_id: &str,
+        kind: &'static str,
+        version: u16,
+    ) -> Result<T> {
+        let (object_id, stored_kind, stored_version) = self.conn.query_row(
+            "SELECT object_id, kind, version FROM artifact_objects WHERE artifact_id=?1",
+            params![artifact_id],
+            |row| {
+                Ok((
+                    ObjectId(row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        if stored_kind != kind || stored_version != i64::from(version) {
+            return Err(Error::Corrupt(format!(
+                "artifact object `{artifact_id}` has kind/version {stored_kind}/{stored_version}, expected {kind}/{version}"
+            )));
+        }
+        self.get_object(kind, &object_id)
+    }
+
+    fn put_artifact_cas_object<T: Serialize>(
+        &self,
+        artifact_id: &str,
+        kind: &'static str,
+        version: u16,
+        logical_bytes: u64,
+        value: &T,
+    ) -> Result<ObjectId> {
+        let canonical_bytes = cbor(value)?;
+        let logical_bytes = i64::try_from(logical_bytes).map_err(|_| {
+            Error::InvalidInput("artifact logical byte count exceeds SQLite range".into())
+        })?;
+        self.conn.execute_batch("SAVEPOINT trail_artifact_object")?;
+        let publication = (|| -> Result<ObjectId> {
+            let object_id = self.put_object(kind, version, value)?;
+            let stored = self.conn.query_row(
+                "SELECT kind, version, bytes FROM objects WHERE object_id=?1",
+                params![object_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )?;
+            if stored.0 != kind || stored.1 != i64::from(version) || stored.2 != canonical_bytes {
+                return Err(Error::Corrupt(format!(
+                    "content-addressed object {} conflicts with artifact `{artifact_id}`",
+                    object_id
+                )));
+            }
+            let existing = self
+                .conn
+                .query_row(
+                    "SELECT object_id, kind, version, logical_bytes
+                     FROM artifact_objects WHERE artifact_id=?1",
+                    params![artifact_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((existing_object, existing_kind, existing_version, existing_bytes)) =
+                existing
+            {
+                if existing_object != object_id.0
+                    || existing_kind != kind
+                    || existing_version != i64::from(version)
+                    || existing_bytes != logical_bytes
+                {
+                    return Err(Error::Corrupt(format!(
+                        "artifact ID `{artifact_id}` resolves to conflicting object evidence"
+                    )));
+                }
+                return Ok(object_id);
+            }
+            self.conn.execute(
+                "INSERT INTO artifact_objects(
+                    artifact_id, object_id, kind, version, logical_bytes, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    artifact_id,
+                    object_id.0,
+                    kind,
+                    i64::from(version),
+                    logical_bytes,
+                    now_ts(),
+                ],
+            )?;
+            Ok(object_id)
+        })();
+        match publication {
+            Ok(object_id) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT trail_artifact_object")?;
+                Ok(object_id)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_artifact_object;
+                     RELEASE SAVEPOINT trail_artifact_object",
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn ingest_artifact_file_bytes(&self, bytes: &[u8], mode: u32) -> Result<ArtifactFileId> {
+        if mode & !0o777 != 0 {
+            return Err(Error::InvalidInput(format!(
+                "artifact file mode {mode:o} contains unsupported bits"
+            )));
+        }
+        validate_artifact_secret_policy(bytes)?;
+        let complete_hash = sha256_hex(bytes);
+        let content = if bytes.len() <= ARTIFACT_WHOLE_BLOB_MAX_BYTES {
+            let blob = ArtifactBlobV1 {
+                version: ARTIFACT_BLOB_VERSION,
+                content_sha256: complete_hash.clone(),
+                bytes: bytes.to_vec(),
+            };
+            let (blob_id, _) = encode_artifact_blob(blob.clone())?;
+            self.put_artifact_cas_object(
+                &blob_id.0,
+                ARTIFACT_BLOB_KIND,
+                ARTIFACT_BLOB_VERSION,
+                bytes.len() as u64,
+                &blob,
+            )?;
+            ArtifactFileContentV1::Blob { blob_id }
+        } else {
+            let mut chunks = Vec::new();
+            for boundary in fastcdc::v2020::FastCDC::new(
+                bytes,
+                ARTIFACT_CHUNK_MIN_BYTES,
+                ARTIFACT_CHUNK_AVERAGE_BYTES,
+                ARTIFACT_CHUNK_MAX_BYTES,
+            ) {
+                let end = boundary
+                    .offset
+                    .checked_add(boundary.length)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("artifact chunk boundary overflow".into())
+                    })?;
+                let chunk_bytes = bytes.get(boundary.offset..end).ok_or_else(|| {
+                    Error::Corrupt("FastCDC returned an out-of-range artifact chunk".into())
+                })?;
+                let chunk = ArtifactChunkV1 {
+                    version: ARTIFACT_CHUNK_VERSION,
+                    content_sha256: sha256_hex(chunk_bytes),
+                    bytes: chunk_bytes.to_vec(),
+                };
+                let (chunk_id, _) = encode_artifact_chunk(chunk.clone())?;
+                self.put_artifact_cas_object(
+                    &chunk_id.0,
+                    ARTIFACT_CHUNK_KIND,
+                    ARTIFACT_CHUNK_VERSION,
+                    chunk_bytes.len() as u64,
+                    &chunk,
+                )?;
+                chunks.push(ArtifactChunkRefV1 {
+                    chunk_id,
+                    size_bytes: chunk_bytes.len() as u64,
+                });
+            }
+            let chunk_list = ArtifactChunkListV1 {
+                version: ARTIFACT_CHUNK_LIST_VERSION,
+                algorithm: "fastcdc-v1".into(),
+                file_size_bytes: bytes.len() as u64,
+                file_sha256: complete_hash.clone(),
+                chunks,
+            };
+            let (chunk_list_id, _) = encode_artifact_chunk_list(chunk_list.clone())?;
+            self.put_artifact_cas_object(
+                &chunk_list_id.0,
+                ARTIFACT_CHUNK_LIST_KIND,
+                ARTIFACT_CHUNK_LIST_VERSION,
+                bytes.len() as u64,
+                &chunk_list,
+            )?;
+            ArtifactFileContentV1::Chunks { chunk_list_id }
+        };
+        let file = ArtifactFileNodeV1 {
+            version: ARTIFACT_FILE_NODE_VERSION,
+            mode,
+            executable: mode & 0o111 != 0,
+            size_bytes: bytes.len() as u64,
+            content_sha256: complete_hash,
+            content,
+        };
+        let (file_id, _) = encode_artifact_file_node(file.clone())?;
+        self.put_artifact_cas_object(
+            &file_id.0,
+            ARTIFACT_FILE_NODE_KIND,
+            ARTIFACT_FILE_NODE_VERSION,
+            bytes.len() as u64,
+            &file,
+        )?;
+        Ok(file_id)
+    }
+
+    fn ingest_artifact_file_path(&self, path: &Path, mode: u32) -> Result<ArtifactFileId> {
+        let before = fs::symlink_metadata(path)?;
+        if !before.is_file() {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: "artifact file input changed type during ingestion".into(),
+            });
+        }
+        if before.len() <= ARTIFACT_WHOLE_BLOB_MAX_BYTES as u64 {
+            let bytes = fs::read(path)?;
+            let after = fs::symlink_metadata(path)?;
+            ensure_artifact_file_unchanged(path, &before, &after, bytes.len() as u64)?;
+            return self.ingest_artifact_file_bytes(&bytes, mode);
+        }
+
+        let mut complete_hasher = Sha256::new();
+        let mut chunks = Vec::new();
+        for item in fastcdc::v2020::StreamCDC::new(
+            File::open(path)?,
+            ARTIFACT_CHUNK_MIN_BYTES,
+            ARTIFACT_CHUNK_AVERAGE_BYTES,
+            ARTIFACT_CHUNK_MAX_BYTES,
+        ) {
+            let boundary = item.map_err(|error| {
+                Error::InvalidInput(format!(
+                    "cannot chunk artifact file `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            validate_artifact_secret_policy(&boundary.data)?;
+            complete_hasher.update(&boundary.data);
+            let chunk = ArtifactChunkV1 {
+                version: ARTIFACT_CHUNK_VERSION,
+                content_sha256: sha256_hex(&boundary.data),
+                bytes: boundary.data,
+            };
+            let (chunk_id, _) = encode_artifact_chunk(chunk.clone())?;
+            self.put_artifact_cas_object(
+                &chunk_id.0,
+                ARTIFACT_CHUNK_KIND,
+                ARTIFACT_CHUNK_VERSION,
+                chunk.bytes.len() as u64,
+                &chunk,
+            )?;
+            chunks.push(ArtifactChunkRefV1 {
+                chunk_id,
+                size_bytes: chunk.bytes.len() as u64,
+            });
+        }
+        let after = fs::symlink_metadata(path)?;
+        let streamed_bytes = chunks
+            .iter()
+            .try_fold(0u64, |total, chunk| total.checked_add(chunk.size_bytes));
+        ensure_artifact_file_unchanged(
+            path,
+            &before,
+            &after,
+            streamed_bytes
+                .ok_or_else(|| Error::InvalidInput("artifact file size overflow".into()))?,
+        )?;
+        let complete_hash = hex::encode(complete_hasher.finalize());
+        let chunk_list = ArtifactChunkListV1 {
+            version: ARTIFACT_CHUNK_LIST_VERSION,
+            algorithm: "fastcdc-v1".into(),
+            file_size_bytes: before.len(),
+            file_sha256: complete_hash.clone(),
+            chunks,
+        };
+        let (chunk_list_id, _) = encode_artifact_chunk_list(chunk_list.clone())?;
+        self.put_artifact_cas_object(
+            &chunk_list_id.0,
+            ARTIFACT_CHUNK_LIST_KIND,
+            ARTIFACT_CHUNK_LIST_VERSION,
+            before.len(),
+            &chunk_list,
+        )?;
+        let node = ArtifactFileNodeV1 {
+            version: ARTIFACT_FILE_NODE_VERSION,
+            mode,
+            executable: mode & 0o111 != 0,
+            size_bytes: before.len(),
+            content_sha256: complete_hash,
+            content: ArtifactFileContentV1::Chunks { chunk_list_id },
+        };
+        let (file_id, _) = encode_artifact_file_node(node.clone())?;
+        self.put_artifact_cas_object(
+            &file_id.0,
+            ARTIFACT_FILE_NODE_KIND,
+            ARTIFACT_FILE_NODE_VERSION,
+            before.len(),
+            &node,
+        )?;
+        Ok(file_id)
+    }
+
+    fn ingest_artifact_tree(&self, source: &Path) -> Result<(ArtifactTreeId, ArtifactTreeRootV1)> {
+        let _lock = self.acquire_write_lock()?;
+        self.ingest_artifact_tree_under_write_lock(source)
+    }
+
+    pub(crate) fn ingest_artifact_tree_under_write_lock(
+        &self,
+        source: &Path,
+    ) -> Result<(ArtifactTreeId, ArtifactTreeRootV1)> {
+        let root_before = fs::symlink_metadata(source)?;
+        if root_before.file_type().is_symlink() || !root_before.is_dir() {
+            return Err(Error::InvalidPath {
+                path: source.to_string_lossy().into_owned(),
+                reason: "artifact tree source must be a real directory".into(),
+            });
+        }
+        let mut directories = BTreeMap::<String, Vec<ArtifactDirectoryEntryV1>>::new();
+        directories.insert(String::new(), Vec::new());
+        let mut entry_count = 0u64;
+        let mut logical_bytes = 0u64;
+        let mut case_paths = Vec::new();
+
+        for entry in walkdir::WalkDir::new(source)
+            .follow_links(false)
+            .max_depth(MAX_ARTIFACT_TREE_DEPTH + 1)
+        {
+            let entry = entry.map_err(|error| Error::InvalidInput(error.to_string()))?;
+            if entry.depth() == 0 {
+                continue;
+            }
+            if entry.depth() > MAX_ARTIFACT_TREE_DEPTH {
+                return Err(Error::InvalidInput(format!(
+                    "artifact tree exceeds maximum depth {MAX_ARTIFACT_TREE_DEPTH}"
+                )));
+            }
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidInput("artifact tree entry count overflow".into()))?;
+            if entry_count > MAX_ARTIFACT_TREE_ENTRIES {
+                return Err(Error::InvalidInput(format!(
+                    "artifact tree exceeds {MAX_ARTIFACT_TREE_ENTRIES} entries"
+                )));
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|_| Error::InvalidPath {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    reason: "artifact walk escaped its source root".into(),
+                })?;
+            let relative = relative.to_str().ok_or_else(|| Error::InvalidPath {
+                path: relative.to_string_lossy().into_owned(),
+                reason: "artifact paths must be valid Unicode".into(),
+            })?;
+            let relative = normalize_relative_path(relative)?;
+            case_paths.push(relative.clone());
+            let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
+            validate_artifact_entry_name(name)?;
+            directories.entry(parent.to_string()).or_default();
+            let file_type = entry.file_type();
+            validate_artifact_metadata_policy(entry.path(), &fs::symlink_metadata(entry.path())?)?;
+            if file_type.is_dir() {
+                directories.entry(relative).or_default();
+            } else if file_type.is_file() {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                logical_bytes = logical_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    Error::InvalidInput("artifact tree logical byte count overflow".into())
+                })?;
+                if logical_bytes > MAX_ARTIFACT_TREE_LOGICAL_BYTES {
+                    return Err(Error::InvalidInput(format!(
+                        "artifact tree exceeds {MAX_ARTIFACT_TREE_LOGICAL_BYTES} logical bytes"
+                    )));
+                }
+                let file_id = self.ingest_artifact_file_path(
+                    entry.path(),
+                    normalized_artifact_file_mode(&metadata),
+                )?;
+                directories
+                    .get_mut(parent)
+                    .unwrap()
+                    .push(ArtifactDirectoryEntryV1 {
+                        name: name.to_string(),
+                        target: ArtifactDirectoryEntryTargetV1::File { node_id: file_id },
+                    });
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(entry.path())?;
+                let target = target.to_str().ok_or_else(|| Error::InvalidPath {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    reason: "artifact symlink targets must be valid Unicode".into(),
+                })?;
+                validate_artifact_symlink_within_tree(parent, target)?;
+                directories
+                    .get_mut(parent)
+                    .unwrap()
+                    .push(ArtifactDirectoryEntryV1 {
+                        name: name.to_string(),
+                        target: ArtifactDirectoryEntryTargetV1::Symlink {
+                            target: target.to_string(),
+                        },
+                    });
+            } else {
+                return Err(Error::InvalidPath {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    reason: "artifact trees support only directories, regular files, and confined symlinks".into(),
+                });
+            }
+        }
+        validate_no_case_fold_collisions(&case_paths)?;
+
+        let mut paths = directories.keys().cloned().collect::<Vec<_>>();
+        paths.sort_by(|left, right| {
+            right
+                .split('/')
+                .count()
+                .cmp(&left.split('/').count())
+                .then_with(|| left.cmp(right))
+        });
+        for path in paths.into_iter().filter(|path| !path.is_empty()) {
+            let node = canonical_artifact_directory_node(ArtifactDirectoryNodeV1 {
+                version: ARTIFACT_DIRECTORY_NODE_VERSION,
+                entries: directories.remove(&path).unwrap_or_default(),
+            })?;
+            let (node_id, _) = encode_artifact_directory_node(node.clone())?;
+            self.put_artifact_cas_object(
+                &node_id.0,
+                ARTIFACT_DIRECTORY_NODE_KIND,
+                ARTIFACT_DIRECTORY_NODE_VERSION,
+                0,
+                &node,
+            )?;
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+            directories
+                .get_mut(parent)
+                .unwrap()
+                .push(ArtifactDirectoryEntryV1 {
+                    name: name.to_string(),
+                    target: ArtifactDirectoryEntryTargetV1::Directory { node_id },
+                });
+        }
+        let root_node = canonical_artifact_directory_node(ArtifactDirectoryNodeV1 {
+            version: ARTIFACT_DIRECTORY_NODE_VERSION,
+            entries: directories.remove("").unwrap_or_default(),
+        })?;
+        let (root_directory_id, _) = encode_artifact_directory_node(root_node.clone())?;
+        self.put_artifact_cas_object(
+            &root_directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+            logical_bytes,
+            &root_node,
+        )?;
+        let tree = ArtifactTreeRootV1 {
+            version: ARTIFACT_TREE_ROOT_VERSION,
+            root_directory_id,
+            logical_bytes,
+            entry_count,
+            path_normalizer: "trail-paths/v1".into(),
+        };
+        let (tree_id, _) = encode_artifact_tree_root(tree.clone())?;
+        self.put_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+            logical_bytes,
+            &tree,
+        )?;
+        let root_after = fs::symlink_metadata(source)?;
+        if !same_artifact_metadata(&root_before, &root_after) {
+            return Err(Error::InvalidInput(
+                "artifact tree root changed during ingestion".into(),
+            ));
+        }
+        Ok((tree_id, tree))
+    }
+
+    pub(crate) fn artifact_tree_flat_entries(
+        &self,
+        tree_id: &ArtifactTreeId,
+    ) -> Result<BTreeMap<String, ArtifactFlatEntry>> {
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        let (actual_tree_id, _) = encode_artifact_tree_root(tree.clone())?;
+        if &actual_tree_id != tree_id {
+            return Err(Error::Corrupt(format!(
+                "artifact tree root `{tree_id}` has conflicting encoded identity"
+            )));
+        }
+        let mut entries = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        self.flatten_artifact_directory(
+            &tree.root_directory_id,
+            "",
+            0,
+            &mut visiting,
+            &mut entries,
+        )?;
+        let logical_bytes = entries
+            .values()
+            .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes));
+        if entries.len() as u64 != tree.entry_count || logical_bytes != Some(tree.logical_bytes) {
+            return Err(Error::Corrupt(format!(
+                "artifact tree `{tree_id}` count or logical-byte edge is invalid"
+            )));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn put_legacy_artifact_envelope_under_write_lock(
+        &self,
+        layer_key: &WorkspaceLayerKeyV1,
+        cache_key: &str,
+        tree_root_id: ArtifactTreeId,
+    ) -> Result<ArtifactEnvelopeId> {
+        validate_resolution_text(cache_key, "legacy layer cache key")?;
+        let envelope = ArtifactEnvelopeV1 {
+            version: ARTIFACT_ENVELOPE_VERSION,
+            desired_identity: ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
+                cache_key: cache_key.to_string(),
+                canonical_key: layer_key.clone(),
+            },
+            tree_root_id,
+            component_id: format!("legacy:{}", layer_key.adapter),
+            output_name: "legacy-layer".into(),
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            portability_scope: layer_key.portability_scope.clone(),
+            trust_scope: "workspace-layer-v1".into(),
+            resolution_snapshot_id: None,
+            validation_receipt_ids: Vec::new(),
+        };
+        let (envelope_id, quarantined) = self.put_artifact_envelope_under_write_lock(envelope)?;
+        if quarantined {
+            return Err(Error::InvalidInput(format!(
+                "artifact desired identity `{cache_key}` produced divergent content and was quarantined"
+            )));
+        }
+        Ok(envelope_id)
+    }
+
+    pub(crate) fn put_artifact_envelope_under_write_lock(
+        &self,
+        envelope: ArtifactEnvelopeV1,
+    ) -> Result<(ArtifactEnvelopeId, bool)> {
+        let desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key.clone(),
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => desired_key.0.clone(),
+        };
+        validate_resolution_text(&desired_key, "artifact desired key")?;
+        validate_resolution_text(&envelope.trust_scope, "artifact trust scope")?;
+        let (envelope_id, _) = encode_artifact_envelope(envelope.clone())?;
+        let object_id = self.put_artifact_cas_object(
+            &envelope_id.0,
+            ARTIFACT_ENVELOPE_KIND,
+            ARTIFACT_ENVELOPE_VERSION,
+            0,
+            &envelope,
+        )?;
+        self.conn
+            .execute_batch("SAVEPOINT trail_artifact_envelope")?;
+        let publication = (|| -> Result<bool> {
+            let incumbent = self
+                .conn
+                .query_row(
+                    "SELECT envelope_id,tree_root_id FROM artifact_envelopes
+                     WHERE desired_key=?1 AND trust_scope=?2 AND state='ready'
+                     ORDER BY envelope_id LIMIT 1",
+                    params![desired_key, envelope.trust_scope],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let active_quarantine = self
+                .conn
+                .query_row(
+                    "SELECT quarantine_id FROM artifact_quarantines
+                     WHERE desired_key=?1 AND trust_scope=?2 AND state='active'
+                     ORDER BY quarantine_id LIMIT 1",
+                    params![desired_key, envelope.trust_scope],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let divergent_incumbent = incumbent
+                .as_ref()
+                .filter(|(_, tree_root_id)| tree_root_id != &envelope.tree_root_id.0);
+            let quarantined = active_quarantine.is_some() || divergent_incumbent.is_some();
+            self.conn.execute(
+                "INSERT INTO artifact_envelopes(
+                    envelope_id, desired_key, trust_scope, tree_root_id, object_id, state,
+                    verification_state, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'verified', ?7, ?7)
+                 ON CONFLICT(envelope_id) DO UPDATE SET updated_at=excluded.updated_at",
+                params![
+                    envelope_id.0,
+                    desired_key,
+                    envelope.trust_scope,
+                    envelope.tree_root_id.0,
+                    object_id.0,
+                    if quarantined { "quarantined" } else { "ready" },
+                    now_ts(),
+                ],
+            )?;
+            if let Some((incumbent_id, incumbent_tree_id)) = divergent_incumbent {
+                let incumbent_envelope_id = ArtifactEnvelopeId::parse(incumbent_id.clone())
+                    .map_err(|error| {
+                        Error::Corrupt(format!("invalid incumbent envelope ID: {error}"))
+                    })?;
+                let incumbent_tree_root_id = ArtifactTreeId::parse(incumbent_tree_id.clone())
+                    .map_err(|error| {
+                        Error::Corrupt(format!("invalid incumbent artifact tree ID: {error}"))
+                    })?;
+                let evidence = ArtifactDivergenceEvidenceV1 {
+                    version: ARTIFACT_DIVERGENCE_EVIDENCE_VERSION,
+                    trust_scope: envelope.trust_scope.clone(),
+                    desired_key: desired_key.clone(),
+                    incumbent_envelope_id: incumbent_envelope_id.clone(),
+                    incumbent_tree_root_id,
+                    candidate_envelope_id: envelope_id.clone(),
+                    candidate_tree_root_id: envelope.tree_root_id.clone(),
+                    reason_code: "tree_root_divergence".into(),
+                };
+                let evidence_object = self.put_object(
+                    ARTIFACT_DIVERGENCE_EVIDENCE_KIND,
+                    ARTIFACT_DIVERGENCE_EVIDENCE_VERSION,
+                    &evidence,
+                )?;
+                let quarantine_id = crate::ids::ArtifactQuarantineId::new(&cbor(&evidence)?);
+                self.conn.execute(
+                    "UPDATE artifact_envelopes SET state='quarantined',updated_at=?1
+                     WHERE envelope_id IN (?2,?3)",
+                    params![now_ts(), incumbent_id, envelope_id.0],
+                )?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO artifact_quarantines(
+                        quarantine_id,trust_scope,desired_key,incumbent_envelope_id,
+                        candidate_envelope_id,reason_code,evidence_object_id,state,created_at
+                     ) VALUES(?1,?2,?3,?4,?5,'tree_root_divergence',?6,'active',?7)",
+                    params![
+                        quarantine_id.0,
+                        envelope.trust_scope,
+                        desired_key,
+                        incumbent_id,
+                        envelope_id.0,
+                        evidence_object.0,
+                        now_ts(),
+                    ],
+                )?;
+                for held_envelope in [incumbent_id, &envelope_id.0] {
+                    let hold_id = format!(
+                        "hold_{}",
+                        crate::ids::short_hash(
+                            format!("{}:{held_envelope}", quarantine_id.0).as_bytes(),
+                            32,
+                        )
+                    );
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO artifact_holds(
+                            hold_id,target_kind,target_id,reason,created_at
+                         ) VALUES(?1,'artifact_envelope',?2,?3,?4)",
+                        params![hold_id, held_envelope, quarantine_id.0, now_ts()],
+                    )?;
+                }
+            }
+            Ok(quarantined)
+        })();
+        match publication {
+            Ok(quarantined) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT trail_artifact_envelope")?;
+                Ok((envelope_id, quarantined))
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_artifact_envelope;
+                     RELEASE SAVEPOINT trail_artifact_envelope",
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn verify_ready_artifact_envelope_under_write_lock(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        expected_tree_id: &ArtifactTreeId,
+    ) -> Result<ArtifactEnvelopeV1> {
+        let (desired_key, trust_scope, tree_root_id, state, verification_state) =
+            self.conn.query_row(
+                "SELECT desired_key, trust_scope, tree_root_id, state, verification_state
+             FROM artifact_envelopes WHERE envelope_id=?1",
+                params![envelope_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+        if state != "ready"
+            || verification_state != "verified"
+            || tree_root_id != expected_tree_id.0
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact envelope `{envelope_id}` is not ready for tree `{expected_tree_id}`"
+            )));
+        }
+        let envelope: ArtifactEnvelopeV1 = self.get_artifact_cas_object(
+            &envelope_id.0,
+            ARTIFACT_ENVELOPE_KIND,
+            ARTIFACT_ENVELOPE_VERSION,
+        )?;
+        let (actual_id, _) = encode_artifact_envelope(envelope.clone())?;
+        if actual_id != *envelope_id || envelope.tree_root_id != *expected_tree_id {
+            return Err(Error::Corrupt(format!(
+                "artifact envelope `{envelope_id}` has conflicting content identity"
+            )));
+        }
+        let encoded_desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key,
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => &desired_key.0,
+        };
+        if encoded_desired_key != &desired_key || envelope.trust_scope != trust_scope {
+            return Err(Error::Corrupt(format!(
+                "artifact envelope `{envelope_id}` database identity disagrees with its object"
+            )));
+        }
+        Ok(envelope)
+    }
+
+    pub(crate) fn list_artifact_quarantines(&self) -> Result<Vec<ArtifactQuarantineRecordV1>> {
+        let mut statement = self.conn.prepare(
+            "SELECT quarantine_id,trust_scope,desired_key,incumbent_envelope_id,
+                    candidate_envelope_id,reason_code,evidence_object_id,state,resolution,
+                    created_at,resolved_at
+             FROM artifact_quarantines ORDER BY created_at,quarantine_id",
+        )?;
+        let rows = statement
+            .query_map([], artifact_quarantine_tuple_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(artifact_quarantine_record).collect()
+    }
+
+    pub(crate) fn artifact_quarantine(
+        &self,
+        quarantine_id: &ArtifactQuarantineId,
+    ) -> Result<ArtifactQuarantineRecordV1> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT quarantine_id,trust_scope,desired_key,incumbent_envelope_id,
+                        candidate_envelope_id,reason_code,evidence_object_id,state,resolution,
+                        created_at,resolved_at
+                 FROM artifact_quarantines WHERE quarantine_id=?1",
+                params![quarantine_id.0],
+                artifact_quarantine_tuple_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "artifact quarantine `{quarantine_id}` does not exist"
+                ))
+            })?;
+        artifact_quarantine_record(row)
+    }
+
+    pub(crate) fn resolve_artifact_quarantine(
+        &self,
+        quarantine_id: &ArtifactQuarantineId,
+        resolution: ArtifactQuarantineResolutionV1,
+    ) -> Result<ArtifactQuarantineRecordV1> {
+        let _lock = self.acquire_write_lock()?;
+        let record = self.artifact_quarantine(quarantine_id)?;
+        if record.state != "active" {
+            return Err(Error::InvalidInput(format!(
+                "artifact quarantine `{quarantine_id}` is already resolved"
+            )));
+        }
+        let competing = self.conn.query_row(
+            "SELECT COUNT(*) FROM artifact_quarantines
+             WHERE trust_scope=?1 AND desired_key=?2 AND state='active' AND quarantine_id<>?3",
+            params![record.trust_scope, record.desired_key, quarantine_id.0],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if competing != 0 {
+            return Err(Error::InvalidInput(format!(
+                "artifact quarantine `{quarantine_id}` cannot resolve while {competing} related quarantine(s) remain active"
+            )));
+        }
+        self.conn
+            .execute_batch("SAVEPOINT trail_quarantine_resolution")?;
+        let resolved = (|| -> Result<()> {
+            let accepted = match resolution {
+                ArtifactQuarantineResolutionV1::RetainPrivate
+                | ArtifactQuarantineResolutionV1::RetireAll => None,
+                ArtifactQuarantineResolutionV1::AcceptIncumbent => {
+                    Some(record.incumbent_envelope_id.as_ref().ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "artifact quarantine `{quarantine_id}` has no incumbent to accept"
+                        ))
+                    })?)
+                }
+                ArtifactQuarantineResolutionV1::AcceptCandidate => {
+                    Some(&record.candidate_envelope_id)
+                }
+            };
+            if matches!(resolution, ArtifactQuarantineResolutionV1::RetireAll) {
+                self.conn.execute(
+                    "UPDATE artifact_envelopes SET state='retired',updated_at=?1
+                     WHERE envelope_id=?2 OR envelope_id=?3",
+                    params![
+                        now_ts(),
+                        record.incumbent_envelope_id.as_ref().map(|id| &id.0),
+                        record.candidate_envelope_id.0,
+                    ],
+                )?;
+            } else if let Some(accepted) = accepted {
+                self.conn.execute(
+                    "UPDATE artifact_envelopes SET state='retired',updated_at=?1
+                     WHERE envelope_id=?2 OR envelope_id=?3",
+                    params![
+                        now_ts(),
+                        record.incumbent_envelope_id.as_ref().map(|id| &id.0),
+                        record.candidate_envelope_id.0,
+                    ],
+                )?;
+                self.conn.execute(
+                    "UPDATE artifact_envelopes SET state='ready',updated_at=?1
+                     WHERE envelope_id=?2 AND verification_state='verified'",
+                    params![now_ts(), accepted.0],
+                )?;
+            }
+            self.conn.execute(
+                "UPDATE artifact_quarantines SET state='resolved',resolution=?1,resolved_at=?2
+                 WHERE quarantine_id=?3 AND state='active'",
+                params![resolution.as_str(), now_ts(), quarantine_id.0],
+            )?;
+            self.conn.execute(
+                "DELETE FROM artifact_holds WHERE reason=?1",
+                params![quarantine_id.0],
+            )?;
+            Ok(())
+        })();
+        match resolved {
+            Ok(()) => self
+                .conn
+                .execute_batch("RELEASE SAVEPOINT trail_quarantine_resolution")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_quarantine_resolution;
+                     RELEASE SAVEPOINT trail_quarantine_resolution",
+                );
+                return Err(error);
+            }
+        }
+        self.artifact_quarantine(quarantine_id)
+    }
+
+    pub(crate) fn materialize_artifact_tree_under_write_lock(
+        &self,
+        tree_id: &ArtifactTreeId,
+        destination: &Path,
+    ) -> Result<()> {
+        if destination.exists() {
+            return Err(Error::InvalidPath {
+                path: destination.to_string_lossy().into_owned(),
+                reason: "artifact materialization destination already exists".into(),
+            });
+        }
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        let (actual_id, _) = encode_artifact_tree_root(tree.clone())?;
+        if actual_id != *tree_id {
+            return Err(Error::Corrupt(
+                "artifact tree cannot materialize because its identity is invalid".into(),
+            ));
+        }
+        // Verify every edge and complete-file digest before exposing a path.
+        self.artifact_tree_flat_entries(tree_id)?;
+        fs::create_dir(destination)?;
+        let materialized =
+            self.materialize_artifact_directory(&tree.root_directory_id, destination, 0);
+        if let Err(error) = materialized {
+            super::workspace_layer::make_tree_writable(destination);
+            let _ = fs::remove_dir_all(destination);
+            return Err(error);
+        }
+        super::workspace_layer::sync_layer_tree(destination)?;
+        Ok(())
+    }
+
+    fn materialize_artifact_directory(
+        &self,
+        directory_id: &ArtifactTreeId,
+        destination: &Path,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_ARTIFACT_TREE_DEPTH {
+            return Err(Error::Corrupt(
+                "artifact materialization exceeds the directory-depth bound".into(),
+            ));
+        }
+        let directory: ArtifactDirectoryNodeV1 = self.get_artifact_cas_object(
+            &directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+        )?;
+        for entry in directory.entries {
+            validate_artifact_entry_name(&entry.name)?;
+            let path = destination.join(&entry.name);
+            match entry.target {
+                ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                    fs::create_dir(&path)?;
+                    self.materialize_artifact_directory(&node_id, &path, depth + 1)?;
+                    set_artifact_materialized_mode(&path, 0o755)?;
+                }
+                ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                    let file: ArtifactFileNodeV1 = self.get_artifact_cas_object(
+                        &node_id.0,
+                        ARTIFACT_FILE_NODE_KIND,
+                        ARTIFACT_FILE_NODE_VERSION,
+                    )?;
+                    let mut output = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    match &file.content {
+                        ArtifactFileContentV1::Blob { blob_id } => {
+                            let blob: ArtifactBlobV1 = self.get_artifact_cas_object(
+                                &blob_id.0,
+                                ARTIFACT_BLOB_KIND,
+                                ARTIFACT_BLOB_VERSION,
+                            )?;
+                            output.write_all(&blob.bytes)?;
+                        }
+                        ArtifactFileContentV1::Chunks { chunk_list_id } => {
+                            let list: ArtifactChunkListV1 = self.get_artifact_cas_object(
+                                &chunk_list_id.0,
+                                ARTIFACT_CHUNK_LIST_KIND,
+                                ARTIFACT_CHUNK_LIST_VERSION,
+                            )?;
+                            for chunk_ref in list.chunks {
+                                let chunk: ArtifactChunkV1 = self.get_artifact_cas_object(
+                                    &chunk_ref.chunk_id.0,
+                                    ARTIFACT_CHUNK_KIND,
+                                    ARTIFACT_CHUNK_VERSION,
+                                )?;
+                                output.write_all(&chunk.bytes)?;
+                            }
+                        }
+                    }
+                    output.sync_all()?;
+                    set_artifact_materialized_mode(&path, file.mode)?;
+                }
+                ArtifactDirectoryEntryTargetV1::Symlink { target } => {
+                    validate_artifact_symlink_target(&target)?;
+                    #[cfg(unix)]
+                    symlink_file(target, &path)?;
+                    #[cfg(windows)]
+                    std::os::windows::fs::symlink_file(target, &path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flatten_artifact_directory(
+        &self,
+        directory_id: &ArtifactTreeId,
+        prefix: &str,
+        depth: usize,
+        visiting: &mut BTreeSet<ArtifactTreeId>,
+        output: &mut BTreeMap<String, ArtifactFlatEntry>,
+    ) -> Result<()> {
+        if depth > MAX_ARTIFACT_TREE_DEPTH || !visiting.insert(directory_id.clone()) {
+            return Err(Error::Corrupt(
+                "artifact directory graph is too deep or cyclic".into(),
+            ));
+        }
+        let directory: ArtifactDirectoryNodeV1 = self.get_artifact_cas_object(
+            &directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+        )?;
+        let (actual_id, canonical) = encode_artifact_directory_node(directory.clone())?;
+        if actual_id != *directory_id
+            || from_cbor::<ArtifactDirectoryNodeV1>(&canonical)? != directory
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact directory `{directory_id}` has conflicting encoded identity"
+            )));
+        }
+        for entry in directory.entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            if output.len() as u64 >= MAX_ARTIFACT_TREE_ENTRIES {
+                return Err(Error::Corrupt(
+                    "artifact directory graph exceeds its entry bound".into(),
+                ));
+            }
+            match entry.target {
+                ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                    if output
+                        .insert(
+                            path.clone(),
+                            ArtifactFlatEntry {
+                                kind: "directory",
+                                mode: 0o755,
+                                size_bytes: 0,
+                                content_hash: None,
+                                symlink_target: None,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Error::Corrupt("duplicate artifact tree path".into()));
+                    }
+                    self.flatten_artifact_directory(&node_id, &path, depth + 1, visiting, output)?;
+                }
+                ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                    let file: ArtifactFileNodeV1 = self.get_artifact_cas_object(
+                        &node_id.0,
+                        ARTIFACT_FILE_NODE_KIND,
+                        ARTIFACT_FILE_NODE_VERSION,
+                    )?;
+                    let (actual_id, _) = encode_artifact_file_node(file.clone())?;
+                    if actual_id != node_id {
+                        return Err(Error::Corrupt(
+                            "artifact file node has conflicting encoded identity".into(),
+                        ));
+                    }
+                    self.verify_artifact_file_content(&file)?;
+                    if output
+                        .insert(
+                            path,
+                            ArtifactFlatEntry {
+                                kind: "file",
+                                mode: file.mode,
+                                size_bytes: file.size_bytes,
+                                content_hash: Some(file.content_sha256),
+                                symlink_target: None,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Error::Corrupt("duplicate artifact tree path".into()));
+                    }
+                }
+                ArtifactDirectoryEntryTargetV1::Symlink { target } => {
+                    validate_artifact_symlink_within_tree(prefix, &target)?;
+                    if output
+                        .insert(
+                            path,
+                            ArtifactFlatEntry {
+                                kind: "symlink",
+                                mode: 0o777,
+                                size_bytes: 0,
+                                content_hash: None,
+                                symlink_target: Some(target),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(Error::Corrupt("duplicate artifact tree path".into()));
+                    }
+                }
+            }
+        }
+        visiting.remove(directory_id);
+        Ok(())
+    }
+
+    fn verify_artifact_file_content(&self, file: &ArtifactFileNodeV1) -> Result<()> {
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        match &file.content {
+            ArtifactFileContentV1::Blob { blob_id } => {
+                let blob: ArtifactBlobV1 = self.get_artifact_cas_object(
+                    &blob_id.0,
+                    ARTIFACT_BLOB_KIND,
+                    ARTIFACT_BLOB_VERSION,
+                )?;
+                let (actual, _) = encode_artifact_blob(blob.clone())?;
+                if actual != *blob_id {
+                    return Err(Error::Corrupt(
+                        "artifact blob identity edge is invalid".into(),
+                    ));
+                }
+                size = blob.bytes.len() as u64;
+                hasher.update(blob.bytes);
+            }
+            ArtifactFileContentV1::Chunks { chunk_list_id } => {
+                let list: ArtifactChunkListV1 = self.get_artifact_cas_object(
+                    &chunk_list_id.0,
+                    ARTIFACT_CHUNK_LIST_KIND,
+                    ARTIFACT_CHUNK_LIST_VERSION,
+                )?;
+                let (actual, _) = encode_artifact_chunk_list(list.clone())?;
+                if actual != *chunk_list_id {
+                    return Err(Error::Corrupt(
+                        "artifact chunk-list identity edge is invalid".into(),
+                    ));
+                }
+                for chunk_ref in list.chunks {
+                    let chunk: ArtifactChunkV1 = self.get_artifact_cas_object(
+                        &chunk_ref.chunk_id.0,
+                        ARTIFACT_CHUNK_KIND,
+                        ARTIFACT_CHUNK_VERSION,
+                    )?;
+                    let (actual, _) = encode_artifact_chunk(chunk.clone())?;
+                    if actual != chunk_ref.chunk_id
+                        || chunk.bytes.len() as u64 != chunk_ref.size_bytes
+                    {
+                        return Err(Error::Corrupt(
+                            "artifact chunk identity edge is invalid".into(),
+                        ));
+                    }
+                    size = size
+                        .checked_add(chunk_ref.size_bytes)
+                        .ok_or_else(|| Error::Corrupt("artifact file size edge overflow".into()))?;
+                    hasher.update(chunk.bytes);
+                }
+            }
+        }
+        if size != file.size_bytes || hex::encode(hasher.finalize()) != file.content_sha256 {
+            return Err(Error::Corrupt(
+                "artifact file complete size or hash edge is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn put_artifact_resolution_snapshot(
+        &self,
+        mut plan: ArtifactResolutionPlanV1,
+        snapshot_bytes: Vec<u8>,
+        resolved_identities: BTreeMap<String, String>,
+        checksums: BTreeMap<String, String>,
+        mut contacted_authorities: Vec<String>,
+        refresh: bool,
+    ) -> Result<(ObjectId, ArtifactResolutionSnapshotV1)> {
+        let _lock = self.acquire_write_lock()?;
+        normalize_artifact_resolution_plan(&mut plan)?;
+        if snapshot_bytes.len() as u64 > plan.limits.candidate_bytes {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution candidate contains {} bytes; maximum is {}",
+                snapshot_bytes.len(),
+                plan.limits.candidate_bytes
+            )));
+        }
+        contacted_authorities.sort();
+        contacted_authorities.dedup();
+        if contacted_authorities.len() > MAX_RESOLUTION_AUTHORITIES
+            || contacted_authorities
+                .iter()
+                .any(|authority| !plan.allowed_authorities.contains(authority))
+        {
+            return Err(Error::InvalidInput(
+                "resolver contacted an undeclared or excessive network authority".into(),
+            ));
+        }
+        validate_identity_map(&resolved_identities, "resolved identity")?;
+        validate_identity_map(&checksums, "snapshot checksum")?;
+
+        let current = self.artifact_resolution_snapshot_for_proposal(&plan.proposal_key)?;
+        if let Some((current_id, current_snapshot)) = current.as_ref()
+            && !refresh
+        {
+            let candidate_sha256 = sha256_hex(&snapshot_bytes);
+            if current_snapshot.content_sha256 != candidate_sha256 {
+                return Err(Error::InvalidInput(format!(
+                    "proposal `{}` already has pinned snapshot {}; use explicit refresh to replace it",
+                    plan.proposal_key, current_id
+                )));
+            }
+            return Ok((current_id.clone(), current_snapshot.clone()));
+        }
+
+        let content_sha256 = sha256_hex(&snapshot_bytes);
+        let content = ArtifactResolutionContentV1 {
+            version: ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+            content_sha256: content_sha256.clone(),
+            bytes: snapshot_bytes,
+        };
+        let predecessor_snapshot_id = current.map(|(snapshot_id, _)| snapshot_id);
+        let snapshot = ArtifactResolutionSnapshotV1 {
+            version: ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+            proposal_key: plan.proposal_key.clone(),
+            source_root: plan.source_root.clone(),
+            component_id: plan.component_id.clone(),
+            adapter_identity: plan.adapter_identity.clone(),
+            snapshot_format: plan.snapshot_format.clone(),
+            content_object_id: self.put_object(
+                ARTIFACT_RESOLUTION_CONTENT_KIND,
+                ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+                &content,
+            )?,
+            content_sha256,
+            resolved_identities,
+            checksums,
+            resolver_executable_identity: plan.executable_identity,
+            policy_identity: plan.policy_identity,
+            contacted_authorities,
+            predecessor_snapshot_id,
+            verification_state: ArtifactResolutionVerificationStateV1::Verified,
+        };
+        validate_artifact_resolution_snapshot(&snapshot)?;
+        let snapshot_id = self.put_object(
+            ARTIFACT_RESOLUTION_SNAPSHOT_KIND,
+            ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+            &snapshot,
+        )?;
+
+        self.conn
+            .execute_batch("SAVEPOINT trail_artifact_resolution_snapshot")?;
+        let publication = (|| -> Result<()> {
+            if refresh {
+                self.conn.execute(
+                    "UPDATE artifact_resolution_snapshots
+                     SET state='superseded', superseded_at=?1
+                     WHERE proposal_key=?2 AND state='current'",
+                    params![now_ts(), plan.proposal_key],
+                )?;
+            }
+            self.conn.execute(
+                "INSERT INTO artifact_resolution_snapshots(
+                    snapshot_id, proposal_key, source_root, component_id,
+                    adapter_identity, content_object_id, predecessor_snapshot_id,
+                    verification_state, state, created_at, superseded_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'verified', 'current', ?8, NULL)",
+                params![
+                    snapshot_id.0,
+                    snapshot.proposal_key,
+                    snapshot.source_root.0,
+                    snapshot.component_id,
+                    snapshot.adapter_identity,
+                    snapshot.content_object_id.0,
+                    snapshot
+                        .predecessor_snapshot_id
+                        .as_ref()
+                        .map(|id| id.0.as_str()),
+                    now_ts(),
+                ],
+            )?;
+            Ok(())
+        })();
+        match publication {
+            Ok(()) => self
+                .conn
+                .execute_batch("RELEASE SAVEPOINT trail_artifact_resolution_snapshot")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_artifact_resolution_snapshot;
+                     RELEASE SAVEPOINT trail_artifact_resolution_snapshot",
+                );
+                return Err(error);
+            }
+        }
+        Ok((snapshot_id, snapshot))
+    }
+
+    pub(crate) fn artifact_resolution_snapshot_for_proposal(
+        &self,
+        proposal_key: &str,
+    ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1)>> {
+        validate_resolution_text(proposal_key, "proposal key")?;
+        let snapshot_id = self
+            .conn
+            .query_row(
+                "SELECT snapshot_id FROM artifact_resolution_snapshots
+                 WHERE proposal_key=?1 AND state='current'",
+                params![proposal_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(ObjectId);
+        let Some(snapshot_id) = snapshot_id else {
+            return Ok(None);
+        };
+        let snapshot = self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, &snapshot_id)?;
+        validate_artifact_resolution_snapshot(&snapshot)?;
+        Ok(Some((snapshot_id, snapshot)))
+    }
+
+    pub(crate) fn artifact_resolution_snapshot_content(
+        &self,
+        snapshot: &ArtifactResolutionSnapshotV1,
+    ) -> Result<Vec<u8>> {
+        validate_artifact_resolution_snapshot(snapshot)?;
+        let content: ArtifactResolutionContentV1 = self.get_object(
+            ARTIFACT_RESOLUTION_CONTENT_KIND,
+            &snapshot.content_object_id,
+        )?;
+        if content.version != ARTIFACT_RESOLUTION_SNAPSHOT_VERSION
+            || content.content_sha256 != snapshot.content_sha256
+            || sha256_hex(&content.bytes) != snapshot.content_sha256
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact resolution snapshot content {} failed identity verification",
+                snapshot.content_object_id
+            )));
+        }
+        Ok(content.bytes)
+    }
+}
+
+pub(crate) fn normalize_artifact_resolution_plan(
+    plan: &mut ArtifactResolutionPlanV1,
+) -> Result<()> {
+    if plan.version != ARTIFACT_RESOLUTION_PLAN_VERSION {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution plan version {} is unsupported",
+            plan.version
+        )));
+    }
+    for (value, field) in [
+        (&plan.proposal_key, "proposal key"),
+        (&plan.component_id, "component id"),
+        (&plan.adapter_identity, "adapter identity"),
+        (&plan.policy_identity, "policy identity"),
+        (&plan.program, "program"),
+        (&plan.resolved_program, "resolved program"),
+        (&plan.executable_identity, "executable identity"),
+        (&plan.snapshot_format, "snapshot format"),
+    ] {
+        validate_resolution_text(value, field)?;
+    }
+    if plan.argv.is_empty() || plan.argv.len() > MAX_RESOLUTION_ARGV {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolver argv must contain between 1 and {MAX_RESOLUTION_ARGV} entries"
+        )));
+    }
+    for argument in &plan.argv {
+        validate_resolution_text(argument, "resolver argv")?;
+    }
+    validate_resolution_relative_path(&plan.working_directory, "working directory", true)?;
+    validate_resolution_relative_path(&plan.candidate_output, "candidate output", false)?;
+    if plan.readable_inputs.is_empty() || plan.readable_inputs.len() > MAX_RESOLUTION_INPUTS {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution plan must contain between 1 and {MAX_RESOLUTION_INPUTS} readable inputs"
+        )));
+    }
+    for input in &plan.readable_inputs {
+        validate_resolution_relative_path(&input.source_path, "readable input", false)?;
+        validate_sha256(&input.content_hash, "readable input hash")?;
+    }
+    plan.readable_inputs.sort();
+    if plan
+        .readable_inputs
+        .windows(2)
+        .any(|pair| pair[0].source_path == pair[1].source_path)
+    {
+        return Err(Error::InvalidInput(
+            "artifact resolution plan contains duplicate readable input paths".into(),
+        ));
+    }
+    normalize_string_set(
+        &mut plan.allowed_authorities,
+        MAX_RESOLUTION_AUTHORITIES,
+        "allowed authority",
+    )?;
+    normalize_string_set(
+        &mut plan.credential_handles,
+        MAX_RESOLUTION_CREDENTIAL_HANDLES,
+        "credential handle",
+    )?;
+    if plan.environment_roles.len() > MAX_RESOLUTION_ENVIRONMENT_NAMES {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution plan has too many environment roles; maximum is {MAX_RESOLUTION_ENVIRONMENT_NAMES}"
+        )));
+    }
+    for name in plan.environment_roles.keys() {
+        if name.is_empty()
+            || name.len() > 128
+            || !name.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || character.is_ascii_alphanumeric()
+                        && (index > 0 || !character.is_ascii_digit())
+            })
+        {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution environment name `{name}` is invalid"
+            )));
+        }
+    }
+    if plan.limits.timeout_ms == 0
+        || plan.limits.stdout_bytes == 0
+        || plan.limits.stderr_bytes == 0
+        || plan.limits.candidate_bytes == 0
+        || plan.limits.candidate_entries == 0
+        || plan.limits.child_processes == 0
+    {
+        return Err(Error::InvalidInput(
+            "artifact resolver limits must all be non-zero".into(),
+        ));
+    }
+    if plan.validations.is_empty() || plan.validations.len() > MAX_RESOLUTION_VALIDATIONS {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution plan must contain between 1 and {MAX_RESOLUTION_VALIDATIONS} validations"
+        )));
+    }
+    for validation in &plan.validations {
+        validate_resolution_text(&validation.name, "validation name")?;
+        validate_identity_map(&validation.parameters, "validation parameter")?;
+    }
+    plan.validations.sort();
+    if plan
+        .validations
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err(Error::InvalidInput(
+            "artifact resolution plan contains duplicate validation names".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn artifact_desired_key_v2(
+    mut material: ArtifactDesiredKeyMaterialV2,
+) -> Result<ArtifactDesiredKeyV2> {
+    if material.version != ARTIFACT_DESIRED_KEY_MATERIAL_VERSION {
+        return Err(Error::InvalidInput(format!(
+            "artifact desired-key material version {} is unsupported",
+            material.version
+        )));
+    }
+    for (value, field) in [
+        (&material.component_id, "component id"),
+        (&material.adapter_identity, "adapter identity"),
+        (
+            &material.adapter_implementation_version,
+            "adapter implementation version",
+        ),
+        (
+            &material.adapter_distribution_digest,
+            "adapter distribution digest",
+        ),
+        (&material.adapter_protocol, "adapter protocol"),
+        (
+            &material.source_closure.normalizer_version,
+            "source normalizer",
+        ),
+        (&material.target, "target"),
+        (&material.platform, "platform"),
+        (&material.architecture, "architecture"),
+        (&material.abi, "ABI"),
+        (&material.portability_scope, "portability scope"),
+        (&material.trust_scope, "trust scope"),
+        (&material.network_policy, "network policy"),
+        (&material.sandbox_policy, "sandbox policy"),
+    ] {
+        validate_resolution_text(value, field)?;
+    }
+    if !material.source_closure.certified_complete
+        && material.source_closure.complete_source_root.is_none()
+    {
+        return Err(Error::InvalidInput(
+            "uncertified artifact source closure must pin the complete source root".into(),
+        ));
+    }
+    if let Some(snapshot_id) = &material.resolution_snapshot_id {
+        validate_resolution_text(&snapshot_id.0, "resolution snapshot ID")?;
+    }
+    if let Some(source_root) = &material.source_closure.complete_source_root {
+        validate_resolution_text(&source_root.0, "complete source root")?;
+    }
+    if material.source_closure.certified_complete
+        && material.source_closure.declared_inputs.is_empty()
+    {
+        return Err(Error::InvalidInput(
+            "certified artifact source closure must declare at least one input".into(),
+        ));
+    }
+    if material.source_closure.declared_inputs.len() > MAX_RESOLUTION_INPUTS {
+        return Err(Error::InvalidInput(format!(
+            "artifact source closure exceeds {MAX_RESOLUTION_INPUTS} declared inputs"
+        )));
+    }
+    for input in &material.source_closure.declared_inputs {
+        validate_resolution_relative_path(&input.source_path, "source closure input", false)?;
+        validate_sha256(&input.content_hash, "source closure input hash")?;
+    }
+    material.source_closure.declared_inputs.sort();
+    if material
+        .source_closure
+        .declared_inputs
+        .windows(2)
+        .any(|pair| pair[0].source_path == pair[1].source_path)
+    {
+        return Err(Error::InvalidInput(
+            "artifact source closure contains duplicate paths".into(),
+        ));
+    }
+    validate_identity_map(&material.upstream_identities, "upstream identity")?;
+    if material.actions.is_empty() || material.actions.len() > MAX_RESOLUTION_VALIDATIONS {
+        return Err(Error::InvalidInput(
+            "artifact desired-key material has an empty or excessive action list".into(),
+        ));
+    }
+    for action in &mut material.actions {
+        validate_resolution_text(&action.name, "action name")?;
+        validate_resolution_text(&action.executable_identity, "action executable identity")?;
+        validate_resolution_relative_path(
+            &action.working_directory,
+            "action working directory",
+            true,
+        )?;
+        if action.argv.is_empty() || action.argv.len() > MAX_RESOLUTION_ARGV {
+            return Err(Error::InvalidInput(
+                "artifact action argv is empty or excessive".into(),
+            ));
+        }
+        for argument in &action.argv {
+            validate_resolution_text(argument, "action argv")?;
+        }
+        normalize_string_set(
+            &mut action.environment_names,
+            MAX_RESOLUTION_ENVIRONMENT_NAMES,
+            "action environment name",
+        )?;
+    }
+    material.actions.sort();
+    if material
+        .actions
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err(Error::InvalidInput(
+            "artifact desired-key material contains duplicate action names".into(),
+        ));
+    }
+    if material.outputs.is_empty() || material.outputs.len() > MAX_RESOLUTION_VALIDATIONS {
+        return Err(Error::InvalidInput(
+            "artifact desired-key material has an empty or excessive output list".into(),
+        ));
+    }
+    for output in &material.outputs {
+        validate_resolution_text(&output.name, "output name")?;
+        validate_resolution_relative_path(&output.output_path, "output path", false)?;
+        validate_resolution_relative_path(&output.mount_path, "output mount path", false)?;
+        if let Some(gate) = &output.gate {
+            validate_resolution_text(gate, "output gate")?;
+        }
+        if !material.portability_certified
+            && (output.reuse != EnvironmentReuseMode::None
+                || output.scope != EnvironmentSharingScope::Lane)
+        {
+            return Err(Error::InvalidInput(format!(
+                "artifact output `{}` lacks portability evidence and must use lane-private, non-reusable policy",
+                output.name
+            )));
+        }
+    }
+    material.outputs.sort();
+    for validation in &material.validations {
+        validate_resolution_text(&validation.name, "validation name")?;
+        validate_identity_map(&validation.parameters, "validation parameter")?;
+    }
+    material.validations.sort();
+    for export in &material.source_exports {
+        validate_resolution_text(&export.name, "source export name")?;
+        validate_resolution_relative_path(
+            &export.artifact_subpath,
+            "source export subpath",
+            false,
+        )?;
+        validate_resolution_relative_path(&export.destination, "source export destination", false)?;
+        validate_resolution_text(&export.collision_policy, "source export collision policy")?;
+        validate_resolution_text(&export.required_validation, "source export validation")?;
+    }
+    material.source_exports.sort();
+    if material.build_environment.len() > MAX_RESOLUTION_ENVIRONMENT_NAMES {
+        return Err(Error::InvalidInput(
+            "artifact build environment contains too many entries".into(),
+        ));
+    }
+    for (name, value) in &material.build_environment {
+        validate_resolution_text(name, "build environment name")?;
+        validate_resolution_text(value, "build environment value")?;
+        if is_sensitive_json_key(name) || contains_sensitive_text(value) {
+            return Err(Error::InvalidInput(format!(
+                "artifact build environment `{name}` may contain secret material"
+            )));
+        }
+    }
+    let canonical = cbor(&material)?;
+    Ok(ArtifactDesiredKeyV2::new(&canonical))
+}
+
+pub(crate) fn diff_artifact_desired_key_v2(
+    previous: &ArtifactDesiredKeyMaterialV2,
+    current: &ArtifactDesiredKeyMaterialV2,
+) -> Result<ArtifactDesiredKeyDiffV2> {
+    let previous_key = artifact_desired_key_v2(previous.clone())?;
+    let current_key = artifact_desired_key_v2(current.clone())?;
+    let mut edges = Vec::new();
+
+    diff_artifact_scalar(
+        "resolution",
+        "format_version",
+        &previous.version,
+        &current.version,
+        &mut edges,
+    );
+    diff_artifact_scalar(
+        "resolution",
+        "component_id",
+        &previous.component_id,
+        &current.component_id,
+        &mut edges,
+    );
+    diff_artifact_scalar(
+        "resolution",
+        "snapshot",
+        &previous.resolution_snapshot_id,
+        &current.resolution_snapshot_id,
+        &mut edges,
+    );
+    diff_artifact_scalar(
+        "resolution",
+        "source_closure",
+        &previous.source_closure,
+        &current.source_closure,
+        &mut edges,
+    );
+    diff_artifact_map(
+        "resolution",
+        "upstream",
+        &previous.upstream_identities,
+        &current.upstream_identities,
+        &mut edges,
+    );
+
+    for (name, left, right) in [
+        (
+            "adapter_identity",
+            &previous.adapter_identity,
+            &current.adapter_identity,
+        ),
+        (
+            "adapter_implementation_version",
+            &previous.adapter_implementation_version,
+            &current.adapter_implementation_version,
+        ),
+        (
+            "adapter_distribution_digest",
+            &previous.adapter_distribution_digest,
+            &current.adapter_distribution_digest,
+        ),
+        (
+            "adapter_protocol",
+            &previous.adapter_protocol,
+            &current.adapter_protocol,
+        ),
+    ] {
+        diff_artifact_scalar("tool", name, left, right, &mut edges);
+    }
+    let previous_actions = previous
+        .actions
+        .iter()
+        .map(|action| (action.name.as_str(), action))
+        .collect::<BTreeMap<_, _>>();
+    let current_actions = current
+        .actions
+        .iter()
+        .map(|action| (action.name.as_str(), action))
+        .collect::<BTreeMap<_, _>>();
+    for name in previous_actions
+        .keys()
+        .chain(current_actions.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let left = previous_actions.get(name);
+        let right = current_actions.get(name);
+        diff_artifact_scalar(
+            "tool",
+            &format!("action:{name}:executable"),
+            &left.map(|action| &action.executable_identity),
+            &right.map(|action| &action.executable_identity),
+            &mut edges,
+        );
+        let left_contract = left.map(|action| {
+            (
+                action.phase,
+                &action.argv,
+                &action.working_directory,
+                &action.environment_names,
+            )
+        });
+        let right_contract = right.map(|action| {
+            (
+                action.phase,
+                &action.argv,
+                &action.working_directory,
+                &action.environment_names,
+            )
+        });
+        diff_artifact_scalar("action", name, &left_contract, &right_contract, &mut edges);
+    }
+    diff_artifact_named_contracts(
+        "output",
+        &previous.outputs,
+        &current.outputs,
+        |output| output.name.as_str(),
+        &mut edges,
+    );
+    diff_artifact_named_contracts(
+        "validation",
+        &previous.validations,
+        &current.validations,
+        |validation| validation.name.as_str(),
+        &mut edges,
+    );
+    diff_artifact_named_contracts(
+        "export",
+        &previous.source_exports,
+        &current.source_exports,
+        |export| export.name.as_str(),
+        &mut edges,
+    );
+    diff_artifact_map(
+        "trust",
+        "environment",
+        &previous.build_environment,
+        &current.build_environment,
+        &mut edges,
+    );
+    for (name, left, right) in [
+        ("target", &previous.target, &current.target),
+        ("platform", &previous.platform, &current.platform),
+        (
+            "architecture",
+            &previous.architecture,
+            &current.architecture,
+        ),
+        ("abi", &previous.abi, &current.abi),
+        (
+            "portability_scope",
+            &previous.portability_scope,
+            &current.portability_scope,
+        ),
+        ("trust_scope", &previous.trust_scope, &current.trust_scope),
+        (
+            "network_policy",
+            &previous.network_policy,
+            &current.network_policy,
+        ),
+    ] {
+        diff_artifact_scalar("trust", name, left, right, &mut edges);
+    }
+    diff_artifact_scalar(
+        "trust",
+        "portability_certified",
+        &previous.portability_certified,
+        &current.portability_certified,
+        &mut edges,
+    );
+    diff_artifact_scalar(
+        "trust",
+        "script_policy",
+        &previous.script_policy,
+        &current.script_policy,
+        &mut edges,
+    );
+    diff_artifact_scalar(
+        "sandbox",
+        "sandbox_policy",
+        &previous.sandbox_policy,
+        &current.sandbox_policy,
+        &mut edges,
+    );
+    edges.sort_by(|left, right| {
+        artifact_invalidation_dimension_rank(&left.dimension)
+            .cmp(&artifact_invalidation_dimension_rank(&right.dimension))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.change.cmp(&right.change))
+    });
+    edges.dedup();
+    Ok(ArtifactDesiredKeyDiffV2 {
+        previous_key,
+        current_key,
+        first: edges.first().cloned(),
+        edges,
+    })
+}
+
+fn artifact_invalidation_dimension_rank(dimension: &str) -> u8 {
+    match dimension {
+        "resolution" => 0,
+        "tool" => 1,
+        "action" => 2,
+        "output" => 3,
+        "validation" => 4,
+        "export" => 5,
+        "trust" => 6,
+        "sandbox" => 7,
+        _ => u8::MAX,
+    }
+}
+
+type ArtifactQuarantineTuple = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+);
+
+fn artifact_quarantine_tuple_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ArtifactQuarantineTuple> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn artifact_quarantine_record(row: ArtifactQuarantineTuple) -> Result<ArtifactQuarantineRecordV1> {
+    Ok(ArtifactQuarantineRecordV1 {
+        quarantine_id: ArtifactQuarantineId::parse(row.0)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact quarantine ID: {error}")))?,
+        trust_scope: row.1,
+        desired_key: row.2,
+        incumbent_envelope_id: row
+            .3
+            .map(ArtifactEnvelopeId::parse)
+            .transpose()
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?,
+        candidate_envelope_id: ArtifactEnvelopeId::parse(row.4)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?,
+        reason_code: row.5,
+        evidence_object_id: ObjectId(row.6),
+        state: row.7,
+        resolution: row.8,
+        created_at: row.9,
+        resolved_at: row.10,
+    })
+}
+
+fn diff_artifact_scalar<T: PartialEq>(
+    dimension: &str,
+    name: &str,
+    previous: &T,
+    current: &T,
+    edges: &mut Vec<ArtifactInvalidationEdgeV2>,
+) {
+    if previous != current {
+        edges.push(ArtifactInvalidationEdgeV2 {
+            dimension: dimension.into(),
+            name: name.into(),
+            change: "modified".into(),
+        });
+    }
+}
+
+fn diff_artifact_map(
+    dimension: &str,
+    prefix: &str,
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+    edges: &mut Vec<ArtifactInvalidationEdgeV2>,
+) {
+    for name in previous
+        .keys()
+        .chain(current.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let change = match (previous.get(name), current.get(name)) {
+            (None, Some(_)) => Some("added"),
+            (Some(_), None) => Some("removed"),
+            (Some(left), Some(right)) if left != right => Some("modified"),
+            _ => None,
+        };
+        if let Some(change) = change {
+            edges.push(ArtifactInvalidationEdgeV2 {
+                dimension: dimension.into(),
+                name: format!("{prefix}:{name}"),
+                change: change.into(),
+            });
+        }
+    }
+}
+
+fn diff_artifact_named_contracts<T: PartialEq>(
+    dimension: &str,
+    previous: &[T],
+    current: &[T],
+    name: impl Fn(&T) -> &str,
+    edges: &mut Vec<ArtifactInvalidationEdgeV2>,
+) {
+    let previous = previous
+        .iter()
+        .map(|item| (name(item), item))
+        .collect::<BTreeMap<_, _>>();
+    let current = current
+        .iter()
+        .map(|item| (name(item), item))
+        .collect::<BTreeMap<_, _>>();
+    for item_name in previous
+        .keys()
+        .chain(current.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let change = match (previous.get(item_name), current.get(item_name)) {
+            (None, Some(_)) => Some("added"),
+            (Some(_), None) => Some("removed"),
+            (Some(left), Some(right)) if left != right => Some("modified"),
+            _ => None,
+        };
+        if let Some(change) = change {
+            edges.push(ArtifactInvalidationEdgeV2 {
+                dimension: dimension.into(),
+                name: item_name.into(),
+                change: change.into(),
+            });
+        }
+    }
+}
+
+fn encode_artifact_directory_node(
+    mut node: ArtifactDirectoryNodeV1,
+) -> Result<(ArtifactTreeId, Vec<u8>)> {
+    if node.version != ARTIFACT_DIRECTORY_NODE_VERSION {
+        return Err(Error::InvalidInput(
+            "artifact directory node has an unsupported version".into(),
+        ));
+    }
+    node.entries.sort();
+    for entry in &node.entries {
+        validate_artifact_entry_name(&entry.name)?;
+        if let ArtifactDirectoryEntryTargetV1::Symlink { target } = &entry.target {
+            validate_artifact_symlink_target(target)?;
+        }
+    }
+    if node
+        .entries
+        .windows(2)
+        .any(|pair| pair[0].name == pair[1].name)
+    {
+        return Err(Error::InvalidInput(
+            "artifact directory contains duplicate entry names".into(),
+        ));
+    }
+    let bytes = cbor(&node)?;
+    Ok((
+        artifact_tree_id(ARTIFACT_DIRECTORY_NODE_KIND, &bytes),
+        bytes,
+    ))
+}
+
+fn canonical_artifact_directory_node(
+    node: ArtifactDirectoryNodeV1,
+) -> Result<ArtifactDirectoryNodeV1> {
+    let (_, bytes) = encode_artifact_directory_node(node)?;
+    from_cbor(&bytes)
+}
+
+fn decode_artifact_directory_node(bytes: &[u8]) -> Result<ArtifactDirectoryNodeV1> {
+    let node: ArtifactDirectoryNodeV1 = from_cbor(bytes)?;
+    let (_, canonical) = encode_artifact_directory_node(node.clone())?;
+    if canonical != bytes {
+        return Err(Error::Corrupt(
+            "artifact directory node is not canonically ordered".into(),
+        ));
+    }
+    Ok(node)
+}
+
+fn encode_artifact_blob(blob: ArtifactBlobV1) -> Result<(ArtifactBlobId, Vec<u8>)> {
+    if blob.version != ARTIFACT_BLOB_VERSION || sha256_hex(&blob.bytes) != blob.content_sha256 {
+        return Err(Error::InvalidInput(
+            "artifact blob version or complete content hash is invalid".into(),
+        ));
+    }
+    let bytes = cbor(&blob)?;
+    Ok((ArtifactBlobId::new(&blob.bytes), bytes))
+}
+
+fn decode_artifact_blob(bytes: &[u8], expected: &ArtifactBlobId) -> Result<ArtifactBlobV1> {
+    let blob: ArtifactBlobV1 = from_cbor(bytes)?;
+    let (actual, canonical) = encode_artifact_blob(blob.clone())?;
+    if &actual != expected || canonical != bytes {
+        return Err(Error::Corrupt(
+            "artifact blob content identity or canonical encoding is invalid".into(),
+        ));
+    }
+    Ok(blob)
+}
+
+fn encode_artifact_chunk(chunk: ArtifactChunkV1) -> Result<(ArtifactChunkId, Vec<u8>)> {
+    if chunk.version != ARTIFACT_CHUNK_VERSION || sha256_hex(&chunk.bytes) != chunk.content_sha256 {
+        return Err(Error::InvalidInput(
+            "artifact chunk version or content hash is invalid".into(),
+        ));
+    }
+    let bytes = cbor(&chunk)?;
+    Ok((ArtifactChunkId::new(&chunk.bytes), bytes))
+}
+
+fn encode_artifact_chunk_list(list: ArtifactChunkListV1) -> Result<(ArtifactChunkListId, Vec<u8>)> {
+    if list.version != ARTIFACT_CHUNK_LIST_VERSION
+        || list.algorithm != "fastcdc-v1"
+        || list.chunks.is_empty()
+        || list.chunks.iter().any(|chunk| chunk.size_bytes == 0)
+        || list
+            .chunks
+            .iter()
+            .try_fold(0u64, |total, chunk| total.checked_add(chunk.size_bytes))
+            != Some(list.file_size_bytes)
+    {
+        return Err(Error::InvalidInput(
+            "artifact chunk list has invalid version, algorithm, or size edges".into(),
+        ));
+    }
+    validate_sha256(&list.file_sha256, "chunk-list file hash")?;
+    let bytes = cbor(&list)?;
+    Ok((
+        ArtifactChunkListId::new(&artifact_identity_seed(ARTIFACT_CHUNK_LIST_KIND, &bytes)),
+        bytes,
+    ))
+}
+
+fn encode_artifact_file_node(node: ArtifactFileNodeV1) -> Result<(ArtifactFileId, Vec<u8>)> {
+    if node.version != ARTIFACT_FILE_NODE_VERSION
+        || node.mode & !0o777 != 0
+        || node.executable != (node.mode & 0o111 != 0)
+    {
+        return Err(Error::InvalidInput(
+            "artifact file node has invalid version or normalized mode".into(),
+        ));
+    }
+    validate_sha256(&node.content_sha256, "file content hash")?;
+    let bytes = cbor(&node)?;
+    Ok((
+        ArtifactFileId::new(&artifact_identity_seed(ARTIFACT_FILE_NODE_KIND, &bytes)),
+        bytes,
+    ))
+}
+
+fn encode_artifact_tree_root(root: ArtifactTreeRootV1) -> Result<(ArtifactTreeId, Vec<u8>)> {
+    if root.version != ARTIFACT_TREE_ROOT_VERSION || root.path_normalizer != "trail-paths/v1" {
+        return Err(Error::InvalidInput(
+            "artifact tree root has invalid version or path normalizer".into(),
+        ));
+    }
+    let bytes = cbor(&root)?;
+    Ok((artifact_tree_id(ARTIFACT_TREE_ROOT_KIND, &bytes), bytes))
+}
+
+fn encode_artifact_envelope(
+    mut envelope: ArtifactEnvelopeV1,
+) -> Result<(ArtifactEnvelopeId, Vec<u8>)> {
+    if envelope.version != ARTIFACT_ENVELOPE_VERSION {
+        return Err(Error::InvalidInput(
+            "artifact envelope has an unsupported version".into(),
+        ));
+    }
+    validate_resolution_text(&envelope.component_id, "envelope component id")?;
+    validate_resolution_text(&envelope.output_name, "envelope output name")?;
+    validate_resolution_text(&envelope.portability_scope, "envelope portability scope")?;
+    validate_resolution_text(&envelope.trust_scope, "envelope trust scope")?;
+    envelope.validation_receipt_ids.sort();
+    envelope.validation_receipt_ids.dedup();
+    let bytes = cbor(&envelope)?;
+    Ok((
+        ArtifactEnvelopeId::new(&artifact_identity_seed(ARTIFACT_ENVELOPE_KIND, &bytes)),
+        bytes,
+    ))
+}
+
+fn artifact_tree_id(kind: &str, bytes: &[u8]) -> ArtifactTreeId {
+    ArtifactTreeId::new(&artifact_identity_seed(kind, bytes))
+}
+
+fn artifact_identity_seed(kind: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut seed = Vec::with_capacity(kind.len() + bytes.len() + 10);
+    seed.extend_from_slice(kind.as_bytes());
+    seed.push(0);
+    seed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    seed.extend_from_slice(bytes);
+    seed
+}
+
+fn validate_artifact_entry_name(name: &str) -> Result<()> {
+    let normalized = normalize_relative_path(name)?;
+    if normalized != name || name.contains('/') {
+        return Err(Error::InvalidInput(format!(
+            "artifact directory entry `{name}` is not one normalized path component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_symlink_target(target: &str) -> Result<()> {
+    if target.is_empty()
+        || target.len() > MAX_RESOLUTION_TEXT_BYTES
+        || Path::new(target).is_absolute()
+        || target.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidInput(
+            "artifact symlink target is empty, absolute, oversized, or contains controls".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_symlink_within_tree(parent: &str, target: &str) -> Result<()> {
+    validate_artifact_symlink_target(target)?;
+    let mut components = parent
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    for component in Path::new(target).components() {
+        match component {
+            Component::Normal(component) => {
+                let component = component.to_str().ok_or_else(|| Error::InvalidPath {
+                    path: target.into(),
+                    reason: "artifact symlink target must be valid Unicode".into(),
+                })?;
+                validate_artifact_entry_name(component)?;
+                components.push(component);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components.pop().is_none() {
+                    return Err(Error::InvalidPath {
+                        path: target.into(),
+                        reason: "artifact symlink escapes the tree root".into(),
+                    });
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::InvalidPath {
+                    path: target.into(),
+                    reason: "artifact symlink target must be relative".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_artifact_file_unchanged(
+    path: &Path,
+    before: &fs::Metadata,
+    after: &fs::Metadata,
+    observed_bytes: u64,
+) -> Result<()> {
+    if observed_bytes != before.len() || !same_artifact_metadata(before, after) {
+        return Err(Error::InvalidInput(format!(
+            "artifact file `{}` changed during ingestion",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_secret_policy(bytes: &[u8]) -> Result<()> {
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && contains_sensitive_text(text)
+    {
+        return Err(Error::InvalidInput(
+            "artifact content may contain secret material and cannot enter shared CAS".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_metadata_policy(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if metadata.permissions().mode() & 0o7000 != 0 {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: "setuid, setgid, and sticky artifact modes are prohibited".into(),
+            });
+        }
+        if metadata.is_file()
+            && metadata.len() > ARTIFACT_WHOLE_BLOB_MAX_BYTES as u64
+            && metadata.blocks().saturating_mul(512) < metadata.len() / 2
+        {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: "excessively sparse artifact files are prohibited".into(),
+            });
+        }
+        let mut attributes = xattr::list(path)?
+            .filter(|attribute| attribute != "com.apple.provenance")
+            .collect::<Vec<_>>();
+        attributes.sort();
+        if let Some(attribute) = attributes.first() {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: format!(
+                    "artifact extended attribute `{}` is prohibited",
+                    attribute.to_string_lossy()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn same_artifact_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.file_type() == right.file_type()
+        && left.modified().ok() == right.modified().ok()
+}
+
+#[cfg(unix)]
+fn normalized_artifact_file_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+#[cfg(not(unix))]
+fn normalized_artifact_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o644
+}
+
+#[cfg(unix)]
+fn set_artifact_materialized_mode(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_artifact_materialized_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn validate_artifact_resolution_snapshot(snapshot: &ArtifactResolutionSnapshotV1) -> Result<()> {
+    if snapshot.version != ARTIFACT_RESOLUTION_SNAPSHOT_VERSION {
+        return Err(Error::Corrupt(format!(
+            "artifact resolution snapshot version {} is unsupported",
+            snapshot.version
+        )));
+    }
+    validate_resolution_text(&snapshot.proposal_key, "snapshot proposal key")?;
+    validate_resolution_text(&snapshot.component_id, "snapshot component id")?;
+    validate_resolution_text(&snapshot.adapter_identity, "snapshot adapter identity")?;
+    validate_resolution_text(&snapshot.snapshot_format, "snapshot format")?;
+    validate_resolution_text(
+        &snapshot.resolver_executable_identity,
+        "snapshot resolver executable identity",
+    )?;
+    validate_resolution_text(&snapshot.policy_identity, "snapshot policy identity")?;
+    validate_sha256(&snapshot.content_sha256, "snapshot content hash")?;
+    validate_identity_map(&snapshot.resolved_identities, "resolved identity")?;
+    validate_identity_map(&snapshot.checksums, "snapshot checksum")?;
+    if snapshot.contacted_authorities.len() > MAX_RESOLUTION_AUTHORITIES
+        || !snapshot
+            .contacted_authorities
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(Error::Corrupt(
+            "artifact snapshot authorities are excessive, duplicated, or not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_string_set(values: &mut Vec<String>, maximum: usize, field: &str) -> Result<()> {
+    if values.len() > maximum {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution {field} count exceeds {maximum}"
+        )));
+    }
+    for value in values.iter() {
+        validate_resolution_text(value, field)?;
+    }
+    values.sort();
+    values.dedup();
+    Ok(())
+}
+
+fn validate_identity_map(values: &BTreeMap<String, String>, field: &str) -> Result<()> {
+    if values.len() > MAX_RESOLUTION_INPUTS {
+        return Err(Error::InvalidInput(format!(
+            "artifact {field} count exceeds {MAX_RESOLUTION_INPUTS}"
+        )));
+    }
+    for (key, value) in values {
+        validate_resolution_text(key, field)?;
+        validate_resolution_text(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_resolution_relative_path(value: &str, field: &str, allow_dot: bool) -> Result<()> {
+    if allow_dot && value == "." {
+        return Ok(());
+    }
+    let normalized = normalize_relative_path(value)?;
+    if normalized != value {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution {field} `{value}` is not normalized"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_resolution_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_RESOLUTION_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution {field} is empty, oversized, or contains control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolution {field} must be a SHA-256 hex digest"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::time::Instant;
+
+    fn fixture_plan(source_root: ObjectId) -> ArtifactResolutionPlanV1 {
+        ArtifactResolutionPlanV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            proposal_key: "proposal_fixture".into(),
+            source_root,
+            component_id: "cargo:root".into(),
+            adapter_identity: "trail.builtin/cargo@1".into(),
+            policy_identity: "policy_fixture".into(),
+            program: "cargo".into(),
+            resolved_program: "/usr/bin/cargo".into(),
+            executable_identity: "sha256:fixture".into(),
+            argv: vec!["cargo".into(), "generate-lockfile".into()],
+            working_directory: ".".into(),
+            readable_inputs: vec![ArtifactResolutionInputV1 {
+                source_path: "Cargo.toml".into(),
+                content_hash: "11".repeat(32),
+                size_bytes: 12,
+            }],
+            candidate_output: "candidate/Cargo.lock".into(),
+            allowed_authorities: vec!["index.crates.io:443".into()],
+            credential_handles: Vec::new(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            environment_roles: BTreeMap::from([(
+                "CARGO_HOME".into(),
+                ArtifactEnvironmentRoleV1::Runtime,
+            )]),
+            limits: ArtifactActionLimitsV1 {
+                timeout_ms: 60_000,
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                candidate_bytes: 1024 * 1024,
+                candidate_entries: 1,
+                child_processes: 8,
+            },
+            snapshot_format: "cargo-lock/v4".into(),
+            validations: vec![ArtifactValidationV1 {
+                name: "cargo-lock-structure".into(),
+                kind: ArtifactValidationKindV1::Structural,
+                required: true,
+                parameters: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn fixture_desired_material(source_root: ObjectId) -> ArtifactDesiredKeyMaterialV2 {
+        ArtifactDesiredKeyMaterialV2 {
+            version: 2,
+            component_id: "cargo:root".into(),
+            adapter_identity: "trail.builtin/cargo@1".into(),
+            adapter_implementation_version: "1".into(),
+            adapter_distribution_digest: "builtin:cargo:1".into(),
+            adapter_protocol: "trail.environment-adapter/builtin-v1".into(),
+            resolution_snapshot_id: None,
+            source_closure: ArtifactSourceClosureV2 {
+                normalizer_version: "source-paths/v1".into(),
+                certified_complete: false,
+                complete_source_root: Some(source_root),
+                declared_inputs: vec![ArtifactResolutionInputV1 {
+                    source_path: "Cargo.toml".into(),
+                    content_hash: "11".repeat(32),
+                    size_bytes: 12,
+                }],
+            },
+            upstream_identities: BTreeMap::new(),
+            actions: vec![ArtifactActionIdentityV2 {
+                name: "build".into(),
+                phase: ArtifactActionPhaseV2::Construct,
+                executable_identity: "sha256:cargo".into(),
+                argv: vec!["cargo".into(), "build".into(), "--locked".into()],
+                working_directory: ".".into(),
+                environment_names: vec!["CARGO_TARGET_DIR".into()],
+            }],
+            outputs: vec![ArtifactOutputContractV2 {
+                name: "target".into(),
+                output_path: "target".into(),
+                mount_path: "target".into(),
+                policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
+            }],
+            validations: vec![ArtifactValidationV1 {
+                name: "tree".into(),
+                kind: ArtifactValidationKindV1::Structural,
+                required: true,
+                parameters: BTreeMap::new(),
+            }],
+            source_exports: Vec::new(),
+            build_environment: BTreeMap::from([("RUSTFLAGS".into(), "-Cdebuginfo=0".into())]),
+            target: "debug".into(),
+            platform: "darwin".into(),
+            architecture: "aarch64".into(),
+            abi: "apple".into(),
+            portability_certified: true,
+            portability_scope: "workspace".into(),
+            trust_scope: "builtin".into(),
+            network_policy: "deny".into(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            sandbox_policy: "native-deny-by-default".into(),
+        }
+    }
+
+    #[test]
+    fn desired_key_v2_is_canonical_and_separates_identity_dimensions() {
+        let source_root = ObjectId("object_source".into());
+        let mut left = fixture_desired_material(source_root.clone());
+        left.upstream_identities.insert("z".into(), "2".into());
+        left.upstream_identities.insert("a".into(), "1".into());
+        let mut right = fixture_desired_material(source_root);
+        right.upstream_identities.insert("a".into(), "1".into());
+        right.upstream_identities.insert("z".into(), "2".into());
+        let left_key = artifact_desired_key_v2(left.clone()).unwrap();
+        assert_eq!(left_key, artifact_desired_key_v2(right).unwrap());
+
+        left.resolution_snapshot_id = Some(ObjectId("object_snapshot".into()));
+        assert_ne!(left_key, artifact_desired_key_v2(left).unwrap());
+    }
+
+    #[test]
+    fn desired_key_v2_requires_safe_source_fallback_and_rejects_secrets() {
+        let mut material = fixture_desired_material(ObjectId("object_source".into()));
+        material.source_closure.complete_source_root = None;
+        assert!(artifact_desired_key_v2(material.clone()).is_err());
+
+        material.source_closure.complete_source_root = Some(ObjectId("object_source".into()));
+        let first_source = artifact_desired_key_v2(material.clone()).unwrap();
+        material.source_closure.complete_source_root = Some(ObjectId("object_other_source".into()));
+        assert_ne!(
+            first_source,
+            artifact_desired_key_v2(material.clone()).unwrap()
+        );
+
+        material.portability_certified = false;
+        assert!(artifact_desired_key_v2(material.clone()).is_err());
+        material.outputs[0].reuse = EnvironmentReuseMode::None;
+        material.outputs[0].scope = EnvironmentSharingScope::Lane;
+        assert!(artifact_desired_key_v2(material.clone()).is_ok());
+
+        material
+            .build_environment
+            .insert("API_TOKEN".into(), "super-secret".into());
+        assert!(artifact_desired_key_v2(material).is_err());
+    }
+
+    #[test]
+    fn desired_key_v2_diff_reports_first_and_complete_ordered_invalidation_edges() {
+        let previous = fixture_desired_material(ObjectId("object_source".into()));
+        let mut current = previous.clone();
+        current.resolution_snapshot_id = Some(ObjectId("object_snapshot".into()));
+        current.adapter_implementation_version = "2".into();
+        current.actions[0].argv.push("--release".into());
+        current.outputs[0].mount_path = "target-v2".into();
+        current.validations[0]
+            .parameters
+            .insert("profile".into(), "strict".into());
+        current.source_exports.push(ArtifactSourceExportContractV2 {
+            name: "bindings".into(),
+            artifact_subpath: "generated".into(),
+            destination: "src/generated".into(),
+            collision_policy: "reject".into(),
+            required_validation: "tree".into(),
+        });
+        current.trust_scope = "signed-plugin".into();
+        current.sandbox_policy = "native-strict".into();
+
+        let diff = diff_artifact_desired_key_v2(&previous, &current).unwrap();
+        assert_ne!(diff.previous_key, diff.current_key);
+        assert_eq!(diff.first.as_ref().unwrap().dimension, "resolution");
+        assert_eq!(
+            diff.edges
+                .iter()
+                .map(|edge| edge.dimension.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "resolution",
+                "tool",
+                "action",
+                "output",
+                "validation",
+                "export",
+                "trust",
+                "sandbox",
+            ])
+        );
+        let mut sorted = diff.edges.clone();
+        sorted.sort_by(|left, right| {
+            artifact_invalidation_dimension_rank(&left.dimension)
+                .cmp(&artifact_invalidation_dimension_rank(&right.dimension))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.change.cmp(&right.change))
+        });
+        assert_eq!(diff.edges, sorted);
+    }
+
+    #[test]
+    fn desired_key_v2_preserves_absence_unicode_and_normalizer_semantics() {
+        let material = fixture_desired_material(ObjectId("object_source".into()));
+        let mut encoded = serde_json::to_value(&material).unwrap();
+        encoded.as_object_mut().unwrap().remove("source_exports");
+        assert!(serde_json::from_value::<ArtifactDesiredKeyMaterialV2>(encoded).is_err());
+
+        let mut empty_snapshot = material.clone();
+        empty_snapshot.resolution_snapshot_id = Some(ObjectId(String::new()));
+        assert!(artifact_desired_key_v2(empty_snapshot).is_err());
+        assert!(artifact_desired_key_v2(material.clone()).is_ok());
+
+        let mut composed = material.clone();
+        composed.source_closure.certified_complete = true;
+        composed.source_closure.complete_source_root = None;
+        composed.source_closure.declared_inputs[0].source_path = "café/Cargo.toml".into();
+        let composed_key = artifact_desired_key_v2(composed.clone()).unwrap();
+        let mut decomposed = composed.clone();
+        decomposed.source_closure.declared_inputs[0].source_path = "cafe\u{301}/Cargo.toml".into();
+        assert!(artifact_desired_key_v2(decomposed).is_err());
+
+        composed.source_closure.normalizer_version = "source-paths/v2".into();
+        assert_ne!(composed_key, artifact_desired_key_v2(composed).unwrap());
+    }
+
+    #[test]
+    fn each_desired_key_v2_identity_dimension_invalidates_independently() {
+        let base = fixture_desired_material(ObjectId("object_source".into()));
+        let base_key = artifact_desired_key_v2(base.clone()).unwrap();
+        let mut variants = Vec::new();
+
+        let mut value = base.clone();
+        value.adapter_distribution_digest = "builtin:cargo:2".into();
+        variants.push(("adapter", value));
+        let mut value = base.clone();
+        value.source_closure.normalizer_version = "source-paths/v2".into();
+        variants.push(("source", value));
+        let mut value = base.clone();
+        value.actions[0].argv.push("--release".into());
+        variants.push(("action", value));
+        let mut value = base.clone();
+        value.outputs[0].mount_path = "target-v2".into();
+        variants.push(("output", value));
+        let mut value = base.clone();
+        value.validations[0].required = false;
+        variants.push(("validation", value));
+        let mut value = base.clone();
+        value.source_exports.push(ArtifactSourceExportContractV2 {
+            name: "generated".into(),
+            artifact_subpath: "generated".into(),
+            destination: "src/generated".into(),
+            collision_policy: "reject".into(),
+            required_validation: "tree".into(),
+        });
+        variants.push(("export", value));
+        let mut value = base.clone();
+        value.abi = "musl".into();
+        variants.push(("platform", value));
+        let mut value = base;
+        value.sandbox_policy = "native-strict".into();
+        variants.push(("sandbox", value));
+
+        for (dimension, variant) in variants {
+            assert_ne!(
+                base_key,
+                artifact_desired_key_v2(variant).unwrap(),
+                "identity dimension `{dimension}` did not invalidate the desired key"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn desired_key_v2_is_stable_for_arbitrary_declared_input_order(
+            inputs in prop::collection::btree_map("[a-z]{1,12}", any::<u64>(), 0..32)
+        ) {
+            let mut forward = fixture_desired_material(ObjectId("object_source".into()));
+            forward.source_closure.certified_complete = true;
+            forward.source_closure.complete_source_root = None;
+            forward.source_closure.declared_inputs = inputs
+                .iter()
+                .map(|(name, value)| ArtifactResolutionInputV1 {
+                    source_path: format!("inputs/{name}"),
+                    content_hash: sha256_hex(&value.to_le_bytes()),
+                    size_bytes: 8,
+                })
+                .collect();
+            if forward.source_closure.declared_inputs.is_empty() {
+                forward.source_closure.declared_inputs.push(ArtifactResolutionInputV1 {
+                    source_path: "inputs/empty".into(),
+                    content_hash: sha256_hex(b"empty"),
+                    size_bytes: 0,
+                });
+            }
+            let mut reverse = forward.clone();
+            reverse.source_closure.declared_inputs.reverse();
+            prop_assert_eq!(
+                artifact_desired_key_v2(forward).unwrap(),
+                artifact_desired_key_v2(reverse).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "qualification benchmark; run explicitly with --nocapture"]
+    fn artifact_cas_benchmark_records_whole_chunked_and_successor_reuse() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+
+        let whole_bytes = deterministic_benchmark_bytes(ARTIFACT_WHOLE_BLOB_MAX_BYTES);
+        let whole_cpu = process_cpu_micros();
+        let whole_started = Instant::now();
+        let whole_file = db.ingest_artifact_file_bytes(&whole_bytes, 0o644).unwrap();
+        let whole_wall_micros = whole_started.elapsed().as_micros() as u64;
+        let whole_cpu_micros = process_cpu_micros().saturating_sub(whole_cpu);
+        let whole_node: ArtifactFileNodeV1 = db
+            .get_artifact_cas_object(
+                &whole_file.0,
+                ARTIFACT_FILE_NODE_KIND,
+                ARTIFACT_FILE_NODE_VERSION,
+            )
+            .unwrap();
+        assert!(matches!(
+            whole_node.content,
+            ArtifactFileContentV1::Blob { .. }
+        ));
+        let whole_counts = artifact_benchmark_storage_counts(&db);
+
+        let chunked_bytes = deterministic_benchmark_bytes(16 * 1024 * 1024);
+        let chunked_cpu = process_cpu_micros();
+        let chunked_started = Instant::now();
+        let chunked_file = db
+            .ingest_artifact_file_bytes(&chunked_bytes, 0o644)
+            .unwrap();
+        let chunked_wall_micros = chunked_started.elapsed().as_micros() as u64;
+        let chunked_cpu_micros = process_cpu_micros().saturating_sub(chunked_cpu);
+        let chunked_node: ArtifactFileNodeV1 = db
+            .get_artifact_cas_object(
+                &chunked_file.0,
+                ARTIFACT_FILE_NODE_KIND,
+                ARTIFACT_FILE_NODE_VERSION,
+            )
+            .unwrap();
+        let ArtifactFileContentV1::Chunks { chunk_list_id } = chunked_node.content else {
+            panic!("large benchmark file did not use FastCDC chunks");
+        };
+        let initial_list: ArtifactChunkListV1 = db
+            .get_artifact_cas_object(
+                &chunk_list_id.0,
+                ARTIFACT_CHUNK_LIST_KIND,
+                ARTIFACT_CHUNK_LIST_VERSION,
+            )
+            .unwrap();
+        assert!(initial_list.chunks.len() > 1);
+        let chunked_counts = artifact_benchmark_storage_counts(&db);
+
+        let mut successor_bytes = chunked_bytes;
+        let midpoint = successor_bytes.len() / 2;
+        for byte in &mut successor_bytes[midpoint..midpoint + 64] {
+            *byte ^= 0x5a;
+        }
+        let successor_cpu = process_cpu_micros();
+        let successor_started = Instant::now();
+        let successor_file = db
+            .ingest_artifact_file_bytes(&successor_bytes, 0o644)
+            .unwrap();
+        let successor_wall_micros = successor_started.elapsed().as_micros() as u64;
+        let successor_cpu_micros = process_cpu_micros().saturating_sub(successor_cpu);
+        let successor_node: ArtifactFileNodeV1 = db
+            .get_artifact_cas_object(
+                &successor_file.0,
+                ARTIFACT_FILE_NODE_KIND,
+                ARTIFACT_FILE_NODE_VERSION,
+            )
+            .unwrap();
+        let ArtifactFileContentV1::Chunks {
+            chunk_list_id: successor_list_id,
+        } = successor_node.content
+        else {
+            panic!("large successor benchmark file did not use FastCDC chunks");
+        };
+        let successor_list: ArtifactChunkListV1 = db
+            .get_artifact_cas_object(
+                &successor_list_id.0,
+                ARTIFACT_CHUNK_LIST_KIND,
+                ARTIFACT_CHUNK_LIST_VERSION,
+            )
+            .unwrap();
+        let initial_chunks = initial_list
+            .chunks
+            .iter()
+            .map(|chunk| &chunk.chunk_id)
+            .collect::<BTreeSet<_>>();
+        let reused_chunks = successor_list
+            .chunks
+            .iter()
+            .filter(|chunk| initial_chunks.contains(&chunk.chunk_id))
+            .count();
+        assert!(reused_chunks > 0, "successor failed to reuse any CDC chunk");
+        let successor_counts = artifact_benchmark_storage_counts(&db);
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "trail.artifact-cas-benchmark/v1",
+                "whole": {
+                    "logical_bytes": whole_bytes.len(),
+                    "cpu_micros": whole_cpu_micros,
+                    "wall_micros": whole_wall_micros,
+                    "object_count": whole_counts.0,
+                    "unique_object_bytes": whole_counts.2,
+                },
+                "chunked": {
+                    "logical_bytes": 16 * 1024 * 1024,
+                    "cpu_micros": chunked_cpu_micros,
+                    "wall_micros": chunked_wall_micros,
+                    "new_object_count": chunked_counts.0 - whole_counts.0,
+                    "new_unique_object_bytes": chunked_counts.2 - whole_counts.2,
+                    "chunk_count": initial_list.chunks.len(),
+                },
+                "successor": {
+                    "logical_bytes": successor_bytes.len(),
+                    "cpu_micros": successor_cpu_micros,
+                    "wall_micros": successor_wall_micros,
+                    "new_object_count": successor_counts.0 - chunked_counts.0,
+                    "new_unique_object_bytes": successor_counts.2 - chunked_counts.2,
+                    "chunk_count": successor_list.chunks.len(),
+                    "reused_chunks": reused_chunks,
+                }
+            })
+        );
+    }
+
+    fn artifact_benchmark_storage_counts(db: &Trail) -> (u64, u64, u64) {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(a.logical_bytes),0),
+                        COALESCE(SUM(LENGTH(o.bytes)),0)
+                 FROM artifact_objects a JOIN objects o ON o.object_id=a.object_id",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn deterministic_benchmark_bytes(size: usize) -> Vec<u8> {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        (0..size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn process_cpu_micros() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the supplied rusage on success, and
+        // the pointer is valid for the duration of this call.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return 0;
+        }
+        // SAFETY: the success branch above guarantees initialization.
+        let usage = unsafe { usage.assume_init() };
+        timeval_micros(usage.ru_utime).saturating_add(timeval_micros(usage.ru_stime))
+    }
+
+    fn timeval_micros(value: libc::timeval) -> u64 {
+        u64::try_from(value.tv_sec)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::try_from(value.tv_usec).unwrap_or(0))
+    }
+
+    #[test]
+    fn divergent_tree_roots_for_one_desired_key_are_quarantined_and_held() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let first_source = tempfile::tempdir().unwrap();
+        let second_source = tempfile::tempdir().unwrap();
+        fs::write(first_source.path().join("result"), "first\n").unwrap();
+        fs::write(second_source.path().join("result"), "second\n").unwrap();
+        let (first_tree, _) = db
+            .ingest_artifact_tree_under_write_lock(first_source.path())
+            .unwrap();
+        let (second_tree, _) = db
+            .ingest_artifact_tree_under_write_lock(second_source.path())
+            .unwrap();
+        let desired_key =
+            artifact_desired_key_v2(fixture_desired_material(ObjectId("object_source".into())))
+                .unwrap();
+        let envelope = |tree_root_id| ArtifactEnvelopeV1 {
+            version: ARTIFACT_ENVELOPE_VERSION,
+            desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+                desired_key: desired_key.clone(),
+            },
+            tree_root_id,
+            component_id: "cargo:root".into(),
+            output_name: "target".into(),
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            portability_scope: "workspace".into(),
+            trust_scope: "builtin".into(),
+            resolution_snapshot_id: None,
+            validation_receipt_ids: Vec::new(),
+        };
+
+        let (first_envelope, first_quarantined) = db
+            .put_artifact_envelope_under_write_lock(envelope(first_tree.clone()))
+            .unwrap();
+        assert!(!first_quarantined);
+        db.verify_ready_artifact_envelope_under_write_lock(&first_envelope, &first_tree)
+            .unwrap();
+        let (second_envelope, second_quarantined) = db
+            .put_artifact_envelope_under_write_lock(envelope(second_tree.clone()))
+            .unwrap();
+        assert!(second_quarantined);
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&first_envelope, &first_tree)
+            .is_err());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes
+                     WHERE envelope_id IN (?1,?2) AND state='quarantined'",
+                    params![first_envelope.0, second_envelope.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let (quarantine_id, evidence_object_id) = db
+            .conn
+            .query_row(
+                "SELECT quarantine_id,evidence_object_id FROM artifact_quarantines
+                 WHERE desired_key=?1 AND trust_scope='builtin' AND state='active'",
+                params![desired_key.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert!(quarantine_id.starts_with("artifact_quarantine_"));
+        let evidence: ArtifactDivergenceEvidenceV1 = db
+            .get_object(
+                ARTIFACT_DIVERGENCE_EVIDENCE_KIND,
+                &ObjectId(evidence_object_id),
+            )
+            .unwrap();
+        assert_eq!(evidence.incumbent_tree_root_id, first_tree);
+        assert_eq!(evidence.candidate_tree_root_id, second_tree);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_holds WHERE reason=?1",
+                    params![quarantine_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let quarantine_id = ArtifactQuarantineId::parse(quarantine_id).unwrap();
+        assert_eq!(db.list_artifact_quarantines().unwrap().len(), 1);
+        assert_eq!(
+            db.artifact_quarantine(&quarantine_id).unwrap().state,
+            "active"
+        );
+        let resolved = db
+            .resolve_artifact_quarantine(
+                &quarantine_id,
+                ArtifactQuarantineResolutionV1::RetainPrivate,
+            )
+            .unwrap();
+        assert_eq!(resolved.state, "resolved");
+        assert_eq!(resolved.resolution.as_deref(), Some("retain_private"));
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&second_envelope, &second_tree)
+            .is_err());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_holds WHERE reason=?1",
+                    params![quarantine_id.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_layer_identity_never_defaults_to_v2() {
+        let legacy = ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
+            cache_key: "legacy-cache-key".into(),
+            canonical_key: WorkspaceLayerKeyV1 {
+                kind: "dependency".into(),
+                adapter: "node".into(),
+                adapter_version: 1,
+                inputs: BTreeMap::from([("lock".into(), "digest".into())]),
+                tool_versions: BTreeMap::from([("node".into(), "22".into())]),
+                platform: "darwin".into(),
+                architecture: "aarch64".into(),
+                portability_scope: "platform".into(),
+                strategy: "npm-ci".into(),
+            },
+        };
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(encoded["identity_version"], "workspace_layer_v1");
+        let decoded: ArtifactDesiredIdentityV1 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, legacy);
+        assert!(decoded.desired_key_v2().is_none());
+    }
+
+    #[test]
+    fn artifact_object_codecs_are_canonical_and_validate_edges() {
+        let blob = ArtifactBlobV1 {
+            version: ARTIFACT_BLOB_VERSION,
+            content_sha256: sha256_hex(b"same bytes"),
+            bytes: b"same bytes".to_vec(),
+        };
+        let (blob_id, blob_bytes) = encode_artifact_blob(blob.clone()).unwrap();
+        assert_eq!(decode_artifact_blob(&blob_bytes, &blob_id).unwrap(), blob);
+
+        let file = ArtifactFileNodeV1 {
+            version: ARTIFACT_FILE_NODE_VERSION,
+            mode: 0o644,
+            executable: false,
+            size_bytes: 10,
+            content_sha256: sha256_hex(b"same bytes"),
+            content: ArtifactFileContentV1::Blob { blob_id },
+        };
+        let (file_id, _) = encode_artifact_file_node(file).unwrap();
+        let directory = ArtifactDirectoryNodeV1 {
+            version: ARTIFACT_DIRECTORY_NODE_VERSION,
+            entries: vec![
+                ArtifactDirectoryEntryV1 {
+                    name: "z".into(),
+                    target: ArtifactDirectoryEntryTargetV1::Symlink { target: "a".into() },
+                },
+                ArtifactDirectoryEntryV1 {
+                    name: "a".into(),
+                    target: ArtifactDirectoryEntryTargetV1::File { node_id: file_id },
+                },
+            ],
+        };
+        let (directory_id, canonical) = encode_artifact_directory_node(directory).unwrap();
+        let decoded = decode_artifact_directory_node(&canonical).unwrap();
+        assert_eq!(decoded.entries[0].name, "a");
+        assert_eq!(
+            directory_id,
+            encode_artifact_directory_node(decoded).unwrap().0
+        );
+
+        let root = ArtifactTreeRootV1 {
+            version: ARTIFACT_TREE_ROOT_VERSION,
+            root_directory_id: directory_id.clone(),
+            logical_bytes: 10,
+            entry_count: 2,
+            path_normalizer: "trail-paths/v1".into(),
+        };
+        assert_ne!(encode_artifact_tree_root(root).unwrap().0, directory_id);
+    }
+
+    #[test]
+    fn artifact_object_codecs_reject_noncanonical_or_broken_edges() {
+        let invalid_directory = ArtifactDirectoryNodeV1 {
+            version: ARTIFACT_DIRECTORY_NODE_VERSION,
+            entries: vec![
+                ArtifactDirectoryEntryV1 {
+                    name: "duplicate".into(),
+                    target: ArtifactDirectoryEntryTargetV1::Symlink { target: "a".into() },
+                },
+                ArtifactDirectoryEntryV1 {
+                    name: "duplicate".into(),
+                    target: ArtifactDirectoryEntryTargetV1::Symlink { target: "b".into() },
+                },
+            ],
+        };
+        assert!(encode_artifact_directory_node(invalid_directory).is_err());
+
+        let invalid_chunks = ArtifactChunkListV1 {
+            version: ARTIFACT_CHUNK_LIST_VERSION,
+            algorithm: "fastcdc-v1".into(),
+            file_size_bytes: 99,
+            file_sha256: "11".repeat(32),
+            chunks: vec![ArtifactChunkRefV1 {
+                chunk_id: ArtifactChunkId::new(b"chunk"),
+                size_bytes: 1,
+            }],
+        };
+        assert!(encode_artifact_chunk_list(invalid_chunks).is_err());
+
+        let chunk = ArtifactChunkV1 {
+            version: ARTIFACT_CHUNK_VERSION,
+            content_sha256: "00".repeat(32),
+            bytes: b"not zero".to_vec(),
+        };
+        assert!(encode_artifact_chunk(chunk).is_err());
+    }
+
+    #[test]
+    fn artifact_file_storage_uses_whole_blobs_then_fastcdc_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let _lock = db.acquire_write_lock().unwrap();
+
+        let small = vec![b'a'; ARTIFACT_WHOLE_BLOB_MAX_BYTES];
+        let small_id = db.ingest_artifact_file_bytes(&small, 0o644).unwrap();
+        let small_file: ArtifactFileNodeV1 = db
+            .get_object(
+                ARTIFACT_FILE_NODE_KIND,
+                &artifact_object_id(&db, &small_id.0),
+            )
+            .unwrap();
+        assert!(matches!(
+            small_file.content,
+            ArtifactFileContentV1::Blob { .. }
+        ));
+
+        let mut large = Vec::with_capacity(5 * 1024 * 1024);
+        for index in 0..5 * 1024 * 1024 {
+            large.push(((index * 31 + index / 97) % 251) as u8);
+        }
+        let large_id = db.ingest_artifact_file_bytes(&large, 0o755).unwrap();
+        let large_file: ArtifactFileNodeV1 = db
+            .get_object(
+                ARTIFACT_FILE_NODE_KIND,
+                &artifact_object_id(&db, &large_id.0),
+            )
+            .unwrap();
+        let ArtifactFileContentV1::Chunks { chunk_list_id } = large_file.content else {
+            panic!("large artifact file must use chunks");
+        };
+        let chunk_list: ArtifactChunkListV1 = db
+            .get_object(
+                ARTIFACT_CHUNK_LIST_KIND,
+                &artifact_object_id(&db, &chunk_list_id.0),
+            )
+            .unwrap();
+        assert_eq!(chunk_list.algorithm, "fastcdc-v1");
+        assert_eq!(chunk_list.file_size_bytes, large.len() as u64);
+        assert!(chunk_list.chunks.len() >= 2);
+        assert!(chunk_list
+            .chunks
+            .iter()
+            .all(|chunk| chunk.size_bytes <= ARTIFACT_CHUNK_MAX_BYTES as u64));
+    }
+
+    #[test]
+    fn equal_artifact_files_reuse_cas_objects_across_desired_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let _lock = db.acquire_write_lock().unwrap();
+        let bytes = b"framework-neutral reusable bytes";
+        let first = db.ingest_artifact_file_bytes(bytes, 0o644).unwrap();
+        let object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let second = db.ingest_artifact_file_bytes(bytes, 0o644).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            object_count
+        );
+    }
+
+    #[test]
+    fn artifact_tree_ingestion_is_order_independent_and_reuses_content() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for root in [left.path(), right.path()] {
+            fs::create_dir_all(root.join("nested")).unwrap();
+        }
+        fs::write(left.path().join("z.txt"), "z\n").unwrap();
+        fs::write(left.path().join("nested/a.txt"), "a\n").unwrap();
+        fs::write(right.path().join("nested/a.txt"), "a\n").unwrap();
+        fs::write(right.path().join("z.txt"), "z\n").unwrap();
+
+        let (left_id, left_tree) = db.ingest_artifact_tree(left.path()).unwrap();
+        let object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let (right_id, right_tree) = db.ingest_artifact_tree(right.path()).unwrap();
+        assert_eq!(left_id, right_id);
+        assert_eq!(left_tree, right_tree);
+        assert_eq!(left_tree.entry_count, 3);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            object_count
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_tree_ingestion_rejects_escaping_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("../outside", source.path().join("escape")).unwrap();
+        let error = db.ingest_artifact_tree(source.path()).unwrap_err();
+        assert!(error.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn artifact_tree_ingestion_rejects_secret_content() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("generated.env"),
+            "API_TOKEN=do-not-store\n",
+        )
+        .unwrap();
+        let error = db.ingest_artifact_tree(source.path()).unwrap_err();
+        assert!(error.to_string().contains("secret material"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_tree_ingestion_rejects_privileged_modes_and_xattrs() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+
+        let privileged = tempfile::tempdir().unwrap();
+        let privileged_file = privileged.path().join("tool");
+        fs::write(&privileged_file, "tool\n").unwrap();
+        let mut permissions = fs::metadata(&privileged_file).unwrap().permissions();
+        permissions.set_mode(0o4755);
+        fs::set_permissions(&privileged_file, permissions).unwrap();
+        let error = db.ingest_artifact_tree(privileged.path()).unwrap_err();
+        assert!(error.to_string().contains("setuid"));
+
+        let attributed = tempfile::tempdir().unwrap();
+        let attributed_file = attributed.path().join("artifact");
+        fs::write(&attributed_file, "clean\n").unwrap();
+        let attribute = if cfg!(target_os = "macos") {
+            "com.trail.test"
+        } else {
+            "user.trail-test"
+        };
+        xattr::set(&attributed_file, attribute, b"value").unwrap();
+        let error = db.ingest_artifact_tree(attributed.path()).unwrap_err();
+        assert!(error.to_string().contains("extended attribute"));
+    }
+
+    #[test]
+    fn artifact_object_publication_rolls_back_and_retries_after_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let _lock = db.acquire_write_lock().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_artifact_mapping
+                 BEFORE INSERT ON artifact_objects
+                 BEGIN SELECT RAISE(ABORT, 'injected artifact publication failure'); END;",
+            )
+            .unwrap();
+        assert!(db
+            .ingest_artifact_file_bytes(b"atomic bytes", 0o644)
+            .is_err());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM objects WHERE kind IN
+                     ('ArtifactBlob','ArtifactFileNode')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_artifact_mapping")
+            .unwrap();
+        db.ingest_artifact_file_bytes(b"atomic bytes", 0o644)
+            .unwrap();
+    }
+
+    #[test]
+    fn artifact_object_publication_detects_corrupt_preexisting_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let _lock = db.acquire_write_lock().unwrap();
+        let file_id = db
+            .ingest_artifact_file_bytes(b"collision evidence", 0o644)
+            .unwrap();
+        let file: ArtifactFileNodeV1 = db
+            .get_object(
+                ARTIFACT_FILE_NODE_KIND,
+                &artifact_object_id(&db, &file_id.0),
+            )
+            .unwrap();
+        let ArtifactFileContentV1::Blob { blob_id } = file.content else {
+            panic!("small fixture must use a whole blob");
+        };
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=x'00' WHERE object_id=?1",
+                params![artifact_object_id(&db, &blob_id.0).0],
+            )
+            .unwrap();
+        let error = db
+            .ingest_artifact_file_bytes(b"collision evidence", 0o644)
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn concurrent_equal_tree_publishers_converge_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), "shared\n").unwrap();
+        let source = source.path().to_path_buf();
+        let workspace = temp.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let source = source.clone();
+            let workspace = workspace.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let db = Trail::open(workspace).unwrap();
+                barrier.wait();
+                Trail::with_write_lock_wait(Duration::from_secs(10), || {
+                    db.ingest_artifact_tree(&source)
+                })
+                .unwrap()
+                .0
+            }));
+        }
+        let first = handles.remove(0).join().unwrap();
+        let second = handles.remove(0).join().unwrap();
+        assert_eq!(first, second);
+
+        let reopened = Trail::open(temp.path()).unwrap();
+        assert_eq!(
+            artifact_object_id(&reopened, &first.0),
+            artifact_object_id(&reopened, &second.0)
+        );
+    }
+
+    #[test]
+    fn successor_large_file_reuses_unchanged_fastcdc_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let _lock = db.acquire_write_lock().unwrap();
+        let mut first_bytes = Vec::with_capacity(12 * 1024 * 1024);
+        for index in 0..12 * 1024 * 1024 {
+            first_bytes.push(((index * 17 + index / 53 + index / 997) % 251) as u8);
+        }
+        let first = db.ingest_artifact_file_bytes(&first_bytes, 0o644).unwrap();
+        let mut second_bytes = first_bytes;
+        second_bytes[6 * 1024 * 1024] ^= 0x5a;
+        let second = db.ingest_artifact_file_bytes(&second_bytes, 0o644).unwrap();
+        let first_chunks = artifact_file_chunk_ids(&db, &first);
+        let second_chunks = artifact_file_chunk_ids(&db, &second);
+        assert!(first_chunks.len() >= 3);
+        assert!(
+            first_chunks.intersection(&second_chunks).next().is_some(),
+            "a small successor edit should preserve at least one content-defined chunk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_tree_normalizes_hardlinks_and_confined_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("original"), "same inode\n").unwrap();
+        fs::hard_link(
+            source.path().join("original"),
+            source.path().join("hardlink"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("original", source.path().join("symlink")).unwrap();
+        let (_, tree) = db.ingest_artifact_tree(source.path()).unwrap();
+        assert_eq!(tree.entry_count, 3);
+        let root: ArtifactDirectoryNodeV1 = db
+            .get_object(
+                ARTIFACT_DIRECTORY_NODE_KIND,
+                &artifact_object_id(&db, &tree.root_directory_id.0),
+            )
+            .unwrap();
+        let file_ids = root
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.target {
+                ArtifactDirectoryEntryTargetV1::File { node_id } => Some(node_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_ids.len(), 2);
+        assert_eq!(file_ids[0], file_ids[1]);
+        assert!(root.entries.iter().any(|entry| matches!(
+            &entry.target,
+            ArtifactDirectoryEntryTargetV1::Symlink { target } if target == "original"
+        )));
+    }
+
+    #[test]
+    fn artifact_tree_rejects_non_nfc_and_case_colliding_paths() {
+        let non_nfc = ArtifactDirectoryNodeV1 {
+            version: ARTIFACT_DIRECTORY_NODE_VERSION,
+            entries: vec![ArtifactDirectoryEntryV1 {
+                name: "e\u{301}".into(),
+                target: ArtifactDirectoryEntryTargetV1::Symlink {
+                    target: "safe".into(),
+                },
+            }],
+        };
+        assert!(encode_artifact_directory_node(non_nfc).is_err());
+        assert!(
+            validate_no_case_fold_collisions(&["Node".to_string(), "node".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_tree_materializes_from_authoritative_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("nested")).unwrap();
+        fs::write(source.path().join("nested/artifact"), "reconstruct me\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+        let materialization_parent = tempfile::tempdir().unwrap();
+        let destination = materialization_parent.path().join("materialized");
+        let _lock = db.acquire_write_lock().unwrap();
+        db.materialize_artifact_tree_under_write_lock(&tree_id, &destination)
+            .unwrap();
+        assert_eq!(
+            fs::read(destination.join("nested/artifact")).unwrap(),
+            b"reconstruct me\n"
+        );
+        assert_eq!(
+            db.ingest_artifact_tree_under_write_lock(&destination)
+                .unwrap()
+                .0,
+            tree_id
+        );
+    }
+
+    fn artifact_file_chunk_ids(db: &Trail, file_id: &ArtifactFileId) -> BTreeSet<ArtifactChunkId> {
+        let file: ArtifactFileNodeV1 = db
+            .get_object(ARTIFACT_FILE_NODE_KIND, &artifact_object_id(db, &file_id.0))
+            .unwrap();
+        let ArtifactFileContentV1::Chunks { chunk_list_id } = file.content else {
+            panic!("large fixture must use chunks");
+        };
+        let list: ArtifactChunkListV1 = db
+            .get_object(
+                ARTIFACT_CHUNK_LIST_KIND,
+                &artifact_object_id(db, &chunk_list_id.0),
+            )
+            .unwrap();
+        list.chunks
+            .into_iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect()
+    }
+
+    fn artifact_object_id(db: &Trail, artifact_id: &str) -> ObjectId {
+        ObjectId(
+            db.conn
+                .query_row(
+                    "SELECT object_id FROM artifact_objects WHERE artifact_id=?1",
+                    params![artifact_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn resolution_plan_is_canonical_and_bounded() {
+        let mut plan = fixture_plan(ObjectId("object_source".into()));
+        plan.allowed_authorities = vec![
+            "index.crates.io:443".into(),
+            "crates.io:443".into(),
+            "index.crates.io:443".into(),
+        ];
+        normalize_artifact_resolution_plan(&mut plan).unwrap();
+        assert_eq!(
+            plan.allowed_authorities,
+            vec!["crates.io:443", "index.crates.io:443"]
+        );
+
+        plan.argv = vec!["cargo".into(); MAX_RESOLUTION_ARGV + 1];
+        assert!(normalize_artifact_resolution_plan(&mut plan).is_err());
+    }
+
+    #[test]
+    fn resolution_snapshot_is_content_addressed_reused_and_refreshed() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let plan = fixture_plan(source_root);
+
+        let (first_id, first) = db
+            .put_artifact_resolution_snapshot(
+                plan.clone(),
+                b"version = 4\n".to_vec(),
+                BTreeMap::from([("package:a".into(), "1.0.0".into())]),
+                BTreeMap::from([("package:a".into(), "22".repeat(32))]),
+                vec!["index.crates.io:443".into()],
+                false,
+            )
+            .unwrap();
+        let (reused_id, reused) = db
+            .put_artifact_resolution_snapshot(
+                plan.clone(),
+                b"version = 4\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![],
+                false,
+            )
+            .unwrap();
+        assert_eq!(reused_id, first_id);
+        assert_eq!(reused, first);
+        assert_eq!(
+            db.artifact_resolution_snapshot_content(&first).unwrap(),
+            b"version = 4\n"
+        );
+
+        let (next_id, next) = db
+            .put_artifact_resolution_snapshot(
+                plan,
+                b"version = 4\n# refreshed\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![],
+                true,
+            )
+            .unwrap();
+        assert_ne!(next_id, first_id);
+        assert_eq!(next.predecessor_snapshot_id, Some(first_id));
+        assert_eq!(
+            db.artifact_resolution_snapshot_for_proposal("proposal_fixture")
+                .unwrap()
+                .unwrap()
+                .0,
+            next_id
+        );
+    }
+
+    #[test]
+    fn resolution_snapshot_rejects_undeclared_authority_and_implicit_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let plan = fixture_plan(source_root);
+        let error = db
+            .put_artifact_resolution_snapshot(
+                plan.clone(),
+                b"lock".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec!["evil.example:443".into()],
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("undeclared"));
+
+        db.put_artifact_resolution_snapshot(
+            plan.clone(),
+            b"lock".to_vec(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        let error = db
+            .put_artifact_resolution_snapshot(
+                plan,
+                b"different lock".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![],
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit refresh"));
+    }
+}

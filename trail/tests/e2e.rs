@@ -11510,6 +11510,97 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
 }
 
 #[test]
+fn manifest_only_environment_discovery_has_cli_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"manifest-only\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"name":"manifest-only","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "manifest-only",
+        Some("main"),
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        },
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let rust = db
+        .discover_workspace_environment("manifest-only", None)
+        .unwrap();
+    let expected = serde_json::to_value(&rust).unwrap();
+    assert_eq!(expected["components"].as_array().unwrap().len(), 2);
+    assert!(expected["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|component| {
+            component["status"] == "blocked"
+                && component["reasons"][0]["code"] == "resolution_snapshot_missing"
+                && component["recovery_actions"][0]["command"].is_null()
+        }));
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/manifest-only/environment/discover",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http.status, 200);
+    assert_eq!(http.body_json::<serde_json::Value>().unwrap(), expected);
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_discover",
+                "arguments": {"lane": "manifest-only"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], expected);
+
+    let cli = run_trail_json(temp.path(), &["env", "discover", "manifest-only"]);
+    assert_eq!(cli, expected);
+
+    let openapi = trail::server::openapi_spec();
+    let component = &openapi["components"]["schemas"]["EnvironmentDiscoveredComponentReport"];
+    assert!(component["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "status"));
+    assert_eq!(
+        component["properties"]["status"]["enum"],
+        serde_json::json!(["ready", "resolvable", "blocked", "unsupported", "ambiguous"])
+    );
+}
+
+#[test]
 fn environment_graph_has_cli_http_mcp_and_openapi_parity() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("input.txt"), "graph\n").unwrap();

@@ -981,6 +981,9 @@ impl Trail {
                     component_root: component_root.to_string(),
                     kind: component.kind,
                     adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+                    status: EnvironmentComponentProposalStatus::Ready,
+                    reasons: Vec::new(),
+                    recovery_actions: Vec::new(),
                 }))
             }
             _ => Err(Error::InvalidInput(format!(

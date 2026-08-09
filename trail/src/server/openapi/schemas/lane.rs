@@ -725,13 +725,42 @@ pub(super) fn lane_schemas() -> Value {
         },
         "EnvironmentDiscoveredComponentReport": {
             "type": "object",
-            "required": ["component_id", "component_root", "kind", "adapter_identity"],
+            "required": ["component_id", "component_root", "kind", "adapter_identity", "status", "reasons", "recovery_actions"],
             "additionalProperties": false,
             "properties": {
                 "component_id": { "type": "string" },
                 "component_root": { "type": "string" },
                 "kind": { "type": "string" },
-                "adapter_identity": { "type": "string" }
+                "adapter_identity": { "type": "string" },
+                "status": { "type": "string", "enum": ["ready", "resolvable", "blocked", "unsupported", "ambiguous"] },
+                "reasons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["code", "message"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "code": { "type": "string" },
+                            "message": { "type": "string" }
+                        }
+                    }
+                },
+                "recovery_actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["code", "description"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "code": { "type": "string" },
+                            "description": { "type": "string" },
+                            "command": {
+                                "type": ["array", "null"],
+                                "items": { "type": "string" }
+                            }
+                        }
+                    }
+                }
             }
         },
         "EnvironmentDiscoveryConflictReport": {

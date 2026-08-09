@@ -260,6 +260,9 @@ impl Trail {
                 component_root: recipe.component.root,
                 kind: recipe.component.kind,
                 adapter_identity: RECIPE_ADAPTER_IDENTITY.to_string(),
+                status: EnvironmentComponentProposalStatus::Ready,
+                reasons: Vec::new(),
+                recovery_actions: Vec::new(),
             })
             .collect())
     }

@@ -744,12 +744,43 @@ pub struct EnvironmentGenerationReport {
     pub retired_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentComponentProposalStatus {
+    #[default]
+    Ready,
+    Resolvable,
+    Blocked,
+    Unsupported,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentProposalReasonReport {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentRecoveryActionReport {
+    pub code: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentDiscoveredComponentReport {
     pub component_id: String,
     pub component_root: String,
     pub kind: String,
     pub adapter_identity: String,
+    #[serde(default)]
+    pub status: EnvironmentComponentProposalStatus,
+    #[serde(default)]
+    pub reasons: Vec<EnvironmentProposalReasonReport>,
+    #[serde(default)]
+    pub recovery_actions: Vec<EnvironmentRecoveryActionReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1454,6 +1485,27 @@ mod workdir_mode_tests {
         assert_eq!(report.backend(), WorkdirBackend::Mixed);
         report.copied_files = 0;
         assert_eq!(report.backend(), WorkdirBackend::Clone);
+    }
+
+    #[test]
+    fn legacy_discovered_component_defaults_to_ready_proposal_status() {
+        let report: EnvironmentDiscoveredComponentReport = serde_json::from_value(
+            serde_json::json!({
+                "component_id": "node",
+                "component_root": "",
+                "kind": "dependency",
+                "adapter_identity": "trail/node@1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(report.status, EnvironmentComponentProposalStatus::Ready);
+        assert!(report.reasons.is_empty());
+        assert!(report.recovery_actions.is_empty());
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["reasons"], serde_json::json!([]));
+        assert_eq!(value["recovery_actions"], serde_json::json!([]));
     }
 
     #[test]

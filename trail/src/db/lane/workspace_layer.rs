@@ -577,6 +577,114 @@ impl Trail {
         Ok(())
     }
 
+    /// Rebuild missing verified layer cache directories from authoritative CAS
+    /// envelopes during workspace-open recovery. This runs under the existing
+    /// workspace write lock, stages into an attempt-owned directory, validates
+    /// against the legacy manifest, and only then publishes by atomic rename.
+    pub(crate) fn recover_workspace_layer_materializations(&self) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT l.layer_id,l.storage_path,l.manifest_object_id,
+                    s.tree_root_id,s.envelope_id
+             FROM workspace_layers l
+             JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+             JOIN artifact_envelopes e ON e.envelope_id=s.envelope_id
+             WHERE l.state='ready' AND s.state='verified'
+               AND e.state='ready' AND e.verification_state='verified'
+             ORDER BY l.layer_id",
+        )?;
+        let candidates = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for (layer_id, stored_path, manifest_id, tree_id, envelope_id) in candidates {
+            let final_path = self.db_dir.join("cache/layers").join(&layer_id);
+            if Path::new(&stored_path) != final_path {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` has a non-canonical materialization path"
+                )));
+            }
+            if final_path.exists() {
+                continue;
+            }
+            let tree_id = crate::ids::ArtifactTreeId::parse(tree_id)
+                .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+            let envelope_id =
+                crate::ids::ArtifactEnvelopeId::parse(envelope_id).map_err(|error| {
+                    Error::Corrupt(format!("invalid artifact envelope ID: {error}"))
+                })?;
+            let envelope =
+                self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)?;
+            if !matches!(
+                envelope.desired_identity,
+                ArtifactDesiredIdentityV1::WorkspaceLayerV1 { .. }
+            ) {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` references a non-legacy artifact envelope"
+                )));
+            }
+            let mut manifest: WorkspaceLayerManifest = self.get_object(
+                WORKSPACE_LAYER_MANIFEST_KIND,
+                &ObjectId(manifest_id.clone()),
+            )?;
+            self.hydrate_workspace_layer_manifest(&mut manifest)?;
+            let staging = self
+                .db_dir
+                .join("cache/staging")
+                .join(format!("restore_{layer_id}"));
+            if staging.exists() {
+                make_tree_writable(&staging);
+                fs::remove_dir_all(&staging)?;
+            }
+            fs::create_dir_all(staging.parent().unwrap())?;
+            self.materialize_artifact_tree_under_write_lock(&tree_id, &staging)?;
+            test_crash_point("layer_after_cas_materialization");
+            // The legacy manifest records the immutable attachment modes
+            // (0555/0444), so seal the reconstructed children before the
+            // byte-for-byte manifest comparison.
+            let actual = scan_layer_entries(&staging, true)?;
+            if manifest.layer_id != layer_id || manifest.entries != actual {
+                make_tree_writable(&staging);
+                fs::remove_dir_all(&staging)?;
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` CAS materialization disagrees with its manifest"
+                )));
+            }
+            fs::create_dir_all(final_path.parent().unwrap())?;
+            fs::rename(&staging, &final_path)?;
+            set_layer_read_only(
+                &final_path,
+                true,
+                layer_mode(&fs::symlink_metadata(&final_path)?),
+            )?;
+            sync_directory(final_path.parent().unwrap());
+            let physical_bytes = layer_physical_bytes(&final_path)?;
+            self.conn.execute(
+                "UPDATE workspace_layers SET physical_bytes=?1,last_used_at=?2
+                 WHERE layer_id=?3 AND state='ready'",
+                params![physical_bytes as i64, now_ts(), layer_id],
+            )?;
+            let report = self
+                .workspace_layer_by_cache_key(&manifest.cache_key)?
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "workspace layer `{layer_id}` disappeared after CAS materialization"
+                    ))
+                })?;
+            write_workspace_layer_publish_marker_from_report(&report, &manifest_id)?;
+            write_workspace_layer_verification_stamp(&report, &manifest_id)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_workspace_layer_publications_integrity(&self) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT p.publication_id,p.view_id,p.predecessor_generation_id,
@@ -1273,12 +1381,27 @@ impl Trail {
                 now,
             ],
         )?;
+        test_crash_point("layer_after_reservation");
 
         let publish = (|| -> Result<WorkspaceLayerReport> {
             copy_layer_tree(source, &staging)?;
-            let _validated_entries = scan_layer_entries(&staging, false)?;
+            let validated_entries = scan_layer_entries(&staging, false)?;
             sync_layer_tree(&staging)?;
             test_crash_point("layer_after_staging_sync");
+            let (artifact_tree_id, artifact_tree) =
+                self.ingest_artifact_tree_under_write_lock(&staging)?;
+            test_crash_point("layer_after_cas_tree");
+            verify_artifact_shadow_matches_layer_entries(
+                &artifact_tree,
+                &self.artifact_tree_flat_entries(&artifact_tree_id)?,
+                &validated_entries,
+            )?;
+            let artifact_envelope_id = self.put_legacy_artifact_envelope_under_write_lock(
+                key,
+                &cache_key,
+                artifact_tree_id.clone(),
+            )?;
+            test_crash_point("layer_after_envelope_ready");
             let entries = scan_layer_entries(&staging, true)?;
             let logical_bytes = entries.values().map(|entry| entry.size_bytes).sum();
             let entry_count = entries.len() as u64;
@@ -1353,6 +1476,17 @@ impl Trail {
             )?;
             sync_directory(final_path.parent().unwrap());
             test_crash_point("layer_after_atomic_rename");
+            self.conn.execute(
+                "INSERT OR REPLACE INTO workspace_layer_artifact_shadows(
+                    layer_id, tree_root_id, envelope_id, state, verified_at
+                 ) VALUES(?1, ?2, ?3, 'verified', ?4)",
+                params![
+                    layer_id,
+                    artifact_tree_id.0,
+                    artifact_envelope_id.0,
+                    now_ts()
+                ],
+            )?;
             self.conn.execute(
                 "UPDATE workspace_layers SET manifest_object_id = ?1, storage_path = ?2, state = 'ready', logical_bytes = ?3, physical_bytes = ?4, entry_count = ?5, builder_id = NULL, lease_expires_at = NULL, last_used_at = ?6 WHERE cache_key = ?7",
                 params![
@@ -1461,6 +1595,18 @@ impl Trail {
                 "workspace layer `{layer_id}` cannot recover because its published tree is corrupt"
             )));
         }
+        let (artifact_tree_id, artifact_tree) =
+            self.ingest_artifact_tree_under_write_lock(final_path)?;
+        verify_artifact_shadow_matches_layer_entries(
+            &artifact_tree,
+            &self.artifact_tree_flat_entries(&artifact_tree_id)?,
+            &actual,
+        )?;
+        let artifact_envelope_id = self.put_legacy_artifact_envelope_under_write_lock(
+            key,
+            cache_key,
+            artifact_tree_id.clone(),
+        )?;
         self.conn.execute(
             "INSERT INTO workspace_layers (layer_id, kind, cache_key, adapter, adapter_version, manifest_object_id, storage_path, state, logical_bytes, physical_bytes, entry_count, portability_scope, builder_id, lease_expires_at, last_used_at, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?12) \
@@ -1478,6 +1624,17 @@ impl Trail {
                 marker.entry_count as i64,
                 key.portability_scope,
                 now_ts(),
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workspace_layer_artifact_shadows(
+                layer_id, tree_root_id, envelope_id, state, verified_at
+             ) VALUES(?1, ?2, ?3, 'verified', ?4)",
+            params![
+                layer_id,
+                artifact_tree_id.0,
+                artifact_envelope_id.0,
+                now_ts()
             ],
         )?;
         let report = self
@@ -1897,16 +2054,16 @@ impl Trail {
                             path.display()
                         )));
                     }
-                    if let Err(err) = self.conn.execute(
-                        "DELETE FROM workspace_layers WHERE layer_id = ?1
-                         AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
-                        params![candidate.id],
-                    ) {
-                        let _ = fs::rename(&trash_path, &path);
-                        return Err(Error::from(err));
+                    match self.delete_workspace_layer_row_and_shadow(&candidate.id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = fs::rename(&trash_path, &path);
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = fs::rename(&trash_path, &path);
+                            return Err(error);
+                        }
                     }
                     make_tree_writable(&trash_path);
                     fs::remove_dir_all(&trash_path).map_err(|err| {
@@ -1916,14 +2073,9 @@ impl Trail {
                         ))
                     })?;
                 } else {
-                    self.conn.execute(
-                        "DELETE FROM workspace_layers WHERE layer_id = ?1
-                         AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
-                        params![candidate.id],
-                    )?;
+                    if !self.delete_workspace_layer_row_and_shadow(&candidate.id)? {
+                        continue;
+                    }
                     remove_workspace_layer_trash_entries(&trash, &candidate.id)?;
                 }
                 let _ = fs::remove_file(workspace_layer_marker_path(&path));
@@ -2030,6 +2182,57 @@ impl Trail {
             candidates: selected,
             deleted,
         })
+    }
+
+    fn delete_workspace_layer_row_and_shadow(&self, layer_id: &str) -> Result<bool> {
+        self.conn
+            .execute_batch("SAVEPOINT trail_workspace_layer_gc")?;
+        let deletion = (|| -> Result<bool> {
+            let pinned = self.conn.query_row(
+                "SELECT (EXISTS(SELECT 1 FROM workspace_view_layers WHERE layer_id=?1)
+                         OR EXISTS(SELECT 1 FROM environment_generation_components WHERE layer_id=?1)
+                         OR EXISTS(SELECT 1 FROM workspace_layer_publications WHERE layer_id=?1 AND phase IN ('published','activated'))
+                         OR EXISTS(SELECT 1 FROM workspace_layer_pins WHERE layer_id=?1 AND (expires_at IS NULL OR expires_at > unixepoch())))",
+                params![layer_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if pinned {
+                return Ok(false);
+            }
+            self.conn.execute(
+                "DELETE FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer_id],
+            )?;
+            Ok(self.conn.execute(
+                "DELETE FROM workspace_layers WHERE layer_id=?1
+                 AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id=?1)
+                 AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id=?1)
+                 AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id=?1 AND phase IN ('published','activated'))
+                 AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id=?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
+                params![layer_id],
+            )? != 0)
+        })();
+        match deletion {
+            Ok(true) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT trail_workspace_layer_gc")?;
+                Ok(true)
+            }
+            Ok(false) => {
+                self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_workspace_layer_gc;
+                     RELEASE SAVEPOINT trail_workspace_layer_gc",
+                )?;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_workspace_layer_gc;
+                     RELEASE SAVEPOINT trail_workspace_layer_gc",
+                );
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn workspace_view_layer_reports(
@@ -4756,6 +4959,49 @@ fn scan_layer_entries(
     Ok(entries)
 }
 
+fn verify_artifact_shadow_matches_layer_entries(
+    tree: &ArtifactTreeRootV1,
+    artifact_entries: &BTreeMap<String, super::workspace_artifact::ArtifactFlatEntry>,
+    layer_entries: &BTreeMap<String, WorkspaceLayerEntry>,
+) -> Result<()> {
+    let layer_logical_bytes = layer_entries
+        .values()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes));
+    if tree.entry_count != layer_entries.len() as u64
+        || Some(tree.logical_bytes) != layer_logical_bytes
+        || artifact_entries.len() != layer_entries.len()
+    {
+        return Err(Error::Corrupt(
+            "CAS shadow count or logical bytes disagree with the workspace layer scan".into(),
+        ));
+    }
+    for (path, layer) in layer_entries {
+        let artifact = artifact_entries.get(path).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "CAS shadow is missing workspace layer path `{path}`"
+            ))
+        })?;
+        let normalized_mode = match layer.kind.as_str() {
+            "directory" => 0o755,
+            "file" if layer.mode & 0o111 != 0 => 0o755,
+            "file" => 0o644,
+            "symlink" => 0o777,
+            _ => layer.mode,
+        };
+        if artifact.kind != layer.kind
+            || artifact.mode != normalized_mode
+            || artifact.size_bytes != layer.size_bytes
+            || artifact.content_hash != layer.content_hash
+            || artifact.symlink_target != layer.symlink_target
+        {
+            return Err(Error::Corrupt(format!(
+                "CAS shadow disagrees with workspace layer path `{path}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sha256_layer_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -4893,7 +5139,7 @@ fn immutable_layer_mode(directory: bool, _original_mode: u32) -> u32 {
     }
 }
 
-fn sync_layer_tree(root: &Path) -> Result<()> {
+pub(crate) fn sync_layer_tree(root: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
         if entry.file_type().is_file() {
@@ -5514,9 +5760,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_materialization_crash_helper() {
+        let Some(workspace) = std::env::var_os("TRAIL_TEST_CRASH_WORKSPACE") else {
+            return;
+        };
+        let _ = Trail::open(PathBuf::from(workspace));
+        panic!("cache materialization crash helper passed its requested crash point");
+    }
+
+    #[test]
     fn killing_cache_publish_at_each_durable_phase_preserves_source_and_recovers() {
         for phase in [
+            "layer_after_reservation",
             "layer_after_staging_sync",
+            "layer_after_cas_tree",
+            "layer_after_envelope_ready",
             "layer_after_publish_marker",
             "layer_after_atomic_rename",
             "layer_after_ready_state",
@@ -5590,6 +5848,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn killing_cas_rematerialization_before_activation_retries_without_private_data_loss() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "restore-source",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let source_upper = db
+            .workspace_view_paths_for_lane("restore-source")
+            .unwrap()
+            .source_upper;
+        fs::write(source_upper.join("uncheckpointed.rs"), "keep me\n").unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(built.path().join("pkg/index.js"), "cached\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let storage_path = PathBuf::from(&layer.storage_path);
+        make_tree_writable(&storage_path);
+        fs::remove_dir_all(&storage_path).unwrap();
+        drop(db);
+
+        let phase = "layer_after_cas_materialization";
+        let ready = workspace.path().join(format!("{phase}.ready"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::lane::workspace_layer::tests::cache_materialization_crash_helper",
+                "--nocapture",
+            ])
+            .env("RUST_TEST_THREADS", "1")
+            .env("TRAIL_TEST_CRASH_AT", phase)
+            .env("TRAIL_TEST_CRASH_READY", &ready)
+            .env("TRAIL_TEST_CRASH_WORKSPACE", workspace.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_crash_handshake(&mut child, &ready, phase);
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(source_upper.join("uncheckpointed.rs")).unwrap(),
+            "keep me\n"
+        );
+        let reopened = Trail::open(workspace.path()).unwrap();
+        reopened.verify_workspace_layer(&layer.layer_id).unwrap();
+        assert_eq!(
+            fs::read_to_string(storage_path.join("pkg/index.js")).unwrap(),
+            "cached\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source_upper.join("uncheckpointed.rs")).unwrap(),
+            "keep me\n"
+        );
+    }
+
     fn wait_for_crash_handshake(child: &mut std::process::Child, ready: &Path, phase: &str) {
         for _ in 0..1_000 {
             if ready.is_file() {
@@ -5622,6 +5956,34 @@ mod tests {
             .unwrap();
         assert_eq!(first.layer_id, second.layer_id);
         assert_eq!(db.list_workspace_layers().unwrap().len(), 1);
+        let shadow = db
+            .conn
+            .query_row(
+                "SELECT tree_root_id, envelope_id, state FROM workspace_layer_artifact_shadows
+                 WHERE layer_id=?1",
+                params![first.layer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(shadow.0.starts_with("artifact_tree_"));
+        assert!(shadow.1.starts_with("artifact_envelope_"));
+        assert_eq!(shadow.2, "verified");
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT state FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![shadow.1],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ready"
+        );
         assert!(
             fs::metadata(Path::new(&first.storage_path).join("pkg/index.js"))
                 .unwrap()
@@ -5629,6 +5991,138 @@ mod tests {
                 .readonly()
         );
         db.verify_workspace_layer(&first.layer_id).unwrap();
+    }
+
+    #[test]
+    fn workspace_open_reconstructs_missing_layer_materialization_from_verified_cas() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(
+            built.path().join("pkg/index.js"),
+            "module.exports = 'cas';\n",
+        )
+        .unwrap();
+        let published = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let storage_path = PathBuf::from(&published.storage_path);
+        let object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        make_tree_writable(&storage_path);
+        fs::remove_dir_all(&storage_path).unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(storage_path.join("pkg/index.js")).unwrap(),
+            "module.exports = 'cas';\n"
+        );
+        assert!(fs::metadata(storage_path.join("pkg/index.js"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        reopened
+            .verify_workspace_layer(&published.layer_id)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            object_count
+        );
+    }
+
+    #[test]
+    fn cas_shadow_comparison_rejects_path_metadata_and_digest_disagreement() {
+        let tree = ArtifactTreeRootV1 {
+            version: ARTIFACT_TREE_ROOT_VERSION,
+            root_directory_id: crate::ids::ArtifactTreeId::new(b"root"),
+            logical_bytes: 4,
+            entry_count: 1,
+            path_normalizer: "trail-paths/v1".into(),
+        };
+        let artifact = BTreeMap::from([(
+            "artifact".into(),
+            super::workspace_artifact::ArtifactFlatEntry {
+                kind: "file",
+                mode: 0o644,
+                size_bytes: 4,
+                content_hash: Some(sha256_hex(b"good")),
+                symlink_target: None,
+            },
+        )]);
+        let mut layer = BTreeMap::from([(
+            "artifact".into(),
+            WorkspaceLayerEntry {
+                kind: "file".into(),
+                mode: 0o644,
+                size_bytes: 4,
+                content_hash: Some(sha256_hex(b"good")),
+                symlink_target: None,
+            },
+        )]);
+        verify_artifact_shadow_matches_layer_entries(&tree, &artifact, &layer).unwrap();
+        layer.get_mut("artifact").unwrap().content_hash = Some(sha256_hex(b"evil"));
+        assert!(verify_artifact_shadow_matches_layer_entries(&tree, &artifact, &layer).is_err());
+    }
+
+    #[test]
+    #[ignore = "known pre-CAS failure: distinct desired keys duplicate equal authoritative trees"]
+    fn equal_content_under_distinct_keys_reuses_authoritative_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "identical bytes\n").unwrap();
+        let first_key = key();
+        let mut second_key = key();
+        second_key
+            .inputs
+            .insert("feature".into(), "different-desired-key".into());
+
+        let first = db
+            .publish_workspace_layer_from_directory(&first_key, built.path())
+            .unwrap();
+        let second = db
+            .publish_workspace_layer_from_directory(&second_key, built.path())
+            .unwrap();
+
+        assert_eq!(
+            first.storage_path, second.storage_path,
+            "equal content should have one authoritative CAS tree"
+        );
+    }
+
+    #[test]
+    #[ignore = "known pre-CAS failure: one desired key silently reuses a divergent content tree"]
+    fn one_desired_key_rejects_a_divergent_content_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let divergent = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("artifact"), "producer A\n").unwrap();
+        fs::write(divergent.path().join("artifact"), "producer B\n").unwrap();
+        db.publish_workspace_layer_from_directory(&key(), first.path())
+            .unwrap();
+
+        let error = db
+            .publish_workspace_layer_from_directory(&key(), divergent.path())
+            .expect_err("a divergent content root for one desired key must be quarantined");
+        assert!(error.to_string().contains("divergent"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
-    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCacheAccess,
-    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
-    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
-    WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
+    WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
 };
 use super::*;
 
@@ -61,6 +61,40 @@ impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
             }
         }
         Ok(false)
+    }
+
+    fn propose(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<WorkspaceEnvironmentAdapterProposal>> {
+        let root = normalize_package_root(component_root)?;
+        if db
+            .root_file_entry(source_root, &join_repo_path(&root, "package.json"))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        for (name, _) in supported_lockfiles() {
+            if db
+                .root_file_entry(source_root, &join_repo_path(&root, name))?
+                .is_some()
+            {
+                return Ok(Some(WorkspaceEnvironmentAdapterProposal::ready()));
+            }
+        }
+        Ok(Some(WorkspaceEnvironmentAdapterProposal::blocked(
+            EnvironmentProposalReasonReport {
+                code: "resolution_snapshot_missing".to_string(),
+                message: "package.json is present but no supported package-manager lockfile or Trail-managed resolution snapshot is available".to_string(),
+            },
+            EnvironmentRecoveryActionReport {
+                code: "record_node_lock".to_string(),
+                description: "Generate and record a supported npm, pnpm, Yarn, or Bun lockfile, or resolve this component after resolver support is configured".to_string(),
+                command: None,
+            },
+        )))
     }
 
     fn plan(
