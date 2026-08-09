@@ -54,7 +54,7 @@ impl Trail {
             sibling_stage(&db_dir, "restore-stage"),
         )?;
 
-        let restore_result = (|| -> Result<(u64, crate::model::FsckReport)> {
+        let restore_result = (|| -> Result<(u64, u64, crate::model::FsckReport)> {
             restore_step(
                 "create restore stage structure",
                 (|| -> Result<()> {
@@ -76,6 +76,7 @@ impl Trail {
                         &backup_path.join("worktrees"),
                         &temp_dir.join("worktrees"),
                     )?;
+                    copy_dir_recursive(&backup_path.join("views"), &temp_dir.join("views"))?;
                     secure_restored_db_dir(&temp_dir)
                 })(),
             )?;
@@ -111,6 +112,9 @@ impl Trail {
                 )?;
                 rewritten
             };
+            let restored_private_views: u64 =
+                db.conn
+                    .query_row("SELECT COUNT(*) FROM workspace_views", [], |row| row.get(0))?;
             test_crash_point("restore_after_staged_workdir_rewrite");
             restore_step("recover restore stage", db.recover_after_open())?;
             test_crash_point("restore_after_staged_recovery");
@@ -121,6 +125,10 @@ impl Trail {
                     fsck.errors.join("; ")
                 )));
             }
+            restore_step(
+                "finalize restored workspace view paths",
+                db.finalize_restored_workspace_view_paths(),
+            )?;
             let checkpoint_busy: i64 =
                 db.conn
                     .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
@@ -133,9 +141,9 @@ impl Trail {
             test_crash_point("restore_after_staged_checkpoint");
             restore_step("sync restore stage", sync_tree_bottom_up(&temp_dir))?;
             test_crash_point("restore_after_staged_sync");
-            Ok((rewritten_workdirs, fsck))
+            Ok((rewritten_workdirs, restored_private_views, fsck))
         })();
-        let (rewritten_workdirs, fsck) = match restore_result {
+        let (rewritten_workdirs, restored_private_views, fsck) = match restore_result {
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = remove_any(&temp_dir);
@@ -162,6 +170,11 @@ impl Trail {
             replaced_existing,
             restored_trailignore,
             rewritten_workdirs,
+            restored_private_views,
+            retained_private_bytes: manifest.retained_private_bytes,
+            rebuildable_materializations: manifest.rebuildable_materializations,
+            rebuildable_materialization_bytes: manifest.rebuildable_materialization_bytes,
+            rebuildable_performance_caches: manifest.rebuildable_performance_caches,
             checked_refs: fsck.checked_refs,
             checked_roots: fsck.checked_roots,
             checked_texts: fsck.checked_texts,

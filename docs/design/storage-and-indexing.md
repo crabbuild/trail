@@ -4,10 +4,11 @@ Environment layer manifests and their sorted page objects are authoritative
 content-addressed objects rooted by `workspace_layers`. Object GC preserves the
 root and every page. `workspace_layer_publications` records private-output
 promotion phases and producer evidence; doctor, fsck, backup, restore, and
-schema validation treat those rows as authoritative schema-v1 state. Because
-backup archives exclude workspace cache bytes and mounted views, restore keeps
-publication history but closes attachable attempts as `recovered` and clears
-their layer/generation links.
+schema validation treat those rows as authoritative schema-v1 state. Backup
+archives exclude mountpoints, generated/scratch uppers, and workspace cache
+bytes while retaining source uppers and their authenticated recovery journals.
+Restore keeps publication history, closes attachable attempts as `recovered`,
+and clears only machine-local layer/runtime links.
 
 Artifact CAS rows are verified against the raw `objects` bytes rather than the
 process-local object cache. `fsck` checks object metadata/content identity,
@@ -25,11 +26,17 @@ completed restore staging is removed idempotently. Unknown layer directories or
 restore staging are never deleted implicitly and remain visible to doctor and
 fsck as bounded orphan diagnostics.
 
-Private backup-verification stages validate durable CAS and canonical layer-path
-identity without requiring the intentionally omitted materialization cache.
-Restore stages reconstruct verified CAS-backed layers under the private stage and
-rebase their durable paths to the destination `.trail` directory before atomic
-publication. Legacy cache absence remains rebuildable through environment
+Private backup-verification stages validate durable CAS without requiring the
+intentionally omitted materialization cache. Resolution snapshots, artifact
+objects, envelopes, attestations, historical generations, and exact generation
+bindings remain in the portable SQLite snapshot. Host-local materialization
+rows, performance-cache namespaces, active runtime resources, and generation
+activation pointers do not. Restore first recovers retained source uppers from
+private staged paths, then rebases them to the destination `.trail` directory
+immediately before atomic publication. Reports distinguish retained private
+bytes from omitted rebuildable materializations and caches. Verification checks
+a deterministic retained-private tree digest before opening the staged
+database. Legacy cache absence remains rebuildable through environment
 synchronization rather than making an otherwise valid database-only backup
 unverifiable.
 

@@ -77,11 +77,21 @@ trail backup verify /tmp/trail-backup
 trail backup restore /tmp/trail-backup
 ```
 
-Restore rewrites materialized lane workdir paths so they point inside the restored workspace,
-re-secures the private `.trail` and `.trail/index` directories, and rotates the
-changed-path filesystem identity. The next daemon-backed command rebinds the
-observer to the restored host and reconciles the workspace before trusting its
-incremental ledger again.
+Backups retain source uppers and recovery journals plus authoritative artifact
+snapshots, objects, envelopes, attestations, historical generations, and exact
+generation bindings. They omit mounted projections, generated/scratch uppers,
+artifact materializations, and performance caches. Create, verify, and restore
+reports expose retained private bytes and the count/known bytes of omitted state
+as rebuildable. Verification seals the retained private tree by normalized path,
+entry type, symlink target, and file content.
+
+Restore rewrites lane workdir and retained-view paths so they point inside the
+restored workspace, re-secures the private `.trail` and `.trail/index`
+directories, retires copied active environment pointers, and rotates the
+changed-path filesystem identity. The next environment sync reconstructs
+materializations and caches from the retained authority. The next daemon-backed
+command rebinds the observer to the restored host and reconciles the workspace
+before trusting its incremental ledger again.
 
 ## Garbage Collection
 

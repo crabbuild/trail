@@ -30,6 +30,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Lane forks now inherit only individually verified CAS-backed outputs after desired-key,
   envelope/tree, current adapter package, scope, portability, and backend checks, while
   allocating fresh artifact bindings and private workspace identities.
+- Portable backups now retain source uppers and authoritative artifact snapshots,
+  objects, envelopes, attestations, historical generations, and exact bindings while
+  reporting omitted materializations and performance caches as rebuildable.
 
 ### Changed
 

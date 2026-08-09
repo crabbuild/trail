@@ -2827,6 +2827,18 @@ pub(crate) struct BackupManifest {
     sqlite_bytes: u64,
     sqlite_sha256: String,
     worktree_bytes: u64,
+    #[serde(default)]
+    retained_private_views: u64,
+    #[serde(default)]
+    retained_private_bytes: u64,
+    #[serde(default)]
+    retained_private_sha256: String,
+    #[serde(default)]
+    rebuildable_materializations: u64,
+    #[serde(default)]
+    rebuildable_materialization_bytes: u64,
+    #[serde(default)]
+    rebuildable_performance_caches: u64,
 }
 
 #[derive(Debug)]

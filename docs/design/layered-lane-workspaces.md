@@ -1472,8 +1472,11 @@ Existing lanes using the current mode vocabulary remain valid:
 - New materialized selections default to `auto`; mounted modes remain explicit.
 
 Backups from older schemas restore without views. New backups restore source
-uppers but rebuild caches. JSON reports add fields compatibly where possible;
-new report types are preferred over changing unrelated existing shapes.
+uppers and authenticated journals but rebuild generated/scratch state,
+materializations, and performance caches. Authoritative artifact objects and
+generation bindings survive even though copied active generations are retired
+until a fresh sync. JSON reports identify retained private bytes and omitted
+rebuildable state explicitly.
 
 ## Alternatives Considered
 

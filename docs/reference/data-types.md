@@ -189,6 +189,10 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `BackupRestoreReport`
 - `ExternalMutationAuditRecord`
 
+Backup reports separate retained source-view private state from omitted
+rebuildable materializations and performance caches. Restore reports the number
+of private views successfully staged and rebased.
+
 ## Artifact Resolution Types
 
 - `ArtifactResolutionPlanV1`: pinned executable, argv, source inputs, authority and

@@ -5737,6 +5737,285 @@ mod tests {
     }
 
     #[test]
+    fn backup_restore_preserves_artifact_authority_and_private_source_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='backup-artifact'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "backup-artifact",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let lane = db.lane_details("backup-artifact").unwrap().branch;
+        let mountpoint = db.default_lane_workdir_path("backup-artifact").unwrap();
+        let view = db
+            .create_workspace_view(
+                &lane.lane_id,
+                &lane.head_change,
+                &lane.head_root,
+                "test-cow",
+                &mountpoint,
+            )
+            .unwrap();
+        let source_upper = PathBuf::from(&view.source_upper);
+        let mut journal = super::workdir::ViewMutationJournal::open(&source_upper).unwrap();
+        journal
+            .append(
+                super::workdir::ViewMutationKind::Create,
+                "agent-change.rs",
+                None,
+            )
+            .unwrap();
+        fs::write(source_upper.join("agent-change.rs"), "private source\n").unwrap();
+
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let (snapshot_id, _) = db
+            .put_artifact_resolution_snapshot(
+                fixture_plan(source_root.clone()),
+                b"version = 4\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+        let artifact_source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(artifact_source.path().join("deps")).unwrap();
+        fs::write(
+            artifact_source.path().join("deps/library.rlib"),
+            "immutable artifact\n",
+        )
+        .unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(artifact_source.path()).unwrap();
+        let mut desired_material = fixture_desired_material(source_root.clone());
+        desired_material.resolution_snapshot_id = Some(snapshot_id.clone());
+        let desired_key = artifact_desired_key_v2(desired_material).unwrap();
+        let (envelope_id, quarantined) = db
+            .put_artifact_envelope_under_write_lock(ArtifactEnvelopeV1 {
+                version: ARTIFACT_ENVELOPE_VERSION,
+                desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+                    desired_key: desired_key.clone(),
+                },
+                tree_root_id: tree_id.clone(),
+                component_id: "cargo:root".into(),
+                output_name: "target".into(),
+                output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                portability_scope: "workspace".into(),
+                trust_scope: "builtin".into(),
+                resolution_snapshot_id: Some(snapshot_id.clone()),
+                validation_receipt_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(!quarantined);
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
+        let materialization = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+
+        let generation_id = "envgen_backup_artifact";
+        db.conn
+            .execute(
+                "INSERT INTO environment_generations(
+                     generation_id,view_id,generation_sequence,source_root,specification_digest,
+                     predecessor_generation_id,state,created_at,activated_at,retired_at)
+                 VALUES(?1,?2,1,?3,'backup-spec',NULL,'active',1,1,NULL)",
+                params![generation_id, &view.view_id, source_root.0],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
+                 VALUES(?1,?2,1)",
+                params![&view.view_id, generation_id],
+            )
+            .unwrap();
+        let binding_identity = format!(
+            "artifact_binding_{}",
+            crate::ids::short_hash(
+                format!("{generation_id}\0cargo:root\0target\0{envelope_id}").as_bytes(),
+                32,
+            )
+        );
+        db.conn
+            .execute(
+                "INSERT INTO artifact_generation_bindings(
+                     binding_id,generation_id,component_id,output_name,desired_key,envelope_id,
+                     tree_root_id,binding_identity,created_at)
+                 VALUES(?1,?2,'cargo:root','target',?3,?4,?5,?6,1)",
+                params![
+                    format!(
+                        "binding_{}",
+                        crate::ids::short_hash(binding_identity.as_bytes(), 32)
+                    ),
+                    generation_id,
+                    desired_key.0,
+                    envelope_id.0,
+                    tree_id.0,
+                    binding_identity,
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_attestations(
+                     attestation_id,envelope_id,object_id,producer_identity,trust_scope,state,
+                     created_at,updated_at)
+                 VALUES('artifact_attestation_backup',?1,?2,'trail-test','builtin','valid',1,1)",
+                params![envelope_id.0, snapshot_id.0],
+            )
+            .unwrap();
+        let cache_path = workspace.path().join(".trail/cache/namespaces/backup");
+        fs::create_dir_all(&cache_path).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO environment_cache_namespaces(
+                     namespace_id,adapter_identity,cache_name,protocol,access,authority,scope,
+                     compatibility_json,storage_path,last_used_at,created_at)
+                 VALUES('cache_backup','trail/test@1','registry','content-v1','read_write',
+                        'performance_only','workspace',X'7B7D',?1,1,1)",
+                params![cache_path.to_string_lossy()],
+            )
+            .unwrap();
+
+        let backup_parent = tempfile::tempdir().unwrap();
+        let backup = backup_parent.path().join("portable-backup");
+        let created = db.create_backup(&backup, false).unwrap();
+        assert_eq!(created.retained_private_views, 1);
+        assert!(created.retained_private_bytes > 0);
+        assert!(created.rebuildable_materializations >= 1);
+        assert!(created.rebuildable_materialization_bytes >= materialization.physical_bytes);
+        assert_eq!(created.rebuildable_performance_caches, 1);
+
+        let backup_conn = Connection::open(backup.join(DB_RELATIVE_PATH)).unwrap();
+        for table in [
+            "artifact_resolution_snapshots",
+            "artifact_envelopes",
+            "artifact_attestations",
+            "artifact_generation_bindings",
+            "environment_generations",
+        ] {
+            let count: i64 = backup_conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "backup lost authoritative table {table}");
+        }
+        assert_eq!(
+            backup_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_materializations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backup_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM environment_cache_namespaces",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let backed_up_private = backup
+            .join("views")
+            .join(&view.view_id)
+            .join("source-upper/agent-change.rs");
+        assert_eq!(
+            fs::read_to_string(&backed_up_private).unwrap(),
+            "private source\n"
+        );
+        let verified = Trail::verify_backup(&backup).unwrap();
+        assert!(verified.valid, "{:?}", verified.errors);
+        assert_eq!(verified.retained_private_views, 1);
+        fs::write(&backed_up_private, "tampered source\n").unwrap();
+        let tampered = Trail::verify_backup(&backup).unwrap();
+        assert!(!tampered.valid);
+        assert!(tampered
+            .errors
+            .iter()
+            .any(|error| error.contains("retained private SHA-256 mismatch")));
+        fs::write(&backed_up_private, "private source\n").unwrap();
+        assert!(Trail::verify_backup(&backup).unwrap().valid);
+
+        drop(backup_conn);
+        drop(db);
+        let restored = tempfile::tempdir().unwrap();
+        let restore = Trail::restore_backup(restored.path(), &backup, false).unwrap();
+        assert_eq!(restore.restored_private_views, 1);
+        assert_eq!(
+            restore.rebuildable_materializations,
+            created.rebuildable_materializations
+        );
+        let restored_db = Trail::open(restored.path()).unwrap();
+        let restored_view = restored_db
+            .lane_workspace_view("backup-artifact")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(Path::new(&restored_view.source_upper).join("agent-change.rs"))
+                .unwrap(),
+            "private source\n"
+        );
+        assert!(Path::new(&restored_view.generated_upper).is_dir());
+        assert_eq!(
+            restored_db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_generation_bindings",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            restored_db
+                .conn
+                .query_row(
+                    "SELECT state FROM environment_generations WHERE generation_id=?1",
+                    params![generation_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "retired"
+        );
+        assert_eq!(
+            restored_db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_materializations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        let rebuilt = restored_db
+            .ensure_artifact_tree_materialization(&tree_id)
+            .unwrap();
+        assert!(!rebuilt.reused);
+        assert_eq!(
+            fs::read_to_string(rebuilt.storage_path.join("deps/library.rlib")).unwrap(),
+            "immutable artifact\n"
+        );
+    }
+
+    #[test]
     fn artifact_materialization_rejects_noncanonical_database_path_without_touching_it() {
         let workspace = tempfile::tempdir().unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();

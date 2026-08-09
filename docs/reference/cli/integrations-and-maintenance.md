@@ -534,6 +534,13 @@ trail backup restore <PATH> [--force]
 | `backup verify` | Check that a backup is readable |
 | `backup restore` | Restore from a backup |
 
+Backup output reports `retained_private_views`/`retained_private_bytes` and
+`rebuildable_materializations`/`rebuildable_materialization_bytes` plus
+`rebuildable_performance_caches`. Restore additionally reports
+`restored_private_views`. Rebuildable counts describe deliberately omitted
+host-local projections; authoritative artifact objects and bindings remain in
+the backup.
+
 ## Fsck
 
 ```text

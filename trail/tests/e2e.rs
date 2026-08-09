@@ -12336,8 +12336,21 @@ publish = "manual"
     let restored = tempfile::tempdir().unwrap();
     Trail::restore_backup(restored.path(), &backup, false).unwrap();
     let restored_db = Trail::open(restored.path()).unwrap();
-    assert!(restored_db
+    let restored_view = restored_db
         .lane_workspace_view("private-http")
+        .unwrap()
+        .expect("backup must retain the lane's private source view");
+    assert!(Path::new(&restored_view.source_upper)
+        .starts_with(restored.path().canonicalize().unwrap().join(".trail")));
+    assert!(Path::new(&restored_view.generated_upper).is_dir());
+    assert!(
+        !Path::new(&restored_view.generated_upper)
+            .join(".trail-generated/private")
+            .exists(),
+        "generated private output is rebuildable and must not enter the backup"
+    );
+    assert!(restored_db
+        .active_environment_generation("private-http")
         .unwrap()
         .is_none());
     assert!(restored_db.fsck().unwrap().errors.is_empty());

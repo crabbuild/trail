@@ -199,7 +199,9 @@ Reports are deliberately not the same as storage rows. Examples:
 
 - `LaneReadinessReport` aggregates branch status, workdir state, approvals, conflicts, and gate status.
 - `LaneHandoffReport` bundles readiness, current session context, recent events, spans, operations, and next steps.
-- `BackupRestoreReport` includes restore effects such as rewritten workdirs.
+- Backup reports distinguish retained private view bytes from omitted
+  rebuildable materializations/performance caches; `BackupRestoreReport` also
+  reports rewritten workdirs and restored private views.
 - `GuardrailCheckReport` includes decision, reasons, path checks, approvals, and optional approval request instructions.
 
 This keeps command/API consumers from having to join internal tables themselves.
