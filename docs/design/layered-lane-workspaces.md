@@ -680,6 +680,14 @@ deletion remains correct but is intentionally not the optimized control path.
 Trail must not infer that a lockfile update is valid merely because an agent
 mutated `node_modules`. The lockfile and adapter build remain authoritative.
 
+When a leaf package intentionally omits a lockfile, Trail may resolve one manager-specific
+snapshot selected by `packageManager` (defaulting to npm). npm, pnpm, Yarn, and Bun retain
+distinct lock names, formats, and frozen-install argv, but all use the common verified
+snapshot projection. The snapshot stays outside source and Git; the resulting
+`node_modules` seed, package download cache, COW upper, and invalidation behavior are the
+same as for a tracked lockfile. Until a narrower package input closure is certified, the
+managed snapshot is pinned to the complete source root.
+
 ### Cargo adapter
 
 Cargo needs a different strategy because `target` mixes reusable compiler

@@ -586,6 +586,13 @@ staging. Cargo still observes a normal `Cargo.lock` and runs `--locked --offline
 the repository, lane source upper, and later Git export remain unchanged. A different
 source root is a different proposal until a narrower input closure is certified.
 
+Node uses the same metadata projection with ecosystem policy left in adapter data:
+`packageManager` selects an npm, pnpm, Yarn, or Bun snapshot format and fixed resolver
+argv, while the common host validates source/snapshot identity and prevents source
+replacement. All managers converge on a frozen dependency seed plus a performance-only
+download cache and lane-private COW upper; Trail core does not gain manager-specific
+workspace or storage modes.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own

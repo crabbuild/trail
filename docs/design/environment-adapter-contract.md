@@ -138,6 +138,15 @@ dependencies, pnpm workspace roots, and Yarn Berry/PnP rather than publishing an
 escaping, or incorrectly keyed layer. Those forms require explicit workspace-graph and
 link contracts before they can graduate.
 
+Without a source lockfile, `packageManager` selects an npm, pnpm, Yarn, or Bun resolution
+contract (npm is the deterministic default). Each manager has its own snapshot format,
+candidate path, and fixed lock-only argv. The verified snapshot is projected into a
+complete pinned-source staging tree and participates in layer identity by both content
+digest and snapshot authority. Frozen installation still produces the ordinary
+`immutable_seed_private` `node_modules` lower, while downloads remain in the existing
+performance-only content-store namespace and every lane receives a private writable
+upper. Unsupported managers remain visible as blocked proposals.
+
 The first public Rust protocol crate is `trail-environment-adapter-sdk`. Local executable
 packages remain `experimental`: Trail verifies and content-addresses them, records
 append-only activation/tombstone history, revalidates their executable before every use,

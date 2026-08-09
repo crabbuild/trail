@@ -7,6 +7,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Manifest-only Node components can now resolve manager-specific npm, pnpm, Yarn, or
+  Bun lock snapshots into Trail metadata, then reuse the existing frozen-install
+  dependency seed and performance-only content cache with lane-private COW writes.
 - Cargo components without a source-tracked `Cargo.lock` are now reported as resolvable;
   a verified Trail-managed lock snapshot can be projected into isolated staging for
   real `cargo build --locked --offline` target-seed construction without entering source.

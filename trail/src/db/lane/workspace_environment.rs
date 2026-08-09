@@ -8187,19 +8187,11 @@ mod tests {
         assert!(discovery.conflicts.is_empty());
         assert_eq!(discovery.components.len(), 2);
         for component in &discovery.components {
-            if component.adapter_identity == "trail/cargo-target-seed@1" {
-                assert_eq!(
-                    component.status,
-                    EnvironmentComponentProposalStatus::Resolvable
-                );
-                assert!(component.recovery_actions[0].command.is_none());
-            } else {
-                assert_eq!(
-                    component.status,
-                    EnvironmentComponentProposalStatus::Blocked
-                );
-                assert!(component.recovery_actions[0].command.is_none());
-            }
+            assert_eq!(
+                component.status,
+                EnvironmentComponentProposalStatus::Resolvable
+            );
+            assert!(component.recovery_actions[0].command.is_none());
             assert_eq!(component.reasons.len(), 1);
             assert_eq!(component.reasons[0].code, "resolution_snapshot_missing");
             assert_eq!(component.recovery_actions.len(), 1);
