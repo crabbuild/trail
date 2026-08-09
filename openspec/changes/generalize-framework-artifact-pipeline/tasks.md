@@ -108,7 +108,7 @@
 - [x] 11.5 Build behavior-based conformance fixtures shared by built-ins, plugins, and repository v2 for discovery through collection and emit machine-readable certification reports
 - [x] 11.6 Add real-tool gates for dependency resolution, compiled incremental output, framework/bundler composition, path-bound private state, external metadata, custom pipeline, and source export
 - [x] 11.7 Add deterministic 10k/100k/1M-entry and 1/5/20-lane experiments measuring content reuse, materialization amplification, private deltas, phase latency, object count, and skipped evidence
-- [ ] 11.8 Run native CAS-backed isolation/materialization/promotion/export/recovery matrices on NFS, FUSE, and Dokan owning hosts; leave unavailable gates explicitly unverified
+- [x] 11.8 Run native CAS-backed isolation/materialization/promotion/export/recovery matrices on NFS, FUSE, and Dokan owning hosts; leave unavailable gates explicitly unverified
 
 ## 12. Documentation, Compatibility, and Completion Gates
 
@@ -119,4 +119,4 @@
 - [x] 12.5 Run `cargo fmt --all -- --check`, workspace check/test, and Clippy with `--locked`, applicable features, and the checkout-specific external `CARGO_TARGET_DIR`
 - [x] 12.6 Run schema-v1, storage/rebuild/backup/restore, managed execution, environment/inheritance/retirement, CLI/terminal, HTTP/MCP, SDK, changed-path, and applicable native gates
 - [x] 12.7 Run critical construction, quarantine, publication, activation, and GC tests with both `RUST_TEST_THREADS=1` and the default scheduler
-- [ ] 12.8 Inspect final diff/status for only intended files, deterministic/bounded contracts, no secret or machine path, no local build artifacts, no external-checkout mutation, and no unsupported platform/performance claim
+- [x] 12.8 Inspect final diff/status for only intended files, deterministic/bounded contracts, no secret or machine path, no local build artifacts, no external-checkout mutation, and no unsupported platform/performance claim
