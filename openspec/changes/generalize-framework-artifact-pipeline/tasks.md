@@ -85,8 +85,8 @@
 - [x] 9.3 Add SDK v3 builders with canonical collections, validation errors, finite limits, example adapters, package capability declarations, and documentation
 - [x] 9.4 Repeat complete host validation for every v3 response and reject duplicate IDs, bad normalization, invalid graph/phase combinations, oversized data, unsupported required fields, and package/protocol mismatch
 - [x] 9.5 Extend plugin inspect/install/trust/revocation reports with selected protocol, resolution/export capability, certification ceiling, and content/attestation policy
-- [ ] 9.6 Add golden frames, CBOR round trips, compatibility fixtures, truncation/over-limit, fuzz/property, malicious response, signature/revocation, and Linux/macOS/Windows enforcement tests
-- [ ] 9.7 Run SDK unit/doc tests and native plugin verification scripts with the checkout-specific external `CARGO_TARGET_DIR`
+- [x] 9.6 Add golden frames, CBOR round trips, compatibility fixtures, truncation/over-limit, fuzz/property, malicious response, signature/revocation, and Linux/macOS/Windows enforcement tests
+- [x] 9.7 Run SDK unit/doc tests and native plugin verification scripts with the checkout-specific external `CARGO_TARGET_DIR`
 
 ## 10. Built-In Migration and Framework Composition
 

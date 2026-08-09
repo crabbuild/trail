@@ -3675,6 +3675,44 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v3_host_identity_is_enforced_for_every_supported_platform() {
+        for (operating_system, architecture) in [
+            ("linux", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            let (mut plugin, mut request, mut response) = valid_v3_exchange();
+            plugin.manifest.adapter.supported_operating_systems =
+                vec![operating_system.to_string()];
+            plugin.manifest.adapter.supported_architectures = vec![architecture.to_string()];
+            request.host.operating_system = operating_system.into();
+            request.host.architecture = architecture.into();
+            if let AdapterResultV3::Planned { pipeline } = &mut response.result {
+                pipeline.identity.platform = operating_system.into();
+                pipeline.identity.architecture = architecture.into();
+            } else {
+                unreachable!();
+            }
+            assert!(
+                validate_environment_plugin_v3_exchange(&plugin, &request, response.clone())
+                    .is_ok(),
+                "matching {operating_system}/{architecture} identity must pass"
+            );
+
+            let AdapterResultV3::Planned { pipeline } = &mut response.result else {
+                unreachable!();
+            };
+            pipeline.identity.architecture = "mismatched".into();
+            assert!(
+                validate_environment_plugin_v3_exchange(&plugin, &request, response)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed the pinned host identity")
+            );
+        }
+    }
+
+    #[test]
     fn protocol_v2_typed_dependencies_normalize_to_host_edge_semantics() {
         let plan = AdapterPlanV2::builder("application", "generated")
             .build_requires("compiler")

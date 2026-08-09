@@ -2996,6 +2996,7 @@ version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "proptest",
  "serde",
  "serde_bytes",
  "serde_cbor",

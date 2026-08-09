@@ -105,6 +105,10 @@ All notable changes to Trail are documented in this file. Trail follows
   shared protocol-capability record with selected protocol, resolution/export and host
   evidence flags, certification ceiling, content policy, and host-attestation policy;
   the HTTP/OpenAPI adapter catalog projects the same typed fields.
+- Protocol-v3 compatibility now has checked-in length-prefixed CBOR request/response
+  frames, fail-closed truncation and size-limit tests, property-based exact-negotiation
+  coverage, hostile host-validation cases, and an SDK contract gate on Linux, macOS,
+  and Windows.
 
 ### Changed
 

@@ -1055,6 +1055,15 @@ ceiling. Unknown required fields and enum values fail CBOR decoding. Multi-versi
 packages continue negotiating v2 until the v3 invocation/normalization path is enabled,
 so merely installing a v3 declaration cannot bypass this validator.
 
+The SDK freezes representative proposal request/response frames as length-prefixed CBOR
+hex fixtures and decodes them on every test run. Contract tests also exercise truncated
+headers and bodies, declared and encoded size overruns, legacy-only negotiation, and
+property-generated protocol order/duplication/unknown-version combinations. The layered
+workspace CI matrix runs these SDK contracts on Linux, macOS, and Windows. Trail's host
+tests separately repeat malicious response, package mismatch, capability ceiling,
+platform-identity, publisher-signature, and revocation checks; native plugin scripts own
+the operating-system sandbox evidence.
+
 The planner capability set is deliberately fixed rather than open-ended: bounded pinned
 bytes in, discovery or plan data out, no direct repository reads or writes, no child
 process, no network, no shell, no secrets, no database, and no mount/publication

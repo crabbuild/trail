@@ -1,0 +1,16 @@
+schema = "trail.environment-adapter-package/v1"
+
+[adapter]
+canonical_identity = "fixture/legacy-v2@1"
+implementation_version = "1"
+selectors = ["fixture-v2"]
+kind = "generated"
+layer_adapter_name = "fixture-v2"
+discovery_markers = ["fixture.v2"]
+protocols = ["trail.environment-adapter/v2", "trail.environment-adapter/v1"]
+stability = "experimental"
+description = "Legacy v2 package with no v3 capability metadata"
+
+[executable]
+path = "fixture-adapter"
+sha256 = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
