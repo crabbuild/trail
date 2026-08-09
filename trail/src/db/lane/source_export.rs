@@ -3,6 +3,9 @@ use super::*;
 use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
 
 const ARTIFACT_SOURCE_EXPORT_PLAN_VERSION: u16 = 1;
+const MAX_SOURCE_EXPORT_FILES: usize = 10_000;
+const MAX_SOURCE_EXPORT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SOURCE_EXPORT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Trail {
     /// Plan one explicit generated-source export without writing source.
@@ -247,6 +250,216 @@ impl Trail {
             logical_bytes,
         })
     }
+
+    /// Revalidate and apply a pinned export through Trail's ordinary structured
+    /// source patch path. Artifact storage is read directly; it is never
+    /// mounted over or aliased into lane source.
+    pub fn execute_artifact_source_export(
+        &mut self,
+        plan: ArtifactSourceExportPlanV1,
+    ) -> Result<ArtifactSourceExportExecutionReportV1> {
+        if plan.version != ARTIFACT_SOURCE_EXPORT_PLAN_VERSION
+            || plan.authorization != ArtifactSourceExportAuthorizationV1::ExplicitUser
+        {
+            return Err(Error::InvalidInput(
+                "source export plan version or authorization is invalid".into(),
+            ));
+        }
+        let current = self.plan_artifact_source_export(
+            &plan.lane,
+            &plan.component_id,
+            &plan.export_name,
+            plan.authorization,
+        )?;
+        if current != plan {
+            return Err(Error::InvalidInput(format!(
+                "source export plan for `{}/{}` is stale; replan against the current source, generation, artifact, validation, gate, and destination state",
+                plan.component_id, plan.export_name
+            )));
+        }
+
+        let exported_files = self.source_export_patch_files(&plan)?;
+        if exported_files.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "source export `{}` selected no regular files",
+                plan.export_name
+            )));
+        }
+        let existing = self.load_root_files_for_selections(
+            &plan.source_root,
+            std::slice::from_ref(&plan.destination),
+        )?;
+        let mut edits = Vec::new();
+        if plan.collision_mode == ArtifactSourceExportCollisionModeV1::Replace {
+            edits.extend(
+                existing
+                    .keys()
+                    .filter(|path| !exported_files.contains_key(*path))
+                    .cloned()
+                    .map(|path| PatchEdit::Delete { path }),
+            );
+        }
+        for (path, (bytes, executable)) in exported_files {
+            match String::from_utf8(bytes) {
+                Ok(content) if !content.contains('\0') => edits.push(PatchEdit::Write {
+                    path,
+                    content,
+                    executable,
+                }),
+                Ok(content) => edits.push(PatchEdit::WriteBytes {
+                    path,
+                    bytes_hex: hex::encode(content.into_bytes()),
+                    executable,
+                }),
+                Err(error) => edits.push(PatchEdit::WriteBytes {
+                    path,
+                    bytes_hex: hex::encode(error.into_bytes()),
+                    executable,
+                }),
+            }
+        }
+        let branch = self.lane_branch(&plan.lane)?;
+        let patch = PatchDocument {
+            base_change: Some(branch.head_change.0),
+            message: Some(format!(
+                "Export {}/{} from artifact {}",
+                plan.component_id, plan.export_name, plan.envelope_id
+            )),
+            session_id: branch.session_id,
+            allow_ignored: false,
+            allow_stale: false,
+            edits,
+        };
+        let applied = self.apply_lane_patch(&plan.lane, patch)?;
+        Ok(ArtifactSourceExportExecutionReportV1 {
+            plan: plan.clone(),
+            operation: applied.operation,
+            root_id: applied.root_id,
+            changed_paths: applied.changed_paths,
+            checkpointed: true,
+            git_handoff: vec![
+                "trail".into(),
+                "lane".into(),
+                "merge".into(),
+                plan.lane,
+                "--into".into(),
+                self.config.workspace.default_branch.clone(),
+                "--dry-run".into(),
+            ],
+        })
+    }
+
+    fn source_export_patch_files(
+        &self,
+        plan: &ArtifactSourceExportPlanV1,
+    ) -> Result<BTreeMap<String, (Vec<u8>, bool)>> {
+        let root_entry = self
+            .artifact_tree_lazy_entry(&plan.tree_root_id, &plan.artifact_subpath)?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "source export `{}` artifact subtree disappeared",
+                    plan.export_name
+                ))
+            })?;
+        let current_subtree = source_export_subtree_identity(&root_entry)?;
+        if current_subtree != plan.subtree {
+            return Err(Error::InvalidInput(format!(
+                "source export `{}` artifact subtree identity changed",
+                plan.export_name
+            )));
+        }
+
+        let mut pending = vec![(plan.artifact_subpath.clone(), String::new(), root_entry)];
+        let mut files = BTreeMap::new();
+        let mut total_bytes = 0u64;
+        while let Some((artifact_path, relative_path, entry)) = pending.pop() {
+            match entry {
+                ArtifactLazyEntry::Directory { .. } => {
+                    let mut children =
+                        self.artifact_tree_lazy_children(&plan.tree_root_id, &artifact_path)?;
+                    children.reverse();
+                    for (name, child) in children {
+                        let child_artifact_path = join_source_export_path(&artifact_path, &name);
+                        let child_relative_path = if relative_path.is_empty() {
+                            name
+                        } else {
+                            join_source_export_path(&relative_path, &name)
+                        };
+                        pending.push((child_artifact_path, child_relative_path, child));
+                    }
+                }
+                ArtifactLazyEntry::File {
+                    node_id,
+                    mode,
+                    size_bytes,
+                } => {
+                    if files.len() >= MAX_SOURCE_EXPORT_FILES
+                        || size_bytes > MAX_SOURCE_EXPORT_FILE_BYTES
+                    {
+                        return Err(Error::InvalidInput(format!(
+                            "source export `{}` exceeds file count or per-file byte limits",
+                            plan.export_name
+                        )));
+                    }
+                    total_bytes = total_bytes.checked_add(size_bytes).ok_or_else(|| {
+                        Error::InvalidInput("source export byte count overflowed".into())
+                    })?;
+                    if total_bytes > MAX_SOURCE_EXPORT_TOTAL_BYTES {
+                        return Err(Error::InvalidInput(format!(
+                            "source export `{}` exceeds the {MAX_SOURCE_EXPORT_TOTAL_BYTES}-byte limit",
+                            plan.export_name
+                        )));
+                    }
+                    let count = u32::try_from(size_bytes).map_err(|_| {
+                        Error::InvalidInput("source export file size exceeds read bounds".into())
+                    })?;
+                    let bytes = self.artifact_file_read_range(&node_id, 0, count)?;
+                    if bytes.len() as u64 != size_bytes {
+                        return Err(Error::Corrupt(format!(
+                            "source export file `{artifact_path}` was not read completely"
+                        )));
+                    }
+                    let destination = if relative_path.is_empty() {
+                        plan.destination.clone()
+                    } else {
+                        join_source_export_path(&plan.destination, &relative_path)
+                    };
+                    let destination = normalize_relative_path(&destination)?;
+                    if files
+                        .insert(destination.clone(), (bytes, mode & 0o111 != 0))
+                        .is_some()
+                    {
+                        return Err(Error::Corrupt(format!(
+                            "source export produced duplicate destination `{destination}`"
+                        )));
+                    }
+                }
+                ArtifactLazyEntry::Symlink { .. } => {
+                    return Err(Error::InvalidInput(format!(
+                        "source export `{}` contains a symlink; generated source exports currently accept regular files and directories only",
+                        plan.export_name
+                    )));
+                }
+            }
+        }
+        Ok(files)
+    }
+}
+
+fn source_export_subtree_identity(
+    entry: &ArtifactLazyEntry,
+) -> Result<ArtifactSourceExportSubtreeV1> {
+    match entry {
+        ArtifactLazyEntry::Directory { node_id } => Ok(ArtifactSourceExportSubtreeV1::Directory {
+            node_id: node_id.clone(),
+        }),
+        ArtifactLazyEntry::File { node_id, .. } => Ok(ArtifactSourceExportSubtreeV1::File {
+            node_id: node_id.clone(),
+        }),
+        ArtifactLazyEntry::Symlink { .. } => Err(Error::InvalidInput(
+            "source export cannot select a symlink root".into(),
+        )),
+    }
 }
 
 fn join_source_export_path(parent: &str, child: &str) -> String {
@@ -265,9 +478,17 @@ mod tests {
         collision: &str,
         gate: Option<&str>,
         existing_destination: bool,
+        ignore_destination: bool,
     ) -> (tempfile::TempDir, Trail) {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("input.txt"), "identity\n").unwrap();
+        if ignore_destination {
+            fs::write(
+                workspace.path().join(".trailignore"),
+                "src/generated-client/\n",
+            )
+            .unwrap();
+        }
         if existing_destination {
             fs::create_dir_all(workspace.path().join("src/generated-client")).unwrap();
             fs::write(
@@ -422,7 +643,7 @@ collision = "{collision}"
 
     #[test]
     fn source_export_plan_pins_artifact_subtree_destination_and_authorization() {
-        let (_workspace, db) = setup_source_export_fixture("fail", None, false);
+        let (_workspace, db) = setup_source_export_fixture("fail", None, false, false);
         let plan = db
             .plan_artifact_source_export(
                 "export",
@@ -456,7 +677,7 @@ collision = "{collision}"
 
     #[test]
     fn source_export_plan_rejects_missing_gate_and_fail_collision() {
-        let (_workspace, db) = setup_source_export_fixture("replace", Some("test"), false);
+        let (_workspace, db) = setup_source_export_fixture("replace", Some("test"), false, false);
         let error = db
             .plan_artifact_source_export(
                 "export",
@@ -469,7 +690,7 @@ collision = "{collision}"
             .to_string()
             .contains("requires a recorded `test` gate"));
 
-        let (_workspace, db) = setup_source_export_fixture("fail", None, true);
+        let (_workspace, db) = setup_source_export_fixture("fail", None, true, false);
         let error = db
             .plan_artifact_source_export(
                 "export",
@@ -479,5 +700,170 @@ collision = "{collision}"
             )
             .unwrap_err();
         assert!(error.to_string().contains("collision mode is `fail`"));
+    }
+
+    #[test]
+    fn source_export_execution_checkpoints_normal_source_and_reports_git_handoff() {
+        let (_workspace, mut db) = setup_source_export_fixture("fail", None, false, false);
+        let plan = db
+            .plan_artifact_source_export(
+                "export",
+                "custom.export",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        let report = db.execute_artifact_source_export(plan).unwrap();
+        assert!(report.checkpointed);
+        assert_eq!(
+            report.git_handoff,
+            vec![
+                "trail",
+                "lane",
+                "merge",
+                "export",
+                "--into",
+                "main",
+                "--dry-run"
+            ]
+        );
+        assert!(report
+            .changed_paths
+            .iter()
+            .any(|change| change.path == "src/generated-client/new.rs"));
+        let diff = db.diff_lane("export", false).unwrap();
+        assert!(diff
+            .files
+            .iter()
+            .any(|change| change.path == "src/generated-client/new.rs"));
+        let branch = db.lane_branch("export").unwrap();
+        let entry = db
+            .root_file_entry(&branch.head_root, "src/generated-client/new.rs")
+            .unwrap()
+            .unwrap();
+        let bytes = db
+            .materialize_entries_bytes(&BTreeMap::from([(
+                "src/generated-client/new.rs".into(),
+                entry,
+            )]))
+            .unwrap();
+        assert_eq!(bytes["src/generated-client/new.rs"], b"generated\n");
+    }
+
+    #[test]
+    fn source_export_execution_replaces_pinned_content_and_rejects_stale_or_ignored_writes() {
+        let (_workspace, mut db) = setup_source_export_fixture("replace", None, true, false);
+        let plan = db
+            .plan_artifact_source_export(
+                "export",
+                "custom.export",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        let report = db.execute_artifact_source_export(plan).unwrap();
+        assert!(report
+            .changed_paths
+            .iter()
+            .any(|change| change.path == "src/generated-client/old.rs"));
+        let branch = db.lane_branch("export").unwrap();
+        assert!(db
+            .root_file_entry(&branch.head_root, "src/generated-client/old.rs")
+            .unwrap()
+            .is_none());
+
+        let (_workspace, mut db) = setup_source_export_fixture("fail", None, false, false);
+        let plan = db
+            .plan_artifact_source_export(
+                "export",
+                "custom.export",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        let branch = db.lane_branch("export").unwrap();
+        db.apply_lane_patch(
+            "export",
+            PatchDocument {
+                base_change: Some(branch.head_change.0),
+                message: Some("advance source".into()),
+                session_id: None,
+                allow_ignored: false,
+                allow_stale: false,
+                edits: vec![PatchEdit::Write {
+                    path: "advanced.txt".into(),
+                    content: "advanced\n".into(),
+                    executable: false,
+                }],
+            },
+        )
+        .unwrap();
+        let error = db.execute_artifact_source_export(plan).unwrap_err();
+        assert!(error.to_string().contains("is stale"));
+
+        let (_workspace, mut db) = setup_source_export_fixture("replace", None, true, false);
+        let plan = db
+            .plan_artifact_source_export(
+                "export",
+                "custom.export",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        let branch = db.lane_branch("export").unwrap();
+        db.apply_lane_patch(
+            "export",
+            PatchDocument {
+                base_change: Some(branch.head_change.0),
+                message: Some("conflict with planned destination".into()),
+                session_id: None,
+                allow_ignored: false,
+                allow_stale: false,
+                edits: vec![PatchEdit::Write {
+                    path: "src/generated-client/old.rs".into(),
+                    content: "changed after plan\n".into(),
+                    executable: false,
+                }],
+            },
+        )
+        .unwrap();
+        let error = db.execute_artifact_source_export(plan).unwrap_err();
+        assert!(error.to_string().contains("is stale"));
+        let branch = db.lane_branch("export").unwrap();
+        assert!(db
+            .root_file_entry(&branch.head_root, "src/generated-client/new.rs")
+            .unwrap()
+            .is_none());
+        let entry = db
+            .root_file_entry(&branch.head_root, "src/generated-client/old.rs")
+            .unwrap()
+            .unwrap();
+        let bytes = db
+            .materialize_entries_bytes(&BTreeMap::from([(
+                "src/generated-client/old.rs".into(),
+                entry,
+            )]))
+            .unwrap();
+        assert_eq!(
+            bytes["src/generated-client/old.rs"],
+            b"changed after plan\n"
+        );
+
+        let (_workspace, mut db) = setup_source_export_fixture("fail", None, false, true);
+        let plan = db
+            .plan_artifact_source_export(
+                "export",
+                "custom.export",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        let error = db.execute_artifact_source_export(plan).unwrap_err();
+        assert!(error.to_string().contains("ignored"));
+        let branch = db.lane_branch("export").unwrap();
+        assert!(db
+            .root_file_entry(&branch.head_root, "src/generated-client/new.rs")
+            .unwrap()
+            .is_none());
     }
 }

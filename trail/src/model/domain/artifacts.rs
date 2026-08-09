@@ -874,6 +874,16 @@ pub struct ArtifactSourceExportPlanV1 {
     pub authorization: ArtifactSourceExportAuthorizationV1,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactSourceExportExecutionReportV1 {
+    pub plan: ArtifactSourceExportPlanV1,
+    pub operation: ChangeId,
+    pub root_id: ObjectId,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub checkpointed: bool,
+    pub git_handoff: Vec<String>,
+}
+
 /// Canonical identity inputs for the framework-neutral artifact pipeline.
 ///
 /// Secret values and mutable provider allocation IDs have no representation in

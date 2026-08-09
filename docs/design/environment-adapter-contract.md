@@ -250,6 +250,16 @@ permits execution to consider the pinned destination and does not bypass later s
 guardrails. Planning reads CAS objects directly and never materializes or mounts the
 artifact into source.
 
+Execution repeats the complete plan and rejects any mismatch before mutation. It reads
+the pinned directory/file objects directly from CAS with finite file/count/byte limits,
+rejects symlinked export trees, computes `fail` or pinned `replace` edits, and submits one
+ordinary structured lane patch. That shared path enforces repository-relative path and
+case safety, `.trailignore`, hard private-path guardrails, patch/file limits, secret
+scanning, exact lane-head compare-and-swap, atomic root publication, changed-path diff,
+and workdir projection. The resulting operation is the source checkpoint; its report
+includes the normal changed paths and a `trail lane merge ... --dry-run` Git-handoff
+command. Artifact mounts and generated uppers are never used as the write mechanism.
+
 ### Add a repository adapter without Rust
 
 Use `trail/command@1` when the adapter can be represented as pinned byte inputs, an argv

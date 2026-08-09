@@ -81,6 +81,14 @@ All notable changes to Trail are documented in this file. Trail follows
   artifact identities, exact file-or-directory subtree, destination content state,
   collision policy, validation and gate receipts, and explicit authorization without
   writing source or materializing the artifact.
+- Source-export execution now revalidates every plan pin, reads bounded regular files
+  directly from CAS, and applies fail/replace semantics through one normal guarded lane
+  patch so ignore, secret, path, collision, diff, checkpoint, and Git-handoff behavior
+  stays identical to ordinary source changes; artifact mounting is never a write path.
+- Repository-pipeline compatibility coverage now snapshots the v2 source-export wire
+  contract while exercising v1 planning, include/profile cycles, unsafe and
+  secret-capable declarations, stale and conflicting destinations, ignored paths, a
+  custom command framework, and visibility of exported source in the normal lane diff.
 
 ### Changed
 

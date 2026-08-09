@@ -3142,10 +3142,18 @@ validation = "path-contract"
         assert_eq!(compiled.outputs.len(), 2);
         assert_eq!(compiled.validations.len(), 1);
         assert_eq!(compiled.source_exports.len(), 1);
-        assert_eq!(compiled.source_exports[0].name, "seed");
-        assert_eq!(compiled.source_exports[0].output_name, "seed");
-        assert_eq!(compiled.source_exports[0].authorization_mode, "explicit");
-        assert_eq!(compiled.source_exports[0].required_gate, None);
+        assert_eq!(
+            serde_json::to_value(&compiled.source_exports[0]).unwrap(),
+            serde_json::json!({
+                "name": "seed",
+                "output_name": "seed",
+                "artifact_subpath": "generated-client",
+                "destination": "src/generated-client",
+                "collision_policy": "fail",
+                "required_validation": "path-contract",
+                "authorization_mode": "explicit"
+            })
+        );
         assert_eq!(
             compiled.desired_key,
             super::super::workspace_artifact::artifact_desired_key_v2(compiled.desired_material)
@@ -3258,6 +3266,15 @@ validation = "path-contract"
                 name: "forbidden process graph",
                 command: &["cp", "input.txt", "generated/result.txt"],
                 before_output: "[component.capabilities]\nprocess = \"reviewed_builtin_graph\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "exceeds the repository-declaration ceiling",
+            },
+            Case {
+                name: "secret-tainted constructor",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nsecrets = \"opaque_handles\"\n",
                 reuse: "exact",
                 scope: "workspace",
                 after_output: "",
