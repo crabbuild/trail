@@ -5737,6 +5737,53 @@ mod tests {
     }
 
     #[test]
+    fn artifact_materialization_cache_eviction_releases_object_gc_lease() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), b"rebuildable cache\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+        let materialization = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+
+        assert_eq!(db.gc(false).unwrap().pruned_objects, 0);
+        let preview = db.workspace_cache_gc(true, Some(0)).unwrap();
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.kind == "artifact_materialization"
+                && candidate.id == materialization.materialization_id
+        }));
+        assert!(materialization.storage_path.exists());
+
+        let collected = db.workspace_cache_gc(false, Some(0)).unwrap();
+        assert!(collected.deleted.iter().any(|candidate| {
+            candidate.kind == "artifact_materialization"
+                && candidate.id == materialization.materialization_id
+        }));
+        assert!(!materialization.storage_path.exists());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_materializations",
+                    [],
+                    |row| { row.get::<_, u64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+
+        let object_gc = db.gc(false).unwrap();
+        assert!(object_gc.pruned_objects > 0);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn backup_restore_preserves_artifact_authority_and_private_source_state() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(
@@ -6650,5 +6697,249 @@ mod tests {
             ArtifactResolutionAttemptStatusV1::Succeeded
         );
         assert_eq!(finished.snapshot_id, Some(snapshot_id));
+    }
+
+    #[test]
+    fn object_gc_collects_unbound_artifact_envelopes_and_content_graphs() {
+        let (workspace, mut db, source_root) = initialized_resolution_fixture();
+        let candidate = tempfile::tempdir().unwrap();
+        for index in 0..130 {
+            fs::write(
+                candidate.path().join(format!("result-{index:03}.bin")),
+                format!("unbound artifact {index}\n"),
+            )
+            .unwrap();
+        }
+        let (tree_id, _) = db.ingest_artifact_tree(candidate.path()).unwrap();
+        let desired_key = artifact_desired_key_v2(fixture_desired_material(source_root)).unwrap();
+        let (envelope_id, quarantined) = db
+            .put_artifact_envelope_under_write_lock(ArtifactEnvelopeV1 {
+                version: ARTIFACT_ENVELOPE_VERSION,
+                desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key },
+                tree_root_id: tree_id,
+                component_id: "cargo:root".into(),
+                output_name: "target".into(),
+                output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                portability_scope: "workspace".into(),
+                trust_scope: "builtin".into(),
+                resolution_snapshot_id: None,
+                validation_receipt_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(!quarantined);
+        let artifact_object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+        assert!(artifact_object_count > 256);
+
+        let preview = db.gc(true).unwrap();
+        assert!(preview.prunable_objects >= artifact_object_count);
+        assert_eq!(preview.pruned_objects, 0);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![envelope_id.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let collected = db.gc(false).unwrap();
+        assert!(collected.pruned_objects >= artifact_object_count);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_envelopes", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.gc(false).unwrap().pruned_objects, 0);
+        drop(workspace);
+    }
+
+    #[test]
+    fn object_gc_preserves_shared_chunks_until_the_last_hold_is_removed() {
+        let (_workspace, mut db, source_root) = initialized_resolution_fixture();
+        let first_candidate = tempfile::tempdir().unwrap();
+        let second_candidate = tempfile::tempdir().unwrap();
+        let mut shared = vec![0_u8; ARTIFACT_WHOLE_BLOB_MAX_BYTES + 512 * 1024];
+        for (index, byte) in shared.iter_mut().enumerate() {
+            *byte = ((index.wrapping_mul(31)) % 251) as u8;
+        }
+        for candidate in [&first_candidate, &second_candidate] {
+            fs::write(candidate.path().join("shared.bin"), &shared).unwrap();
+        }
+        fs::write(first_candidate.path().join("only-first"), b"first\n").unwrap();
+        fs::write(second_candidate.path().join("only-second"), b"second\n").unwrap();
+        let (first_tree, _) = db.ingest_artifact_tree(first_candidate.path()).unwrap();
+        let (second_tree, _) = db.ingest_artifact_tree(second_candidate.path()).unwrap();
+
+        let first_key =
+            artifact_desired_key_v2(fixture_desired_material(source_root.clone())).unwrap();
+        let mut second_material = fixture_desired_material(source_root);
+        second_material.target = "release".into();
+        let second_key = artifact_desired_key_v2(second_material).unwrap();
+        let envelope = |desired_key, tree_root_id| ArtifactEnvelopeV1 {
+            version: ARTIFACT_ENVELOPE_VERSION,
+            desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key },
+            tree_root_id,
+            component_id: "cargo:root".into(),
+            output_name: "target".into(),
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            portability_scope: "workspace".into(),
+            trust_scope: "builtin".into(),
+            resolution_snapshot_id: None,
+            validation_receipt_ids: Vec::new(),
+        };
+        let (first_envelope, _) = db
+            .put_artifact_envelope_under_write_lock(envelope(first_key, first_tree))
+            .unwrap();
+        let (second_envelope, _) = db
+            .put_artifact_envelope_under_write_lock(envelope(second_key, second_tree))
+            .unwrap();
+        for (hold_id, envelope_id) in [
+            ("hold_first", &first_envelope),
+            ("hold_second", &second_envelope),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO artifact_holds(
+                        hold_id,target_kind,target_id,reason,created_at
+                     ) VALUES(?1,'artifact_envelope',?2,'gc-test',?3)",
+                    params![hold_id, envelope_id.0, now_ts()],
+                )
+                .unwrap();
+        }
+        let chunk_objects = {
+            let mut statement = db
+                .conn
+                .prepare(
+                    "SELECT object_id FROM artifact_objects
+                     WHERE kind=?1 ORDER BY object_id",
+                )
+                .unwrap();
+            statement
+                .query_map(params![ARTIFACT_CHUNK_KIND], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(!chunk_objects.is_empty());
+
+        assert_eq!(db.gc(false).unwrap().pruned_objects, 0);
+        db.conn
+            .execute("DELETE FROM artifact_holds WHERE hold_id='hold_first'", [])
+            .unwrap();
+        let first_collection = db.gc(false).unwrap();
+        assert!(first_collection.pruned_objects > 0);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![first_envelope.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![second_envelope.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        for object_id in &chunk_objects {
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM objects WHERE object_id=?1",
+                        params![object_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+
+        db.conn
+            .execute("DELETE FROM artifact_holds WHERE hold_id='hold_second'", [])
+            .unwrap();
+        let final_collection = db.gc(false).unwrap();
+        assert!(final_collection.pruned_objects > 0);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        for object_id in chunk_objects {
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM objects WHERE object_id=?1",
+                        params![object_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn object_gc_traces_resolution_snapshots_and_live_attempt_evidence() {
+        let (_workspace, mut db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let (fence, attempt) = db.begin_artifact_resolution_attempt(plan.clone()).unwrap();
+        let (snapshot_id, snapshot) = db
+            .put_artifact_resolution_snapshot(
+                plan,
+                b"version = 4\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec!["index.crates.io:443".into()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(db.gc(false).unwrap().pruned_objects, 0);
+        for object_id in [
+            attempt.plan_object_id.0,
+            snapshot_id.0,
+            snapshot.content_object_id.0,
+        ] {
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM objects WHERE object_id=?1",
+                        params![object_id],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        db.cancel_artifact_resolution_attempt(&fence.attempt_id)
+            .unwrap();
     }
 }

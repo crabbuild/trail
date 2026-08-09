@@ -102,6 +102,28 @@ trail gc --dry-run
 trail gc
 ```
 
+Object GC now understands artifact CAS graphs. It retains content reachable
+from generation bindings, layer shadows and pins, durable attempts and
+resolution snapshots, attestations, quarantines, active holds, and recorded
+materialization leases. It follows envelope, tree, directory, file, blob,
+chunk-list, and chunk edges, so a chunk shared by several artifacts is removed
+only after the last retained graph disappears.
+
+Collection is deterministic and restartable: unreachable envelopes are ordered
+before their tree mappings, object IDs are stable within each class, and live
+deletion uses 256-object transactions. Corrupt or ambiguous reachability stops
+the operation without treating missing evidence as permission to delete. Run
+the cache collector before object GC when you also want an unused verified
+materialization to stop retaining its reconstructible tree:
+
+```sh
+trail cache gc
+trail gc
+```
+
+Backup archives are self-contained and are created under the workspace write
+lock; they do not pin the source workspace after publication.
+
 ## Code Facts Used
 
 - Storage schema: `trail/src/db/storage/schema`

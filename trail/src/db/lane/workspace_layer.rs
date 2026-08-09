@@ -2751,7 +2751,11 @@ impl Trail {
     pub(crate) fn workspace_layer_object_roots(&self) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT manifest_object_id FROM workspace_layers
-             WHERE manifest_object_id IS NOT NULL ORDER BY layer_id",
+             WHERE manifest_object_id IS NOT NULL
+             UNION
+             SELECT manifest_object_id FROM workspace_layer_publications
+             WHERE manifest_object_id IS NOT NULL
+             ORDER BY manifest_object_id",
         )?;
         let manifests = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -2831,9 +2835,16 @@ impl Trail {
         )?;
         let blobs = cache_tree_usage(&self.db_dir.join("cache/blobs"))?;
         let environment_caches = cache_tree_usage(&self.db_dir.join("cache/namespaces"))?;
+        let artifact_materializations = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(physical_bytes, 0)), 0)
+             FROM artifact_materializations WHERE state != 'building'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok((layer_bytes.max(0) as u64)
             .saturating_add(blobs)
-            .saturating_add(environment_caches))
+            .saturating_add(environment_caches)
+            .saturating_add(artifact_materializations.max(0) as u64))
     }
 
     pub fn workspace_cache_gc(
@@ -2929,6 +2940,53 @@ impl Trail {
                             "performance_cache_retention_expired".to_string()
                         } else {
                             "performance_cache_lru".to_string()
+                        },
+                    },
+                    last_used_at,
+                    retention_expired: last_used_at <= cutoff,
+                });
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT materialization_id,storage_path,COALESCE(physical_bytes,0),
+                        last_used_at,state
+                 FROM artifact_materializations
+                 ORDER BY last_used_at ASC,materialization_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (materialization_id, storage_path, physical_bytes, last_used_at, state) = row?;
+                if state == "building" {
+                    continue;
+                }
+                let expected = cache_root
+                    .join("artifact-materializations")
+                    .join(&materialization_id);
+                if Path::new(&storage_path) != expected {
+                    return Err(Error::Corrupt(format!(
+                        "artifact materialization `{materialization_id}` has invalid storage path `{storage_path}`"
+                    )));
+                }
+                found.push(CacheGcCandidate {
+                    entry: WorkspaceCacheGcEntry {
+                        kind: "artifact_materialization".to_string(),
+                        id: materialization_id,
+                        path: storage_path,
+                        physical_bytes,
+                        pinned: false,
+                        reason: if last_used_at <= cutoff {
+                            "artifact_materialization_retention_expired".to_string()
+                        } else {
+                            "artifact_materialization_lru".to_string()
                         },
                     },
                     last_used_at,
@@ -3179,6 +3237,85 @@ impl Trail {
                         .join("cache/namespace-leases")
                         .join(&candidate.id),
                 );
+            } else if candidate.kind == "artifact_materialization" {
+                let expected = cache_root
+                    .join("artifact-materializations")
+                    .join(&candidate.id);
+                if path != expected {
+                    return Err(Error::Corrupt(format!(
+                        "artifact materialization `{}` escaped cache storage",
+                        candidate.id
+                    )));
+                }
+                let state = self
+                    .conn
+                    .query_row(
+                        "SELECT state FROM artifact_materializations
+                         WHERE materialization_id=?1",
+                        params![candidate.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if state.as_deref() == Some("building") {
+                    continue;
+                }
+                let trash_path = trash.join(format!(
+                    "artifact-materialization.{}.{}",
+                    candidate.id,
+                    crate::ids::short_hash(
+                        format!("{}:{}", candidate.id, now_nanos()).as_bytes(),
+                        12
+                    )
+                ));
+                if path.exists() {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(Error::Corrupt(format!(
+                            "artifact materialization `{}` is not a real directory",
+                            candidate.id
+                        )));
+                    }
+                    let root_mode = layer_mode(&metadata);
+                    make_tree_writable(&path);
+                    if let Err(error) = fs::rename(&path, &trash_path) {
+                        let _ = set_layer_read_only(&path, true, root_mode);
+                        return Err(Error::InvalidInput(format!(
+                            "failed to quarantine artifact materialization `{}`: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+                let removed = self.conn.execute(
+                    "DELETE FROM artifact_materializations
+                     WHERE materialization_id=?1 AND state!='building'",
+                    params![candidate.id],
+                );
+                match removed {
+                    Ok(1) => {}
+                    Ok(_) => {
+                        if trash_path.exists() {
+                            let _ = fs::rename(&trash_path, &path);
+                            let _ = set_layer_read_only(&path, true, 0o755);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        if trash_path.exists() {
+                            let _ = fs::rename(&trash_path, &path);
+                            let _ = set_layer_read_only(&path, true, 0o755);
+                        }
+                        return Err(Error::from(error));
+                    }
+                }
+                if trash_path.exists() {
+                    make_tree_writable(&trash_path);
+                    fs::remove_dir_all(&trash_path).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "failed to remove quarantined artifact materialization `{}`: {error}",
+                            trash_path.display()
+                        ))
+                    })?;
+                }
             } else {
                 if !path.is_file() {
                     continue;

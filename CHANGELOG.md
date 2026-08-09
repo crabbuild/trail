@@ -33,6 +33,10 @@ All notable changes to Trail are documented in this file. Trail follows
 - Portable backups now retain source uppers and authoritative artifact snapshots,
   objects, envelopes, attestations, historical generations, and exact bindings while
   reporting omitted materializations and performance caches as rebuildable.
+- Object GC now traces artifact envelopes through deterministic directory, file,
+  blob, chunk-list, and chunk edges from generation, attempt, snapshot, attestation,
+  quarantine, hold, layer, and materialization roots, then reclaims last-reference
+  content in restartable deterministic batches.
 
 ### Changed
 

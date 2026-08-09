@@ -244,8 +244,34 @@ Garbage collection works from reachability:
 - Operations reference roots, parents, messages, conflict sets, and event payload objects.
 - Roots reference file entries and text/blob content.
 - Lane events and coordination records can reference object IDs.
+- Artifact generation bindings and workspace-layer shadows root their exact
+  envelope and tree identities. Construction/resolution attempts, resolution
+  snapshots, attestations, quarantines, active holds, and in-progress layer
+  publications root their durable object evidence.
+- Artifact envelopes traverse to tree roots, resolution snapshots, and
+  validation receipts. Tree roots traverse directory nodes; directory nodes
+  traverse directories/files; file nodes traverse blobs or chunk lists; and
+  chunk lists traverse chunks. Shared nodes remain live while any rooted graph
+  reaches them.
+- A recorded real-directory artifact materialization acts as a conservative
+  local cache lease. Cache eviction removes that row independently; a later
+  object GC may collect the CAS graph if no durable authority remains.
+- Portable backups do not add roots to the source database: backup creation is
+  serialized by the workspace write lock, and the completed archive contains
+  its own authoritative object graph.
 
-`gc --dry-run` reports without pruning. Normal GC deletes unreachable known objects while preserving reachable roots and references.
+An unbound artifact envelope row is an index, not an independent retention
+root. GC may therefore collect a ready envelope left between publication and
+generation activation when no generation, attempt, attestation, quarantine,
+shadow, or hold retains it.
+
+`gc --dry-run` reports without pruning. Normal GC validates artifact identities
+and edges before deleting anything, orders unreachable envelopes before their
+content nodes, and commits sorted batches of at most 256 objects. Each batch is
+idempotent: interruption preserves earlier committed batches and rolls back the
+current batch, while a later invocation recomputes reachability. Missing roots,
+invalid edges, corrupt identities, unsupported active hold targets, or foreign
+key disagreement fail closed rather than risking reachable content.
 
 ## Backup and Restore
 
