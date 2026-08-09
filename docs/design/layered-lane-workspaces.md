@@ -609,17 +609,21 @@ case-colliding paths are rejected. Layer files become read-only before publish.
 
 ### Build and publish protocol
 
-1. Acquire a lease for the cache key in one SQLite transaction.
+1. Acquire the cache-key file lock and reserve a durable, generation-fenced attempt.
 2. If a complete layer already exists, pin and use it.
 3. Build in `.trail/cache/staging/<build-id>`.
 4. Run guardrail and approval checks before network access or lifecycle scripts.
 5. Validate the resulting tree and build the manifest.
 6. Sync files and metadata according to durability policy.
 7. Atomically rename staging to the immutable layer location.
-8. Mark the layer complete and wake waiters.
+8. Mark the attempt complete and release durable waiters.
 
-Concurrent callers for the same key wait for one builder. A dead builder lease
-is recoverable; incomplete staging directories are never mounted.
+Concurrent callers for the same key record waiter evidence and reuse one builder's
+result. Attempts expose `reserved`, `building`, `validating`, `publishing`, and
+`completed` phases. Every mutation is fenced by attempt ID, owner generation, PID, and
+process-start token. Trail replaces an owner only when that exact process identity is
+proven dead or mismatched; unknown liveness remains owned. Incomplete staging
+directories are never mounted.
 
 ### Node adapter
 

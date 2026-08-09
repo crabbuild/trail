@@ -10,6 +10,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Added Rust library artifact resolution component/batch operations with durable fenced
   attempts, content-addressed snapshot reuse, explicit-only refresh, bounded redacted
   evidence, and deterministic reports.
+- Workspace-layer singleflight now records durable generation-fenced owner phases and
+  waiter outcomes, and only recovers a lock when the exact PID/start identity is proven
+  dead or mismatched.
 - Environment discovery now reports marker-recognized plugins that do not support the
   current host as typed `unsupported` proposals without launching plugin code.
 

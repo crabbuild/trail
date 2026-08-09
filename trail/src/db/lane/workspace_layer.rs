@@ -5,6 +5,23 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 
 const LAYER_BUILD_LEASE_SECS: i64 = 300;
+const CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS: u64 = 10;
+
+#[derive(Clone, Debug)]
+struct ArtifactConstructionAttemptFence {
+    attempt_id: String,
+    owner_generation: u64,
+    owner_pid: u32,
+    owner_start_token: String,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactConstructionWaiterFence {
+    attempt_id: String,
+    waiter_id: String,
+    owner_pid: u32,
+    owner_start_token: String,
+}
 const WORKSPACE_LAYER_VERIFICATION_STAMP_VERSION: u16 = 1;
 const WORKSPACE_LAYER_SIDECAR_MAX_BYTES: u64 = 64 * 1024;
 
@@ -1173,20 +1190,356 @@ impl Trail {
         Ok(sha256_hex(&serde_json::to_vec(key)?))
     }
 
+    fn begin_artifact_construction_attempt(
+        &self,
+        desired_key: &str,
+        source_root: &ObjectId,
+    ) -> Result<ArtifactConstructionAttemptFence> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let _: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, source_root)?;
+        if let Some((attempt_id, generation, owner_pid, owner_start_token)) = self
+            .conn
+            .query_row(
+                "SELECT attempt_id,owner_generation,owner_pid,owner_start_token
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 AND status='running'",
+                params![desired_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            let owner_pid = u32::try_from(owner_pid).map_err(|_| {
+                Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has invalid owner PID"
+                ))
+            })?;
+            if process_start_token_match(owner_pid, &owner_start_token)
+                != ProcessIdentityMatch::DeadOrMismatch
+            {
+                return Err(Error::InvalidInput(format!(
+                    "artifact desired key `{desired_key}` is still owned by live or indeterminate construction attempt `{attempt_id}`"
+                )));
+            }
+            let updated = self.conn.execute(
+                "UPDATE artifact_construction_attempts
+                 SET phase='completed',status='abandoned',reason_code='owner_lost',
+                     reason='construction owner process exited',heartbeat_at=?1,finished_at=?1
+                 WHERE attempt_id=?2 AND owner_generation=?3 AND owner_pid=?4
+                   AND owner_start_token=?5 AND status='running'",
+                params![
+                    now_ts(),
+                    attempt_id,
+                    generation,
+                    i64::from(owner_pid),
+                    owner_start_token
+                ],
+            )?;
+            if updated != 1 {
+                return Err(Error::InvalidInput(format!(
+                    "artifact construction attempt `{attempt_id}` changed during dead-owner fencing"
+                )));
+            }
+            self.conn.execute(
+                "UPDATE artifact_construction_waiters
+                 SET status='abandoned',updated_at=?1
+                 WHERE attempt_id=?2 AND status='waiting'",
+                params![now_ts(), attempt_id],
+            )?;
+        }
+        let owner_generation = self.conn.query_row(
+            "SELECT COALESCE(MAX(owner_generation),0)+1
+             FROM artifact_construction_attempts WHERE desired_key=?1",
+            params![desired_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let owner_generation = u64::try_from(owner_generation).map_err(|_| {
+            Error::Corrupt("artifact construction generation exceeds supported range".into())
+        })?;
+        let owner_pid = std::process::id();
+        let owner_start_token = current_process_start_token();
+        let attempt_id = format!(
+            "construct_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{desired_key}\0{}\0{owner_generation}\0{owner_pid}\0{owner_start_token}\0{}",
+                    source_root.0,
+                    now_nanos()
+                )
+                .as_bytes(),
+                32
+            )
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_construction_attempts(
+                attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'reserved','running',NULL,NULL,NULL,NULL,0,?7,?7,NULL)",
+            params![
+                attempt_id,
+                desired_key,
+                source_root.0,
+                i64::try_from(owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(owner_pid),
+                owner_start_token,
+                now_ts(),
+            ],
+        )?;
+        Ok(ArtifactConstructionAttemptFence {
+            attempt_id,
+            owner_generation,
+            owner_pid,
+            owner_start_token,
+        })
+    }
+
+    fn register_artifact_construction_waiter(
+        &self,
+        desired_key: &str,
+    ) -> Result<Option<ArtifactConstructionWaiterFence>> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let Some((attempt_id, owner_pid, owner_start_token)) = self
+            .conn
+            .query_row(
+                "SELECT attempt_id,owner_pid,owner_start_token
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 AND status='running'",
+                params![desired_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let construction_owner_pid = u32::try_from(owner_pid).map_err(|_| {
+            Error::Corrupt(format!(
+                "artifact construction attempt `{attempt_id}` has invalid owner PID"
+            ))
+        })?;
+        if process_start_token_match(construction_owner_pid, &owner_start_token)
+            == ProcessIdentityMatch::DeadOrMismatch
+        {
+            return Ok(None);
+        }
+        let owner_pid = std::process::id();
+        let owner_start_token = current_process_start_token();
+        let waiter_id = format!(
+            "waiter_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{attempt_id}\0{owner_pid}\0{owner_start_token}\0{}",
+                    now_nanos()
+                )
+                .as_bytes(),
+                32
+            )
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_construction_waiters(
+                attempt_id,waiter_id,owner_pid,owner_start_token,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'waiting',?5,?5)",
+            params![
+                attempt_id,
+                waiter_id,
+                i64::from(owner_pid),
+                owner_start_token,
+                now_ts()
+            ],
+        )?;
+        Ok(Some(ArtifactConstructionWaiterFence {
+            attempt_id,
+            waiter_id,
+            owner_pid,
+            owner_start_token,
+        }))
+    }
+
+    fn finish_artifact_construction_waiter(
+        &self,
+        waiter: &ArtifactConstructionWaiterFence,
+        status: &str,
+    ) -> Result<()> {
+        if !matches!(status, "released" | "cancelled" | "abandoned") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction waiter status `{status}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_waiters SET status=?1,updated_at=?2
+             WHERE attempt_id=?3 AND waiter_id=?4 AND owner_pid=?5
+               AND owner_start_token=?6 AND status='waiting'",
+            params![
+                status,
+                now_ts(),
+                waiter.attempt_id,
+                waiter.waiter_id,
+                i64::from(waiter.owner_pid),
+                waiter.owner_start_token,
+            ],
+        )?;
+        if updated == 0 {
+            let existing_status = self
+                .conn
+                .query_row(
+                    "SELECT status FROM artifact_construction_waiters
+                     WHERE attempt_id=?1 AND waiter_id=?2 AND owner_pid=?3
+                       AND owner_start_token=?4",
+                    params![
+                        waiter.attempt_id,
+                        waiter.waiter_id,
+                        i64::from(waiter.owner_pid),
+                        waiter.owner_start_token,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "released" | "cancelled" | "abandoned"))
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "artifact construction waiter `{}` lost its exact owner fence",
+                waiter.waiter_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn advance_artifact_construction_attempt(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        phase: &str,
+    ) -> Result<()> {
+        if !matches!(phase, "building" | "validating" | "publishing") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction phase `{phase}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_attempts SET phase=?1,heartbeat_at=?2
+             WHERE attempt_id=?3 AND owner_generation=?4 AND owner_pid=?5
+               AND owner_start_token=?6 AND status='running' AND cancel_requested=0",
+            params![
+                phase,
+                now_ts(),
+                attempt.attempt_id,
+                i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(attempt.owner_pid),
+                attempt.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` lost its exact owner fence or was cancelled",
+                attempt.attempt_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_artifact_construction_attempt(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        status: &str,
+        reason_code: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(status, "succeeded" | "failed" | "cancelled" | "abandoned") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction attempt status `{status}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_attempts
+             SET phase='completed',status=?1,reason_code=?2,reason=?3,
+                 heartbeat_at=?4,finished_at=?4
+             WHERE attempt_id=?5 AND owner_generation=?6 AND owner_pid=?7
+               AND owner_start_token=?8 AND status='running'",
+            params![
+                status,
+                reason_code,
+                reason,
+                now_ts(),
+                attempt.attempt_id,
+                i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(attempt.owner_pid),
+                attempt.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` lost its exact owner fence",
+                attempt.attempt_id
+            )));
+        }
+        self.conn.execute(
+            "UPDATE artifact_construction_waiters SET status='released',updated_at=?1
+             WHERE attempt_id=?2 AND status='waiting'",
+            params![now_ts(), attempt.attempt_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn build_workspace_layer_singleflight<F>(
         &self,
         key: &WorkspaceLayerKeyV1,
+        source_root: &ObjectId,
         builder: F,
     ) -> Result<WorkspaceLayerReport>
     where
         F: FnOnce(&Path) -> Result<PathBuf>,
     {
-        self.build_workspace_layer_singleflight_with_cancel(key, &AtomicBool::new(false), builder)
+        self.build_workspace_layer_singleflight_with_cancel(
+            key,
+            source_root,
+            &AtomicBool::new(false),
+            builder,
+        )
     }
 
     pub(crate) fn build_workspace_layer_singleflight_with_cancel<F>(
         &self,
         key: &WorkspaceLayerKeyV1,
+        source_root: &ObjectId,
         cancelled: &AtomicBool,
         builder: F,
     ) -> Result<WorkspaceLayerReport>
@@ -1206,8 +1559,12 @@ impl Trail {
         fs::create_dir_all(lock_path.parent().unwrap())?;
         let token = format!("{}:{}", std::process::id(), current_process_start_token());
         let deadline = Instant::now() + Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64);
+        let mut waiter = None;
         let guard = loop {
             if cancelled.load(AtomicOrdering::Acquire) {
+                if let Some(waiter) = waiter.as_ref() {
+                    self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                }
                 return Err(Error::InvalidInput(format!(
                     "cancelled while waiting for workspace layer key {cache_key}"
                 )));
@@ -1229,6 +1586,9 @@ impl Trail {
                     if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
                         && layer.state == "ready"
                     {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "released")?;
+                        }
                         return self.verify_workspace_layer_for_attach(&layer.layer_id);
                     }
                     if build_lock_is_stale(&lock_path)? {
@@ -1236,12 +1596,21 @@ impl Trail {
                         let _ = fs::rename(&lock_path, stale);
                         continue;
                     }
+                    if waiter.is_none() {
+                        waiter = self.register_artifact_construction_waiter(&cache_key)?;
+                    }
                     if Instant::now() >= deadline {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                        }
                         return Err(Error::InvalidInput(format!(
                             "timed out waiting for workspace layer key {cache_key}"
                         )));
                     }
                     if cancelled.load(AtomicOrdering::Acquire) {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                        }
                         return Err(Error::InvalidInput(format!(
                             "cancelled while waiting for workspace layer key {cache_key}"
                         )));
@@ -1251,10 +1620,20 @@ impl Trail {
                 Err(err) => return Err(Error::Io(err)),
             }
         };
+        if let Some(waiter) = waiter.as_ref() {
+            self.finish_artifact_construction_waiter(waiter, "abandoned")?;
+        }
+        let attempt = self.begin_artifact_construction_attempt(&cache_key, source_root)?;
         let builder_limit = self.config().workspace_views.concurrent_cache_builders;
         if builder_limit > 0
             && active_cache_builder_count(lock_path.parent().unwrap())? > builder_limit
         {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("builder_quota_exceeded"),
+                Some("workspace cache builder quota exceeded"),
+            )?;
             drop(guard);
             return Err(Error::InvalidInput(format!(
                 "workspace cache builder quota exceeded (limit {builder_limit})"
@@ -1263,6 +1642,7 @@ impl Trail {
         if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
             && layer.state == "ready"
         {
+            self.finish_artifact_construction_attempt(&attempt, "succeeded", None, None)?;
             drop(guard);
             return self.verify_workspace_layer_for_attach(&layer.layer_id);
         }
@@ -1271,40 +1651,85 @@ impl Trail {
             crate::ids::short_hash(format!("{cache_key}:{token}").as_bytes(), 12)
         ));
         if build_dir.exists() {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("staging_path_collision"),
+                Some("workspace layer build directory already exists"),
+            )?;
             return Err(Error::InvalidInput(format!(
                 "workspace layer build directory `{}` already exists",
                 build_dir.display()
             )));
         }
-        fs::create_dir_all(&build_dir)?;
+        if let Err(error) = fs::create_dir_all(&build_dir) {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("staging_create_failed"),
+                Some("workspace layer staging directory could not be created"),
+            )?;
+            return Err(Error::Io(error));
+        }
+        self.advance_artifact_construction_attempt(&attempt, "building")?;
         let output = match builder(&build_dir) {
             Ok(output) => output,
             Err(err) => {
                 make_tree_writable(&build_dir);
                 let failed = build_dir.with_extension(format!("failed.{}", now_ts()));
                 let _ = fs::rename(&build_dir, failed);
+                self.finish_artifact_construction_attempt(
+                    &attempt,
+                    "failed",
+                    Some("builder_failed"),
+                    Some("workspace layer builder failed"),
+                )?;
                 return Err(err);
             }
         };
-        self.enforce_workspace_cache_build_quota(&output)?;
+        self.advance_artifact_construction_attempt(&attempt, "validating")?;
+        if let Err(error) = self.enforce_workspace_cache_build_quota(&output) {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("output_quota_exceeded"),
+                Some("workspace layer output failed quota validation"),
+            )?;
+            return Err(error);
+        }
         // Different ready DAG nodes may finish their external builds at the
         // same time.  Publication is intentionally serialized by the
         // workspace lock, so a builder waits for that short commit boundary
         // instead of treating another independent builder as a command
         // conflict.
+        self.advance_artifact_construction_attempt(&attempt, "publishing")?;
         let report =
             Self::with_write_lock_wait(Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64), || {
                 self.publish_workspace_layer_from_directory(key, &output)
-            })?;
+            });
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.finish_artifact_construction_attempt(
+                    &attempt,
+                    "failed",
+                    Some("publication_failed"),
+                    Some("workspace layer publication failed"),
+                )?;
+                return Err(error);
+            }
+        };
+        self.finish_artifact_construction_attempt(&attempt, "succeeded", None, None)?;
         make_tree_writable(&build_dir);
         let _ = fs::remove_dir_all(&build_dir);
         drop(guard);
         Ok(report)
     }
 
-    /// Publish a prebuilt directory as an immutable cache layer. The
-    /// workspace write lock is the singleflight boundary: concurrent callers
-    /// for the same canonical key observe one completed publish and reuse it.
+    /// Publish a prebuilt directory as an immutable cache layer. Callers that
+    /// need construction singleflight use `build_workspace_layer_singleflight`;
+    /// this operation serializes the short publication transaction and reuses
+    /// an already-ready canonical key.
     pub fn publish_workspace_layer_from_directory(
         &self,
         key: &WorkspaceLayerKeyV1,
@@ -4404,7 +4829,7 @@ fn build_lock_is_stale(path: &Path) -> Result<bool> {
     let Ok(pid) = pid.parse::<u32>() else {
         return malformed_build_lock_is_stale(path);
     };
-    Ok(!process_matches_start_token(pid, token))
+    Ok(process_start_token_match(pid, token) == ProcessIdentityMatch::DeadOrMismatch)
 }
 
 fn acquire_environment_cache_maintenance(
@@ -6663,31 +7088,111 @@ mod tests {
         fs::write(workspace.path().join("README.md"), "root\n").unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let workspace_path = workspace.path().to_path_buf();
+        let observer = Trail::open(workspace.path()).unwrap();
+        let source_root = observer.resolve_refish("main").unwrap().root_id;
+        let key = key();
+        let cache_key = observer.workspace_layer_cache_key(&key).unwrap();
         let builds = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let workspace_path = workspace_path.clone();
-            let builds = Arc::clone(&builds);
-            let key = key();
-            workers.push(std::thread::spawn(move || {
-                let db = Trail::open(&workspace_path).unwrap();
-                db.build_workspace_layer_singleflight(&key, |build_dir| {
-                    builds.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(150));
-                    let output = build_dir.join("output");
-                    fs::create_dir_all(&output).unwrap();
-                    fs::write(output.join("index.js"), "shared\n").unwrap();
-                    Ok(output)
-                })
-                .unwrap()
-            }));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let owner_workspace = workspace_path.clone();
+        let owner_builds = Arc::clone(&builds);
+        let owner_key = key.clone();
+        let owner_root = source_root.clone();
+        let owner = std::thread::spawn(move || {
+            let db = Trail::open(&owner_workspace).unwrap();
+            db.build_workspace_layer_singleflight(&owner_key, &owner_root, |build_dir| {
+                owner_builds.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let output = build_dir.join("output");
+                fs::create_dir_all(&output).unwrap();
+                fs::write(output.join("index.js"), "shared\n").unwrap();
+                Ok(output)
+            })
+            .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let waiter_workspace = workspace_path.clone();
+        let waiter_key = key.clone();
+        let waiter_root = source_root.clone();
+        let waiter = std::thread::spawn(move || {
+            let db = Trail::open(&waiter_workspace).unwrap();
+            db.build_workspace_layer_singleflight(&waiter_key, &waiter_root, |_| {
+                panic!("a singleflight waiter must not invoke a second builder")
+            })
+            .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiting = observer
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_construction_waiters w
+                     JOIN artifact_construction_attempts a ON a.attempt_id=w.attempt_id
+                     WHERE a.desired_key=?1 AND w.status='waiting'",
+                    params![cache_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not publish durable waiting evidence"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let reports = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect::<Vec<_>>();
+        let running = observer
+            .conn
+            .query_row(
+                "SELECT phase,status,owner_generation
+                 FROM artifact_construction_attempts WHERE desired_key=?1",
+                params![cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(running, ("building".into(), "running".into(), 1));
+
+        release_tx.send(()).unwrap();
+        let owner_report = owner.join().unwrap();
+        let waiter_report = waiter.join().unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        assert_eq!(reports[0].layer_id, reports[1].layer_id);
+        assert_eq!(owner_report.layer_id, waiter_report.layer_id);
+        let completed = observer
+            .conn
+            .query_row(
+                "SELECT phase,status,owner_generation
+                 FROM artifact_construction_attempts WHERE desired_key=?1",
+                params![cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), "succeeded".into(), 1));
+        let waiter_status = observer
+            .conn
+            .query_row(
+                "SELECT status FROM artifact_construction_waiters",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(waiter_status, "released");
     }
 
     #[test]
@@ -6697,6 +7202,7 @@ mod tests {
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let db = Trail::open(workspace.path()).unwrap();
         let key = key();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
         let cache_key = db.workspace_layer_cache_key(&key).unwrap();
         let lock_dir = db.db_dir.join("cache/staging/locks");
         fs::create_dir_all(&lock_dir).unwrap();
@@ -6708,15 +7214,26 @@ mod tests {
         .unwrap();
         let cancelled = AtomicBool::new(true);
         let error = db
-            .build_workspace_layer_singleflight_with_cancel(&key, &cancelled, |_| {
+            .build_workspace_layer_singleflight_with_cancel(&key, &source_root, &cancelled, |_| {
                 panic!("a cancelled waiter must not invoke the builder")
             })
             .unwrap_err();
         assert!(error.to_string().contains("cancelled while waiting"));
 
         fs::write(&lock, "4294967295:dead-owner").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_attempts(
+                    attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                    owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                    reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+                 VALUES('construct_dead',?1,?2,1,4294967295,'dead-owner','building',
+                        'running',NULL,NULL,NULL,NULL,0,?3,?3,NULL)",
+                params![cache_key, source_root.0, now_ts()],
+            )
+            .unwrap();
         let report = db
-            .build_workspace_layer_singleflight(&key, |build_dir| {
+            .build_workspace_layer_singleflight(&key, &source_root, |build_dir| {
                 let output = build_dir.join("output");
                 fs::create_dir_all(&output).unwrap();
                 fs::write(output.join("artifact"), "recovered\n").unwrap();
@@ -6728,6 +7245,63 @@ mod tests {
             fs::read_to_string(Path::new(&report.storage_path).join("artifact")).unwrap(),
             "recovered\n"
         );
+        let attempts = db
+            .conn
+            .prepare(
+                "SELECT owner_generation,phase,status,reason_code
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 ORDER BY owner_generation",
+            )
+            .unwrap()
+            .query_map(params![cache_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            attempts,
+            vec![
+                (
+                    1,
+                    "completed".into(),
+                    "abandoned".into(),
+                    Some("owner_lost".into())
+                ),
+                (2, "completed".into(), "succeeded".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn construction_phase_updates_require_the_exact_owner_generation() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let attempt = db
+            .begin_artifact_construction_attempt("exact-fence-test", &source_root)
+            .unwrap();
+        let mut stale_fence = attempt.clone();
+        stale_fence.owner_generation += 1;
+
+        let error = db
+            .advance_artifact_construction_attempt(&stale_fence, "building")
+            .unwrap_err();
+        assert!(error.to_string().contains("lost its exact owner fence"));
+        db.finish_artifact_construction_attempt(
+            &attempt,
+            "abandoned",
+            Some("test_complete"),
+            Some("test completed"),
+        )
+        .unwrap();
     }
 
     #[test]

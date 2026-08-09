@@ -1866,8 +1866,12 @@ impl Trail {
                 "building",
                 None,
             )?;
-            let prepared =
-                self.prepare_workspace_environment_artifacts(&view.view_id, &plan, &cache_key);
+            let prepared = self.prepare_workspace_environment_artifacts(
+                &view.view_id,
+                &source_root,
+                &plan,
+                &cache_key,
+            );
             let mut prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
@@ -2098,9 +2102,11 @@ impl Trail {
                     None,
                 )?;
             }
-            let mut prepared = match self
-                .prepare_workspace_environment_artifacts_parallel(&view.view_id, &planned)
-            {
+            let mut prepared = match self.prepare_workspace_environment_artifacts_parallel(
+                &view.view_id,
+                &discovery.source_root,
+                &planned,
+            ) {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     let reason = format!(
@@ -2796,6 +2802,7 @@ impl Trail {
     fn prepare_workspace_environment_artifacts(
         &self,
         view_id: &str,
+        source_root: &ObjectId,
         plan: &WorkspaceEnvironmentPlan,
         component_key: &str,
     ) -> Result<PreparedEnvironmentArtifacts> {
@@ -2825,10 +2832,11 @@ impl Trail {
             WorkspaceEnvironmentOutputPolicy::ImmutableShared
             | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => {
                 let prior = self.workspace_layer_by_cache_key(component_key)?;
-                let layer = self
-                    .build_workspace_layer_singleflight(&plan.layer_key, |build_dir| {
-                        self.execute_workspace_environment_plan(plan, build_dir)
-                    })?;
+                let layer = self.build_workspace_layer_singleflight(
+                    &plan.layer_key,
+                    source_root,
+                    |build_dir| self.execute_workspace_environment_plan(plan, build_dir),
+                )?;
                 let hit = prior
                     .as_ref()
                     .is_some_and(|candidate| candidate.state == "ready");
@@ -3041,6 +3049,7 @@ impl Trail {
     fn prepare_workspace_environment_artifacts_parallel(
         &self,
         view_id: &str,
+        source_root: &ObjectId,
         planned: &[(WorkspaceEnvironmentPlan, String, Option<String>)],
     ) -> Result<Vec<PreparedEnvironmentArtifacts>> {
         let concurrency = usize::try_from(
@@ -3055,7 +3064,7 @@ impl Trail {
             return planned
                 .iter()
                 .map(|(plan, key, _)| {
-                    self.prepare_workspace_environment_artifacts(view_id, plan, key)
+                    self.prepare_workspace_environment_artifacts(view_id, source_root, plan, key)
                 })
                 .collect();
         }
@@ -3091,6 +3100,7 @@ impl Trail {
             }
             let workspace = self.workspace_root().to_path_buf();
             let view_id = view_id.to_string();
+            let source_root = source_root.clone();
             let wave = thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(ready.len());
                 for (component_id, index) in &ready {
@@ -3099,12 +3109,18 @@ impl Trail {
                     let key = planned[*index].1.clone();
                     let workspace = workspace.clone();
                     let view_id = view_id.clone();
+                    let source_root = source_root.clone();
                     handles.push((
                         *index,
                         component_id,
                         scope.spawn(move || {
                             let db = Trail::open(&workspace)?;
-                            db.prepare_workspace_environment_artifacts(&view_id, &plan, &key)
+                            db.prepare_workspace_environment_artifacts(
+                                &view_id,
+                                &source_root,
+                                &plan,
+                                &key,
+                            )
                         }),
                     ));
                 }

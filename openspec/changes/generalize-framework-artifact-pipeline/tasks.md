@@ -43,7 +43,7 @@
 - [x] 5.3 Compare shadow content roots against current full-tree verification and fail publication on any path, metadata, size, or digest disagreement
 - [x] 5.4 Change new layer publication to make content objects/envelopes authoritative and treat `.trail/cache/layers` bytes as verified reconstructible materializations
 - [x] 5.5 Insert CAS sealing into the current manual/on-sync/successful-gate publication path without changing quiescence, source/generation/gate pins, or successor activation semantics
-- [ ] 5.6 Extend current singleflight with durable owner/waiter phase evidence and exact dead-owner fencing while retaining bounded DAG scheduling and cancellation
+- [x] 5.6 Extend current singleflight with durable owner/waiter phase evidence and exact dead-owner fencing while retaining bounded DAG scheduling and cancellation
 - [x] 5.7 Add crash points from reservation through object publication, envelope readiness, materialization, and activation; prove prior generations and live private uppers remain intact
 
 ## 6. CAS-Backed COW, Recovery, Reachability, and Space

@@ -590,10 +590,18 @@ Trail uses distinct leases for:
 - cache maintenance;
 - garbage collection.
 
-Build waiters may stream progress and either reuse the published result or retry after a
-failed lease. Leases contain owner operation, heartbeat, expiry, and recovery metadata.
-No lease alone proves safety: publication also requires staging ownership and manifest
-validation, while activation also requires a lane transaction.
+The cache-key file lock remains the fast exclusion boundary. Each lock owner also records
+a durable construction attempt with a monotonically increasing owner generation, exact
+PID/start identity, source-root pin, heartbeat, and `reserved`, `building`, `validating`,
+`publishing`, or `completed` phase. Contenders record durable waiter rows. Completion
+releases those waiters; cancellation records their terminal state without invoking a
+second builder. Trail only replaces an owner when process liveness proves the exact
+PID/start identity dead or mismatched—an indeterminate identity is never stolen.
+
+No lock or attempt row alone proves safety: publication also requires staging ownership,
+content sealing, and manifest validation, while activation also requires a lane
+transaction. The bounded component-DAG scheduler remains independent of per-key
+singleflight, so unrelated ready components can build concurrently.
 
 Garbage collection considers active generations, retained predecessors, checkpoints,
 running operations, open backend references, and leases. Logical and physical byte

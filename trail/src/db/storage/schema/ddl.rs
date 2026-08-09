@@ -158,6 +158,8 @@ CREATE TABLE artifact_construction_attempts (
                 owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
                 owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
                 owner_start_token TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN
+                    ('reserved','building','validating','publishing','completed')),
                 status TEXT NOT NULL CHECK (status IN
                     ('running','succeeded','failed','cancelled','abandoned')),
                 candidate_journal_object_id TEXT REFERENCES objects(object_id),
