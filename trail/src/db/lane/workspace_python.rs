@@ -1,10 +1,13 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, workspace_mounted_commands_identity,
-    WorkspaceEnvironmentAdapter, WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCommand,
-    WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy,
-    WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentAdapter, WorkspaceEnvironmentAdapterMetadata,
+    WorkspaceEnvironmentAdapterProposal, WorkspaceEnvironmentCacheAccess,
+    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
+    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
+    WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
 };
 use super::*;
+use crate::ids::sha256_hex;
 
 pub(crate) struct PythonVenvAdapter;
 
@@ -12,6 +15,15 @@ pub(crate) static PYTHON_VENV_ADAPTER: PythonVenvAdapter = PythonVenvAdapter;
 
 const PYTHON_IDENTITY_FILES: [&str; 7] = [
     "pyproject.toml",
+    "uv.lock",
+    "poetry.lock",
+    "pdm.lock",
+    "Pipfile.lock",
+    "requirements.lock",
+    "requirements.txt",
+];
+
+const PYTHON_RESOLUTION_FILES: [&str; 6] = [
     "uv.lock",
     "poetry.lock",
     "pdm.lock",
@@ -63,6 +75,94 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
             }
         }
         Ok(false)
+    }
+
+    fn propose(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<WorkspaceEnvironmentAdapterProposal>> {
+        let root = normalize_python_component_root(component_root)?;
+        if !self.detect(db, source_root, &root)? {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceEnvironmentAdapterProposal::ready()))
+    }
+
+    fn resolution_plan(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<ArtifactResolutionPlanV1>> {
+        let root = normalize_python_component_root(component_root)?;
+        let pyproject_path = join_python_path(&root, "pyproject.toml");
+        let Some(pyproject) = db.root_file_entry(source_root, &pyproject_path)? else {
+            return Ok(None);
+        };
+        let uv = resolve_workspace_tool_executable("uv")?;
+        let policy_identity = sha256_hex(
+            format!(
+                "python-uv-requirements-resolver-v1\0{}\0offline\0generate-hashes",
+                uv.identity
+            )
+            .as_bytes(),
+        );
+        Ok(Some(ArtifactResolutionPlanV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            proposal_key: python_resolution_proposal_key(source_root, &root),
+            source_root: source_root.clone(),
+            component_id: self.component_id(&root)?,
+            adapter_identity: self.identity().to_string(),
+            policy_identity,
+            program: "uv".to_string(),
+            resolved_program: uv.path.to_string_lossy().into_owned(),
+            executable_identity: uv.identity,
+            argv: vec![
+                "uv".to_string(),
+                "pip".to_string(),
+                "compile".to_string(),
+                "--offline".to_string(),
+                "--generate-hashes".to_string(),
+                "--output-file".to_string(),
+                "requirements.lock".to_string(),
+                "pyproject.toml".to_string(),
+            ],
+            working_directory: if root.is_empty() {
+                ".".to_string()
+            } else {
+                root.clone()
+            },
+            readable_inputs: vec![ArtifactResolutionInputV1 {
+                source_path: pyproject_path,
+                content_hash: pyproject.content_hash,
+                size_bytes: pyproject.size_bytes,
+            }],
+            candidate_output: join_python_path(&root, "requirements.lock"),
+            allowed_authorities: Vec::new(),
+            credential_handles: Vec::new(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            environment_roles: BTreeMap::new(),
+            limits: ArtifactActionLimitsV1 {
+                timeout_ms: 10 * 60 * 1_000,
+                stdout_bytes: 1024 * 1024,
+                stderr_bytes: 1024 * 1024,
+                candidate_bytes: 64 * 1024 * 1024,
+                candidate_entries: 1,
+                child_processes: 64,
+            },
+            snapshot_format: "python-requirements-hashes-v1".to_string(),
+            validations: vec![ArtifactValidationV1 {
+                name: "python-requirements-hashes".to_string(),
+                kind: ArtifactValidationKindV1::Framework,
+                required: true,
+                parameters: BTreeMap::from([(
+                    "hash_mode".to_string(),
+                    "required-for-nonempty".to_string(),
+                )]),
+            }],
+        }))
     }
 
     fn plan(
@@ -123,25 +223,143 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 workspace_mounted_commands_identity(std::slice::from_ref(&mounted_command))?,
             ),
         ]);
+        let source_resolution = python_source_resolution(db, source_root, &component_root)?;
+        let managed_snapshot = if source_resolution.is_none() {
+            python_resolution_snapshot(db, source_root, &component_root)?
+        } else {
+            None
+        };
+        let mut resolution_inputs = Vec::new();
+        let mut source_projection = None;
+        let managed_resolution = managed_snapshot.is_some();
+        if let Some((snapshot_id, snapshot, bytes)) = managed_snapshot {
+            let resolution_plan = self
+                .resolution_plan(db, source_root, &component_root)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Python component `{}` has no supported source lock and cannot produce a managed resolution plan",
+                        display_python_root(&component_root)
+                    ))
+                })?;
+            if snapshot.resolver_executable_identity != resolution_plan.executable_identity
+                || snapshot.policy_identity != resolution_plan.policy_identity
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Python component `{}` resolution snapshot was created by a different uv executable or resolver policy; resolve it again for the current tool",
+                    display_python_root(&component_root)
+                )));
+            }
+            let resolution_path = join_python_path(&component_root, "requirements.lock");
+            let size_bytes = u64::try_from(bytes.len()).map_err(|_| {
+                Error::InvalidInput(
+                    "Python resolution snapshot exceeds platform limits".to_string(),
+                )
+            })?;
+            key_inputs.insert("source_root".to_string(), source_root.0.clone());
+            key_inputs.insert(
+                format!("input:{resolution_path}"),
+                snapshot.content_sha256.clone(),
+            );
+            key_inputs.insert(
+                "resolution_authority".to_string(),
+                format!("snapshot:{}", snapshot_id.0),
+            );
+            resolution_inputs.push(WorkspaceEnvironmentResolutionInput {
+                snapshot_id,
+                source_root: source_root.clone(),
+                source_path: resolution_path.clone(),
+                staging_path: format!("project/{resolution_path}"),
+                content_hash: snapshot.content_sha256,
+                size_bytes,
+            });
+            source_projection = Some((source_root.clone(), "project".to_string()));
+        }
         let mut inputs = Vec::new();
         for file in PYTHON_IDENTITY_FILES {
             let path = join_python_path(&component_root, file);
             if let Some(entry) = db.root_file_entry(source_root, &path)? {
                 key_inputs.insert(format!("input:{path}"), entry.content_hash.clone());
-                inputs.push(WorkspaceEnvironmentInput {
-                    source_path: path.clone(),
-                    staging_path: format!("project/{path}"),
-                    entry,
-                });
+                if !managed_resolution {
+                    inputs.push(WorkspaceEnvironmentInput {
+                        source_path: path.clone(),
+                        staging_path: format!("project/{path}"),
+                        entry,
+                    });
+                }
             }
         }
-        if inputs.is_empty() {
+        if inputs.is_empty() && resolution_inputs.is_empty() {
             return Err(Error::InvalidInput(format!(
                 "Python component `{}` has no supported dependency manifest or lockfile",
                 display_python_root(&component_root)
             )));
         }
         inputs.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+        let download_cache = db.declare_workspace_environment_cache(
+            self.identity(),
+            "python-downloads",
+            WorkspaceEnvironmentCacheProtocol::ContentStore,
+            WorkspaceEnvironmentCacheAccess::ToolConcurrent,
+            BTreeMap::from([
+                ("python_executable".to_string(), python.identity.clone()),
+                ("platform".to_string(), std::env::consts::OS.to_string()),
+                (
+                    "architecture".to_string(),
+                    std::env::consts::ARCH.to_string(),
+                ),
+            ]),
+        )?;
+        let pre_commands = if managed_resolution {
+            let working_directory = if component_root.is_empty() {
+                "project".to_string()
+            } else {
+                format!("project/{component_root}")
+            };
+            vec![WorkspaceEnvironmentCommand {
+                program: "python".to_string(),
+                resolved_program: python.path.clone(),
+                executable_identity: python.identity.clone(),
+                args: vec![
+                    "-m".to_string(),
+                    "pip".to_string(),
+                    "download".to_string(),
+                    "--require-hashes".to_string(),
+                    "--no-deps".to_string(),
+                    "--disable-pip-version-check".to_string(),
+                    "--dest".to_string(),
+                    download_cache
+                        .storage_path
+                        .join("wheels")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "-r".to_string(),
+                    "requirements.lock".to_string(),
+                ],
+                working_directory,
+                environment: BTreeMap::from([
+                    (
+                        "PIP_CACHE_DIR".to_string(),
+                        download_cache
+                            .storage_path
+                            .join("pip")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "UV_CACHE_DIR".to_string(),
+                        download_cache
+                            .storage_path
+                            .join("uv")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                ]),
+                remove_environment: Vec::new(),
+                cache_names: vec![download_cache.name.clone()],
+            }]
+        } else {
+            Vec::new()
+        };
         Ok(WorkspaceEnvironmentPlan {
             component_id,
             adapter_identity: self.identity().to_string(),
@@ -166,15 +384,15 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 strategy: "python-venv-private-mounted-init-v2".to_string(),
             },
             inputs,
-            resolution_inputs: Vec::new(),
-            source_projection: None,
-            pre_commands: Vec::new(),
+            resolution_inputs,
+            source_projection,
+            pre_commands,
             // Python virtual environments commonly embed absolute interpreter
             // and prefix paths, so the host initializes this output through
             // an ephemeral candidate view mounted at the final lane path.
             command: None,
             mounted_commands: vec![mounted_command],
-            caches: Vec::new(),
+            caches: vec![download_cache],
             external_artifacts: Vec::new(),
             runtime_resources: Vec::new(),
             sandbox_policy: WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin,
@@ -194,6 +412,88 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                     .to_string(),
         })
     }
+}
+
+fn python_source_resolution(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<Option<String>> {
+    for file in PYTHON_RESOLUTION_FILES {
+        let path = join_python_path(component_root, file);
+        if db.root_file_entry(source_root, &path)?.is_some() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn python_resolution_proposal_key(source_root: &ObjectId, component_root: &str) -> String {
+    let identity = format!(
+        "python-requirements-resolution-v1\0{}\0{}\0{}",
+        source_root.0, component_root, PYTHON_VENV_ADAPTER_METADATA.canonical_identity
+    );
+    format!("python_requirements_v1_{}", sha256_hex(identity.as_bytes()))
+}
+
+fn python_resolution_snapshot(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>> {
+    let proposal_key = python_resolution_proposal_key(source_root, component_root);
+    let Some((snapshot_id, snapshot)) =
+        db.artifact_resolution_snapshot_for_proposal(&proposal_key)?
+    else {
+        return Ok(None);
+    };
+    let expected_component = PYTHON_VENV_ADAPTER.component_id(component_root)?;
+    if snapshot.source_root != *source_root
+        || snapshot.component_id != expected_component
+        || snapshot.adapter_identity != PYTHON_VENV_ADAPTER.identity()
+        || snapshot.snapshot_format != "python-requirements-hashes-v1"
+        || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
+        || !snapshot.secret_taint.is_clear()
+    {
+        return Err(Error::Corrupt(format!(
+            "Python resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
+        )));
+    }
+    let bytes = db.artifact_resolution_snapshot_content(&snapshot)?;
+    validate_python_requirements_snapshot(&bytes)?;
+    Ok(Some((snapshot_id, snapshot, bytes)))
+}
+
+fn validate_python_requirements_snapshot(bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        Error::InvalidInput("Trail-managed Python requirements snapshot is not UTF-8".to_string())
+    })?;
+    let mut has_requirement = false;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("--hash=sha256:") {
+            continue;
+        }
+        if line.starts_with('-') || line.contains(" @ ") {
+            return Err(Error::InvalidInput(
+                "Trail-managed Python requirements snapshot contains an unpinned directive or URL"
+                    .to_string(),
+            ));
+        }
+        has_requirement = true;
+        if !line.contains("==") {
+            return Err(Error::InvalidInput(
+                "Trail-managed Python requirements snapshot contains an unpinned requirement"
+                    .to_string(),
+            ));
+        }
+    }
+    if has_requirement && !text.contains("--hash=sha256:") {
+        return Err(Error::InvalidInput(
+            "Trail-managed Python requirements snapshot contains packages without SHA-256 hashes"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_python_executable() -> Result<super::workspace_environment::ResolvedWorkspaceTool> {
@@ -260,6 +560,174 @@ mod tests {
         }
         let _ = child.kill();
         panic!("timed out waiting for mounted crash helper at {phase}");
+    }
+
+    #[test]
+    fn python_requirements_snapshot_requires_pins_and_hashes() {
+        validate_python_requirements_snapshot(
+            b"# generated\nexample==1.2.3 --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        validate_python_requirements_snapshot(b"# no dependencies\n").unwrap();
+        assert!(validate_python_requirements_snapshot(b"example>=1\n")
+            .unwrap_err()
+            .to_string()
+            .contains("unpinned"));
+        assert!(validate_python_requirements_snapshot(b"example==1\n")
+            .unwrap_err()
+            .to_string()
+            .contains("without SHA-256"));
+        assert!(validate_python_requirements_snapshot(b"-e ../example\n")
+            .unwrap_err()
+            .to_string()
+            .contains("directive or URL"));
+    }
+
+    #[test]
+    fn managed_python_resolution_warms_download_cache_but_keeps_venv_and_bytecode_private() {
+        let Ok(python) = resolve_python_executable() else {
+            return;
+        };
+        let Ok(uv) = resolve_workspace_tool_executable("uv") else {
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let pyproject =
+            "[project]\nname = \"managed-python\"\nversion = \"0.1.0\"\ndependencies = []\n";
+        fs::write(workspace.path().join("pyproject.toml"), pyproject).unwrap();
+        let resolver = tempfile::tempdir().unwrap();
+        fs::write(resolver.path().join("pyproject.toml"), pyproject).unwrap();
+        let generated = Command::new(&uv.path)
+            .args([
+                "pip",
+                "compile",
+                "--offline",
+                "--generate-hashes",
+                "--output-file",
+                "requirements.lock",
+                "pyproject.toml",
+            ])
+            .current_dir(resolver.path())
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "uv resolution failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let requirements = fs::read(resolver.path().join("requirements.lock")).unwrap();
+        validate_python_requirements_snapshot(&requirements).unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.get_ref("refs/branches/main").unwrap().root_id;
+        let resolution_plan = PYTHON_VENV_ADAPTER
+            .resolution_plan(&db, &source_root, "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolution_plan.executable_identity, uv.identity);
+        db.resolve_artifact_component(
+            ArtifactResolutionRequestV1 {
+                plan: resolution_plan,
+                candidate: ArtifactResolutionCandidateV1 {
+                    snapshot_bytes: requirements,
+                    resolved_identities: BTreeMap::new(),
+                    checksums: BTreeMap::new(),
+                    contacted_authorities: Vec::new(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    redactions: Vec::new(),
+                },
+            },
+            false,
+        )
+        .unwrap();
+
+        for lane in ["managed-python-one", "managed-python-two"] {
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                lane,
+                Some("main"),
+                if cfg!(target_os = "macos") {
+                    LaneWorkdirMode::NfsCow
+                } else if cfg!(target_os = "windows") {
+                    LaneWorkdirMode::DokanCow
+                } else {
+                    LaneWorkdirMode::FuseCow
+                },
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        }
+        let plan = db
+            .plan_workspace_environment("managed-python-one", "python", None)
+            .unwrap();
+        assert_eq!(plan.inputs.len(), 1);
+        assert_eq!(plan.inputs[0].source_path, "requirements.lock");
+        assert_eq!(plan.caches.len(), 1);
+        assert_eq!(plan.caches[0].protocol, "content_store");
+        assert_eq!(plan.caches[0].authority, "performance_only");
+        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(plan.commands[0].phase, "staging");
+        assert_eq!(plan.commands[1].phase, "mounted_initialization");
+        assert!(!workspace.path().join("requirements.lock").exists());
+        assert!(db
+            .root_file_entry(&source_root, "requirements.lock")
+            .unwrap()
+            .is_none());
+
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("TRAIL_RUN_FUSE_COW_TESTS").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        #[cfg(windows)]
+        if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let first = db
+            .sync_workspace_environment_component("managed-python-one", "python", None, None)
+            .unwrap();
+        let second = db
+            .sync_workspace_environment_component("managed-python-two", "python", None, None)
+            .unwrap();
+        assert!(first.layers.is_empty());
+        assert!(second.layers.is_empty());
+        assert_eq!(
+            first.generation.components[0].caches[0].namespace_id,
+            second.generation.components[0].caches[0].namespace_id
+        );
+        assert_eq!(first.generation.components[0].outputs[0].layer_id, None);
+        let first_paths = db
+            .workspace_view_paths_for_lane("managed-python-one")
+            .unwrap();
+        let second_paths = db
+            .workspace_view_paths_for_lane("managed-python-two")
+            .unwrap();
+        let first_bytecode = first_paths
+            .generated_upper
+            .join(".venv/lib/private/__pycache__");
+        fs::create_dir_all(&first_bytecode).unwrap();
+        fs::write(first_bytecode.join("module.pyc"), b"private bytecode").unwrap();
+        assert!(!second_paths
+            .generated_upper
+            .join(".venv/lib/private/__pycache__/module.pyc")
+            .exists());
+        assert!(first_paths
+            .generated_upper
+            .join(".venv/pyvenv.cfg")
+            .is_file());
+        assert!(second_paths
+            .generated_upper
+            .join(".venv/pyvenv.cfg")
+            .is_file());
+        assert!(python.path.is_absolute());
     }
 
     #[test]

@@ -7,6 +7,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Python environments can now bind an optional uv-generated, hash-bearing requirements
+  snapshot, warm a performance-only wheel/download cache, and still keep `.venv`, its
+  bytecode, and embedded path state entirely lane-private.
 - `trail.environment/v2` framework fixtures now compose Next.js and Vite build/state
   components over the Node dependency component: `.next` and `.vite` remain lane-private,
   while validated Vite `dist` content can use an independently keyed immutable layer.

@@ -112,6 +112,11 @@ Generated and dependency directories frequently dominate the source checkout:
 - Python environments, Java/Gradle caches, generated SDKs, and editor indexes
   add similar amplification.
 
+Python keeps the path-bearing virtual environment and bytecode in the lane-private
+generated upper. A hash-bearing managed requirements snapshot may warm a shared,
+evictable wheel/download content cache, but that cache never becomes environment
+authority and `.venv` is never promoted as a portable layer without relocation proof.
+
 Filesystem reflinks reduce data-block duplication, but do not remove directory
 entry and inode cost, do not help on every filesystem, and do not by themselves
 provide a safe shared model for mutable generated directories.

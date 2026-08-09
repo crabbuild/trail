@@ -26,9 +26,11 @@ generation activation. The first built-ins are:
 - `trail/python-venv@1`: recognizes `pyproject.toml` and the common uv, Poetry, PDM,
   Pipenv, and requirements lock/manifest files, provisions a layer-free lane-private
   `.venv`, and keys it by every present dependency file plus the resolved Python
-  executable. Trail automatically creates the virtual environment through an ephemeral
-  candidate view at the lane's final mountpoint, so scripts and prefix metadata embed
-  the correct absolute path without exposing partial state;
+  executable. An optional uv-generated hash-bearing requirements snapshot remains Trail
+  metadata and warms a shared performance-only wheel/download cache. Trail automatically
+  creates the virtual environment through an ephemeral candidate view at the lane's final
+  mountpoint, so scripts, bytecode, and prefix metadata stay private and embed the correct
+  absolute path without exposing partial state;
 - `trail/oci-image@1`: reads `trail.oci.toml`, accepts only lowercase SHA-256
   digest-pinned OCI references with an explicit platform, and records provider-owned
   image identities without commands, caches, mounts, or manufactured directories;
@@ -1230,9 +1232,13 @@ compatible re-sync preserves the private environment and creates no shared layer
 Additional native fixtures cover multi-component `env sync all`, initializer failure,
 undeclared source writes, kill-point recovery, and abandoned-candidate cleanup.
 
-Sharing interpreter distributions and wheel/download content safely remains a separate
-typed-cache slice; Trail must not represent a path-bearing virtual environment itself as
-a portable immutable artifact without relocation validation.
+An optional resolver plan pins the complete source root, exact uv executable, offline
+hash-generation policy, and `pyproject.toml`, then stores the resulting
+`requirements.lock` as verified environment metadata. The host projects it only into
+attempt staging and runs hash-required `pip download` into a host-owned
+`cache_shared_content` namespace. Evicting that cache affects performance only. Trail
+still must not represent a path-bearing virtual environment, its bytecode, or embedded
+scripts as a portable immutable artifact without relocation validation.
 
 | Concern | Inputs | Policy/binding |
 | --- | --- | --- |

@@ -950,9 +950,10 @@ backend:
 - `trail/cmake-build@1` provisions a layer-free private build tree and defers configure
   to the mounted lane so absolute cache paths remain valid;
 - `trail/python-venv@1` provisions a layer-free private `.venv`, keys it by dependency
-  manifests/locks and interpreter identity, and automatically initializes it through an
-  ephemeral candidate view at the final mountpoint so embedded prefix paths remain valid
-  without weakening atomic generation activation;
+  manifests/locks and interpreter identity, optionally binds a hash-bearing managed
+  requirements snapshot to a performance-only wheel/download cache, and automatically
+  initializes it through an ephemeral candidate view at the final mountpoint so embedded
+  prefixes and bytecode stay lane-private without weakening atomic generation activation;
 - existing layer references are imported into an initial environment generation without
   copying tree content.
 
