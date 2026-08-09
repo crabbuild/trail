@@ -227,6 +227,110 @@ pub struct ArtifactAttestationVerificationReportV1 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactGenerationBindingReportV1 {
+    /// Durable database key. Legacy schema-v1 rows use the `binding_` prefix;
+    /// `binding_identity` carries the portable content identity.
+    pub binding_id: String,
+    pub generation_id: String,
+    pub component_id: String,
+    pub output_name: String,
+    pub desired_key: String,
+    pub envelope_id: ArtifactEnvelopeId,
+    pub tree_root_id: ArtifactTreeId,
+    pub binding_identity: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactReachabilityKindReportV1 {
+    pub kind: String,
+    pub object_count: u64,
+    pub encoded_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactContentReachabilityReportV1 {
+    pub envelope_id: ArtifactEnvelopeId,
+    pub tree_root_id: ArtifactTreeId,
+    pub object_count: u64,
+    pub encoded_bytes: u64,
+    pub logical_bytes: u64,
+    pub by_kind: Vec<ArtifactReachabilityKindReportV1>,
+    pub complete: bool,
+    pub recovery_commands: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactVerificationLevelV1 {
+    Attach,
+    Sample,
+    Full,
+    Reproduce,
+}
+
+impl ArtifactVerificationLevelV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Sample => "sample",
+            Self::Full => "full",
+            Self::Reproduce => "reproduce",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactInspectionReportV1 {
+    pub envelope_id: ArtifactEnvelopeId,
+    pub object_id: ObjectId,
+    pub desired_key: String,
+    pub tree_root_id: ArtifactTreeId,
+    pub state: String,
+    pub verification_state: String,
+    pub trust_state: String,
+    pub quarantine_state: String,
+    pub envelope: ArtifactEnvelopeV1,
+    pub bindings: Vec<ArtifactGenerationBindingReportV1>,
+    pub attestations: Vec<ArtifactAttestationReportV1>,
+    pub quarantines: Vec<ArtifactQuarantineRecordV1>,
+    pub reachability: ArtifactContentReachabilityReportV1,
+    pub storage: ArtifactStorageAccountingReport,
+    pub recovery_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactVerificationReportV1 {
+    pub envelope_id: ArtifactEnvelopeId,
+    pub level: ArtifactVerificationLevelV1,
+    pub desired_key: String,
+    pub tree_root_id: ArtifactTreeId,
+    pub envelope_state: String,
+    pub verification_state: String,
+    pub trust_state: String,
+    pub quarantine_state: String,
+    pub content_identity_valid: bool,
+    pub tree_integrity_valid: bool,
+    pub validation_receipts_valid: bool,
+    pub attestations_valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reproduction_evidence_valid: Option<bool>,
+    pub valid: bool,
+    pub diagnostics: Vec<String>,
+    pub recovery_commands: Vec<String>,
+    pub reachability: ArtifactContentReachabilityReportV1,
+    pub storage: ArtifactStorageAccountingReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSpaceReportV1 {
+    pub scope: String,
+    pub envelope_count: u64,
+    pub active_quarantine_count: u64,
+    pub storage: ArtifactStorageAccountingReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactResolutionContentV1 {
     pub version: u16,
     pub content_sha256: String,
@@ -981,4 +1085,18 @@ pub struct ArtifactQuarantineRecordV1 {
     pub resolution: Option<String>,
     pub created_at: i64,
     pub resolved_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactQuarantineListReportV1 {
+    pub active_count: u64,
+    pub resolved_count: u64,
+    pub quarantines: Vec<ArtifactQuarantineRecordV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactQuarantineResolutionReportV1 {
+    pub quarantine: ArtifactQuarantineRecordV1,
+    pub affected_envelopes: Vec<ArtifactEnvelopeId>,
+    pub recovery_commands: Vec<String>,
 }

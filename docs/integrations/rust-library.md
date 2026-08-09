@@ -40,6 +40,27 @@ pins, reuses the current snapshot unless refresh is explicit, fences a durable a
 redacts bounded diagnostics, and publishes the content-addressed snapshot. Supplying a
 candidate is an executor boundary; CLI/HTTP/MCP resolver execution is not exposed yet.
 
+Artifact lifecycle inspection uses the same serializable reports intended for the other
+interfaces:
+
+```rust
+let artifact = db.inspect_artifact(&envelope_id)?;
+let verification = db.verify_artifact(
+    &envelope_id,
+    ArtifactVerificationLevelV1::Full,
+)?;
+let reachable = db.artifact_content_reachability(&envelope_id)?;
+let quarantines = db.artifact_quarantine_list_report()?;
+let space = db.workspace_artifact_space()?;
+```
+
+`Attach`, `Sample`, and `Full` progressively validate attachment evidence, a
+deterministic object sample, or the complete reachable object graph. `Reproduce`
+performs full verification and requires a passed durable reproducibility receipt; it
+does not silently execute a producer. Quarantine show/resolve and source-export
+plan/execute are also public `Trail` operations. Every collection is deterministically
+ordered and bounded; limit exhaustion is an error rather than an empty report.
+
 ## Data Types
 
 Reports and durable model types are serializable with Serde. Ephemeral resolver request

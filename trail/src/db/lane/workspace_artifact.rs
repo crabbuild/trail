@@ -26,6 +26,8 @@ const ARTIFACT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_ENTRIES: u64 = 1_000_000;
 const MAX_ARTIFACT_TREE_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_DEPTH: usize = 256;
+const MAX_PUBLIC_ARTIFACT_REPORT_ITEMS: usize = 10_000;
+const MAX_PUBLIC_ARTIFACT_OBJECT_REFERENCES: usize = 10_000_000;
 const HOST_WORKSPACE_LAYER_SEAL_VALIDATOR: &str = "trail.host/workspace-layer-sealer@1";
 pub(crate) const HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL: &str =
     "trail.host.workspace-layer.structural-seal/v1";
@@ -2290,6 +2292,590 @@ impl Trail {
         })
     }
 
+    /// Return workspace-wide CAS accounting without requiring a lane view.
+    pub fn workspace_artifact_space(&self) -> Result<ArtifactSpaceReportV1> {
+        let envelope_count =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM artifact_envelopes", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let active_quarantine_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM artifact_quarantines WHERE state='active'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(ArtifactSpaceReportV1 {
+            scope: "workspace".into(),
+            envelope_count: u64::try_from(envelope_count)
+                .map_err(|_| Error::Corrupt("negative artifact envelope count".into()))?,
+            active_quarantine_count: u64::try_from(active_quarantine_count)
+                .map_err(|_| Error::Corrupt("negative artifact quarantine count".into()))?,
+            storage: self.artifact_storage_accounting(None, 0, 0, 0, 0)?,
+        })
+    }
+
+    /// Traverse the durable object graph reachable from one artifact envelope.
+    /// The report is a bounded summary; object identifiers remain private storage
+    /// details and are not expanded into an unbounded public payload.
+    pub fn artifact_content_reachability(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<ArtifactContentReachabilityReportV1> {
+        let tree_root_id = self.artifact_envelope_tree_id(envelope_id)?;
+        let object_ids = self.artifact_envelope_object_ids(envelope_id)?;
+        let objects = self.artifact_object_storage_rows(&object_ids)?;
+        let mut kinds = BTreeMap::<String, (u64, u64)>::new();
+        let mut encoded_bytes = 0_u64;
+        for (_, kind, size_bytes) in objects.values() {
+            encoded_bytes = encoded_bytes.saturating_add(*size_bytes);
+            let entry = kinds.entry(kind.clone()).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(*size_bytes);
+        }
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_root_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        Ok(ArtifactContentReachabilityReportV1 {
+            envelope_id: envelope_id.clone(),
+            tree_root_id,
+            object_count: object_ids.len() as u64,
+            encoded_bytes,
+            logical_bytes: tree.logical_bytes,
+            by_kind: kinds
+                .into_iter()
+                .map(
+                    |(kind, (object_count, encoded_bytes))| ArtifactReachabilityKindReportV1 {
+                        kind,
+                        object_count,
+                        encoded_bytes,
+                    },
+                )
+                .collect(),
+            complete: true,
+            recovery_commands: Vec::new(),
+        })
+    }
+
+    /// Inspect one immutable artifact and all public lifecycle evidence bound to it.
+    pub fn inspect_artifact(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<ArtifactInspectionReportV1> {
+        let (desired_key, trust_scope, tree_root_id, object_id, state, verification_state) = self
+            .conn
+            .query_row(
+                "SELECT desired_key,trust_scope,tree_root_id,object_id,state,verification_state
+                 FROM artifact_envelopes WHERE envelope_id=?1",
+                params![envelope_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::ObjectNotFound {
+                kind: "artifact envelope",
+                id: envelope_id.0.clone(),
+            })?;
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        let object_id = ObjectId(object_id);
+        let envelope: ArtifactEnvelopeV1 = self.get_artifact_cas_object(
+            &envelope_id.0,
+            ARTIFACT_ENVELOPE_KIND,
+            ARTIFACT_ENVELOPE_VERSION,
+        )?;
+        let backing_object_id =
+            self.artifact_backing_object_id(&envelope_id.0, ARTIFACT_ENVELOPE_KIND)?;
+        let (actual_envelope_id, _) = encode_artifact_envelope(envelope.clone())?;
+        let encoded_desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key,
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => &desired_key.0,
+        };
+        if actual_envelope_id != *envelope_id
+            || envelope.tree_root_id != tree_root_id
+            || encoded_desired_key != &desired_key
+            || envelope.trust_scope != trust_scope
+            || backing_object_id != object_id.0
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact envelope `{envelope_id}` database identity disagrees with its object"
+            )));
+        }
+
+        let bindings = self.artifact_generation_bindings(envelope_id)?;
+        let attestations = self.artifact_attestations_for_envelope(envelope_id)?;
+        let quarantines = self
+            .list_artifact_quarantines()?
+            .into_iter()
+            .filter(|record| {
+                record.incumbent_envelope_id.as_ref() == Some(envelope_id)
+                    || record.candidate_envelope_id == *envelope_id
+            })
+            .collect::<Vec<_>>();
+        let active_quarantine = quarantines.iter().find(|record| record.state == "active");
+        let quarantine_state = if active_quarantine.is_some() {
+            "active"
+        } else if quarantines.is_empty() {
+            "none"
+        } else {
+            "resolved"
+        };
+        let trust_state = if attestations.is_empty() {
+            "missing"
+        } else if attestations.iter().all(|report| {
+            self.verify_artifact_attestation(&report.attestation_id)
+                .is_ok_and(|verification| verification.valid)
+        }) {
+            "trusted"
+        } else {
+            "untrusted"
+        };
+        let recovery_commands = active_quarantine
+            .map(|record| {
+                vec![format!(
+                    "trail env artifact quarantine show {}",
+                    record.quarantine_id
+                )]
+            })
+            .unwrap_or_default();
+        let reachability = self.artifact_content_reachability(envelope_id)?;
+        let storage =
+            self.artifact_envelope_storage_accounting(envelope_id, &tree_root_id, &state)?;
+        Ok(ArtifactInspectionReportV1 {
+            envelope_id: envelope_id.clone(),
+            object_id,
+            desired_key,
+            tree_root_id,
+            state,
+            verification_state,
+            trust_state: trust_state.into(),
+            quarantine_state: quarantine_state.into(),
+            envelope,
+            bindings,
+            attestations,
+            quarantines,
+            reachability,
+            storage,
+            recovery_commands,
+        })
+    }
+
+    /// Verify one artifact at an explicit evidence level. `reproduce` validates
+    /// durable reproducibility evidence; executing a fresh producer remains a
+    /// separate managed construction operation.
+    pub fn verify_artifact(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        level: ArtifactVerificationLevelV1,
+    ) -> Result<ArtifactVerificationReportV1> {
+        let inspection = self.inspect_artifact(envelope_id)?;
+        let mut diagnostics = Vec::new();
+        let content_identity_valid = true;
+        let validation_receipts_valid = self
+            .validate_envelope_validation_receipts(&inspection.envelope)
+            .is_ok();
+        if !validation_receipts_valid {
+            diagnostics.push("artifact validation receipts are missing, failed, or stale".into());
+        }
+        let attestation_verifications = inspection
+            .attestations
+            .iter()
+            .map(|attestation| self.verify_artifact_attestation(&attestation.attestation_id))
+            .collect::<Result<Vec<_>>>()?;
+        let attestations_valid = !attestation_verifications.is_empty()
+            && attestation_verifications
+                .iter()
+                .all(|verification| verification.valid);
+        if !attestations_valid {
+            diagnostics.push("artifact attestation trust or binding verification failed".into());
+        }
+
+        let object_ids = self.artifact_envelope_object_ids(envelope_id)?;
+        let tree_integrity = match level {
+            ArtifactVerificationLevelV1::Attach => self
+                .verified_artifact_tree_root(&inspection.tree_root_id)
+                .map(|_| ()),
+            ArtifactVerificationLevelV1::Sample => {
+                let sorted = object_ids.iter().collect::<Vec<_>>();
+                let mut sampled = BTreeSet::new();
+                if let Some(first) = sorted.first() {
+                    sampled.insert((*first).clone());
+                }
+                if let Some(middle) = sorted.get(sorted.len() / 2) {
+                    sampled.insert((*middle).clone());
+                }
+                if let Some(last) = sorted.last() {
+                    sampled.insert((*last).clone());
+                }
+                self.verify_artifact_object_set(&sampled)
+            }
+            ArtifactVerificationLevelV1::Full | ArtifactVerificationLevelV1::Reproduce => {
+                self.verify_artifact_object_set(&object_ids).and_then(|_| {
+                    self.artifact_tree_flat_entries(&inspection.tree_root_id)
+                        .map(drop)
+                })
+            }
+        };
+        let tree_integrity_valid = tree_integrity.is_ok();
+        if let Err(error) = tree_integrity {
+            diagnostics.push(format!(
+                "artifact tree integrity verification failed: {error}"
+            ));
+        }
+
+        let reproduction_evidence_valid = if level == ArtifactVerificationLevelV1::Reproduce {
+            let mut found = false;
+            for receipt_id in &inspection.envelope.validation_receipt_ids {
+                let receipt = self.artifact_validation_receipt(receipt_id)?;
+                if receipt.declaration.kind == ArtifactValidationKindV1::Reproducibility
+                    && receipt.outcome == ArtifactValidationOutcomeV1::Passed
+                {
+                    found = true;
+                }
+            }
+            if !found {
+                diagnostics.push(
+                    "artifact has no passed reproducibility validation receipt; run a managed reproducibility construction before trusting this level"
+                        .into(),
+                );
+            }
+            Some(found)
+        } else {
+            None
+        };
+
+        if inspection.state != "ready" {
+            diagnostics.push(format!(
+                "artifact envelope state is `{}`, not `ready`",
+                inspection.state
+            ));
+        }
+        if inspection.verification_state != "verified" {
+            diagnostics.push(format!(
+                "artifact verification state is `{}`, not `verified`",
+                inspection.verification_state
+            ));
+        }
+        if inspection.quarantine_state == "active" {
+            diagnostics.push("artifact desired identity is actively quarantined".into());
+        }
+        if inspection.trust_state != "trusted" {
+            diagnostics.push(format!(
+                "artifact producer trust state is `{}`",
+                inspection.trust_state
+            ));
+        }
+        let valid = inspection.state == "ready"
+            && inspection.verification_state == "verified"
+            && inspection.quarantine_state != "active"
+            && inspection.trust_state == "trusted"
+            && content_identity_valid
+            && tree_integrity_valid
+            && validation_receipts_valid
+            && attestations_valid
+            && reproduction_evidence_valid.unwrap_or(true);
+        Ok(ArtifactVerificationReportV1 {
+            envelope_id: envelope_id.clone(),
+            level,
+            desired_key: inspection.desired_key,
+            tree_root_id: inspection.tree_root_id,
+            envelope_state: inspection.state,
+            verification_state: inspection.verification_state,
+            trust_state: inspection.trust_state,
+            quarantine_state: inspection.quarantine_state,
+            content_identity_valid,
+            tree_integrity_valid,
+            validation_receipts_valid,
+            attestations_valid,
+            reproduction_evidence_valid,
+            valid,
+            diagnostics,
+            recovery_commands: inspection.recovery_commands,
+            reachability: inspection.reachability,
+            storage: inspection.storage,
+        })
+    }
+
+    fn artifact_envelope_tree_id(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<ArtifactTreeId> {
+        let tree_root_id = self
+            .conn
+            .query_row(
+                "SELECT tree_root_id FROM artifact_envelopes WHERE envelope_id=?1",
+                params![envelope_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ObjectNotFound {
+                kind: "artifact envelope",
+                id: envelope_id.0.clone(),
+            })?;
+        ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))
+    }
+
+    fn artifact_generation_bindings(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<Vec<ArtifactGenerationBindingReportV1>> {
+        let mut statement = self.conn.prepare(
+            "SELECT binding_id,generation_id,component_id,output_name,desired_key,
+                    envelope_id,tree_root_id,binding_identity,created_at
+             FROM artifact_generation_bindings WHERE envelope_id=?1
+             ORDER BY generation_id,component_id,output_name,binding_id",
+        )?;
+        let rows = statement
+            .query_map(params![envelope_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_PUBLIC_ARTIFACT_REPORT_ITEMS {
+            return Err(Error::InvalidInput(format!(
+                "artifact inspection contains {} generation bindings; maximum is {MAX_PUBLIC_ARTIFACT_REPORT_ITEMS}",
+                rows.len()
+            )));
+        }
+        rows.into_iter()
+            .map(
+                |(
+                    binding_id,
+                    generation_id,
+                    component_id,
+                    output_name,
+                    desired_key,
+                    envelope_id,
+                    tree_root_id,
+                    binding_identity,
+                    created_at,
+                )| {
+                    Ok(ArtifactGenerationBindingReportV1 {
+                        binding_id,
+                        generation_id,
+                        component_id,
+                        output_name,
+                        desired_key,
+                        envelope_id: ArtifactEnvelopeId::parse(envelope_id)
+                            .map_err(Error::Corrupt)?,
+                        tree_root_id: ArtifactTreeId::parse(tree_root_id)
+                            .map_err(Error::Corrupt)?,
+                        binding_identity,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn artifact_object_storage_rows(
+        &self,
+        object_ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, (ObjectId, String, u64)>> {
+        let mut objects = BTreeMap::new();
+        let ids = object_ids.iter().collect::<Vec<_>>();
+        for chunk in ids.chunks(512) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT object_id,kind,size_bytes FROM objects WHERE object_id IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(
+                params_from_iter(chunk.iter().map(|object_id| object_id.as_str())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (object_id, kind, size_bytes) = row?;
+                let size_bytes = u64::try_from(size_bytes).map_err(|_| {
+                    Error::Corrupt(format!("artifact object `{object_id}` has negative bytes"))
+                })?;
+                objects.insert(object_id.clone(), (ObjectId(object_id), kind, size_bytes));
+            }
+        }
+        if objects.len() != object_ids.len() {
+            let missing = object_ids
+                .iter()
+                .find(|object_id| !objects.contains_key(*object_id))
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            return Err(Error::Corrupt(format!(
+                "artifact reachability references missing object `{missing}`"
+            )));
+        }
+        Ok(objects)
+    }
+
+    fn artifact_envelope_storage_accounting(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        tree_root_id: &ArtifactTreeId,
+        envelope_state: &str,
+    ) -> Result<ArtifactStorageAccountingReport> {
+        const MAX_INSPECTION_ENVELOPES: usize = 10_000;
+        let selected = self.artifact_envelope_object_ids(envelope_id)?;
+        let selected_rows = self.artifact_object_storage_rows(&selected)?;
+        let envelope_ids = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT envelope_id FROM artifact_envelopes ORDER BY envelope_id")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if envelope_ids.len() > MAX_INSPECTION_ENVELOPES {
+            return Err(Error::InvalidInput(format!(
+                "artifact inspection contains {} envelopes; maximum is {MAX_INSPECTION_ENVELOPES}",
+                envelope_ids.len()
+            )));
+        }
+        let mut reference_counts = BTreeMap::<String, u64>::new();
+        let mut reference_count = 0_usize;
+        for id in envelope_ids {
+            let id = ArtifactEnvelopeId::parse(id).map_err(Error::Corrupt)?;
+            let reachable = self.artifact_envelope_object_ids(&id)?;
+            reference_count = reference_count
+                .checked_add(reachable.len())
+                .ok_or_else(|| {
+                    Error::InvalidInput("artifact inspection reference count overflowed".into())
+                })?;
+            if reference_count > MAX_PUBLIC_ARTIFACT_OBJECT_REFERENCES {
+                return Err(Error::InvalidInput(format!(
+                    "artifact inspection contains more than {MAX_PUBLIC_ARTIFACT_OBJECT_REFERENCES} object references"
+                )));
+            }
+            for object_id in reachable {
+                *reference_counts.entry(object_id).or_default() += 1;
+            }
+        }
+        let mut unique_authoritative_bytes = 0_u64;
+        let mut cross_artifact_shared_bytes = 0_u64;
+        for (object_id, (_, _, bytes)) in &selected_rows {
+            if reference_counts.get(object_id).copied().unwrap_or(1) > 1 {
+                cross_artifact_shared_bytes = cross_artifact_shared_bytes.saturating_add(*bytes);
+            } else {
+                unique_authoritative_bytes = unique_authoritative_bytes.saturating_add(*bytes);
+            }
+        }
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_root_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        let materialized = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(physical_bytes,0)),0)
+             FROM artifact_materializations WHERE tree_root_id=?1",
+            params![tree_root_id.0],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let layer_materialized = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(w.physical_bytes,0)),0)
+             FROM workspace_layer_artifact_shadows s
+             JOIN workspace_layers w ON w.layer_id=s.layer_id
+             WHERE s.envelope_id=?1",
+            params![envelope_id.0],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let materialized_bytes = u64::try_from(materialized)
+            .and_then(|left| {
+                u64::try_from(layer_materialized).map(|right| left.saturating_add(right))
+            })
+            .map_err(|_| Error::Corrupt("artifact materialization has negative bytes".into()))?;
+        Ok(ArtifactStorageAccountingReport {
+            logical_bytes: tree.logical_bytes,
+            unique_authoritative_bytes,
+            cross_artifact_shared_bytes,
+            materialized_bytes,
+            lane_private_bytes: 0,
+            prefetched_bytes: 0,
+            demand_loaded_bytes: 0,
+            reclaimable_bytes: 0,
+            unknown_bytes: 0,
+            accounting: format!(
+                "scope=artifact;state={envelope_state};axes=logical|authoritative|physical|disposition;authoritative=encoded-cbor-bytes-deduplicated;lane-private=not-applicable;reclaimable=requires-workspace-gc-analysis"
+            ),
+        })
+    }
+
+    fn verify_artifact_object_set(&self, object_ids: &BTreeSet<String>) -> Result<()> {
+        for object_id in object_ids {
+            let (kind, version, codec, hash_alg, size_bytes, bytes, artifact_id, logical_bytes) =
+                self.conn
+                    .query_row(
+                        "SELECT o.kind,o.version,o.codec,o.hash_alg,o.size_bytes,o.bytes,
+                            a.artifact_id,a.logical_bytes
+                     FROM objects o LEFT JOIN artifact_objects a ON a.object_id=o.object_id
+                     WHERE o.object_id=?1",
+                        params![object_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, Vec<u8>>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                                row.get::<_, Option<i64>>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .ok_or_else(|| Error::ObjectNotFound {
+                        kind: "artifact reachable object",
+                        id: object_id.clone(),
+                    })?;
+            let version_u16 = u16::try_from(version).map_err(|_| {
+                Error::Corrupt(format!("artifact object `{object_id}` has invalid version"))
+            })?;
+            if codec != "cbor"
+                || hash_alg != "sha256"
+                || size_bytes != i64::try_from(bytes.len()).unwrap_or(-1)
+                || ObjectId::for_bytes(&kind, version_u16, &bytes).0 != *object_id
+            {
+                return Err(Error::Corrupt(format!(
+                    "artifact reachable object `{object_id}` failed content identity verification"
+                )));
+            }
+            if let (Some(artifact_id), Some(logical_bytes)) = (artifact_id, logical_bytes) {
+                self.validate_artifact_cas_object(
+                    &artifact_id,
+                    &kind,
+                    version,
+                    logical_bytes,
+                    &bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn artifact_materialized_bytes(
         &self,
         view_id: Option<&str>,
@@ -3377,6 +3963,12 @@ impl Trail {
         let ids = statement
             .query_map(params![envelope_id.0], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if ids.len() > MAX_PUBLIC_ARTIFACT_REPORT_ITEMS {
+            return Err(Error::InvalidInput(format!(
+                "artifact `{envelope_id}` has {} attestations; maximum is {MAX_PUBLIC_ARTIFACT_REPORT_ITEMS}",
+                ids.len()
+            )));
+        }
         ids.into_iter()
             .map(|id| {
                 ArtifactAttestationId::parse(id)
@@ -3751,7 +4343,7 @@ impl Trail {
         Ok(())
     }
 
-    pub(crate) fn list_artifact_quarantines(&self) -> Result<Vec<ArtifactQuarantineRecordV1>> {
+    pub fn list_artifact_quarantines(&self) -> Result<Vec<ArtifactQuarantineRecordV1>> {
         let mut statement = self.conn.prepare(
             "SELECT quarantine_id,trust_scope,desired_key,incumbent_envelope_id,
                     candidate_envelope_id,reason_code,evidence_object_id,state,resolution,
@@ -3761,10 +4353,16 @@ impl Trail {
         let rows = statement
             .query_map([], artifact_quarantine_tuple_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_PUBLIC_ARTIFACT_REPORT_ITEMS {
+            return Err(Error::InvalidInput(format!(
+                "artifact quarantine report contains {} rows; maximum is {MAX_PUBLIC_ARTIFACT_REPORT_ITEMS}",
+                rows.len()
+            )));
+        }
         rows.into_iter().map(artifact_quarantine_record).collect()
     }
 
-    pub(crate) fn artifact_quarantine(
+    pub fn artifact_quarantine(
         &self,
         quarantine_id: &ArtifactQuarantineId,
     ) -> Result<ArtifactQuarantineRecordV1> {
@@ -3787,7 +4385,7 @@ impl Trail {
         artifact_quarantine_record(row)
     }
 
-    pub(crate) fn resolve_artifact_quarantine(
+    pub fn resolve_artifact_quarantine(
         &self,
         quarantine_id: &ArtifactQuarantineId,
         resolution: ArtifactQuarantineResolutionV1,
@@ -3877,6 +4475,42 @@ impl Trail {
             }
         }
         self.artifact_quarantine(quarantine_id)
+    }
+
+    pub fn artifact_quarantine_list_report(&self) -> Result<ArtifactQuarantineListReportV1> {
+        let quarantines = self.list_artifact_quarantines()?;
+        Ok(ArtifactQuarantineListReportV1 {
+            active_count: quarantines
+                .iter()
+                .filter(|record| record.state == "active")
+                .count() as u64,
+            resolved_count: quarantines
+                .iter()
+                .filter(|record| record.state == "resolved")
+                .count() as u64,
+            quarantines,
+        })
+    }
+
+    pub fn resolve_artifact_quarantine_report(
+        &self,
+        quarantine_id: &ArtifactQuarantineId,
+        resolution: ArtifactQuarantineResolutionV1,
+    ) -> Result<ArtifactQuarantineResolutionReportV1> {
+        let quarantine = self.resolve_artifact_quarantine(quarantine_id, resolution)?;
+        let mut affected_envelopes = quarantine
+            .incumbent_envelope_id
+            .iter()
+            .cloned()
+            .chain(std::iter::once(quarantine.candidate_envelope_id.clone()))
+            .collect::<Vec<_>>();
+        affected_envelopes.sort();
+        affected_envelopes.dedup();
+        Ok(ArtifactQuarantineResolutionReportV1 {
+            quarantine,
+            affected_envelopes,
+            recovery_commands: Vec::new(),
+        })
     }
 
     pub(crate) fn materialize_artifact_tree_under_write_lock(
@@ -6541,6 +7175,29 @@ mod tests {
         assert!(!first_quarantined);
         db.verify_ready_artifact_envelope_under_write_lock(&first_envelope, &first_tree)
             .unwrap();
+        let inspection = db.inspect_artifact(&first_envelope).unwrap();
+        assert_eq!(inspection.state, "ready");
+        assert_eq!(inspection.verification_state, "verified");
+        assert_eq!(inspection.trust_state, "trusted");
+        assert_eq!(inspection.quarantine_state, "none");
+        assert_eq!(inspection.tree_root_id, first_tree);
+        assert!(inspection.reachability.complete);
+        assert!(inspection.reachability.object_count >= 4);
+        assert!(inspection.storage.logical_bytes > 0);
+        assert!(
+            db.verify_artifact(&first_envelope, ArtifactVerificationLevelV1::Full)
+                .unwrap()
+                .valid
+        );
+        let reproduce = db
+            .verify_artifact(&first_envelope, ArtifactVerificationLevelV1::Reproduce)
+            .unwrap();
+        assert!(!reproduce.valid);
+        assert_eq!(reproduce.reproduction_evidence_valid, Some(false));
+        let space = db.workspace_artifact_space().unwrap();
+        assert_eq!(space.envelope_count, 1);
+        assert_eq!(space.active_quarantine_count, 0);
+        assert!(space.storage.logical_bytes > 0);
         let (second_envelope, second_quarantined) = db
             .put_artifact_envelope_under_write_lock(envelope(second_tree.clone()))
             .unwrap();
@@ -6588,19 +7245,32 @@ mod tests {
             2
         );
         let quarantine_id = ArtifactQuarantineId::parse(quarantine_id).unwrap();
-        assert_eq!(db.list_artifact_quarantines().unwrap().len(), 1);
+        let quarantine_list = db.artifact_quarantine_list_report().unwrap();
+        assert_eq!(quarantine_list.active_count, 1);
+        assert_eq!(quarantine_list.resolved_count, 0);
+        assert_eq!(quarantine_list.quarantines.len(), 1);
         assert_eq!(
             db.artifact_quarantine(&quarantine_id).unwrap().state,
             "active"
         );
-        let resolved = db
-            .resolve_artifact_quarantine(
+        let quarantined_inspection = db.inspect_artifact(&first_envelope).unwrap();
+        assert_eq!(quarantined_inspection.state, "quarantined");
+        assert_eq!(quarantined_inspection.quarantine_state, "active");
+        assert!(
+            !db.verify_artifact(&first_envelope, ArtifactVerificationLevelV1::Attach)
+                .unwrap()
+                .valid
+        );
+        let resolution_report = db
+            .resolve_artifact_quarantine_report(
                 &quarantine_id,
                 ArtifactQuarantineResolutionV1::RetainPrivate,
             )
             .unwrap();
+        let resolved = resolution_report.quarantine;
         assert_eq!(resolved.state, "resolved");
         assert_eq!(resolved.resolution.as_deref(), Some("retain_private"));
+        assert_eq!(resolution_report.affected_envelopes.len(), 2);
         assert!(db
             .verify_ready_artifact_envelope_under_write_lock(&second_envelope, &second_tree)
             .is_err());

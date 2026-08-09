@@ -58,6 +58,24 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `LaneTestReport`
 - `LaneGateHistoryReport`
 
+## Environment Artifact Reports
+
+- `ArtifactResolutionComponentReportV1` and `ArtifactResolutionBatchReportV1`
+- `ArtifactInspectionReportV1`
+- `ArtifactVerificationReportV1` and `ArtifactVerificationLevelV1`
+- `ArtifactContentReachabilityReportV1` and `ArtifactReachabilityKindReportV1`
+- `ArtifactAttestationReportV1` and `ArtifactAttestationVerificationReportV1`
+- `ArtifactQuarantineListReportV1` and `ArtifactQuarantineResolutionReportV1`
+- `ArtifactSourceExportPlanV1` and `ArtifactSourceExportExecutionReportV1`
+- `ArtifactSpaceReportV1` and `ArtifactStorageAccountingReport`
+
+Inspection and verification reports carry the exact desired, tree, envelope, trust,
+quarantine, binding, reachability, and storage identities applicable to the operation.
+The accounting axes distinguish logical bytes, unique authoritative bytes, bytes shared
+across artifacts, reconstructible materializations, lane-private bytes, and explicitly
+unknown or reclaimable bytes. A zero value is used only when the axis is known to be zero;
+the `accounting` field states the scope and attribution boundary.
+
 ## Coordination Types
 
 - `LaneSession`

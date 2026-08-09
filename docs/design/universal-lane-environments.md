@@ -871,6 +871,13 @@ policy decisions, stale reasons, operation links, and redaction rules. Long-runn
 build, verification, and runtime operations use Trail operations with progress events
 and cancellation rather than blocking opaque requests.
 
+The shared Rust operation layer now exposes artifact inspection, attach/sample/full/
+reproducibility-evidence verification, quarantine list/show/resolve, bounded content
+reachability, workspace/envelope CAS accounting, resolution reports, and source-export
+reports. CLI, HTTP/OpenAPI, and MCP adapters must project these models directly; they may
+not reinterpret trust, quarantine, reachability, or byte-accounting state. Public
+transport wiring remains a separate implementation step.
+
 ## Readiness, claims, and Git handoff
 
 Environment readiness is one input to lane readiness; it does not replace task claims

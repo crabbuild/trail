@@ -7,6 +7,11 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added shared Rust artifact operations and serializable reports for envelope inspection,
+  attach/sample/full/reproducibility-evidence verification, generation bindings,
+  quarantine list/show/resolve, bounded content reachability, and CAS-aware workspace and
+  per-envelope storage accounting. Existing resolution and source-export operations use
+  the same public model family.
 - Protocol-v2 plugins can now declare framework-neutral `verified_external` store
   identities by provider, safe reference, SHA-256 digest, and platform without creating
   layers or cleanup ownership; repository-v2 conformance fixtures cover JVM-like
