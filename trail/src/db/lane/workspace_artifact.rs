@@ -657,6 +657,450 @@ impl Trail {
         Ok(())
     }
 
+    /// Validate artifact CAS identities, edges, snapshots, envelopes, and
+    /// durable attempt state without mutating repairable evidence.
+    pub(crate) fn validate_artifact_cas_integrity(&self) -> Result<Vec<String>> {
+        let mut errors = Vec::new();
+        let objects = {
+            let mut statement = self.conn.prepare(
+                "SELECT a.artifact_id,a.kind,a.version,a.logical_bytes,a.object_id,
+                        o.kind,o.version,o.codec,o.hash_alg,o.size_bytes,o.bytes
+                 FROM artifact_objects a LEFT JOIN objects o ON o.object_id=a.object_id
+                 ORDER BY a.artifact_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<Vec<u8>>>(10)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            artifact_id,
+            kind,
+            version,
+            logical_bytes,
+            object_id,
+            object_kind,
+            object_version,
+            codec,
+            hash_alg,
+            size_bytes,
+            bytes,
+        ) in objects
+        {
+            let result = (|| -> Result<()> {
+                let bytes = bytes.as_deref().ok_or_else(|| {
+                    Error::Corrupt(format!("backing object {object_id} is missing"))
+                })?;
+                let encoded_version = u16::try_from(version).map_err(|_| {
+                    Error::Corrupt(format!("artifact object version {version} is invalid"))
+                })?;
+                if object_kind.as_deref() != Some(kind.as_str())
+                    || object_version != Some(version)
+                    || codec.as_deref() != Some("cbor")
+                    || hash_alg.as_deref() != Some("sha256")
+                    || size_bytes != i64::try_from(bytes.len()).ok()
+                    || ObjectId::for_bytes(&kind, encoded_version, bytes).0 != object_id
+                {
+                    return Err(Error::Corrupt(format!(
+                        "backing object {object_id} metadata or content identity is invalid"
+                    )));
+                }
+                self.validate_artifact_cas_object(
+                    &artifact_id,
+                    &kind,
+                    version,
+                    logical_bytes,
+                    bytes,
+                )
+            })();
+            if let Err(error) = result {
+                errors.push(format!(
+                    "artifact object {artifact_id} is corrupt: {error}; rebuild the owning environment component before reattaching it"
+                ));
+            }
+        }
+
+        let snapshots = {
+            let mut statement = self.conn.prepare(
+                "SELECT snapshot_id,proposal_key,source_root,component_id,adapter_identity,
+                        content_object_id,verification_state,state
+                 FROM artifact_resolution_snapshots ORDER BY snapshot_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            snapshot_id,
+            proposal_key,
+            source_root,
+            component_id,
+            adapter_identity,
+            content_object_id,
+            verification_state,
+            state,
+        ) in snapshots
+        {
+            let result = (|| -> Result<()> {
+                let snapshot_bytes = self.validated_raw_object_bytes(
+                    ARTIFACT_RESOLUTION_SNAPSHOT_KIND,
+                    &ObjectId(snapshot_id.clone()),
+                    ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+                )?;
+                let snapshot: ArtifactResolutionSnapshotV1 = from_cbor(&snapshot_bytes)?;
+                validate_artifact_resolution_snapshot(&snapshot)?;
+                if snapshot.proposal_key != proposal_key
+                    || snapshot.source_root.0 != source_root
+                    || snapshot.component_id != component_id
+                    || snapshot.adapter_identity != adapter_identity
+                    || snapshot.content_object_id.0 != content_object_id
+                    || verification_state != "verified"
+                    || !matches!(state.as_str(), "current" | "superseded")
+                {
+                    return Err(Error::Corrupt(
+                        "snapshot database identity disagrees with its object".into(),
+                    ));
+                }
+                let content_bytes = self.validated_raw_object_bytes(
+                    ARTIFACT_RESOLUTION_CONTENT_KIND,
+                    &snapshot.content_object_id,
+                    ARTIFACT_RESOLUTION_SNAPSHOT_VERSION,
+                )?;
+                let content: ArtifactResolutionContentV1 = from_cbor(&content_bytes)?;
+                if content.version != ARTIFACT_RESOLUTION_SNAPSHOT_VERSION
+                    || content.content_sha256 != snapshot.content_sha256
+                    || sha256_hex(&content.bytes) != snapshot.content_sha256
+                {
+                    return Err(Error::Corrupt(
+                        "snapshot content failed identity verification".into(),
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!(
+                    "artifact resolution snapshot {snapshot_id} is corrupt: {error}; run explicit component resolution with refresh after restoring or reinitializing the workspace"
+                ));
+            }
+        }
+
+        let envelopes = {
+            let mut statement = self.conn.prepare(
+                "SELECT e.envelope_id,e.tree_root_id,e.object_id,a.object_id,
+                        e.state,e.verification_state
+                 FROM artifact_envelopes e
+                 LEFT JOIN artifact_objects a ON a.artifact_id=e.envelope_id
+                 ORDER BY e.envelope_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (envelope_id, tree_id, object_id, artifact_object_id, state, verification) in envelopes
+        {
+            let result = (|| -> Result<()> {
+                if artifact_object_id.as_deref() != Some(object_id.as_str()) {
+                    return Err(Error::Corrupt(
+                        "envelope object mapping is missing or cross-wired".into(),
+                    ));
+                }
+                let envelope_id =
+                    ArtifactEnvelopeId::parse(envelope_id.clone()).map_err(Error::Corrupt)?;
+                let tree_id = ArtifactTreeId::parse(tree_id).map_err(Error::Corrupt)?;
+                if state == "ready" && verification == "verified" {
+                    self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)?;
+                    self.artifact_tree_flat_entries(&tree_id)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!(
+                    "artifact envelope {envelope_id} is corrupt: {error}; detach affected generations and rebuild the component before reuse"
+                ));
+            }
+        }
+
+        errors.extend(self.validate_artifact_attempt_integrity()?);
+        Ok(errors)
+    }
+
+    fn validated_raw_object_bytes(
+        &self,
+        kind: &'static str,
+        object_id: &ObjectId,
+        version: u16,
+    ) -> Result<Vec<u8>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kind,version,codec,hash_alg,size_bytes,bytes
+                 FROM objects WHERE object_id=?1",
+                params![object_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_kind, stored_version, codec, hash_alg, size_bytes, bytes)) = row else {
+            return Err(Error::ObjectNotFound {
+                kind,
+                id: object_id.0.clone(),
+            });
+        };
+        if stored_kind != kind
+            || stored_version != i64::from(version)
+            || codec != "cbor"
+            || hash_alg != "sha256"
+            || i64::try_from(bytes.len()).ok() != Some(size_bytes)
+            || ObjectId::for_bytes(kind, version, &bytes) != *object_id
+        {
+            return Err(Error::Corrupt(format!(
+                "object {object_id} metadata or content identity is invalid"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn validate_artifact_cas_object(
+        &self,
+        artifact_id: &str,
+        kind: &str,
+        version: i64,
+        logical_bytes: i64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if logical_bytes < 0 {
+            return Err(Error::Corrupt("logical byte count is negative".into()));
+        }
+        let expected_version = match kind {
+            ARTIFACT_DIRECTORY_NODE_KIND => ARTIFACT_DIRECTORY_NODE_VERSION,
+            ARTIFACT_FILE_NODE_KIND => ARTIFACT_FILE_NODE_VERSION,
+            ARTIFACT_BLOB_KIND => ARTIFACT_BLOB_VERSION,
+            ARTIFACT_CHUNK_LIST_KIND => ARTIFACT_CHUNK_LIST_VERSION,
+            ARTIFACT_CHUNK_KIND => ARTIFACT_CHUNK_VERSION,
+            ARTIFACT_TREE_ROOT_KIND => ARTIFACT_TREE_ROOT_VERSION,
+            ARTIFACT_ENVELOPE_KIND => ARTIFACT_ENVELOPE_VERSION,
+            _ => {
+                return Err(Error::Corrupt(format!(
+                    "unknown artifact object kind `{kind}`"
+                )))
+            }
+        };
+        if version != i64::from(expected_version) {
+            return Err(Error::Corrupt(format!(
+                "stored version {version} does not match {kind} version {expected_version}"
+            )));
+        }
+        let actual_id = match kind {
+            ARTIFACT_DIRECTORY_NODE_KIND => {
+                let node: ArtifactDirectoryNodeV1 = from_cbor(bytes)?;
+                for entry in &node.entries {
+                    match &entry.target {
+                        ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                            let _: ArtifactDirectoryNodeV1 = self.get_artifact_cas_object(
+                                &node_id.0,
+                                ARTIFACT_DIRECTORY_NODE_KIND,
+                                ARTIFACT_DIRECTORY_NODE_VERSION,
+                            )?;
+                        }
+                        ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                            let _: ArtifactFileNodeV1 = self.get_artifact_cas_object(
+                                &node_id.0,
+                                ARTIFACT_FILE_NODE_KIND,
+                                ARTIFACT_FILE_NODE_VERSION,
+                            )?;
+                        }
+                        ArtifactDirectoryEntryTargetV1::Symlink { .. } => {}
+                    }
+                }
+                encode_artifact_directory_node(node)?.0 .0
+            }
+            ARTIFACT_FILE_NODE_KIND => {
+                let node: ArtifactFileNodeV1 = from_cbor(bytes)?;
+                self.verify_artifact_file_content(&node)?;
+                if logical_bytes as u64 != node.size_bytes {
+                    return Err(Error::Corrupt(
+                        "file logical byte count disagrees with its node".into(),
+                    ));
+                }
+                encode_artifact_file_node(node)?.0 .0
+            }
+            ARTIFACT_BLOB_KIND => {
+                let blob: ArtifactBlobV1 = from_cbor(bytes)?;
+                if logical_bytes as u64 != blob.bytes.len() as u64 {
+                    return Err(Error::Corrupt(
+                        "blob logical byte count disagrees with its bytes".into(),
+                    ));
+                }
+                encode_artifact_blob(blob)?.0 .0
+            }
+            ARTIFACT_CHUNK_LIST_KIND => {
+                let list: ArtifactChunkListV1 = from_cbor(bytes)?;
+                if logical_bytes as u64 != list.file_size_bytes {
+                    return Err(Error::Corrupt(
+                        "chunk-list logical byte count disagrees with its file size".into(),
+                    ));
+                }
+                for chunk in &list.chunks {
+                    let value: ArtifactChunkV1 = self.get_artifact_cas_object(
+                        &chunk.chunk_id.0,
+                        ARTIFACT_CHUNK_KIND,
+                        ARTIFACT_CHUNK_VERSION,
+                    )?;
+                    if value.bytes.len() as u64 != chunk.size_bytes {
+                        return Err(Error::Corrupt(
+                            "chunk-list edge size disagrees with its chunk".into(),
+                        ));
+                    }
+                }
+                encode_artifact_chunk_list(list)?.0 .0
+            }
+            ARTIFACT_CHUNK_KIND => {
+                let chunk: ArtifactChunkV1 = from_cbor(bytes)?;
+                if logical_bytes as u64 != chunk.bytes.len() as u64 {
+                    return Err(Error::Corrupt(
+                        "chunk logical byte count disagrees with its bytes".into(),
+                    ));
+                }
+                encode_artifact_chunk(chunk)?.0 .0
+            }
+            ARTIFACT_TREE_ROOT_KIND => {
+                let tree: ArtifactTreeRootV1 = from_cbor(bytes)?;
+                if logical_bytes as u64 != tree.logical_bytes {
+                    return Err(Error::Corrupt(
+                        "tree logical byte count disagrees with its root".into(),
+                    ));
+                }
+                encode_artifact_tree_root(tree)?.0 .0
+            }
+            ARTIFACT_ENVELOPE_KIND => {
+                let envelope: ArtifactEnvelopeV1 = from_cbor(bytes)?;
+                if logical_bytes != 0 {
+                    return Err(Error::Corrupt(
+                        "artifact envelope logical byte count must be zero".into(),
+                    ));
+                }
+                encode_artifact_envelope(envelope)?.0 .0
+            }
+            _ => unreachable!(),
+        };
+        if actual_id != artifact_id {
+            return Err(Error::Corrupt(format!(
+                "encoded identity is {actual_id}, not {artifact_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_attempt_integrity(&self) -> Result<Vec<String>> {
+        let mut errors = Vec::new();
+        let mut attempts = self.conn.prepare(
+            "SELECT attempt_id,source_root,owner_pid,owner_start_token,phase,status,
+                    finished_at
+             FROM artifact_construction_attempts ORDER BY attempt_id",
+        )?;
+        for row in attempts.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })? {
+            let (attempt_id, source_root, owner_pid, owner_token, phase, status, finished_at) =
+                row?;
+            if self
+                .get_object::<WorktreeRoot>(WORKTREE_ROOT_KIND, &ObjectId(source_root))
+                .is_err()
+            {
+                errors.push(format!(
+                    "artifact construction attempt {attempt_id} has a missing source root; restore from backup or reinitialize the workspace"
+                ));
+            }
+            if status == "running" {
+                let owner_dead = u32::try_from(owner_pid).map_or(true, |pid| {
+                    process_start_token_match(pid, &owner_token)
+                        == ProcessIdentityMatch::DeadOrMismatch
+                });
+                if phase == "completed" || finished_at.is_some() || owner_dead {
+                    errors.push(format!(
+                        "artifact construction attempt {attempt_id} is incomplete or has a dead owner; reopen Trail to run exact-owner recovery"
+                    ));
+                }
+            } else if phase != "completed" || finished_at.is_none() {
+                errors.push(format!(
+                    "artifact construction attempt {attempt_id} has incoherent terminal phase evidence; restore from backup or reinitialize the workspace"
+                ));
+            }
+        }
+        drop(attempts);
+
+        let mut waiters = self.conn.prepare(
+            "SELECT w.waiter_id,w.status,a.status
+             FROM artifact_construction_waiters w
+             JOIN artifact_construction_attempts a ON a.attempt_id=w.attempt_id
+             ORDER BY w.waiter_id",
+        )?;
+        for row in waiters.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (waiter_id, waiter_status, attempt_status) = row?;
+            if waiter_status == "waiting" && attempt_status != "running" {
+                errors.push(format!(
+                    "artifact construction waiter {waiter_id} remains waiting on a terminal attempt; reopen Trail to recover it"
+                ));
+            }
+        }
+        Ok(errors)
+    }
+
     fn validate_artifact_resolution_plan_pins(
         &self,
         plan: &ArtifactResolutionPlanV1,
@@ -4567,6 +5011,41 @@ mod tests {
                 .0,
             next_id
         );
+    }
+
+    #[test]
+    fn fsck_reads_raw_resolution_snapshot_bytes_past_the_object_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let (_, snapshot) = db
+            .put_artifact_resolution_snapshot(
+                fixture_plan(source_root),
+                b"version = 4\n".to_vec(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                vec![],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            db.artifact_resolution_snapshot_content(&snapshot).unwrap(),
+            b"version = 4\n"
+        );
+
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![snapshot.content_object_id.0],
+            )
+            .unwrap();
+
+        let errors = db.validate_artifact_cas_integrity().unwrap();
+        assert!(errors.iter().any(|error| {
+            error.contains("artifact resolution snapshot")
+                && error.contains("explicit component resolution with refresh")
+        }));
     }
 
     #[test]

@@ -292,10 +292,12 @@ reviewed|db/lane/workspace_layer.rs|preserve_layer_mode|fs::set_permissions|1
 reviewed|db/lane/workspace_layer.rs|promote_workspace_environment_output_with_evidence|fs::remove_dir_all|1
 reviewed|db/lane/workspace_layer.rs|publish_workspace_layer_from_directory_under_write_lock|fs::create_dir_all|2
 reviewed|db/lane/workspace_layer.rs|publish_workspace_layer_from_directory_under_write_lock|fs::rename|2
+reviewed|db/lane/workspace_layer.rs|recover_artifact_construction_attempts_under_write_lock|fs::remove_file|1
 reviewed|db/lane/workspace_layer.rs|recover_workspace_layer_materializations|fs::create_dir_all|2
-reviewed|db/lane/workspace_layer.rs|recover_workspace_layer_materializations|fs::remove_dir_all|2
+reviewed|db/lane/workspace_layer.rs|recover_workspace_layer_materializations|fs::remove_dir_all|1
 reviewed|db/lane/workspace_layer.rs|recover_workspace_layer_materializations|fs::rename|1
 reviewed|db/lane/workspace_layer.rs|recover_workspace_layer_publications|fs::remove_dir_all|1
+reviewed|db/lane/workspace_layer.rs|remove_exact_recovery_directory|fs::remove_dir_all|1
 reviewed|db/lane/workspace_layer.rs|remove_workspace_layer_trash_entries|fs::remove_dir_all|1
 reviewed|db/lane/workspace_layer.rs|remove_workspace_layer_trash_entries|fs::remove_file|1
 reviewed|db/lane/workspace_layer.rs|set_layer_read_only|fs::set_permissions|2

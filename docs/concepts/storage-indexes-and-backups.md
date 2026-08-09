@@ -59,7 +59,13 @@ trail doctor
 trail fsck
 ```
 
-`doctor` checks operational readiness, schema version, current branch, `.trailignore` defaults, runtime integration state, and pending approvals. `fsck` verifies structural integrity.
+`doctor` checks operational readiness, schema version, current branch,
+`.trailignore` defaults, runtime integration state, pending approvals, and
+artifact/materialization health. `fsck` verifies structural integrity including
+raw artifact object identity and edges, resolution snapshots, envelopes,
+construction evidence, and owned versus orphan materializations. Reopening Trail
+recovers only staging owned by a provably dead exact process fence; unknown
+materializations are reported for review instead of deleted automatically.
 
 ## Backups
 

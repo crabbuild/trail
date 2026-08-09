@@ -599,6 +599,7 @@ impl Trail {
     /// workspace write lock, stages into an attempt-owned directory, validates
     /// against the legacy manifest, and only then publishes by atomic rename.
     pub(crate) fn recover_workspace_layer_materializations(&self) -> Result<()> {
+        let private_stage = self.db_dir != self.workspace_root.join(".trail");
         let mut statement = self.conn.prepare(
             "SELECT l.layer_id,l.storage_path,l.manifest_object_id,
                     s.tree_root_id,s.envelope_id
@@ -623,13 +624,42 @@ impl Trail {
         drop(statement);
 
         for (layer_id, stored_path, manifest_id, tree_id, envelope_id) in candidates {
+            if !valid_workspace_layer_id(&layer_id) {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer ID `{layer_id}` is invalid; restore from backup or reinitialize the workspace"
+                )));
+            }
             let final_path = self.db_dir.join("cache/layers").join(&layer_id);
-            if Path::new(&stored_path) != final_path {
+            if private_stage {
+                if !workspace_layer_storage_path_matches_id(&stored_path, &layer_id) {
+                    return Err(Error::Corrupt(format!(
+                        "workspace layer `{layer_id}` has a non-canonical materialization path"
+                    )));
+                }
+                let restored_path = self
+                    .workspace_root
+                    .join(".trail/cache/layers")
+                    .join(&layer_id);
+                if Path::new(&stored_path) != restored_path {
+                    self.conn.execute(
+                        "UPDATE workspace_layers SET storage_path=?1 WHERE layer_id=?2",
+                        params![restored_path.to_string_lossy(), &layer_id],
+                    )?;
+                }
+            } else if Path::new(&stored_path) != final_path {
                 return Err(Error::Corrupt(format!(
                     "workspace layer `{layer_id}` has a non-canonical materialization path"
                 )));
             }
+            let staging = self
+                .db_dir
+                .join("cache/staging")
+                .join(format!("restore_{layer_id}"));
             if final_path.exists() {
+                remove_exact_recovery_directory(
+                    &staging,
+                    "completed artifact materialization staging",
+                )?;
                 continue;
             }
             let tree_id = crate::ids::ArtifactTreeId::parse(tree_id)
@@ -638,8 +668,13 @@ impl Trail {
                 crate::ids::ArtifactEnvelopeId::parse(envelope_id).map_err(|error| {
                     Error::Corrupt(format!("invalid artifact envelope ID: {error}"))
                 })?;
-            let envelope =
-                self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)?;
+            let envelope = self
+                .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` cannot be reconstructed because envelope `{envelope_id}` failed verification: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
             if !matches!(
                 envelope.desired_identity,
                 ArtifactDesiredIdentityV1::WorkspaceLayerV1 { .. }
@@ -648,21 +683,30 @@ impl Trail {
                     "workspace layer `{layer_id}` references a non-legacy artifact envelope"
                 )));
             }
-            let mut manifest: WorkspaceLayerManifest = self.get_object(
-                WORKSPACE_LAYER_MANIFEST_KIND,
-                &ObjectId(manifest_id.clone()),
-            )?;
-            self.hydrate_workspace_layer_manifest(&mut manifest)?;
-            let staging = self
-                .db_dir
-                .join("cache/staging")
-                .join(format!("restore_{layer_id}"));
-            if staging.exists() {
-                make_tree_writable(&staging);
-                fs::remove_dir_all(&staging)?;
-            }
+            let mut manifest: WorkspaceLayerManifest = self
+                .get_object(
+                    WORKSPACE_LAYER_MANIFEST_KIND,
+                    &ObjectId(manifest_id.clone()),
+                )
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` has no valid layer manifest: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            self.hydrate_workspace_layer_manifest(&mut manifest)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` has an invalid paged manifest: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            remove_exact_recovery_directory(&staging, "artifact materialization staging")?;
             fs::create_dir_all(staging.parent().unwrap())?;
-            self.materialize_artifact_tree_under_write_lock(&tree_id, &staging)?;
+            self.materialize_artifact_tree_under_write_lock(&tree_id, &staging)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` could not materialize tree `{tree_id}`: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
             test_crash_point("layer_after_cas_materialization");
             // The legacy manifest records the immutable attachment modes
             // (0555/0444), so seal the reconstructed children before the
@@ -846,6 +890,140 @@ impl Trail {
                         entry.path
                     ));
                 }
+            }
+        }
+        Ok(errors)
+    }
+
+    pub(crate) fn validate_workspace_artifact_layout_integrity(&self) -> Result<Vec<String>> {
+        const MAX_MATERIALIZATION_DIRECTORIES: usize = 100_000;
+        let mut errors = Vec::new();
+        // Backup verification and restore validation open a private SQLite
+        // stage whose disposable cache tree is intentionally absent. Validate
+        // durable path identity there, but reserve physical materialization
+        // checks for an active `.trail` database directory.
+        let private_stage = self.db_dir != self.workspace_root.join(".trail");
+        let layers = {
+            let mut statement = self.conn.prepare(
+                "SELECT l.layer_id,l.storage_path,l.state,
+                        CASE WHEN s.layer_id IS NULL THEN 0 ELSE 1 END
+                 FROM workspace_layers l
+                 LEFT JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+                 ORDER BY l.layer_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let known_layers = layers
+            .iter()
+            .filter(|(layer_id, _, _, _)| valid_workspace_layer_id(layer_id))
+            .map(|(layer_id, _, _, _)| layer_id.clone())
+            .collect::<BTreeSet<_>>();
+        for (layer_id, stored_path, state, cas_backed) in &layers {
+            if !valid_workspace_layer_id(layer_id) {
+                errors.push(format!(
+                    "workspace layer ID `{layer_id}` is invalid; restore from backup or reinitialize the workspace"
+                ));
+                continue;
+            }
+            let expected = self.db_dir.join("cache/layers").join(layer_id);
+            if private_stage {
+                if !workspace_layer_storage_path_matches_id(stored_path, layer_id) {
+                    errors.push(format!(
+                        "workspace layer {layer_id} has a non-canonical storage path; restore from backup or reinitialize the workspace"
+                    ));
+                }
+                continue;
+            }
+            if Path::new(stored_path) != expected {
+                errors.push(format!(
+                    "workspace layer {layer_id} has a non-canonical storage path; restore from backup or reinitialize the workspace"
+                ));
+                continue;
+            }
+            if state != "ready" {
+                continue;
+            }
+            if !expected.is_dir() {
+                errors.push(if *cas_backed {
+                    format!(
+                        "CAS-backed workspace layer {layer_id} has no materialization; reopen Trail to reconstruct it from its verified envelope"
+                    )
+                } else {
+                    format!(
+                        "legacy workspace layer {layer_id} is missing and has no CAS authority; run environment synchronization to rebuild it"
+                    )
+                });
+                continue;
+            }
+            if let Err(error) = self.verify_workspace_layer(layer_id) {
+                errors.push(if *cas_backed {
+                    format!(
+                        "CAS-backed workspace layer {layer_id} failed materialization verification: {error}; move the materialization outside `.trail/cache/layers` and reopen Trail"
+                    )
+                } else {
+                    format!(
+                        "legacy workspace layer {layer_id} failed verification: {error}; run environment synchronization to rebuild it"
+                    )
+                });
+            }
+        }
+
+        let layer_root = self.db_dir.join("cache/layers");
+        if layer_root.is_dir() {
+            for (index, entry) in fs::read_dir(&layer_root)?.enumerate() {
+                if index >= MAX_MATERIALIZATION_DIRECTORIES {
+                    errors.push(format!(
+                        "workspace layer materialization directory exceeds the {MAX_MATERIALIZATION_DIRECTORIES}-entry diagnostic bound; inspect `.trail/cache/layers` manually"
+                    ));
+                    break;
+                }
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if workspace_layer_sidecar_owner(&name)
+                    .is_some_and(|layer_id| known_layers.contains(layer_id))
+                {
+                    continue;
+                }
+                if !known_layers.contains(&name) {
+                    errors.push(format!(
+                        "orphan workspace layer materialization `{name}` has no database owner; move it outside `.trail/cache/layers`, rerun `trail fsck`, then delete it after review"
+                    ));
+                }
+            }
+        }
+
+        let staging_root = self.db_dir.join("cache/staging");
+        if staging_root.is_dir() {
+            for (index, entry) in fs::read_dir(&staging_root)?.enumerate() {
+                if index >= MAX_MATERIALIZATION_DIRECTORIES {
+                    errors.push(format!(
+                        "workspace layer staging directory exceeds the {MAX_MATERIALIZATION_DIRECTORIES}-entry diagnostic bound; inspect `.trail/cache/staging` manually"
+                    ));
+                    break;
+                }
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(layer_id) = name.strip_prefix("restore_") else {
+                    continue;
+                };
+                errors.push(if known_layers.contains(layer_id) {
+                    format!(
+                        "workspace layer {layer_id} retains incomplete materialization staging; reopen Trail to recover the exact staged path"
+                    )
+                } else {
+                    format!(
+                        "orphan artifact materialization staging `{name}` has no database owner; move it outside `.trail/cache/staging` and rerun `trail fsck`"
+                    )
+                });
             }
         }
         Ok(errors)
@@ -1516,6 +1694,138 @@ impl Trail {
              WHERE attempt_id=?2 AND status='waiting'",
             params![now_ts(), attempt.attempt_id],
         )?;
+        Ok(())
+    }
+
+    /// Terminalize construction attempts whose exact process owner is proven
+    /// dead and remove only staging/lock paths derived from that fenced owner.
+    /// This is called by workspace-open recovery while the workspace write
+    /// lock is already held.
+    pub(crate) fn recover_artifact_construction_attempts_under_write_lock(&self) -> Result<()> {
+        let attempts = {
+            let mut statement = self.conn.prepare(
+                "SELECT attempt_id,desired_key,owner_generation,owner_pid,
+                        owner_start_token,cancel_requested
+                 FROM artifact_construction_attempts
+                 WHERE status='running' ORDER BY started_at,attempt_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            attempt_id,
+            desired_key,
+            owner_generation,
+            owner_pid,
+            owner_start_token,
+            cancel_requested,
+        ) in attempts
+        {
+            if !valid_workspace_cache_key(&desired_key) {
+                return Err(Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has an invalid desired key; restore from backup or reinitialize the workspace"
+                )));
+            }
+            let owner_pid = u32::try_from(owner_pid).map_err(|_| {
+                Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has invalid owner PID"
+                ))
+            })?;
+            if process_start_token_match(owner_pid, &owner_start_token)
+                != ProcessIdentityMatch::DeadOrMismatch
+            {
+                continue;
+            }
+            let owner_token = format!("{owner_pid}:{owner_start_token}");
+            let staging = self.db_dir.join("cache/staging").join(format!(
+                "input_{}",
+                crate::ids::short_hash(format!("{desired_key}:{owner_token}").as_bytes(), 12)
+            ));
+            remove_exact_recovery_directory(&staging, "artifact construction staging")?;
+
+            let lock_path = self
+                .db_dir
+                .join("cache/staging/locks")
+                .join(format!("{desired_key}.lock"));
+            if fs::read_to_string(&lock_path)
+                .ok()
+                .is_some_and(|value| value == owner_token)
+            {
+                fs::remove_file(&lock_path)?;
+            }
+
+            self.conn
+                .execute_batch("SAVEPOINT trail_construction_recovery")?;
+            let recovery = (|| -> Result<()> {
+                let status = if cancel_requested {
+                    "cancelled"
+                } else {
+                    "abandoned"
+                };
+                let reason_code = if cancel_requested {
+                    "construction_cancelled"
+                } else {
+                    "owner_lost"
+                };
+                let reason = if cancel_requested {
+                    "construction cancellation was recovered after its owner exited"
+                } else {
+                    "construction owner exited before artifact publication"
+                };
+                let updated = self.conn.execute(
+                    "UPDATE artifact_construction_attempts
+                     SET phase='completed',status=?1,reason_code=?2,reason=?3,
+                         heartbeat_at=?4,finished_at=?4
+                     WHERE attempt_id=?5 AND desired_key=?6 AND owner_generation=?7
+                       AND owner_pid=?8 AND owner_start_token=?9 AND status='running'",
+                    params![
+                        status,
+                        reason_code,
+                        reason,
+                        now_ts(),
+                        attempt_id,
+                        desired_key,
+                        owner_generation,
+                        i64::from(owner_pid),
+                        owner_start_token,
+                    ],
+                )?;
+                if updated != 1 {
+                    return Err(Error::Corrupt(format!(
+                        "artifact construction attempt `{attempt_id}` changed during exact-owner recovery"
+                    )));
+                }
+                self.conn.execute(
+                    "UPDATE artifact_construction_waiters
+                     SET status='abandoned',updated_at=?1
+                     WHERE attempt_id=?2 AND status='waiting'",
+                    params![now_ts(), attempt_id],
+                )?;
+                Ok(())
+            })();
+            match recovery {
+                Ok(()) => self
+                    .conn
+                    .execute_batch("RELEASE SAVEPOINT trail_construction_recovery")?,
+                Err(error) => {
+                    let _ = self.conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT trail_construction_recovery;
+                         RELEASE SAVEPOINT trail_construction_recovery",
+                    );
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4803,6 +5113,63 @@ struct CacheBuildKeyGuard {
     token: String,
 }
 
+fn remove_exact_recovery_directory(path: &Path, purpose: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Corrupt(format!(
+            "{purpose} path `{}` is not a real directory; move it outside `.trail` and reopen Trail",
+            path.display()
+        )));
+    }
+    make_tree_writable(path);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn valid_workspace_layer_id(value: &str) -> bool {
+    value.strip_prefix("layer_").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_workspace_cache_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn workspace_layer_storage_path_matches_id(value: &str, layer_id: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        && path.ends_with(
+            Path::new(".trail")
+                .join("cache")
+                .join("layers")
+                .join(layer_id),
+        )
+}
+
+fn workspace_layer_sidecar_owner(value: &str) -> Option<&str> {
+    let value = value.strip_prefix('.')?;
+    value
+        .strip_suffix(".publish.json")
+        .or_else(|| value.strip_suffix(".verified.json"))
+}
+
 impl Drop for CacheBuildKeyGuard {
     fn drop(&mut self) {
         if fs::read_to_string(&self.path)
@@ -5617,6 +5984,35 @@ mod tests {
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
         }
+    }
+
+    #[test]
+    fn workspace_layer_storage_identity_requires_lowercase_canonical_absolute_paths() {
+        let layer_id = "layer_0123456789abcdef0123456789abcdef";
+        let canonical = std::env::temp_dir()
+            .join(".trail/cache/layers")
+            .join(layer_id);
+        assert!(valid_workspace_layer_id(layer_id));
+        assert!(workspace_layer_storage_path_matches_id(
+            &canonical.to_string_lossy(),
+            layer_id
+        ));
+        assert!(!valid_workspace_layer_id(
+            "layer_0123456789ABCDEF0123456789ABCDEF"
+        ));
+        assert!(!workspace_layer_storage_path_matches_id(
+            &Path::new("relative/.trail/cache/layers")
+                .join(layer_id)
+                .to_string_lossy(),
+            layer_id
+        ));
+        assert!(!workspace_layer_storage_path_matches_id(
+            &std::env::temp_dir()
+                .join("ignored/../.trail/cache/layers")
+                .join(layer_id)
+                .to_string_lossy(),
+            layer_id
+        ));
     }
 
     #[test]
@@ -6469,6 +6865,76 @@ mod tests {
     }
 
     #[test]
+    fn workspace_open_removes_completed_materialization_staging() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "ready\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let staging = db
+            .db_dir
+            .join("cache/staging")
+            .join(format!("restore_{}", layer.layer_id));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), "stale\n").unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert!(!staging.exists());
+        reopened.verify_workspace_layer(&layer.layer_id).unwrap();
+    }
+
+    #[test]
+    fn workspace_open_reports_exact_guidance_for_corrupt_cas_reconstruction() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "ready\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let corrupt_object = db
+            .conn
+            .query_row(
+                "SELECT object_id FROM artifact_objects WHERE kind=?1 ORDER BY artifact_id LIMIT 1",
+                params![ARTIFACT_BLOB_KIND],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![corrupt_object],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+        drop(db);
+
+        let error = match Trail::open(workspace.path()) {
+            Ok(_) => panic!("corrupt CAS reconstruction unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("could not materialize tree"), "{message}");
+        assert!(
+            message.contains("restore the workspace from backup"),
+            "{message}"
+        );
+        assert!(
+            message.contains("run environment synchronization"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn cas_shadow_comparison_rejects_path_metadata_and_digest_disagreement() {
         let tree = ArtifactTreeRootV1 {
             version: ARTIFACT_TREE_ROOT_VERSION,
@@ -7302,6 +7768,179 @@ mod tests {
             Some("test completed"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn workspace_open_recovers_dead_construction_owner_and_exact_staging() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let desired_key = db.workspace_layer_cache_key(&key()).unwrap();
+        let owner_pid = u32::MAX;
+        let owner_start_token = "dead-open-owner";
+        let owner_token = format!("{owner_pid}:{owner_start_token}");
+        let staging = db.db_dir.join("cache/staging").join(format!(
+            "input_{}",
+            crate::ids::short_hash(format!("{desired_key}:{owner_token}").as_bytes(), 12)
+        ));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), "incomplete\n").unwrap();
+        let lock = db
+            .db_dir
+            .join("cache/staging/locks")
+            .join(format!("{desired_key}.lock"));
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, &owner_token).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_attempts(
+                    attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                    owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                    reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+                 VALUES('construct_open_dead',?1,?2,1,?3,?4,'building','running',
+                        NULL,NULL,NULL,NULL,0,?5,?5,NULL)",
+                params![
+                    desired_key,
+                    source_root.0,
+                    i64::from(owner_pid),
+                    owner_start_token,
+                    now_ts()
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_waiters(
+                    attempt_id,waiter_id,owner_pid,owner_start_token,status,created_at,updated_at)
+                 VALUES('construct_open_dead','waiter_open_dead',?1,?2,'waiting',?3,?3)",
+                params![i64::from(owner_pid), owner_start_token, now_ts()],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert!(!staging.exists());
+        assert!(!lock.exists());
+        let attempt = reopened
+            .conn
+            .query_row(
+                "SELECT phase,status,reason_code FROM artifact_construction_attempts
+                 WHERE attempt_id='construct_open_dead'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            attempt,
+            ("completed".into(), "abandoned".into(), "owner_lost".into())
+        );
+        let waiter = reopened
+            .conn
+            .query_row(
+                "SELECT status FROM artifact_construction_waiters
+                 WHERE waiter_id='waiter_open_dead'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(waiter, "abandoned");
+    }
+
+    #[test]
+    fn fsck_and_doctor_report_cas_corruption_and_orphan_materializations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), "verified\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), source.path())
+            .unwrap();
+        drop(db);
+        let db = Trail::open(workspace.path()).unwrap();
+        let corrupt_object = db
+            .conn
+            .query_row(
+                "SELECT object_id FROM artifact_objects WHERE kind=?1 ORDER BY artifact_id LIMIT 1",
+                params![ARTIFACT_BLOB_KIND],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![corrupt_object],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+        let orphan_id = format!("layer_{}", "a".repeat(32));
+        fs::create_dir_all(db.db_dir.join("cache/layers").join(&orphan_id)).unwrap();
+
+        let fsck = db.fsck().unwrap();
+        assert!(
+            fsck.errors.iter().any(|error| {
+                error.contains("artifact object") && error.contains("rebuild the owning")
+            }),
+            "fsck errors: {:?}",
+            fsck.errors
+        );
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("CAS-backed workspace layer")
+                && error.contains("reopen Trail to reconstruct")
+        }));
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("orphan workspace layer materialization")
+                && error.contains("rerun `trail fsck`")
+        }));
+
+        let doctor = db.doctor().unwrap();
+        assert_eq!(doctor.status, "error");
+        let doctor_json = serde_json::to_string(&doctor).unwrap();
+        assert!(doctor_json.contains("CAS-backed workspace layer"));
+        assert!(doctor_json.contains("orphan workspace layer materialization"));
+    }
+
+    #[test]
+    fn fsck_distinguishes_missing_legacy_layer_without_cas_authority() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), "legacy\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), source.path())
+            .unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer.layer_id],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+
+        let fsck = db.fsck().unwrap();
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("legacy workspace layer")
+                && error.contains("run environment synchronization to rebuild it")
+        }));
+        assert!(!fsck
+            .errors
+            .iter()
+            .any(|error| error.contains("reconstruct it from its verified envelope")));
     }
 
     #[test]

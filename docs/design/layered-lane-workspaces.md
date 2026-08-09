@@ -1178,9 +1178,13 @@ Ordinary `du` on mountpoints is insufficient and may report logical bytes
 multiple times. Trail reports should use layer manifests plus platform block or
 extent accounting where available and clearly label estimates.
 
-`fsck` verifies layer manifests and references. Normal Trail object GC and
-workspace-cache GC remain separate commands because cache loss is recoverable
-while object-history loss is not.
+`fsck` verifies layer manifests and references, raw CAS object identities and
+edges, snapshots, envelopes, attempt state, and materialization ownership. It
+labels missing legacy layers as rebuild-required and missing CAS-backed layers
+as reconstructible. Orphan layer/restore directories are reported with review
+guidance rather than deleted without durable ownership evidence. Normal Trail
+object GC and workspace-cache GC remain separate commands because cache loss is
+recoverable while object-history loss is not.
 
 ## Performance Architecture and Targets
 

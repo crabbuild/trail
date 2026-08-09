@@ -13,6 +13,12 @@ All notable changes to Trail are documented in this file. Trail follows
 - Workspace-layer singleflight now records durable generation-fenced owner phases and
   waiter outcomes, and only recovers a lock when the exact PID/start identity is proven
   dead or mismatched.
+- Workspace open now recovers dead artifact constructors and exact owned staging;
+  doctor and fsck validate raw CAS objects, snapshots, envelopes, attempt coherence,
+  legacy/CAS layouts, and orphan materializations with repair guidance.
+- Backup/restore validation now treats omitted materialization caches as disposable,
+  rebases restored layer paths before publication, and parallel environment builders
+  use a bounded SQLite wait during short WAL publication overlap.
 - Environment discovery now reports marker-recognized plugins that do not support the
   current host as typed `unsupported` proposals without launching plugin code.
 

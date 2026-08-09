@@ -724,6 +724,7 @@ impl Trail {
         self.recover_materialization_stages()?;
         self.recover_workspace_views()?;
         self.recover_artifact_resolution_attempts_under_write_lock()?;
+        self.recover_artifact_construction_attempts_under_write_lock()?;
         self.recover_workspace_environment_sync_attempts()?;
         self.recover_environment_hot_access_sessions()?;
         self.recover_workspace_layer_publications()?;

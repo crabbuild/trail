@@ -9,6 +9,30 @@ backup archives exclude workspace cache bytes and mounted views, restore keeps
 publication history but closes attachable attempts as `recovered` and clears
 their layer/generation links.
 
+Artifact CAS rows are verified against the raw `objects` bytes rather than the
+process-local object cache. `fsck` checks object metadata/content identity,
+directory/file/chunk edges, complete tree roots, resolution snapshots, ready
+envelopes, construction-attempt coherence, and layer materialization ownership.
+It distinguishes a legacy layer whose directory is authoritative from a
+CAS-backed layer whose directory can be reconstructed, and reports different
+repair guidance for each.
+
+Workspace-open recovery terminalizes only construction attempts whose exact
+PID/start identity is proven dead or mismatched. It removes only the lock and
+staging directory derived from that owner fence. Missing CAS-backed layer
+materializations are reconstructed through a private staging directory;
+completed restore staging is removed idempotently. Unknown layer directories or
+restore staging are never deleted implicitly and remain visible to doctor and
+fsck as bounded orphan diagnostics.
+
+Private backup-verification stages validate durable CAS and canonical layer-path
+identity without requiring the intentionally omitted materialization cache.
+Restore stages reconstruct verified CAS-backed layers under the private stage and
+rebase their durable paths to the destination `.trail` directory before atomic
+publication. Legacy cache absence remains rebuildable through environment
+synchronization rather than making an otherwise valid database-only backup
+unverifiable.
+
 This design section is advanced/internal. It describes the current storage architecture and index maintenance paths.
 
 ## Storage Overview

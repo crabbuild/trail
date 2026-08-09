@@ -12,6 +12,7 @@ const MAX_ENVIRONMENT_PROPOSAL_REASONS: usize = 16;
 const MAX_ENVIRONMENT_RECOVERY_ACTIONS: usize = 16;
 const MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS: usize = 64;
+const PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS: u64 = 30;
 
 /// One repository file that the host projects into an adapter-owned staging
 /// directory. Adapters describe the mapping; they never receive writable
@@ -3115,6 +3116,15 @@ impl Trail {
                         component_id,
                         scope.spawn(move || {
                             let db = Trail::open(&workspace)?;
+                            // External builds run concurrently, while each
+                            // immutable publication remains serialized by the
+                            // workspace lock. A worker can still meet the
+                            // preceding worker's WAL commit briefly after the
+                            // handoff, so wait within the construction lease
+                            // instead of escaping a transient SQLITE_BUSY.
+                            db.conn.busy_timeout(Duration::from_secs(
+                                PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS,
+                            ))?;
                             db.prepare_workspace_environment_artifacts(
                                 &view_id,
                                 &source_root,

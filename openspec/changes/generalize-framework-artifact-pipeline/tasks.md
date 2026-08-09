@@ -51,7 +51,7 @@
 - [ ] 6.1 Add manifest-backed lazy lookup/materialization to NFS, FUSE, and Dokan integration without changing existing lower/upper/whiteout semantics
 - [ ] 6.2 Add verified materialization caches keyed by tree root/backend compatibility with safe clone/reflink/copy policy and no mutable alias to authoritative content
 - [ ] 6.3 Extend fork compatibility to verify desired key, artifact envelope, tree integrity, adapter/package trust, portability, scope, and backend support while preserving fresh mutable identities
-- [ ] 6.4 Extend workspace-open recovery, doctor, and fsck for incomplete CAS attempts, corrupt/missing objects, orphan materializations, legacy versus CAS-backed layouts, and exact repair guidance
+- [x] 6.4 Extend workspace-open recovery, doctor, and fsck for incomplete CAS attempts, corrupt/missing objects, orphan materializations, legacy versus CAS-backed layouts, and exact repair guidance
 - [ ] 6.5 Extend backup/restore so authoritative snapshots, envelopes, attestations, objects, bindings, and retained private state survive while omitted materializations/caches are reported as rebuildable
 - [ ] 6.6 Implement object-graph reachability and incremental deterministic GC across generations, attempts, leases, quarantines, backups, holds, directories, files, blobs, chunk lists, and chunks
 - [ ] 6.7 Extend lane space/cache reports with logical, unique authoritative, cross-artifact shared, materialized, lane-private, prefetched, demand-loaded, reclaimable, and unknown bytes without double counting

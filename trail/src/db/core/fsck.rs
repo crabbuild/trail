@@ -50,6 +50,12 @@ impl Trail {
         report
             .errors
             .extend(self.validate_workspace_cache_authorities_integrity()?);
+        report
+            .errors
+            .extend(self.validate_artifact_cas_integrity()?);
+        report
+            .errors
+            .extend(self.validate_workspace_artifact_layout_integrity()?);
         Ok(report)
     }
 }
