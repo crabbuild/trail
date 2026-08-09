@@ -2311,6 +2311,55 @@ pub(super) fn environment_plugin_supports_current_host(
             .any(|value| value == std::env::consts::ARCH)
 }
 
+pub(super) fn unsupported_environment_plugin_proposal(
+    plugin: &InstalledEnvironmentPlugin,
+    component_root: &str,
+) -> Result<EnvironmentDiscoveredComponentReport> {
+    let component_root = normalize_plugin_component_root(component_root)?;
+    let component_id = if component_root.is_empty() {
+        format!("plugin:{}", plugin.manifest.adapter.layer_adapter_name)
+    } else {
+        format!(
+            "plugin:{}:{component_root}",
+            plugin.manifest.adapter.layer_adapter_name
+        )
+    };
+    validate_plugin_component_id(&component_id)?;
+    Ok(EnvironmentDiscoveredComponentReport {
+        component_id,
+        component_root,
+        kind: plugin.manifest.adapter.kind.clone(),
+        adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+        status: EnvironmentComponentProposalStatus::Unsupported,
+        reasons: vec![EnvironmentProposalReasonReport {
+            code: "unsupported_host_platform".to_string(),
+            message: format!(
+                "adapter `{}` recognizes this marker but does not support {}/{}",
+                plugin.manifest.adapter.canonical_identity,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        }],
+        recovery_actions: vec![EnvironmentRecoveryActionReport {
+            code: "use_supported_host".to_string(),
+            description: format!(
+                "Use a host matching the adapter's supported operating systems ({}) and architectures ({})",
+                plugin
+                    .manifest
+                    .adapter
+                    .supported_operating_systems
+                    .join(", "),
+                plugin
+                    .manifest
+                    .adapter
+                    .supported_architectures
+                    .join(", ")
+            ),
+            command: None,
+        }],
+    })
+}
+
 pub(super) fn selected_environment_plugin_protocol(
     plugin: &InstalledEnvironmentPlugin,
 ) -> Result<&'static str> {
@@ -3161,6 +3210,26 @@ max_response_bytes = 1048576
         .unwrap();
     }
 
+    fn make_test_package_unsupported_on_current_host(root: &Path) {
+        let manifest_path = root.join(PLUGIN_PACKAGE_MANIFEST);
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        let unsupported_os = if cfg!(target_os = "windows") {
+            "linux"
+        } else {
+            "windows"
+        };
+        fs::write(
+            manifest_path,
+            manifest.replace(
+                "stability = \"experimental\"",
+                &format!(
+                    "supported_operating_systems = [\"{unsupported_os}\"]\nstability = \"experimental\""
+                ),
+            ),
+        )
+        .unwrap();
+    }
+
     fn sign_test_package(root: &Path, signing_key: &SigningKey, publisher: &str) -> PathBuf {
         let mut package: AdapterPackageManifest =
             toml::from_str(&fs::read_to_string(root.join(PLUGIN_PACKAGE_MANIFEST)).unwrap())
@@ -3257,6 +3326,52 @@ max_response_bytes = 1048576
             .adapters
             .iter()
             .all(|entry| entry.canonical_identity != "example/test@1"));
+    }
+
+    #[test]
+    fn unsupported_plugin_marker_returns_proposal_without_invoking_plugin() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("test.plugin"), "recognized marker\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let package = tempfile::tempdir().unwrap();
+        write_test_package(package.path(), "example/unsupported@1");
+        make_test_package_unsupported_on_current_host(package.path());
+        db.install_environment_adapter_plugin(package.path())
+            .unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "unsupported-plugin",
+            Some("main"),
+            if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            },
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        // The fixture executable is not a protocol peer. Discovery can only
+        // succeed if the host reports the pinned marker without launching it.
+        let discovery = db
+            .discover_workspace_environment("unsupported-plugin", None)
+            .unwrap();
+        assert_eq!(discovery.components.len(), 1);
+        let proposal = &discovery.components[0];
+        assert_eq!(proposal.component_id, "plugin:test-plugin");
+        assert_eq!(proposal.adapter_identity, "example/unsupported@1");
+        assert_eq!(
+            proposal.status,
+            EnvironmentComponentProposalStatus::Unsupported
+        );
+        assert_eq!(proposal.reasons[0].code, "unsupported_host_platform");
+        assert_eq!(proposal.recovery_actions[0].code, "use_supported_host");
     }
 
     #[test]

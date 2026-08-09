@@ -189,6 +189,19 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `BackupRestoreReport`
 - `ExternalMutationAuditRecord`
 
+## Artifact Resolution Types
+
+- `ArtifactResolutionPlanV1`: pinned executable, argv, source inputs, authority and
+  policy bounds, candidate contract, limits, and validations.
+- `ArtifactResolutionSnapshotV1`: immutable verified snapshot identity and provenance.
+- `ArtifactResolutionAttemptReportV1`: durable fenced attempt, bounded evidence, and
+  success/failure/recovery state.
+- `ArtifactResolutionRequestV1` and `ArtifactResolutionCandidateV1`: ephemeral Rust-only
+  executor handoff; these are intentionally not serializable.
+- `ArtifactResolutionDecisionV1` and `ArtifactResolutionComponentReportV1`: one typed
+  `resolved`, `reused`, or deliberately `refreshed` decision.
+- `ArtifactResolutionBatchReportV1`: deterministically ordered same-source-root result.
+
 ## Code Facts Used
 
 - IDs: `trail/src/ids.rs`

@@ -835,7 +835,7 @@ impl Trail {
     ) -> Result<EnvironmentDiscoveryReport> {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
-        let mut roots = BTreeSet::new();
+        let mut roots = BTreeMap::<String, BTreeSet<String>>::new();
         let plugins = self.installed_environment_plugins()?;
         if !plugins.is_empty() {
             // This also rejects selectors that collide with built-ins before
@@ -853,11 +853,26 @@ impl Trail {
                 .flat_map(|plugin| plugin.manifest.adapter.discovery_markers.iter().cloned()),
         );
         if let Some(component_root) = component_root {
-            roots.insert(if component_root.trim_matches('/').is_empty() {
+            let root = if component_root.trim_matches('/').is_empty() {
                 String::new()
             } else {
                 normalize_relative_path(component_root)?
-            });
+            };
+            let mut present = BTreeSet::new();
+            for marker in &discovery_markers {
+                if marker.contains('/') {
+                    continue;
+                }
+                let marker_path = if root.is_empty() {
+                    marker.clone()
+                } else {
+                    format!("{root}/{marker}")
+                };
+                if self.root_file_entry(&head.root_id, &marker_path)?.is_some() {
+                    present.insert(marker.clone());
+                }
+            }
+            roots.insert(root, present);
         } else {
             self.for_each_root_file_chunk(&head.root_id, 1024, |chunk| {
                 for (path, _) in chunk {
@@ -865,11 +880,14 @@ impl Trail {
                     if !discovery_markers.contains(file_name) {
                         continue;
                     }
-                    roots.insert(
-                        path.rsplit_once('/')
-                            .map(|(parent, _)| parent.to_string())
-                            .unwrap_or_default(),
-                    );
+                    roots
+                        .entry(
+                            path.rsplit_once('/')
+                                .map(|(parent, _)| parent.to_string())
+                                .unwrap_or_default(),
+                        )
+                        .or_default()
+                        .insert(file_name.to_string());
                 }
                 Ok(())
             })?;
@@ -877,8 +895,16 @@ impl Trail {
 
         let mut components = Vec::new();
         let mut conflicts = Vec::new();
-        for root in roots {
+        for (root, present_markers) in roots {
             for adapter in builtin_environment_adapters() {
+                if !adapter
+                    .metadata()
+                    .discovery_markers
+                    .iter()
+                    .any(|marker| present_markers.contains(*marker))
+                {
+                    continue;
+                }
                 if let Some(proposal) = adapter.propose(self, &head.root_id, &root)? {
                     components.push(EnvironmentDiscoveredComponentReport {
                         component_id: adapter.component_id(&root)?,
@@ -892,7 +918,21 @@ impl Trail {
                 }
             }
             for plugin in &plugins {
+                if !plugin
+                    .manifest
+                    .adapter
+                    .discovery_markers
+                    .iter()
+                    .any(|marker| present_markers.contains(marker))
+                {
+                    continue;
+                }
                 if !super::workspace_plugin::environment_plugin_supports_current_host(plugin) {
+                    components.push(
+                        super::workspace_plugin::unsupported_environment_plugin_proposal(
+                            plugin, &root,
+                        )?,
+                    );
                     continue;
                 }
                 if let Some(component) =

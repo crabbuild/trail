@@ -48,6 +48,208 @@ pub(crate) struct ArtifactFlatEntry {
 }
 
 impl Trail {
+    /// Publish or deliberately refresh one resolver-produced snapshot.
+    ///
+    /// The executor remains a separate capability boundary: this operation
+    /// owns pin validation, attempt fencing, bounded/redacted evidence,
+    /// content-addressed snapshot publication, and reuse. A current snapshot
+    /// is reused without inspecting candidate bytes unless `refresh` is true;
+    /// wall-clock time never advances dependency selection.
+    pub fn resolve_artifact_component(
+        &self,
+        request: ArtifactResolutionRequestV1,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionComponentReportV1> {
+        let ArtifactResolutionRequestV1 {
+            mut plan,
+            candidate,
+        } = request;
+        normalize_artifact_resolution_plan(&mut plan)?;
+        self.validate_artifact_resolution_plan_pins(&plan)?;
+
+        if let Some((snapshot_id, snapshot)) =
+            self.artifact_resolution_snapshot_for_proposal(&plan.proposal_key)?
+            && !refresh
+        {
+            if snapshot.source_root != plan.source_root
+                || snapshot.component_id != plan.component_id
+                || snapshot.adapter_identity != plan.adapter_identity
+                || snapshot.snapshot_format != plan.snapshot_format
+                || snapshot.resolver_executable_identity != plan.executable_identity
+                || snapshot.policy_identity != plan.policy_identity
+            {
+                return Err(Error::InvalidInput(format!(
+                    "artifact proposal key `{}` resolves to stale or incompatible snapshot {}; change the proposal key or request an explicit refresh",
+                    plan.proposal_key, snapshot_id
+                )));
+            }
+            return Ok(ArtifactResolutionComponentReportV1 {
+                component_id: plan.component_id,
+                proposal_key: plan.proposal_key,
+                source_root: plan.source_root,
+                snapshot_id,
+                snapshot,
+                decision: ArtifactResolutionDecisionV1::Reused,
+                refresh_requested: false,
+                attempt: None,
+            });
+        }
+
+        let (fence, _) = self.begin_artifact_resolution_attempt(plan.clone())?;
+        let ArtifactResolutionCandidateV1 {
+            snapshot_bytes,
+            resolved_identities,
+            checksums,
+            contacted_authorities,
+            stdout,
+            stderr,
+            redactions,
+        } = candidate;
+        if snapshot_bytes.is_empty() {
+            let message = "resolver produced an empty or malformed snapshot candidate";
+            let attempt = self.finish_artifact_resolution_attempt_failure(
+                &fence,
+                ArtifactResolutionAttemptFailure {
+                    code: "malformed_resolution_candidate",
+                    message,
+                    contacted_authorities: Vec::new(),
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    redactions: &redactions,
+                    cancelled: false,
+                },
+            )?;
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` failed: {message}",
+                attempt.attempt_id
+            )));
+        }
+        if stdout.len() as u64 > plan.limits.stdout_bytes
+            || stderr.len() as u64 > plan.limits.stderr_bytes
+        {
+            let message = "resolver output exceeded its declared capture limit";
+            let attempt = self.finish_artifact_resolution_attempt_failure(
+                &fence,
+                ArtifactResolutionAttemptFailure {
+                    code: "captured_output_limit_exceeded",
+                    message,
+                    contacted_authorities: Vec::new(),
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    redactions: &redactions,
+                    cancelled: false,
+                },
+            )?;
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` failed: {message}",
+                attempt.attempt_id
+            )));
+        }
+        let publication = self.put_artifact_resolution_snapshot(
+            plan.clone(),
+            snapshot_bytes,
+            resolved_identities,
+            checksums,
+            contacted_authorities.clone(),
+            refresh,
+        );
+        let (snapshot_id, snapshot) = match publication {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let message = error.to_string();
+                if let Err(finish_error) = self.finish_artifact_resolution_attempt_failure(
+                    &fence,
+                    ArtifactResolutionAttemptFailure {
+                        code: "resolution_candidate_rejected",
+                        message: &message,
+                        contacted_authorities: Vec::new(),
+                        stdout: &stdout,
+                        stderr: &stderr,
+                        redactions: &redactions,
+                        cancelled: false,
+                    },
+                ) {
+                    return Err(Error::Corrupt(format!(
+                        "artifact resolution candidate was rejected ({message}) and attempt `{}` could not record failure: {finish_error}",
+                        fence.attempt_id
+                    )));
+                }
+                return Err(error);
+            }
+        };
+        let attempt = self.finish_artifact_resolution_attempt_success(
+            &fence,
+            &snapshot_id,
+            contacted_authorities,
+            &stdout,
+            &stderr,
+            &redactions,
+        )?;
+        if attempt.status != ArtifactResolutionAttemptStatusV1::Succeeded {
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` failed while recording bounded output",
+                attempt.attempt_id
+            )));
+        }
+        Ok(ArtifactResolutionComponentReportV1 {
+            component_id: plan.component_id,
+            proposal_key: plan.proposal_key,
+            source_root: plan.source_root,
+            snapshot_id,
+            snapshot,
+            decision: if refresh {
+                ArtifactResolutionDecisionV1::Refreshed
+            } else {
+                ArtifactResolutionDecisionV1::Resolved
+            },
+            refresh_requested: refresh,
+            attempt: Some(attempt),
+        })
+    }
+
+    /// Resolve a deterministic set of component requests for one pinned root.
+    pub fn resolve_all_artifact_components(
+        &self,
+        mut requests: Vec<ArtifactResolutionRequestV1>,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionBatchReportV1> {
+        if requests.is_empty() {
+            return Err(Error::InvalidInput(
+                "artifact resolve-all requires at least one component request".into(),
+            ));
+        }
+        requests.sort_by(|left, right| {
+            (&left.plan.component_id, &left.plan.proposal_key)
+                .cmp(&(&right.plan.component_id, &right.plan.proposal_key))
+        });
+        if requests.windows(2).any(|pair| {
+            pair[0].plan.component_id == pair[1].plan.component_id
+                || pair[0].plan.proposal_key == pair[1].plan.proposal_key
+        }) {
+            return Err(Error::InvalidInput(
+                "artifact resolve-all contains a duplicate component or proposal key".into(),
+            ));
+        }
+        let source_root = requests[0].plan.source_root.clone();
+        if requests
+            .iter()
+            .any(|request| request.plan.source_root != source_root)
+        {
+            return Err(Error::InvalidInput(
+                "artifact resolve-all requests must pin one source root".into(),
+            ));
+        }
+        let components = requests
+            .into_iter()
+            .map(|request| self.resolve_artifact_component(request, refresh))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ArtifactResolutionBatchReportV1 {
+            source_root,
+            refresh_requested: refresh,
+            components,
+        })
+    }
+
     pub(crate) fn begin_artifact_resolution_attempt(
         &self,
         mut plan: ArtifactResolutionPlanV1,
@@ -3173,6 +3375,18 @@ mod tests {
         plan
     }
 
+    fn fixture_candidate(bytes: &[u8]) -> ArtifactResolutionCandidateV1 {
+        ArtifactResolutionCandidateV1 {
+            snapshot_bytes: bytes.to_vec(),
+            resolved_identities: BTreeMap::from([("fixture".into(), "1.0.0".into())]),
+            checksums: BTreeMap::from([("fixture".into(), sha256_hex(bytes))]),
+            contacted_authorities: vec!["index.crates.io:443".into()],
+            stdout: b"resolver completed".to_vec(),
+            stderr: Vec::new(),
+            redactions: Vec::new(),
+        }
+    }
+
     fn initialized_resolution_fixture() -> (tempfile::TempDir, Trail, ObjectId) {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
@@ -4394,6 +4608,190 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("explicit refresh"));
+    }
+
+    #[test]
+    fn resolve_component_reuses_until_deliberate_refresh() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let first = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: plan.clone(),
+                    candidate: fixture_candidate(b"version = 4\n"),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.decision, ArtifactResolutionDecisionV1::Resolved);
+        assert!(first.attempt.is_some());
+
+        let reused = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: plan.clone(),
+                    candidate: fixture_candidate(b"this candidate must not advance selection"),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(reused.decision, ArtifactResolutionDecisionV1::Reused);
+        assert_eq!(reused.snapshot_id, first.snapshot_id);
+        assert!(reused.attempt.is_none());
+        assert_eq!(db.artifact_resolution_attempts().unwrap().len(), 1);
+
+        let refreshed = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan,
+                    candidate: fixture_candidate(b"version = 4\n# deliberate refresh\n"),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(refreshed.decision, ArtifactResolutionDecisionV1::Refreshed);
+        assert_ne!(refreshed.snapshot_id, first.snapshot_id);
+        assert_eq!(
+            refreshed.snapshot.predecessor_snapshot_id,
+            Some(first.snapshot_id)
+        );
+        assert_eq!(db.artifact_resolution_attempts().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn resolve_all_is_deterministic_and_rejects_mixed_roots() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let first = executable_fixture_plan(&db, source_root.clone());
+        let mut second = first.clone();
+        second.component_id = "node:root".into();
+        second.proposal_key = "proposal_node_fixture".into();
+        second.adapter_identity = "trail.builtin/node@1".into();
+
+        let report = db
+            .resolve_all_artifact_components(
+                vec![
+                    ArtifactResolutionRequestV1 {
+                        plan: second,
+                        candidate: fixture_candidate(b"node-lock"),
+                    },
+                    ArtifactResolutionRequestV1 {
+                        plan: first.clone(),
+                        candidate: fixture_candidate(b"cargo-lock"),
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            report
+                .components
+                .iter()
+                .map(|component| component.component_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cargo:root", "node:root"]
+        );
+
+        let mut mixed = first;
+        mixed.component_id = "mixed".into();
+        mixed.proposal_key = "proposal_mixed".into();
+        mixed.source_root = ObjectId("object_other_root".into());
+        let error = db
+            .resolve_all_artifact_components(
+                vec![
+                    ArtifactResolutionRequestV1 {
+                        plan: executable_fixture_plan(&db, source_root),
+                        candidate: fixture_candidate(b"one"),
+                    },
+                    ArtifactResolutionRequestV1 {
+                        plan: mixed,
+                        candidate: fixture_candidate(b"two"),
+                    },
+                ],
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("one source root"));
+    }
+
+    #[test]
+    fn resolve_component_records_malformed_and_output_limit_failures() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let mut malformed = fixture_candidate(b"");
+        malformed.stderr = b"malformed resolver output".to_vec();
+        let error = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: plan.clone(),
+                    candidate: malformed,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed snapshot"));
+        assert!(db
+            .artifact_resolution_snapshot_for_proposal(&plan.proposal_key)
+            .unwrap()
+            .is_none());
+
+        let mut limited_plan = plan;
+        limited_plan.proposal_key = "proposal_output_limit".into();
+        limited_plan.limits.stdout_bytes = 4;
+        let mut oversized = fixture_candidate(b"valid");
+        oversized.stdout = b"too much output".to_vec();
+        let error = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: limited_plan.clone(),
+                    candidate: oversized,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("capture limit"));
+        assert!(db
+            .artifact_resolution_snapshot_for_proposal(&limited_plan.proposal_key)
+            .unwrap()
+            .is_none());
+        let attempts = db.artifact_resolution_attempts().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| {
+            attempt.status == ArtifactResolutionAttemptStatusV1::Failed
+                && attempt.failure_receipt_object_id.is_some()
+        }));
+    }
+
+    #[test]
+    fn resolve_component_rejects_stale_source_and_tool_identity() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+
+        let mut stale_source = plan.clone();
+        stale_source.readable_inputs[0].content_hash = "00".repeat(32);
+        let error = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: stale_source,
+                    candidate: fixture_candidate(b"stale"),
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after planning"));
+
+        let mut stale_tool = plan;
+        stale_tool.executable_identity = "sha256:stale-tool".into();
+        let error = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: stale_tool,
+                    candidate: fixture_candidate(b"stale"),
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("executable"));
+        assert!(error.to_string().contains("changed after planning"));
     }
 
     #[test]

@@ -346,6 +346,71 @@ pub struct ArtifactResolutionAttemptReportV1 {
     pub recovery_command: Vec<String>,
 }
 
+/// Ephemeral output returned by an authorized resolver executor.
+///
+/// This value is intentionally not serializable. `redactions` can contain
+/// credential bytes used only to scrub bounded diagnostics before Trail makes
+/// attempt evidence durable.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArtifactResolutionCandidateV1 {
+    pub snapshot_bytes: Vec<u8>,
+    pub resolved_identities: BTreeMap<String, String>,
+    pub checksums: BTreeMap<String, String>,
+    pub contacted_authorities: Vec<String>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub redactions: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ArtifactResolutionCandidateV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactResolutionCandidateV1")
+            .field("snapshot_bytes", &self.snapshot_bytes.len())
+            .field("resolved_identities", &self.resolved_identities)
+            .field("checksums", &self.checksums)
+            .field("contacted_authorities", &self.contacted_authorities)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("redactions", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactResolutionRequestV1 {
+    pub plan: ArtifactResolutionPlanV1,
+    pub candidate: ArtifactResolutionCandidateV1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactResolutionDecisionV1 {
+    Resolved,
+    Reused,
+    Refreshed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionComponentReportV1 {
+    pub component_id: String,
+    pub proposal_key: String,
+    pub source_root: ObjectId,
+    pub snapshot_id: ObjectId,
+    pub snapshot: ArtifactResolutionSnapshotV1,
+    pub decision: ArtifactResolutionDecisionV1,
+    pub refresh_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<ArtifactResolutionAttemptReportV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactResolutionBatchReportV1 {
+    pub source_root: ObjectId,
+    pub refresh_requested: bool,
+    pub components: Vec<ArtifactResolutionComponentReportV1>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactActionPhaseV2 {

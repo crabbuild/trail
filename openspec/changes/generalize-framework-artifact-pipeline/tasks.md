@@ -10,12 +10,12 @@
 ## 2. Proposal and Resolution Domain Model
 
 - [x] 2.1 Add typed component proposal/status/reason/recovery models for `ready`, `resolvable`, `blocked`, `unsupported`, and `ambiguous` with deterministic ordering and bounds
-- [ ] 2.2 Refactor built-in, plugin, and repository discovery to return proposals from pinned markers without requiring lock state or invoking tools, network, providers, or repository code
+- [x] 2.2 Refactor built-in, plugin, and repository discovery to return proposals from pinned markers without requiring lock state or invoking tools, network, providers, or repository code
 - [x] 2.3 Add `ArtifactResolutionPlanV1` with proposal/source pins, exact executable/argv, readable inputs, candidate output, authority set, script/environment roles, limits, and validation contract
 - [x] 2.4 Add deterministic `ArtifactResolutionSnapshotV1` object encoding, content identity, provenance, predecessor, verification state, and proposal-key lookup
 - [x] 2.5 Add durable resolver attempts with fenced owner identity, heartbeat, cancellation, bounded output, redacted authority evidence, failure receipts, and orphan recovery
-- [ ] 2.6 Implement explicit resolve-all and resolve-component library operations with deliberate refresh and no time-based dependency advancement
-- [ ] 2.7 Add resolver success, snapshot reuse, refresh, stale source, tool/authority mismatch, credential redaction, process death, malformed output, and size-limit tests
+- [x] 2.6 Implement explicit resolve-all and resolve-component library operations with deliberate refresh and no time-based dependency advancement
+- [x] 2.7 Add resolver success, snapshot reuse, refresh, stale source, tool/authority mismatch, credential redaction, process death, malformed output, and size-limit tests
 
 ## 3. Desired, Content, Artifact, and Binding Identities
 

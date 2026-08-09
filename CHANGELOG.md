@@ -5,6 +5,14 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Added
+
+- Added Rust library artifact resolution component/batch operations with durable fenced
+  attempts, content-addressed snapshot reuse, explicit-only refresh, bounded redacted
+  evidence, and deterministic reports.
+- Environment discovery now reports marker-recognized plugins that do not support the
+  current host as typed `unsupported` proposals without launching plugin code.
+
 ### Changed
 
 - Changed omitted lane workdir mode to lazy qualified transparent `auto`.

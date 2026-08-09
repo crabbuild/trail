@@ -59,6 +59,14 @@ reports logical component identity separately from adapter identity. CLI, HTTP/O
 MCP, and Rust APIs share this state. Existing `trail deps` behavior remains a Node
 compatibility surface.
 
+The Rust library also has a first common resolution-snapshot boundary:
+`resolve_artifact_component` and `resolve_all_artifact_components` accept normalized
+executor candidates, validate pinned source/tool/policy identity, reuse snapshots until
+an explicit refresh, and own durable attempt evidence and publication. This is not yet
+the public `trail env resolve` workflow: resolver process launch, provider integration,
+and CLI/HTTP/MCP operations remain planned. Discovery reports unsupported installed
+plugins from their pinned marker and package metadata without launching the plugin.
+
 Command recipes and v1/v2 plugins may declare stable logical component dependencies.
 `sync all` validates missing nodes, duplicate/self edges, complete cycles, and mount
 collisions before running a command; it then runs a bounded deterministic ready queue,

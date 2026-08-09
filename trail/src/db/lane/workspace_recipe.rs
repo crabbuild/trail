@@ -1586,6 +1586,31 @@ portability = "host"
     }
 
     #[test]
+    fn command_recipe_discovery_does_not_require_or_execute_declared_tool() {
+        let (_workspace, db) = open_recipe_lane(&[
+            "trail-fixture-tool-that-does-not-exist",
+            "input.txt",
+            "generated/copied.txt",
+        ]);
+
+        let discovery = db.discover_workspace_environment("recipe-a", None).unwrap();
+        assert_eq!(discovery.components.len(), 1);
+        assert_eq!(discovery.components[0].component_id, "generated.copy");
+        assert_eq!(
+            discovery.components[0].status,
+            EnvironmentComponentProposalStatus::Ready
+        );
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+
+        let error = db
+            .command_recipe_plan(&discovery.source_root, "generated.copy")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("trail-fixture-tool-that-does-not-exist"));
+    }
+
+    #[test]
     fn local_include_and_versioned_profile_expand_into_a_canonical_plan() {
         let workspace = tempfile::tempdir().unwrap();
         fs::create_dir_all(workspace.path().join("config")).unwrap();
