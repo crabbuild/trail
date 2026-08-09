@@ -742,12 +742,21 @@ impl Trail {
     }
 
     fn ingest_artifact_file_bytes(&self, bytes: &[u8], mode: u32) -> Result<ArtifactFileId> {
+        self.ingest_artifact_file_bytes_with_path(bytes, mode, None)
+    }
+
+    fn ingest_artifact_file_bytes_with_path(
+        &self,
+        bytes: &[u8],
+        mode: u32,
+        relative_path: Option<&str>,
+    ) -> Result<ArtifactFileId> {
         if mode & !0o777 != 0 {
             return Err(Error::InvalidInput(format!(
                 "artifact file mode {mode:o} contains unsupported bits"
             )));
         }
-        validate_artifact_secret_policy(bytes)?;
+        validate_artifact_secret_policy(bytes, relative_path)?;
         let complete_hash = sha256_hex(bytes);
         let content = if bytes.len() <= ARTIFACT_WHOLE_BLOB_MAX_BYTES {
             let blob = ArtifactBlobV1 {
@@ -835,7 +844,12 @@ impl Trail {
         Ok(file_id)
     }
 
-    fn ingest_artifact_file_path(&self, path: &Path, mode: u32) -> Result<ArtifactFileId> {
+    fn ingest_artifact_file_path(
+        &self,
+        path: &Path,
+        relative_path: &str,
+        mode: u32,
+    ) -> Result<ArtifactFileId> {
         let before = fs::symlink_metadata(path)?;
         if !before.is_file() {
             return Err(Error::InvalidPath {
@@ -847,7 +861,7 @@ impl Trail {
             let bytes = fs::read(path)?;
             let after = fs::symlink_metadata(path)?;
             ensure_artifact_file_unchanged(path, &before, &after, bytes.len() as u64)?;
-            return self.ingest_artifact_file_bytes(&bytes, mode);
+            return self.ingest_artifact_file_bytes_with_path(&bytes, mode, Some(relative_path));
         }
 
         let mut complete_hasher = Sha256::new();
@@ -864,7 +878,7 @@ impl Trail {
                     path.display()
                 ))
             })?;
-            validate_artifact_secret_policy(&boundary.data)?;
+            validate_artifact_secret_policy(&boundary.data, Some(relative_path))?;
             complete_hasher.update(&boundary.data);
             let chunk = ArtifactChunkV1 {
                 version: ARTIFACT_CHUNK_VERSION,
@@ -1005,6 +1019,7 @@ impl Trail {
                 }
                 let file_id = self.ingest_artifact_file_path(
                     entry.path(),
+                    &relative,
                     normalized_artifact_file_mode(&metadata),
                 )?;
                 directories
@@ -2885,15 +2900,48 @@ fn ensure_artifact_file_unchanged(
     Ok(())
 }
 
-fn validate_artifact_secret_policy(bytes: &[u8]) -> Result<()> {
-    if let Ok(text) = std::str::from_utf8(bytes)
-        && contains_sensitive_text(text)
-    {
-        return Err(Error::InvalidInput(
-            "artifact content may contain secret material and cannot enter shared CAS".into(),
-        ));
+fn validate_artifact_secret_policy(bytes: &[u8], relative_path: Option<&str>) -> Result<()> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(());
+    };
+    let contains_private_key = {
+        let upper = text.to_ascii_uppercase();
+        upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----")
+    };
+    let sensitive = match relative_path {
+        Some(path) => {
+            contains_private_key
+                || is_secret_bearing_artifact_path(path) && contains_sensitive_text(text)
+        }
+        None => contains_sensitive_text(text),
+    };
+    if sensitive {
+        let path = relative_path
+            .map(|path| format!(" `{path}`"))
+            .unwrap_or_default();
+        return Err(Error::InvalidInput(format!(
+            "artifact content{path} may contain secret material and cannot enter shared CAS"
+        )));
     }
     Ok(())
+}
+
+fn is_secret_bearing_artifact_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    name == ".npmrc"
+        || name == ".pypirc"
+        || name == ".netrc"
+        || name == "credentials"
+        || name == "credentials.json"
+        || name == "secrets"
+        || name == "secrets.json"
+        || name == "id_rsa"
+        || name == "id_ed25519"
+        || name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
 }
 
 fn validate_artifact_metadata_policy(path: &Path, metadata: &fs::Metadata) -> Result<()> {
@@ -3935,6 +3983,31 @@ mod tests {
         )
         .unwrap();
         let error = db.ingest_artifact_tree(source.path()).unwrap_err();
+        assert!(error.to_string().contains("secret material"));
+        assert!(error.to_string().contains("generated.env"));
+    }
+
+    #[test]
+    fn artifact_tree_secret_policy_allows_dependency_source_literals() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("client.js"),
+            "export const example = 'Authorization: Bearer abc123';\n",
+        )
+        .unwrap();
+
+        db.ingest_artifact_tree(source.path()).unwrap();
+
+        fs::write(
+            source.path().join("private.pem"),
+            "-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let error = db.ingest_artifact_tree(source.path()).unwrap_err();
+        assert!(error.to_string().contains("private.pem"));
         assert!(error.to_string().contains("secret material"));
     }
 

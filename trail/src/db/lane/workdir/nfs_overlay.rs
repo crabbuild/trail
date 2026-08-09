@@ -2031,6 +2031,16 @@ mod macos {
                 "cargo generate-lockfile failed: {}",
                 String::from_utf8_lossy(&lock.stderr)
             );
+            let nested_lock = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(temp.path().join("shared-dep"))
+                .output()
+                .unwrap();
+            assert!(
+                nested_lock.status.success(),
+                "nested cargo generate-lockfile failed: {}",
+                String::from_utf8_lossy(&nested_lock.stderr)
+            );
 
             Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
             let mut db = Trail::open(temp.path()).unwrap();
