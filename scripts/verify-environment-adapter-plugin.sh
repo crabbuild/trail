@@ -374,10 +374,19 @@ mounted_kill_generation="$("${trail}" --workspace "${root}" --json env generatio
   >"${packages}/mounted-kill.stdout" 2>"${packages}/mounted-kill.stderr" &
 mounted_sync_pid=$!
 mounted_ready=""
-for _ in $(seq 1 200); do
+# A cold hosted runner can spend close to a minute preparing and mounting the
+# candidate before the fixture command starts. Wait for that command, while
+# still bounding the fault-injection gate and failing early if Trail exits.
+for _ in $(seq 1 2400); do
   mounted_ready="$(find "${root}/.trail/cache/staging" -path '*/process/*/home/running' -type f -print -quit 2>/dev/null || true)"
   if [[ -n "${mounted_ready}" ]]; then
     break
+  fi
+  if ! kill -0 "${mounted_sync_pid}" 2>/dev/null; then
+    wait "${mounted_sync_pid}" 2>/dev/null || true
+    cat "${packages}/mounted-kill.stderr" >&2
+    printf '%s\n' "mounted plugin sync exited before its active-command kill point" >&2
+    exit 1
   fi
   sleep 0.05
 done
