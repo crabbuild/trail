@@ -979,6 +979,29 @@ pub enum PhysicalSharing {
     Unknown,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactStorageAccountingReport {
+    /// Sum of logical file bytes across distinct artifact tree roots in scope.
+    pub logical_bytes: u64,
+    /// Encoded authoritative object bytes referenced by exactly one artifact.
+    pub unique_authoritative_bytes: u64,
+    /// Encoded authoritative object bytes referenced by multiple artifacts.
+    pub cross_artifact_shared_bytes: u64,
+    /// Filesystem-allocated bytes in reconstructible artifact/layer materializations.
+    pub materialized_bytes: u64,
+    /// Filesystem-allocated bytes owned by lane-private source/generated/scratch state.
+    pub lane_private_bytes: u64,
+    /// Persisted bytes created specifically by prefetch. OS page-cache warming is excluded.
+    pub prefetched_bytes: u64,
+    /// Filesystem-allocated bytes in content projections created on demand.
+    pub demand_loaded_bytes: u64,
+    /// Independently reclaimable cache bytes in the report scope.
+    pub reclaimable_bytes: u64,
+    /// Measured bytes whose artifact/cache ownership cannot be classified safely.
+    pub unknown_bytes: u64,
+    /// Exact byte bases and attribution boundary used by this report.
+    pub accounting: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSpaceReport {
@@ -1006,6 +1029,8 @@ pub struct WorkspaceSpaceReport {
     pub physical_sharing: PhysicalSharing,
     #[serde(default)]
     pub physical_sharing_evidence: String,
+    #[serde(default)]
+    pub artifact_storage: ArtifactStorageAccountingReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1135,6 +1160,8 @@ pub struct WorkspaceCacheGcReport {
     pub reclaimed_bytes: u64,
     pub candidates: Vec<WorkspaceCacheGcEntry>,
     pub deleted: Vec<WorkspaceCacheGcEntry>,
+    #[serde(default)]
+    pub artifact_storage: ArtifactStorageAccountingReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1552,6 +1579,56 @@ mod workdir_mode_tests {
         assert_eq!(report.clone_count, 0);
         assert_eq!(report.physical_sharing, PhysicalSharing::Unknown);
         assert_eq!(report.physical_sharing_evidence, "");
+        assert_eq!(
+            report.artifact_storage,
+            ArtifactStorageAccountingReport::default()
+        );
+
+        let cache: WorkspaceCacheGcReport = serde_json::from_value(serde_json::json!({
+            "dry_run": true,
+            "retention_secs": 60,
+            "cache_physical_bytes_before": 10,
+            "reclaimable_bytes": 5,
+            "reclaimed_bytes": 0,
+            "candidates": [],
+            "deleted": []
+        }))
+        .unwrap();
+        assert_eq!(
+            cache.artifact_storage,
+            ArtifactStorageAccountingReport::default()
+        );
+    }
+
+    #[test]
+    fn artifact_storage_accounting_wire_fields_are_stable() {
+        let report = ArtifactStorageAccountingReport {
+            logical_bytes: 1,
+            unique_authoritative_bytes: 2,
+            cross_artifact_shared_bytes: 3,
+            materialized_bytes: 4,
+            lane_private_bytes: 5,
+            prefetched_bytes: 6,
+            demand_loaded_bytes: 7,
+            reclaimable_bytes: 8,
+            unknown_bytes: 9,
+            accounting: "fixture".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "logical_bytes": 1,
+                "unique_authoritative_bytes": 2,
+                "cross_artifact_shared_bytes": 3,
+                "materialized_bytes": 4,
+                "lane_private_bytes": 5,
+                "prefetched_bytes": 6,
+                "demand_loaded_bytes": 7,
+                "reclaimable_bytes": 8,
+                "unknown_bytes": 9,
+                "accounting": "fixture"
+            })
+        );
     }
 
     #[test]

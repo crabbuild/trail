@@ -3,7 +3,37 @@ use crate::db::change_ledger::{ledger_gc_roots, IntentGcRoot};
 
 const GC_DELETE_BATCH_SIZE: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static GC_FAIL_AFTER_COMMITTED_BATCHES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_gc_after_committed_batch_if_requested() -> Result<()> {
+    GC_FAIL_AFTER_COMMITTED_BATCHES.with(|remaining| match remaining.get() {
+        Some(0 | 1) => {
+            remaining.set(None);
+            Err(Error::InvalidInput(
+                "injected object-GC interruption after committed batch".into(),
+            ))
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
 impl Trail {
+    #[cfg(test)]
+    pub(crate) fn set_gc_test_failure_after_committed_batches_for_current_thread(
+        batches: Option<usize>,
+    ) {
+        GC_FAIL_AFTER_COMMITTED_BATCHES.with(|remaining| remaining.set(batches));
+    }
+
     pub fn gc(&mut self, dry_run: bool) -> Result<GcReport> {
         let _lock = self.acquire_write_lock()?;
         // Capture roots before recovery terminalizes an intent. This makes the
@@ -35,19 +65,11 @@ impl Trail {
                 preserved_unknown += 1;
             }
         }
-        // Envelope rows hold SQL foreign keys to tree-root mappings. Delete
-        // unreachable envelopes before all other artifact nodes, then retain
-        // object-id order within each class. This is deterministic and avoids
-        // depending on unrelated content hashes for referential ordering.
-        prunable.sort_by(|left, right| {
-            (left.1 != ARTIFACT_ENVELOPE_KIND)
-                .cmp(&(right.1 != ARTIFACT_ENVELOPE_KIND))
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        let prunable = prunable
-            .into_iter()
-            .map(|(object_id, _)| object_id)
-            .collect::<Vec<_>>();
+        // Every committed batch must leave the uncollected artifact graph
+        // internally valid so a later GC can restart after process loss.
+        // Therefore artifact parents are deleted before their children rather
+        // than relying on unrelated content-hash order.
+        let prunable = self.order_gc_prunable_objects(prunable)?;
         let mut report = GcReport {
             dry_run,
             total_known_objects: total_known,
@@ -60,6 +82,8 @@ impl Trail {
         if !dry_run {
             for batch in prunable.chunks(GC_DELETE_BATCH_SIZE) {
                 report.pruned_objects += self.delete_gc_object_batch(batch)?;
+                #[cfg(test)]
+                fail_gc_after_committed_batch_if_requested()?;
             }
             self.object_cache
                 .lock()
@@ -115,6 +139,165 @@ impl Trail {
                 Err(error)
             }
         }
+    }
+
+    fn order_gc_prunable_objects(&self, prunable: Vec<(String, String)>) -> Result<Vec<String>> {
+        let candidate_kinds = prunable.into_iter().collect::<BTreeMap<_, _>>();
+        let candidate_ids = candidate_kinds.keys().cloned().collect::<BTreeSet<_>>();
+        let mut artifact_ids = BTreeMap::<String, String>::new();
+        let mut artifact_rows = Vec::<(String, String, Vec<u8>)>::new();
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT a.artifact_id,a.object_id,a.kind,o.bytes
+                 FROM artifact_objects a
+                 JOIN objects o ON o.object_id=a.object_id
+                 ORDER BY a.artifact_id",
+            )?;
+            for row in statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })? {
+                let (artifact_id, object_id, kind, bytes) = row?;
+                artifact_ids.insert(artifact_id, object_id.clone());
+                if candidate_ids.contains(&object_id) {
+                    artifact_rows.push((object_id, kind, bytes));
+                }
+            }
+        }
+
+        let mut edges = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut add_artifact_edge = |parent: &str, artifact_id: &str| -> Result<()> {
+            let child = artifact_ids.get(artifact_id).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "garbage-collection artifact edge `{artifact_id}` has no object mapping"
+                ))
+            })?;
+            if candidate_ids.contains(child) {
+                edges
+                    .entry(parent.to_string())
+                    .or_default()
+                    .insert(child.clone());
+            }
+            Ok(())
+        };
+        for (object_id, kind, bytes) in artifact_rows {
+            match kind.as_str() {
+                ARTIFACT_ENVELOPE_KIND => {
+                    let envelope: ArtifactEnvelopeV1 = from_cbor(&bytes)?;
+                    add_artifact_edge(&object_id, &envelope.tree_root_id.0)?;
+                }
+                ARTIFACT_TREE_ROOT_KIND => {
+                    let tree: ArtifactTreeRootV1 = from_cbor(&bytes)?;
+                    add_artifact_edge(&object_id, &tree.root_directory_id.0)?;
+                }
+                ARTIFACT_DIRECTORY_NODE_KIND => {
+                    let directory: ArtifactDirectoryNodeV1 = from_cbor(&bytes)?;
+                    for entry in directory.entries {
+                        match entry.target {
+                            ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                                add_artifact_edge(&object_id, &node_id.0)?;
+                            }
+                            ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                                add_artifact_edge(&object_id, &node_id.0)?;
+                            }
+                            ArtifactDirectoryEntryTargetV1::Symlink { .. } => {}
+                        }
+                    }
+                }
+                ARTIFACT_FILE_NODE_KIND => {
+                    let file: ArtifactFileNodeV1 = from_cbor(&bytes)?;
+                    match file.content {
+                        ArtifactFileContentV1::Blob { blob_id } => {
+                            add_artifact_edge(&object_id, &blob_id.0)?;
+                        }
+                        ArtifactFileContentV1::Chunks { chunk_list_id } => {
+                            add_artifact_edge(&object_id, &chunk_list_id.0)?;
+                        }
+                    }
+                }
+                ARTIFACT_CHUNK_LIST_KIND => {
+                    let list: ArtifactChunkListV1 = from_cbor(&bytes)?;
+                    for chunk in list.chunks {
+                        add_artifact_edge(&object_id, &chunk.chunk_id.0)?;
+                    }
+                }
+                ARTIFACT_BLOB_KIND | ARTIFACT_CHUNK_KIND => {}
+                other => {
+                    return Err(Error::Corrupt(format!(
+                        "garbage-collection encountered unsupported artifact kind `{other}`"
+                    )))
+                }
+            }
+        }
+
+        let mut incoming = candidate_ids
+            .iter()
+            .map(|object_id| (object_id.clone(), 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        for children in edges.values() {
+            for child in children {
+                let count = incoming.get_mut(child).ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "garbage-collection dependency `{child}` is not a candidate"
+                    ))
+                })?;
+                *count = count.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("garbage-collection dependency count overflowed".into())
+                })?;
+            }
+        }
+        let mut ready = incoming
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(object_id, _)| {
+                (
+                    !is_artifact_gc_kind(
+                        candidate_kinds
+                            .get(object_id)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    object_id.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(candidate_ids.len());
+        while let Some((_, object_id)) = ready.pop_first() {
+            ordered.push(object_id.clone());
+            if let Some(children) = edges.get(&object_id) {
+                for child in children {
+                    let count = incoming.get_mut(child).ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "garbage-collection dependency `{child}` disappeared"
+                        ))
+                    })?;
+                    *count = count.checked_sub(1).ok_or_else(|| {
+                        Error::Corrupt("garbage-collection dependency count underflowed".into())
+                    })?;
+                    if *count == 0 {
+                        ready.insert((
+                            !is_artifact_gc_kind(
+                                candidate_kinds
+                                    .get(child)
+                                    .map(String::as_str)
+                                    .unwrap_or_default(),
+                            ),
+                            child.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        if ordered.len() != candidate_ids.len() {
+            return Err(Error::Corrupt(
+                "garbage-collection artifact dependency graph contains a cycle".into(),
+            ));
+        }
+        Ok(ordered)
     }
 
     fn reachable_object_ids_with_intent_roots(
@@ -740,6 +923,19 @@ impl Trail {
             Err(err) => errors.push(format!("failed to walk root {}: {err}", root_id.0)),
         }
     }
+}
+
+fn is_artifact_gc_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        ARTIFACT_DIRECTORY_NODE_KIND
+            | ARTIFACT_FILE_NODE_KIND
+            | ARTIFACT_BLOB_KIND
+            | ARTIFACT_CHUNK_LIST_KIND
+            | ARTIFACT_CHUNK_KIND
+            | ARTIFACT_TREE_ROOT_KIND
+            | ARTIFACT_ENVELOPE_KIND
+    )
 }
 
 fn require_gc_object_version(kind: &str, actual: u16, expected: u16) -> Result<()> {

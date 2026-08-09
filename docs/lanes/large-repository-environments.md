@@ -133,8 +133,16 @@ pinned; callers can also use the Rust `pin_workspace_layer` API for an explicit
 time-bounded or indefinite evidence pin. Private uppers, source, runtime, and
 secrets are never cache candidates.
 
+Use `trail --format json lane space <lane>` and
+`trail --format json cache gc --dry-run` for artifact-aware accounting. The
+`artifact_storage` fields keep logical, authoritative CAS, physical, and
+reclaimable axes separate. Cache-GC accounting describes the pre-deletion
+snapshot and its `reclaimable_bytes` is the exact selected candidate set.
+
 Successful managed commands record only bounded immutable-layer path accesses.
 A later execution with the exact command fingerprint, component keys,
 generation, and manifest identities may prefetch that authenticated hot set.
 Prefetch is advisory and cancellable; lifecycle receipts report its entry and
-byte limits, match state, cancellation, and bytes actually read.
+byte limits, match state, cancellation, and bytes actually read. Those reads
+warm the operating-system page cache without creating a persisted prefetch
+store, so storage accounting reports `prefetched_bytes: 0`.

@@ -246,8 +246,9 @@ are the child source, generated, scratch, and seeded/writable private uppers.
 
 The remaining principal gaps are:
 
-1. Verified real-directory materialization caches do not yet have independent
-   eviction, quotas, or complete reachability accounting.
+1. Verified real-directory materialization caches participate in deterministic
+   cache eviction and reachability/accounting, but do not yet have a separate
+   per-artifact quota policy.
 2. Git-root lower-file reads still use a complete-file projection cache; CAS
    artifact files use direct bounded blob/chunk ranges and materialize only the
    selected file during copy-up.
@@ -256,7 +257,8 @@ The remaining principal gaps are:
 4. Mount lifetime is tied mainly to a terminal agent process; editor workflows
    need daemon-owned or foreground persistent mounts.
 5. The view has no Git compatibility metadata.
-6. Layer cache lifecycle, quota, pinning, and accounting remain incomplete.
+6. Layer cache lifecycle and accounting are implemented; finer per-component
+   quota policy remains incomplete.
 
 ## Architectural Principles
 
@@ -1176,7 +1178,7 @@ Cache GC works from pins and policy:
 - Blob projections are independently reclaimable and rematerializable.
 - Generated uppers follow per-lane retention and archive policy.
 
-`trail lane space` and `trail cache list` should distinguish:
+`trail lane space` and structured cache-GC reports distinguish:
 
 ```text
 logical visible bytes
@@ -1185,11 +1187,25 @@ lane-exclusive physical bytes
 reflink/shared-extent bytes when the platform can report them
 reclaimable cache bytes
 uncheckpointed source bytes
+artifact logical bytes
+unique authoritative CAS bytes
+cross-artifact shared CAS bytes
+artifact materialized bytes
+lane-private bytes
+persisted prefetched bytes
+demand-loaded projection bytes
+artifact/cache reclaimable bytes
+unknown or unattributable bytes
 ```
 
 Ordinary `du` on mountpoints is insufficient and may report logical bytes
 multiple times. Trail reports should use layer manifests plus platform block or
-extent accounting where available and clearly label estimates.
+extent accounting where available and clearly label estimates. Logical,
+authoritative, physical, and reclaimable values are separate axes and must not
+be summed. Unique and cross-artifact shared bytes partition selected encoded
+CAS objects without double counting; reclaimable bytes can overlap a physical
+cache classification. Operating-system page-cache warming is not persisted and
+is explicitly excluded from prefetched bytes.
 
 `fsck` verifies layer manifests and references, raw CAS object identities and
 edges, snapshots, envelopes, attempt state, and materialization ownership. It

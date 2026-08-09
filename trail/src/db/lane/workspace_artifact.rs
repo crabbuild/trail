@@ -10,6 +10,7 @@ const MAX_RESOLUTION_AUTHORITIES: usize = 256;
 const MAX_RESOLUTION_CREDENTIAL_HANDLES: usize = 64;
 const MAX_RESOLUTION_ENVIRONMENT_NAMES: usize = 256;
 const MAX_RESOLUTION_VALIDATIONS: usize = 256;
+const MAX_RESOLUTION_PREDECESSORS: usize = 16_384;
 const MAX_RESOLUTION_TEXT_BYTES: usize = 4 * 1024;
 const ARTIFACT_DESIRED_KEY_MATERIAL_VERSION: u16 = 2;
 const ARTIFACT_WHOLE_BLOB_MAX_BYTES: usize = 1024 * 1024;
@@ -1829,6 +1830,463 @@ impl Trail {
             )));
         }
         Ok(entries)
+    }
+
+    pub(crate) fn artifact_tree_object_ids(
+        &self,
+        tree_id: &ArtifactTreeId,
+    ) -> Result<BTreeSet<String>> {
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        let mut objects =
+            BTreeSet::from([self.artifact_backing_object_id(&tree_id.0, ARTIFACT_TREE_ROOT_KIND)?]);
+        let mut visited_directories = BTreeSet::new();
+        self.collect_artifact_directory_object_ids(
+            &tree.root_directory_id,
+            0,
+            &mut visited_directories,
+            &mut objects,
+        )?;
+        Ok(objects)
+    }
+
+    pub(crate) fn artifact_envelope_object_ids(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<BTreeSet<String>> {
+        let envelope: ArtifactEnvelopeV1 = self.get_artifact_cas_object(
+            &envelope_id.0,
+            ARTIFACT_ENVELOPE_KIND,
+            ARTIFACT_ENVELOPE_VERSION,
+        )?;
+        let mut objects = self.artifact_tree_object_ids(&envelope.tree_root_id)?;
+        objects.insert(self.artifact_backing_object_id(&envelope_id.0, ARTIFACT_ENVELOPE_KIND)?);
+        objects.extend(
+            envelope
+                .validation_receipt_ids
+                .into_iter()
+                .map(|object_id| object_id.0),
+        );
+        if let Some(snapshot_id) = envelope.resolution_snapshot_id {
+            self.collect_artifact_resolution_snapshot_object_ids(&snapshot_id, &mut objects)?;
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT object_id FROM artifact_attestations
+             WHERE envelope_id=?1 ORDER BY attestation_id",
+        )?;
+        for row in statement.query_map(params![envelope_id.0], |row| row.get::<_, String>(0))? {
+            objects.insert(row?);
+        }
+        Ok(objects)
+    }
+
+    fn artifact_backing_object_id(&self, artifact_id: &str, expected_kind: &str) -> Result<String> {
+        let (object_id, kind) = self
+            .conn
+            .query_row(
+                "SELECT object_id,kind FROM artifact_objects WHERE artifact_id=?1",
+                params![artifact_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "artifact object `{artifact_id}` is missing its backing object"
+                ))
+            })?;
+        if kind != expected_kind {
+            return Err(Error::Corrupt(format!(
+                "artifact object `{artifact_id}` has kind {kind}, expected {expected_kind}"
+            )));
+        }
+        Ok(object_id)
+    }
+
+    fn collect_artifact_directory_object_ids(
+        &self,
+        directory_id: &ArtifactTreeId,
+        depth: usize,
+        visited_directories: &mut BTreeSet<ArtifactTreeId>,
+        objects: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if depth > MAX_ARTIFACT_TREE_DEPTH {
+            return Err(Error::Corrupt(
+                "artifact accounting exceeded the directory-depth bound".into(),
+            ));
+        }
+        if !visited_directories.insert(directory_id.clone()) {
+            return Ok(());
+        }
+        objects.insert(
+            self.artifact_backing_object_id(&directory_id.0, ARTIFACT_DIRECTORY_NODE_KIND)?,
+        );
+        let directory: ArtifactDirectoryNodeV1 = self.get_artifact_cas_object(
+            &directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+        )?;
+        for entry in directory.entries {
+            match entry.target {
+                ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                    self.collect_artifact_directory_object_ids(
+                        &node_id,
+                        depth + 1,
+                        visited_directories,
+                        objects,
+                    )?;
+                }
+                ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                    objects.insert(
+                        self.artifact_backing_object_id(&node_id.0, ARTIFACT_FILE_NODE_KIND)?,
+                    );
+                    let file: ArtifactFileNodeV1 = self.get_artifact_cas_object(
+                        &node_id.0,
+                        ARTIFACT_FILE_NODE_KIND,
+                        ARTIFACT_FILE_NODE_VERSION,
+                    )?;
+                    match file.content {
+                        ArtifactFileContentV1::Blob { blob_id } => {
+                            objects.insert(
+                                self.artifact_backing_object_id(&blob_id.0, ARTIFACT_BLOB_KIND)?,
+                            );
+                        }
+                        ArtifactFileContentV1::Chunks { chunk_list_id } => {
+                            objects.insert(self.artifact_backing_object_id(
+                                &chunk_list_id.0,
+                                ARTIFACT_CHUNK_LIST_KIND,
+                            )?);
+                            let list: ArtifactChunkListV1 = self.get_artifact_cas_object(
+                                &chunk_list_id.0,
+                                ARTIFACT_CHUNK_LIST_KIND,
+                                ARTIFACT_CHUNK_LIST_VERSION,
+                            )?;
+                            for chunk in list.chunks {
+                                objects.insert(self.artifact_backing_object_id(
+                                    &chunk.chunk_id.0,
+                                    ARTIFACT_CHUNK_KIND,
+                                )?);
+                            }
+                        }
+                    }
+                }
+                ArtifactDirectoryEntryTargetV1::Symlink { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_artifact_resolution_snapshot_object_ids(
+        &self,
+        snapshot_id: &ObjectId,
+        objects: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let mut pending = BTreeSet::from([snapshot_id.clone()]);
+        let mut visited = BTreeSet::new();
+        while let Some(snapshot_id) = pending.pop_first() {
+            if !visited.insert(snapshot_id.clone()) {
+                continue;
+            }
+            if visited.len() > MAX_RESOLUTION_PREDECESSORS {
+                return Err(Error::Corrupt(
+                    "artifact resolution predecessor graph exceeds its bound".into(),
+                ));
+            }
+            let snapshot: ArtifactResolutionSnapshotV1 =
+                self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, &snapshot_id)?;
+            objects.insert(snapshot_id.0);
+            objects.insert(snapshot.content_object_id.0);
+            pending.extend(snapshot.predecessor_snapshot_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn artifact_storage_accounting(
+        &self,
+        view_id: Option<&str>,
+        lane_private_bytes: u64,
+        demand_loaded_bytes: u64,
+        reclaimable_bytes: u64,
+        measured_unknown_bytes: u64,
+    ) -> Result<ArtifactStorageAccountingReport> {
+        const MAX_ACCOUNTING_ENVELOPES: usize = 10_000;
+        const MAX_ACCOUNTING_TREES: usize = 10_000;
+        const MAX_ACCOUNTING_OBJECTS: usize = 10_000_000;
+        const MAX_ACCOUNTING_OBJECT_REFERENCES: usize = 10_000_000;
+
+        let integrity_errors = self.validate_artifact_cas_integrity()?;
+        if !integrity_errors.is_empty() {
+            return Err(Error::Corrupt(integrity_errors.join("; ")));
+        }
+        let envelopes = {
+            let mut statement = self.conn.prepare(
+                "SELECT envelope_id,tree_root_id FROM artifact_envelopes
+                 ORDER BY envelope_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if envelopes.len() > MAX_ACCOUNTING_ENVELOPES {
+            return Err(Error::InvalidInput(format!(
+                "artifact accounting contains {} envelopes; maximum is {MAX_ACCOUNTING_ENVELOPES}",
+                envelopes.len()
+            )));
+        }
+
+        let mut envelope_graphs = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut object_reference_counts = BTreeMap::<String, u64>::new();
+        let mut reference_count = 0_usize;
+        for (envelope_id, _) in &envelopes {
+            let envelope_id = ArtifactEnvelopeId::parse(envelope_id.clone()).map_err(|error| {
+                Error::Corrupt(format!("invalid artifact envelope ID: {error}"))
+            })?;
+            let graph = self.artifact_envelope_object_ids(&envelope_id)?;
+            reference_count = reference_count.checked_add(graph.len()).ok_or_else(|| {
+                Error::InvalidInput("artifact accounting reference count overflowed".into())
+            })?;
+            if reference_count > MAX_ACCOUNTING_OBJECT_REFERENCES {
+                return Err(Error::InvalidInput(format!(
+                    "artifact accounting contains more than {MAX_ACCOUNTING_OBJECT_REFERENCES} object references"
+                )));
+            }
+            for object_id in &graph {
+                let count = object_reference_counts
+                    .entry(object_id.clone())
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+            envelope_graphs.insert(envelope_id.0, graph);
+        }
+
+        let (selected_envelopes, mut selected_trees) = if let Some(view_id) = view_id {
+            let mut statement = self.conn.prepare(
+                "SELECT b.envelope_id,b.tree_root_id
+                 FROM environment_view_generations v
+                 JOIN artifact_generation_bindings b ON b.generation_id=v.generation_id
+                 WHERE v.view_id=?1
+                 UNION
+                 SELECT s.envelope_id,s.tree_root_id
+                 FROM workspace_view_layers l
+                 JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+                 WHERE l.view_id=?1
+                 ORDER BY envelope_id,tree_root_id",
+            )?;
+            let rows = statement
+                .query_map(params![view_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            (
+                rows.iter()
+                    .map(|(envelope_id, _)| envelope_id.clone())
+                    .collect::<BTreeSet<_>>(),
+                rows.into_iter()
+                    .map(|(_, tree_root_id)| tree_root_id)
+                    .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            (
+                envelopes
+                    .iter()
+                    .map(|(envelope_id, _)| envelope_id.clone())
+                    .collect::<BTreeSet<_>>(),
+                envelopes
+                    .iter()
+                    .map(|(_, tree_root_id)| tree_root_id.clone())
+                    .collect::<BTreeSet<_>>(),
+            )
+        };
+
+        let mut selected_objects = BTreeSet::<String>::new();
+        for envelope_id in &selected_envelopes {
+            let graph = envelope_graphs.get(envelope_id).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "selected artifact envelope `{envelope_id}` is missing its accounting graph"
+                ))
+            })?;
+            selected_objects.extend(graph.iter().cloned());
+        }
+        if view_id.is_none() {
+            let mut statement = self
+                .conn
+                .prepare("SELECT object_id FROM artifact_objects ORDER BY object_id")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                selected_objects.insert(row?);
+            }
+            let mut statement = self.conn.prepare(
+                "SELECT object_id FROM objects WHERE kind IN (
+                    ?1,?2,?3,?4,?5,?6
+                 ) ORDER BY object_id",
+            )?;
+            for row in statement.query_map(
+                params![
+                    ARTIFACT_RESOLUTION_SNAPSHOT_KIND,
+                    ARTIFACT_RESOLUTION_CONTENT_KIND,
+                    ARTIFACT_RESOLUTION_PLAN_KIND,
+                    ARTIFACT_RESOLUTION_CAPTURE_KIND,
+                    ARTIFACT_RESOLUTION_FAILURE_KIND,
+                    ARTIFACT_DIVERGENCE_EVIDENCE_KIND,
+                ],
+                |row| row.get::<_, String>(0),
+            )? {
+                selected_objects.insert(row?);
+            }
+            let mut statement = self.conn.prepare(
+                "SELECT artifact_id FROM artifact_objects
+                 WHERE kind=?1 ORDER BY artifact_id",
+            )?;
+            for row in statement.query_map(params![ARTIFACT_TREE_ROOT_KIND], |row| {
+                row.get::<_, String>(0)
+            })? {
+                selected_trees.insert(row?);
+            }
+        }
+        if selected_trees.len() > MAX_ACCOUNTING_TREES {
+            return Err(Error::InvalidInput(format!(
+                "artifact accounting contains {} selected trees; maximum is {MAX_ACCOUNTING_TREES}",
+                selected_trees.len()
+            )));
+        }
+        if selected_objects.len() > MAX_ACCOUNTING_OBJECTS {
+            return Err(Error::InvalidInput(format!(
+                "artifact accounting contains {} selected objects; maximum is {MAX_ACCOUNTING_OBJECTS}",
+                selected_objects.len()
+            )));
+        }
+
+        let mut unique_authoritative_bytes = 0_u64;
+        let mut cross_artifact_shared_bytes = 0_u64;
+        for chunk in selected_objects.iter().collect::<Vec<_>>().chunks(512) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT object_id,size_bytes FROM objects WHERE object_id IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(
+                params_from_iter(chunk.iter().map(|object_id| object_id.as_str())),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (object_id, size_bytes) = row?;
+                let size_bytes = u64::try_from(size_bytes).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "artifact accounting object `{object_id}` has negative bytes"
+                    ))
+                })?;
+                if object_reference_counts
+                    .get(&object_id)
+                    .copied()
+                    .unwrap_or(1)
+                    > 1
+                {
+                    cross_artifact_shared_bytes =
+                        cross_artifact_shared_bytes.saturating_add(size_bytes);
+                } else {
+                    unique_authoritative_bytes =
+                        unique_authoritative_bytes.saturating_add(size_bytes);
+                }
+            }
+        }
+
+        let mut logical_bytes = 0_u64;
+        for tree_root_id in &selected_trees {
+            let bytes = self.conn.query_row(
+                "SELECT logical_bytes FROM artifact_objects
+                 WHERE artifact_id=?1 AND kind=?2",
+                params![tree_root_id, ARTIFACT_TREE_ROOT_KIND],
+                |row| row.get::<_, i64>(0),
+            )?;
+            logical_bytes = logical_bytes.saturating_add(u64::try_from(bytes).map_err(|_| {
+                Error::Corrupt(format!(
+                    "artifact tree `{tree_root_id}` has negative logical bytes"
+                ))
+            })?);
+        }
+
+        let materialized_bytes = self.artifact_materialized_bytes(view_id, &selected_trees)?;
+        Ok(ArtifactStorageAccountingReport {
+            logical_bytes,
+            unique_authoritative_bytes,
+            cross_artifact_shared_bytes,
+            materialized_bytes,
+            lane_private_bytes,
+            prefetched_bytes: 0,
+            demand_loaded_bytes,
+            reclaimable_bytes,
+            unknown_bytes: measured_unknown_bytes,
+            accounting: format!(
+                "scope={};axes=logical|authoritative|physical|disposition;authoritative=encoded-cbor-bytes-deduplicated;filesystem=allocated-blocks-or-file-size-estimate;reclaimable=overlapping-disposition;prefetch=os-page-cache-excluded",
+                if view_id.is_some() { "lane" } else { "workspace" }
+            ),
+        })
+    }
+
+    fn artifact_materialized_bytes(
+        &self,
+        view_id: Option<&str>,
+        selected_trees: &BTreeSet<String>,
+    ) -> Result<u64> {
+        let materializations = if selected_trees.is_empty() {
+            0
+        } else {
+            let tree_ids = selected_trees.iter().collect::<Vec<_>>();
+            let mut total = 0_u64;
+            for chunk in tree_ids.chunks(512) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT COALESCE(SUM(COALESCE(physical_bytes,0)),0)
+                     FROM artifact_materializations WHERE tree_root_id IN ({placeholders})"
+                );
+                let bytes = self.conn.query_row(
+                    &sql,
+                    params_from_iter(chunk.iter().map(|tree_id| tree_id.as_str())),
+                    |row| row.get::<_, i64>(0),
+                )?;
+                total = total.saturating_add(u64::try_from(bytes).map_err(|_| {
+                    Error::Corrupt("artifact materialization has negative physical bytes".into())
+                })?);
+            }
+            total
+        };
+        let layer_bytes = if let Some(view_id) = view_id {
+            self.conn.query_row(
+                "SELECT COALESCE(SUM(COALESCE(w.physical_bytes,0)),0)
+                 FROM workspace_view_layers l
+                 JOIN workspace_layers w ON w.layer_id=l.layer_id
+                 WHERE l.view_id=?1
+                   AND EXISTS (
+                       SELECT 1 FROM workspace_layer_artifact_shadows s
+                       WHERE s.layer_id=w.layer_id
+                   )",
+                params![view_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            self.conn.query_row(
+                "SELECT COALESCE(SUM(COALESCE(w.physical_bytes,0)),0)
+                 FROM workspace_layers w
+                 WHERE EXISTS (
+                     SELECT 1 FROM workspace_layer_artifact_shadows s
+                     WHERE s.layer_id=w.layer_id
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        Ok(materializations.saturating_add(
+            u64::try_from(layer_bytes).map_err(|_| {
+                Error::Corrupt("workspace layer has negative physical bytes".into())
+            })?,
+        ))
     }
 
     pub(crate) fn artifact_tree_lazy_entry(
@@ -5752,6 +6210,19 @@ mod tests {
             candidate.kind == "artifact_materialization"
                 && candidate.id == materialization.materialization_id
         }));
+        assert_eq!(
+            preview.artifact_storage.materialized_bytes,
+            materialization.physical_bytes
+        );
+        assert!(preview.artifact_storage.reclaimable_bytes >= materialization.physical_bytes);
+        assert_eq!(
+            preview
+                .artifact_storage
+                .materialized_bytes
+                .saturating_add(preview.artifact_storage.demand_loaded_bytes)
+                .saturating_add(preview.artifact_storage.unknown_bytes),
+            preview.cache_physical_bytes_before
+        );
         assert!(materialization.storage_path.exists());
 
         let collected = db.workspace_cache_gc(false, Some(0)).unwrap();
@@ -5770,6 +6241,8 @@ mod tests {
                 .unwrap(),
             0
         );
+        let after_eviction = db.workspace_cache_gc(true, Some(0)).unwrap();
+        assert_eq!(after_eviction.artifact_storage.materialized_bytes, 0);
 
         let object_gc = db.gc(false).unwrap();
         assert!(object_gc.pruned_objects > 0);
@@ -6749,8 +7222,24 @@ mod tests {
             1
         );
 
+        Trail::set_gc_test_failure_after_committed_batches_for_current_thread(Some(1));
+        let interrupted = db.gc(false).unwrap_err();
+        assert!(interrupted
+            .to_string()
+            .contains("injected object-GC interruption"));
+        let remaining_after_interruption = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+        assert!(remaining_after_interruption > 0);
+        assert!(remaining_after_interruption < artifact_object_count);
+
+        drop(db);
+        let mut db = Trail::open(workspace.path()).unwrap();
         let collected = db.gc(false).unwrap();
-        assert!(collected.pruned_objects >= artifact_object_count);
+        assert!(collected.pruned_objects > 0);
         assert_eq!(
             db.conn
                 .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
@@ -6806,11 +7295,55 @@ mod tests {
             validation_receipt_ids: Vec::new(),
         };
         let (first_envelope, _) = db
-            .put_artifact_envelope_under_write_lock(envelope(first_key, first_tree))
+            .put_artifact_envelope_under_write_lock(envelope(first_key, first_tree.clone()))
             .unwrap();
         let (second_envelope, _) = db
             .put_artifact_envelope_under_write_lock(envelope(second_key, second_tree))
             .unwrap();
+        let accounting = db.artifact_storage_accounting(None, 13, 7, 5, 11).unwrap();
+        let authoritative_bytes = db
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(o.bytes)),0)
+                 FROM artifact_objects a JOIN objects o ON o.object_id=a.object_id",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            accounting
+                .unique_authoritative_bytes
+                .saturating_add(accounting.cross_artifact_shared_bytes),
+            authoritative_bytes
+        );
+        assert!(accounting.unique_authoritative_bytes > 0);
+        assert!(accounting.cross_artifact_shared_bytes > 0);
+        assert_eq!(
+            accounting.logical_bytes,
+            (shared.len() * 2 + b"first\n".len() + b"second\n".len()) as u64
+        );
+        assert_eq!(accounting.lane_private_bytes, 13);
+        assert_eq!(accounting.demand_loaded_bytes, 7);
+        assert_eq!(accounting.reclaimable_bytes, 5);
+        assert_eq!(accounting.unknown_bytes, 11);
+        assert_eq!(accounting.prefetched_bytes, 0);
+
+        let materialization = db
+            .ensure_artifact_tree_materialization(&first_tree)
+            .unwrap();
+        let with_materialization = db.artifact_storage_accounting(None, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            with_materialization.materialized_bytes,
+            materialization.physical_bytes
+        );
+        db.conn
+            .execute(
+                "DELETE FROM artifact_materializations WHERE materialization_id=?1",
+                params![materialization.materialization_id],
+            )
+            .unwrap();
+        super::super::workspace_layer::make_tree_writable(&materialization.storage_path);
+        fs::remove_dir_all(materialization.storage_path).unwrap();
         for (hold_id, envelope_id) in [
             ("hold_first", &first_envelope),
             ("hold_second", &second_envelope),
@@ -6903,6 +7436,137 @@ mod tests {
                     .unwrap(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn artifact_accounting_does_not_multiply_shared_authority_across_1_5_20_lanes() {
+        for lane_count in [1_usize, 5, 20] {
+            let (_workspace, mut db, source_root) = initialized_resolution_fixture();
+            let artifact_source = tempfile::tempdir().unwrap();
+            fs::write(
+                artifact_source.path().join("shared-output.bin"),
+                vec![42_u8; 32 * 1024],
+            )
+            .unwrap();
+            let (tree_id, tree) = db.ingest_artifact_tree(artifact_source.path()).unwrap();
+            let desired_key =
+                artifact_desired_key_v2(fixture_desired_material(source_root.clone())).unwrap();
+            let (envelope_id, quarantined) = db
+                .put_artifact_envelope_under_write_lock(ArtifactEnvelopeV1 {
+                    version: ARTIFACT_ENVELOPE_VERSION,
+                    desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+                        desired_key: desired_key.clone(),
+                    },
+                    tree_root_id: tree_id.clone(),
+                    component_id: "cargo:root".into(),
+                    output_name: "target".into(),
+                    output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    portability_scope: "workspace".into(),
+                    trust_scope: "builtin".into(),
+                    resolution_snapshot_id: None,
+                    validation_receipt_ids: Vec::new(),
+                })
+                .unwrap();
+            assert!(!quarantined);
+            let materialization = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+
+            let mode = if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            };
+            let mut lane_reports = Vec::new();
+            for index in 0..lane_count {
+                let lane = format!("accounting-{lane_count}-{index}");
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    &lane,
+                    Some("main"),
+                    mode.clone(),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+                let view = db.lane_workspace_view(&lane).unwrap().unwrap();
+                fs::write(
+                    Path::new(&view.generated_upper).join("lane-private.bin"),
+                    vec![index as u8; 1024 + index],
+                )
+                .unwrap();
+                let generation_id = format!("envgen_accounting_{lane_count}_{index}");
+                db.conn
+                    .execute(
+                        "INSERT INTO environment_generations(
+                             generation_id,view_id,generation_sequence,source_root,
+                             specification_digest,predecessor_generation_id,state,created_at,
+                             activated_at,retired_at)
+                         VALUES(?1,?2,1,?3,'accounting-spec',NULL,'active',1,1,NULL)",
+                        params![generation_id, view.view_id, source_root.0],
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(
+                        "INSERT INTO environment_view_generations(
+                             view_id,generation_id,updated_at) VALUES(?1,?2,1)",
+                        params![view.view_id, generation_id],
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(
+                        "INSERT INTO artifact_generation_bindings(
+                             binding_id,generation_id,component_id,output_name,desired_key,
+                             envelope_id,tree_root_id,binding_identity,created_at)
+                         VALUES(?1,?2,'cargo:root','target',?3,?4,?5,?6,1)",
+                        params![
+                            format!("binding_accounting_{lane_count}_{index}"),
+                            generation_id,
+                            desired_key.0,
+                            envelope_id.0,
+                            tree_id.0,
+                            format!("identity_accounting_{lane_count}_{index}"),
+                        ],
+                    )
+                    .unwrap();
+                lane_reports.push(db.lane_workspace_space(&lane).unwrap());
+            }
+
+            let workspace_accounting = db.artifact_storage_accounting(None, 0, 0, 0, 0).unwrap();
+            assert_eq!(workspace_accounting.logical_bytes, tree.logical_bytes);
+            assert_eq!(workspace_accounting.cross_artifact_shared_bytes, 0);
+            assert!(workspace_accounting.unique_authoritative_bytes > 0);
+            assert_eq!(
+                workspace_accounting.materialized_bytes,
+                materialization.physical_bytes
+            );
+            for report in lane_reports {
+                assert_eq!(report.artifact_storage.logical_bytes, tree.logical_bytes);
+                assert_eq!(
+                    report.artifact_storage.unique_authoritative_bytes,
+                    workspace_accounting.unique_authoritative_bytes
+                );
+                assert_eq!(report.artifact_storage.cross_artifact_shared_bytes, 0);
+                assert_eq!(
+                    report.artifact_storage.materialized_bytes,
+                    materialization.physical_bytes
+                );
+                assert_eq!(
+                    report.artifact_storage.lane_private_bytes,
+                    report.lane_exclusive_physical_bytes
+                );
+                assert!(report.artifact_storage.lane_private_bytes > 0);
+                assert_eq!(
+                    report.artifact_storage.reclaimable_bytes,
+                    materialization.physical_bytes
+                );
+                assert_eq!(report.artifact_storage.prefetched_bytes, 0);
+                assert_eq!(report.artifact_storage.demand_loaded_bytes, 0);
+                assert_eq!(report.artifact_storage.unknown_bytes, 0);
+            }
         }
     }
 

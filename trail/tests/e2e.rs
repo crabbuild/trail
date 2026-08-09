@@ -23514,6 +23514,13 @@ fn native_cow_lane_space_reports_allocated_and_changed_bytes_honestly() {
         report["physical_sharing_evidence"],
         "allocated_blocks_do_not_prove_apfs_extent_sharing"
     );
+    assert_eq!(report["artifact_storage"]["lane_private_bytes"], 0);
+    assert_eq!(report["artifact_storage"]["reclaimable_bytes"], 0);
+    assert_eq!(
+        report["artifact_storage"]["unknown_bytes"],
+        report["filesystem_allocated_bytes"]
+    );
+    assert_eq!(report["artifact_storage"]["prefetched_bytes"], 0);
 
     let output = Command::new(trail_bin())
         .arg("--workspace")
@@ -23537,6 +23544,15 @@ fn native_cow_lane_space_reports_allocated_and_changed_bytes_honestly() {
         "Physical sharing",
         "unknown",
         "allocated_blocks_do_not_prove_apfs_extent_sharing",
+        "Artifact logical",
+        "Artifact authoritative unique",
+        "Artifact authoritative shared",
+        "Artifact materialized",
+        "Artifact lane-private",
+        "Artifact prefetched",
+        "Artifact demand-loaded",
+        "Artifact reclaimable",
+        "Artifact unknown",
     ] {
         assert!(
             stdout.contains(expected),

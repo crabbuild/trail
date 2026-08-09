@@ -266,12 +266,37 @@ generation activation when no generation, attempt, attestation, quarantine,
 shadow, or hold retains it.
 
 `gc --dry-run` reports without pruning. Normal GC validates artifact identities
-and edges before deleting anything, orders unreachable envelopes before their
-content nodes, and commits sorted batches of at most 256 objects. Each batch is
-idempotent: interruption preserves earlier committed batches and rolls back the
-current batch, while a later invocation recomputes reachability. Missing roots,
+and edges before deleting anything, orders unreachable artifact DAGs
+parent-before-child with object-ID tie breaking, and commits batches of at most
+256 objects. Each committed batch leaves the remaining artifact graph valid:
+interruption preserves earlier batches and rolls back the current batch, while
+a later invocation recomputes reachability and resumes. Missing roots,
 invalid edges, corrupt identities, unsupported active hold targets, or foreign
 key disagreement fail closed rather than risking reachable content.
+
+Artifact storage reports use distinct accounting axes rather than one total:
+
+- `logical_bytes` sums file sizes once per distinct artifact tree in scope.
+- `unique_authoritative_bytes` and `cross_artifact_shared_bytes` partition the
+  encoded content-addressed object bytes in scope. An object is counted once;
+  it is shared when more than one artifact envelope references it.
+- `materialized_bytes`, `lane_private_bytes`, `demand_loaded_bytes`, and
+  `unknown_bytes` classify measured filesystem allocation. CAS-backed artifact
+  directories and layers are materialized; source/generated/scratch uppers are
+  lane-private; Git-root blob projections are demand-loaded; legacy layers,
+  tool namespaces, and unattributable native-clone extents remain unknown.
+- `prefetched_bytes` counts persisted storage created only for prefetch. The
+  current hot-set implementation warms the operating-system page cache, so it
+  reports zero and excludes that volatile cache explicitly.
+- `reclaimable_bytes` is an independent policy/disposition axis and can overlap
+  materialized or cache classifications. A lane-scoped report includes only
+  its rebuildable artifact materializations; the legacy top-level workspace
+  reclaimable field remains workspace-wide.
+
+Callers must not add logical, authoritative, physical, and reclaimable axes
+together. Workspace-cache GC captures these values before deletion and sets
+its reclaimable field from the exact ordered candidates selected by retention,
+quota, and free-space policy.
 
 ## Backup and Restore
 

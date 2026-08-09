@@ -1264,6 +1264,7 @@ mod macos {
             let temp = tempfile::tempdir().unwrap();
             fs::create_dir_all(temp.path().join("src")).unwrap();
             fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            fs::write(temp.path().join("delete-after-mount.txt"), "delete me\n").unwrap();
             fs::write(temp.path().join("src/old.txt"), "old\n").unwrap();
             Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
             let mut db = Trail::open(temp.path()).unwrap();
@@ -1291,6 +1292,7 @@ mod macos {
                 .collect::<BTreeSet<_>>();
             assert!(root_names.contains(OsStr::new("docs")));
             fs::rename(workdir.join("src/old.txt"), workdir.join("src/renamed.txt")).unwrap();
+            fs::remove_file(workdir.join("delete-after-mount.txt")).unwrap();
             assert!(db.mount_nfs_cow_workdir_for_lane("nfs-test").is_err());
             let report = db
                 .record_lane_workdir("nfs-test", Some("NFS checkpoint".to_string()))
@@ -1302,7 +1304,12 @@ mod macos {
                 .collect::<BTreeSet<_>>();
             assert_eq!(
                 paths,
-                BTreeSet::from(["README.md", "docs/new.txt", "src/renamed.txt"])
+                BTreeSet::from([
+                    "README.md",
+                    "delete-after-mount.txt",
+                    "docs/new.txt",
+                    "src/renamed.txt",
+                ])
             );
             drop(mount);
             assert!(!is_nfs_mount(&workdir));
@@ -1311,6 +1318,7 @@ mod macos {
             let remount = db.mount_nfs_cow_workdir_for_lane("nfs-test").unwrap();
             assert_eq!(fs::read(workdir.join("README.md")).unwrap(), b"changed\n");
             assert_eq!(fs::read(workdir.join("docs/new.txt")).unwrap(), b"new\n");
+            assert!(!workdir.join("delete-after-mount.txt").exists());
             drop(remount);
             assert!(!is_nfs_mount(&workdir));
         }

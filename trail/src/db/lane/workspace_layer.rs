@@ -2847,6 +2847,31 @@ impl Trail {
             .saturating_add(artifact_materializations.max(0) as u64))
     }
 
+    pub(crate) fn workspace_view_reclaimable_artifact_bytes(&self, view_id: &str) -> Result<u64> {
+        let bytes = self.conn.query_row(
+            "WITH selected_trees(tree_root_id) AS (
+                 SELECT b.tree_root_id
+                 FROM environment_view_generations v
+                 JOIN artifact_generation_bindings b ON b.generation_id=v.generation_id
+                 WHERE v.view_id=?1
+                 UNION
+                 SELECT s.tree_root_id
+                 FROM workspace_view_layers l
+                 JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+                 WHERE l.view_id=?1
+             )
+             SELECT COALESCE(SUM(COALESCE(m.physical_bytes,0)),0)
+             FROM artifact_materializations m
+             JOIN selected_trees t ON t.tree_root_id=m.tree_root_id
+             WHERE m.state != 'building'",
+            params![view_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u64::try_from(bytes).map_err(|_| {
+            Error::Corrupt("artifact materialization has negative physical bytes".into())
+        })
+    }
+
     pub fn workspace_cache_gc(
         &self,
         dry_run: bool,
@@ -2857,6 +2882,12 @@ impl Trail {
         let cutoff = now_ts().saturating_sub(retention_secs.min(i64::MAX as u64) as i64);
         let cache_root = self.db_dir.join("cache");
         let cache_physical_bytes_before = cache_tree_usage(&cache_root)?;
+        let demand_loaded_bytes = cache_tree_usage(&cache_root.join("blobs"))?;
+        let mut artifact_storage =
+            self.artifact_storage_accounting(None, 0, demand_loaded_bytes, 0, 0)?;
+        artifact_storage.unknown_bytes = cache_physical_bytes_before
+            .saturating_sub(demand_loaded_bytes)
+            .saturating_sub(artifact_storage.materialized_bytes);
         let mut found = Vec::<CacheGcCandidate>::new();
         {
             let mut stmt = self.conn.prepare(
@@ -3064,6 +3095,7 @@ impl Trail {
         let reclaimable_bytes = selected
             .iter()
             .fold(0_u64, |sum, item| sum.saturating_add(item.physical_bytes));
+        artifact_storage.reclaimable_bytes = reclaimable_bytes;
         if dry_run {
             return Ok(WorkspaceCacheGcReport {
                 dry_run,
@@ -3073,6 +3105,7 @@ impl Trail {
                 reclaimed_bytes: 0,
                 candidates: selected,
                 deleted: Vec::new(),
+                artifact_storage,
             });
         }
 
@@ -3352,6 +3385,7 @@ impl Trail {
             reclaimed_bytes,
             candidates: selected,
             deleted,
+            artifact_storage,
         })
     }
 

@@ -37,6 +37,13 @@ All notable changes to Trail are documented in this file. Trail follows
   blob, chunk-list, and chunk edges from generation, attempt, snapshot, attestation,
   quarantine, hold, layer, and materialization roots, then reclaims last-reference
   content in restartable deterministic batches.
+- Lane-space and cache-GC reports now expose artifact logical, unique authoritative,
+  cross-artifact shared, materialized, lane-private, persisted-prefetch,
+  demand-loaded, reclaimable, and unknown byte accounting without counting a CAS
+  object more than once.
+- Object GC now orders unreachable artifact DAGs parent-before-child across
+  transaction batches, allowing an interrupted collection to reopen and resume
+  without leaving the remaining CAS graph invalid.
 
 ### Changed
 
