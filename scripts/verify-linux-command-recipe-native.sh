@@ -3,8 +3,14 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
+ci_tmpdir=""
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
+  : "${GITHUB_WORKSPACE:?GitHub Actions did not provide GITHUB_WORKSPACE}"
+  ci_tmpdir="${GITHUB_WORKSPACE}/.trail-ci-recipe-${GITHUB_RUN_ID:-run}-${GITHUB_JOB:-job}"
+  mkdir -p "${ci_tmpdir}"
+  TMPDIR="${ci_tmpdir}"
+  export TMPDIR
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP}/trail-command-recipe-target}"
   export CARGO_TARGET_DIR
   case "${CARGO_TARGET_DIR}" in
@@ -20,6 +26,21 @@ else
 fi
 cargo build -p trail --locked
 trail="${CARGO_TARGET_DIR}/debug/trail"
+
+cleanup() {
+  cd /
+  for root in "${success_root:-}" "${private_root:-}" "${multi_root:-}" \
+    "${host_read_root:-}" "${write_root:-}" "${network_root:-}" "${shell_root:-}"; do
+    if [[ -n "${root}" ]]; then
+      chmod -R u+w "${root}" 2>/dev/null || true
+      rm -rf "${root}"
+    fi
+  done
+  if [[ -n "${ci_tmpdir}" ]]; then
+    rmdir "${ci_tmpdir}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 write_spec() {
   local root="$1"

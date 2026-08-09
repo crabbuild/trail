@@ -3,12 +3,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
+ci_tmpdir=""
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
-  # Hosted Linux images mount /tmp with noexec. Trail intentionally executes
-  # a digest-verified staged adapter, so keep disposable workspaces on the
-  # runner's executable job-local volume.
-  TMPDIR="${RUNNER_TEMP}"
+  : "${GITHUB_WORKSPACE:?GitHub Actions did not provide GITHUB_WORKSPACE}"
+  # Hosted Linux images can mount both /tmp and RUNNER_TEMP with noexec. Trail
+  # intentionally executes a digest-verified staged adapter, so keep only the
+  # disposable fixture workspaces on the executable checkout filesystem.
+  ci_tmpdir="${GITHUB_WORKSPACE}/.trail-ci-adapter-${GITHUB_RUN_ID:-run}-${GITHUB_JOB:-job}"
+  mkdir -p "${ci_tmpdir}"
+  TMPDIR="${ci_tmpdir}"
   export TMPDIR
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP}/trail-adapter-plugin-target}"
   export CARGO_TARGET_DIR
@@ -52,6 +56,9 @@ cleanup() {
   fi
   chmod -R u+w "${root}" "${packages}" "${tool_bin}" 2>/dev/null || true
   rm -rf "${root}" "${packages}" "${tool_bin}"
+  if [[ -n "${ci_tmpdir}" ]]; then
+    rmdir "${ci_tmpdir}" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 cp "${example_dir}/mounted-fixture-tool" "${tool_bin}/mounted-fixture-tool"
