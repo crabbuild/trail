@@ -32,6 +32,7 @@ mod workdir;
 // activate them in later OpenSpec tasks.
 #[allow(dead_code)]
 mod workspace_artifact;
+pub(crate) use workspace_artifact::validate_artifact_validation_receipt;
 mod workspace_cargo;
 mod workspace_cmake;
 mod workspace_environment;

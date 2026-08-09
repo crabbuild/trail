@@ -249,7 +249,8 @@ Garbage collection works from reachability:
   snapshots, attestations, quarantines, active holds, and in-progress layer
   publications root their durable object evidence.
 - Artifact envelopes traverse to tree roots, resolution snapshots, and
-  validation receipts. Tree roots traverse directory nodes; directory nodes
+  typed deterministic validation receipts. Tree roots traverse directory nodes;
+  directory nodes
   traverse directories/files; file nodes traverse blobs or chunk lists; and
   chunk lists traverse chunks. Shared nodes remain live while any rooted graph
   reaches them.

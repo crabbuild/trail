@@ -278,6 +278,16 @@ embedded in source URLs. Publication is an atomic rename or equivalent transacti
 a private staging location. Published immutable content is never repaired in place: a
 bad artifact becomes `corrupt`, references are quarantined, and a new artifact is built.
 
+Validation declarations are framework-neutral and typed as `structural`,
+`loadability`, `framework`, `policy`, `gate`, or `reproducibility`; the legacy
+`ecosystem` wire value remains inspectable under its original meaning. A host-run
+validation emits a canonical `ArtifactValidationReceiptV1` bound to the exact
+desired identity, artifact tree, declaration, validator identity, and validated
+input digest. Receipt evidence is bounded, deterministically ordered, and
+secret-rejected. Wall-clock time and local paths are excluded from receipt
+identity. Only passing receipts with exact desired/tree bindings may enter a
+ready envelope, and attachment revalidates those object identities and bindings.
+
 ## Environment generations
 
 An environment generation is an immutable selection of component instances and

@@ -812,6 +812,15 @@ impl Trail {
                         )?;
                         let _: ArtifactResolutionCaptureV1 = from_cbor(&bytes)?;
                     }
+                    ARTIFACT_VALIDATION_RECEIPT_KIND => {
+                        require_gc_object_version(
+                            &kind,
+                            version,
+                            ARTIFACT_VALIDATION_RECEIPT_VERSION,
+                        )?;
+                        let receipt: ArtifactValidationReceiptV1 = from_cbor(&bytes)?;
+                        crate::db::lane::validate_artifact_validation_receipt(&receipt)?;
+                    }
                     _ => {}
                 }
                 Ok(())

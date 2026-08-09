@@ -44,6 +44,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Object GC now orders unreachable artifact DAGs parent-before-child across
   transaction batches, allowing an interrupted collection to reopen and resume
   without leaving the remaining CAS graph invalid.
+- Artifact validations now distinguish structural, loadability, framework,
+  policy, gate, and reproducibility declarations and produce deterministic,
+  secret-rejected receipts bound to the exact desired identity and tree.
 
 ### Changed
 

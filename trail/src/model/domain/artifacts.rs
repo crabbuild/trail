@@ -15,6 +15,7 @@ pub const ARTIFACT_CHUNK_VERSION: u16 = 1;
 pub const ARTIFACT_TREE_ROOT_VERSION: u16 = 1;
 pub const ARTIFACT_ENVELOPE_VERSION: u16 = 1;
 pub const ARTIFACT_DIVERGENCE_EVIDENCE_VERSION: u16 = 1;
+pub const ARTIFACT_VALIDATION_RECEIPT_VERSION: u16 = 1;
 
 pub const ARTIFACT_DIRECTORY_NODE_KIND: &str = "ArtifactDirectoryNode";
 pub const ARTIFACT_FILE_NODE_KIND: &str = "ArtifactFileNode";
@@ -24,6 +25,7 @@ pub const ARTIFACT_CHUNK_KIND: &str = "ArtifactChunk";
 pub const ARTIFACT_TREE_ROOT_KIND: &str = "ArtifactTreeRoot";
 pub const ARTIFACT_ENVELOPE_KIND: &str = "ArtifactEnvelope";
 pub const ARTIFACT_DIVERGENCE_EVIDENCE_KIND: &str = "ArtifactDivergenceEvidence";
+pub const ARTIFACT_VALIDATION_RECEIPT_KIND: &str = "ArtifactValidationReceipt";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -189,6 +191,12 @@ pub struct ArtifactActionLimitsV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactValidationKindV1 {
     Structural,
+    Loadability,
+    Framework,
+    Policy,
+    Gate,
+    Reproducibility,
+    /// Legacy wire value retained for exact compatibility with existing plans.
     Ecosystem,
 }
 
@@ -200,6 +208,31 @@ pub struct ArtifactValidationV1 {
     pub required: bool,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactValidationOutcomeV1 {
+    Passed,
+    Failed,
+}
+
+/// Canonical, path-independent evidence for one host-run validation.
+///
+/// Wall-clock time and local filesystem paths are intentionally absent so the
+/// same declaration, inputs, validator, result, and bounded evidence produce
+/// the same object identity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactValidationReceiptV1 {
+    pub version: u16,
+    pub declaration: ArtifactValidationV1,
+    pub desired_identity: ArtifactDesiredIdentityV1,
+    pub tree_root_id: ArtifactTreeId,
+    pub validator_identity: String,
+    pub validated_input_digest: String,
+    pub outcome: ArtifactValidationOutcomeV1,
+    #[serde(default)]
+    pub evidence: BTreeMap<String, String>,
 }
 
 /// A complete, host-validated contract for an optional dependency resolver.

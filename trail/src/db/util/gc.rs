@@ -23,6 +23,7 @@ pub(crate) fn known_gc_object_kinds() -> HashSet<&'static str> {
         ARTIFACT_TREE_ROOT_KIND,
         ARTIFACT_ENVELOPE_KIND,
         ARTIFACT_DIVERGENCE_EVIDENCE_KIND,
+        ARTIFACT_VALIDATION_RECEIPT_KIND,
     ]
     .into_iter()
     .collect()

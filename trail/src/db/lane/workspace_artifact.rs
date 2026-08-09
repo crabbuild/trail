@@ -764,6 +764,24 @@ impl Trail {
             }
         }
 
+        let validation_receipts = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT object_id FROM objects WHERE kind=?1 ORDER BY object_id")?;
+            statement
+                .query_map(params![ARTIFACT_VALIDATION_RECEIPT_KIND], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for receipt_id in validation_receipts {
+            if let Err(error) = self.artifact_validation_receipt(&ObjectId(receipt_id.clone())) {
+                errors.push(format!(
+                    "artifact validation receipt {receipt_id} is corrupt: {error}; rerun the exact validator before publishing or attaching the artifact"
+                ));
+            }
+        }
+
         let snapshots = {
             let mut statement = self.conn.prepare(
                 "SELECT snapshot_id,proposal_key,source_root,component_id,adapter_identity,
@@ -2120,7 +2138,7 @@ impl Trail {
             }
             let mut statement = self.conn.prepare(
                 "SELECT object_id FROM objects WHERE kind IN (
-                    ?1,?2,?3,?4,?5,?6
+                    ?1,?2,?3,?4,?5,?6,?7
                  ) ORDER BY object_id",
             )?;
             for row in statement.query_map(
@@ -2131,6 +2149,7 @@ impl Trail {
                     ARTIFACT_RESOLUTION_CAPTURE_KIND,
                     ARTIFACT_RESOLUTION_FAILURE_KIND,
                     ARTIFACT_DIVERGENCE_EVIDENCE_KIND,
+                    ARTIFACT_VALIDATION_RECEIPT_KIND,
                 ],
                 |row| row.get::<_, String>(0),
             )? {
@@ -2933,6 +2952,7 @@ impl Trail {
         };
         validate_resolution_text(&desired_key, "artifact desired key")?;
         validate_resolution_text(&envelope.trust_scope, "artifact trust scope")?;
+        self.validate_envelope_validation_receipts(&envelope)?;
         let (envelope_id, _) = encode_artifact_envelope(envelope.clone())?;
         let object_id = self.put_artifact_cas_object(
             &envelope_id.0,
@@ -3111,7 +3131,28 @@ impl Trail {
                 "artifact envelope `{envelope_id}` database identity disagrees with its object"
             )));
         }
+        self.validate_envelope_validation_receipts(&envelope)
+            .map_err(|error| {
+                Error::Corrupt(format!(
+                    "artifact envelope `{envelope_id}` has invalid validation evidence: {error}"
+                ))
+            })?;
         Ok(envelope)
+    }
+
+    fn validate_envelope_validation_receipts(&self, envelope: &ArtifactEnvelopeV1) -> Result<()> {
+        for receipt_id in &envelope.validation_receipt_ids {
+            let receipt = self.artifact_validation_receipt(receipt_id)?;
+            if receipt.desired_identity != envelope.desired_identity
+                || receipt.tree_root_id != envelope.tree_root_id
+                || receipt.outcome != ArtifactValidationOutcomeV1::Passed
+            {
+                return Err(Error::InvalidInput(format!(
+                    "artifact validation receipt `{receipt_id}` does not pass for the envelope desired identity and tree"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn list_artifact_quarantines(&self) -> Result<Vec<ArtifactQuarantineRecordV1>> {
@@ -3651,6 +3692,32 @@ impl Trail {
         Ok((snapshot_id, snapshot))
     }
 
+    pub(crate) fn put_artifact_validation_receipt(
+        &self,
+        receipt: ArtifactValidationReceiptV1,
+    ) -> Result<ObjectId> {
+        let _lock = self.acquire_write_lock()?;
+        validate_artifact_validation_receipt(&receipt)?;
+        self.put_object(
+            ARTIFACT_VALIDATION_RECEIPT_KIND,
+            ARTIFACT_VALIDATION_RECEIPT_VERSION,
+            &receipt,
+        )
+    }
+
+    pub(crate) fn artifact_validation_receipt(
+        &self,
+        receipt_id: &ObjectId,
+    ) -> Result<ArtifactValidationReceiptV1> {
+        let receipt = self.get_object(ARTIFACT_VALIDATION_RECEIPT_KIND, receipt_id)?;
+        validate_artifact_validation_receipt(&receipt).map_err(|error| {
+            Error::Corrupt(format!(
+                "artifact validation receipt `{receipt_id}` is invalid: {error}"
+            ))
+        })?;
+        Ok(receipt)
+    }
+
     pub(crate) fn artifact_resolution_snapshot_for_proposal(
         &self,
         proposal_key: &str,
@@ -3864,8 +3931,7 @@ pub(crate) fn normalize_artifact_resolution_plan(
         )));
     }
     for validation in &plan.validations {
-        validate_resolution_text(&validation.name, "validation name")?;
-        validate_identity_map(&validation.parameters, "validation parameter")?;
+        validate_artifact_validation_declaration(validation)?;
     }
     plan.validations.sort();
     if plan
@@ -4018,8 +4084,7 @@ pub(crate) fn artifact_desired_key_v2(
     }
     material.outputs.sort();
     for validation in &material.validations {
-        validate_resolution_text(&validation.name, "validation name")?;
-        validate_identity_map(&validation.parameters, "validation parameter")?;
+        validate_artifact_validation_declaration(validation)?;
     }
     material.validations.sort();
     for export in &material.source_exports {
@@ -4813,6 +4878,34 @@ fn validate_identity_map(values: &BTreeMap<String, String>, field: &str) -> Resu
     for (key, value) in values {
         validate_resolution_text(key, field)?;
         validate_resolution_text(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_artifact_validation_declaration(validation: &ArtifactValidationV1) -> Result<()> {
+    validate_resolution_text(&validation.name, "validation name")?;
+    validate_identity_map(&validation.parameters, "validation parameter")
+}
+
+pub(crate) fn validate_artifact_validation_receipt(
+    receipt: &ArtifactValidationReceiptV1,
+) -> Result<()> {
+    if receipt.version != ARTIFACT_VALIDATION_RECEIPT_VERSION {
+        return Err(Error::InvalidInput(format!(
+            "artifact validation receipt version {} is unsupported",
+            receipt.version
+        )));
+    }
+    validate_artifact_validation_declaration(&receipt.declaration)?;
+    validate_resolution_text(&receipt.validator_identity, "validator identity")?;
+    validate_sha256(&receipt.validated_input_digest, "validated input digest")?;
+    validate_identity_map(&receipt.evidence, "validation evidence")?;
+    for (name, value) in &receipt.evidence {
+        if is_sensitive_json_key(name) || contains_sensitive_text(value) {
+            return Err(Error::InvalidInput(format!(
+                "artifact validation evidence `{name}` may contain secret material"
+            )));
+        }
     }
     Ok(())
 }
@@ -5635,6 +5728,114 @@ mod tests {
             bytes: b"not zero".to_vec(),
         };
         assert!(encode_artifact_chunk(chunk).is_err());
+    }
+
+    #[test]
+    fn validation_receipts_are_deterministic_typed_and_bound_to_the_exact_envelope() {
+        let (_workspace, mut db, source_root) = initialized_resolution_fixture();
+        let candidate = tempfile::tempdir().unwrap();
+        fs::write(
+            candidate.path().join("validated.bin"),
+            b"validated output\n",
+        )
+        .unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(candidate.path()).unwrap();
+        let desired_key = artifact_desired_key_v2(fixture_desired_material(source_root)).unwrap();
+        let desired_identity = ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+            desired_key: desired_key.clone(),
+        };
+        let receipt = ArtifactValidationReceiptV1 {
+            version: ARTIFACT_VALIDATION_RECEIPT_VERSION,
+            declaration: ArtifactValidationV1 {
+                name: "cargo-metadata-loads".into(),
+                kind: ArtifactValidationKindV1::Loadability,
+                required: true,
+                parameters: BTreeMap::from([("format".into(), "cargo-metadata-v1".into())]),
+            },
+            desired_identity: desired_identity.clone(),
+            tree_root_id: tree_id.clone(),
+            validator_identity: "trail.builtin/cargo-validator@1#sha256:fixture".into(),
+            validated_input_digest: sha256_hex(b"desired+tree+validator+policy"),
+            outcome: ArtifactValidationOutcomeV1::Passed,
+            evidence: BTreeMap::from([
+                ("checked_entries".into(), "1".into()),
+                ("result".into(), "loadable".into()),
+            ]),
+        };
+        let receipt_id = db.put_artifact_validation_receipt(receipt.clone()).unwrap();
+        assert_eq!(
+            db.put_artifact_validation_receipt(receipt.clone()).unwrap(),
+            receipt_id
+        );
+        assert_eq!(
+            db.artifact_validation_receipt(&receipt_id).unwrap(),
+            receipt
+        );
+
+        let envelope = ArtifactEnvelopeV1 {
+            version: ARTIFACT_ENVELOPE_VERSION,
+            desired_identity: desired_identity.clone(),
+            tree_root_id: tree_id.clone(),
+            component_id: "cargo:root".into(),
+            output_name: "target".into(),
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            portability_scope: "workspace".into(),
+            trust_scope: "builtin".into(),
+            resolution_snapshot_id: None,
+            validation_receipt_ids: vec![receipt_id.clone()],
+        };
+        let (envelope_id, quarantined) = db
+            .put_artifact_envelope_under_write_lock(envelope.clone())
+            .unwrap();
+        assert!(!quarantined);
+        assert_eq!(
+            db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+                .unwrap()
+                .validation_receipt_ids,
+            vec![receipt_id.clone()]
+        );
+        assert!(db.validate_artifact_cas_integrity().unwrap().is_empty());
+        db.conn
+            .execute(
+                "INSERT INTO artifact_holds(
+                     hold_id,target_kind,target_id,reason,created_at)
+                 VALUES('hold_validation_receipt','artifact_envelope',?1,'validation-test',1)",
+                params![envelope_id.0],
+            )
+            .unwrap();
+        db.gc(false).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM objects WHERE object_id=?1",
+                    params![receipt_id.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut failed_receipt = receipt.clone();
+        failed_receipt.outcome = ArtifactValidationOutcomeV1::Failed;
+        let failed_id = db.put_artifact_validation_receipt(failed_receipt).unwrap();
+        let mut failed_envelope = envelope.clone();
+        failed_envelope.validation_receipt_ids = vec![failed_id];
+        assert!(db
+            .put_artifact_envelope_under_write_lock(failed_envelope)
+            .unwrap_err()
+            .to_string()
+            .contains("does not pass"));
+
+        let mut secret_receipt = receipt;
+        secret_receipt.evidence.insert(
+            "output".into(),
+            "Authorization: Bearer validator-secret".into(),
+        );
+        assert!(db
+            .put_artifact_validation_receipt(secret_receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("secret material"));
     }
 
     #[test]

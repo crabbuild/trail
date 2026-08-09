@@ -1633,6 +1633,28 @@ mod workdir_mode_tests {
 
     #[test]
     fn environment_artifact_contract_enums_are_stable_and_reject_unknown_values() {
+        for (kind, wire) in [
+            (ArtifactValidationKindV1::Structural, "structural"),
+            (ArtifactValidationKindV1::Loadability, "loadability"),
+            (ArtifactValidationKindV1::Framework, "framework"),
+            (ArtifactValidationKindV1::Policy, "policy"),
+            (ArtifactValidationKindV1::Gate, "gate"),
+            (
+                ArtifactValidationKindV1::Reproducibility,
+                "reproducibility",
+            ),
+            (ArtifactValidationKindV1::Ecosystem, "ecosystem"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactValidationKindV1>(wire.into()).unwrap(),
+                kind
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactValidationKindV1>("custom".into()).is_err()
+        );
+
         for (policy, wire) in [
             (EnvironmentOutputPolicy::ImmutableShared, "immutable_shared"),
             (
