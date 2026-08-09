@@ -18,15 +18,17 @@ For code-agent tasks, prefer the higher-level `trail agent ...` workflow. Use
 
 ## Quick Start
 
-### Create a virtual lane
+### Create a layered lane
 
 ```sh
 trail lane spawn feature-docs
 trail lane status feature-docs
 ```
 
-A virtual lane stores branch state in Trail and does not create a filesystem
-workdir.
+With no mode flag, Trail selects the platform's qualified transparent backend
+(`fuse-cow`, `nfs-cow`, or `dokan-cow`) and creates only lane metadata and
+private uppers. Use `--workdir-mode virtual` explicitly for a lane with no
+filesystem workdir.
 
 ### Create a lane with a workdir
 
@@ -124,8 +126,8 @@ trail lane rm <NAME> [--force]
 
 | Mode | What it does |
 | --- | --- |
-| `auto` | Tries strict native COW in staging, then restarts with portable materialization when cloning is unavailable. It never selects a mounted backend. |
-| `virtual` | Creates no filesystem workdir. This is the high-scale default. |
+| `auto` | Selects only the platform's qualified transparent layered backend and fails with prerequisite guidance when none is available. This is the default. |
+| `virtual` | Creates no filesystem workdir. Request it explicitly for source-only workflows. |
 | `sparse` | Materializes only selected paths. |
 | `native-cow` | Requires every file to use a filesystem-native clone/reflink and fails without copying otherwise. |
 | `portable-copy` | Opportunistically clones each file, copies bytes when unavailable, and reports `clone`, `mixed`, or `copy`. |

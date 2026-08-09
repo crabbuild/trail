@@ -1,5 +1,10 @@
 # Readiness Gates and Merge Safety
 
+An output with `publish = "successful_gate"` names the exact gate that may
+promote it. Promotion records the successful run receipt, command, source root,
+and active environment generation, and rejects stale evidence. Failed gates
+leave the lane-private output and prior generation unchanged.
+
 Trail treats lane merges as reviewable operations with explicit blockers.
 
 ## Readiness Checks

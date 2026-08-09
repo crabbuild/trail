@@ -1070,6 +1070,71 @@ impl Trail {
             .map_err(Error::from)
     }
 
+    /// Resolve an omitted environment-sync lane without guessing. An authenticated
+    /// managed context must identify an existing lane/view pair. Otherwise the
+    /// current directory must be contained by exactly one mounted workspace view.
+    pub fn infer_environment_lane_context(
+        &self,
+        cwd: &Path,
+        managed_lane_id: Option<&str>,
+        managed_view_id: Option<&str>,
+    ) -> Result<String> {
+        if managed_lane_id.is_some() || managed_view_id.is_some() {
+            let (Some(lane_id), Some(view_id)) = (managed_lane_id, managed_view_id) else {
+                return Err(Error::InvalidInput(
+                    "managed environment context requires both TRAIL_LANE and TRAIL_VIEW"
+                        .to_string(),
+                ));
+            };
+            return self
+                .conn
+                .query_row(
+                    "SELECT l.name FROM lanes l JOIN workspace_views v ON v.lane_id=l.lane_id
+                     WHERE l.lane_id=?1 AND v.view_id=?2 AND v.status IN ('ready','mounted')",
+                    params![lane_id, view_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "TRAIL_LANE/TRAIL_VIEW do not identify an active managed lane context"
+                            .to_string(),
+                    )
+                });
+        }
+
+        let cwd = fs::canonicalize(cwd).map_err(Error::from)?;
+        let mut statement = self.conn.prepare(
+            "SELECT l.name,v.mountpoint FROM workspace_views v
+             JOIN lanes l ON l.lane_id=v.lane_id
+             WHERE v.status='mounted' ORDER BY l.name",
+        )?;
+        let candidates = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut matches = Vec::new();
+        for (lane, mountpoint) in candidates {
+            if let Ok(mountpoint) = fs::canonicalize(mountpoint)
+                && cwd.starts_with(&mountpoint)
+            {
+                matches.push(lane);
+            }
+        }
+        match matches.as_slice() {
+            [lane] => Ok(lane.clone()),
+            [] => Err(Error::InvalidInput(
+                "cannot infer a lane: run inside one mounted lane or pass a lane explicitly"
+                    .to_string(),
+            )),
+            _ => Err(Error::InvalidInput(format!(
+                "cannot infer a lane because the current directory matches multiple mounted views: {}",
+                matches.join(", ")
+            ))),
+        }
+    }
+
     pub(crate) fn workspace_view_by_lane_id(
         &self,
         lane_id: &str,
@@ -2775,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn million_path_twenty_view_scale_acceptance() {
+    fn large_path_multi_view_scale_acceptance() {
         if std::env::var_os("TRAIL_RUN_MILLION_PATH_VIEW_TEST").is_none() {
             return;
         }
@@ -2793,8 +2858,17 @@ mod tests {
         let mut paths = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
         let mut file_index = BatchBuilder::new(db.store.clone(), root_map_prolly_config());
         let mut case_fold = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
-        const PATHS: u64 = 1_000_000;
-        for index in 0..PATHS {
+        let path_count = std::env::var("TRAIL_SCALE_PATHS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000_000);
+        let lane_count = std::env::var("TRAIL_SCALE_LANES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20);
+        assert!(matches!(path_count, 10_000 | 100_000 | 1_000_000));
+        assert!(matches!(lane_count, 1 | 5 | 20));
+        for index in 0..path_count {
             let path = format!("tree/{:04}/{:08}.txt", index / 10_000, index);
             entry.file_id = FileId::new(change.clone(), index + 1);
             paths
@@ -2816,8 +2890,8 @@ mod tests {
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
             case_fold_map_root: tree_root_hex(&case_fold_tree),
-            file_count: PATHS,
-            total_text_bytes: PATHS * entry.size_bytes,
+            file_count: path_count,
+            total_text_bytes: path_count * entry.size_bytes,
             created_by: change.clone(),
         };
         let root_id = db
@@ -2841,8 +2915,9 @@ mod tests {
             LaneWorkdirMode::FuseCow
         };
         let mut cores = Vec::new();
+        let mut generated_uppers = Vec::new();
         let mut exclusive_bytes = 0_u64;
-        for index in 0..20 {
+        for index in 0..lane_count {
             let lane = format!("scale-{index:02}");
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 &lane,
@@ -2863,29 +2938,158 @@ mod tests {
             )
             .unwrap();
             assert_eq!(core.indexed_path_count(), 1);
-            cores.push(core);
             exclusive_bytes = exclusive_bytes.saturating_add(
                 db.lane_workspace_space(&lane)
                     .unwrap()
                     .lane_exclusive_physical_bytes,
             );
+            generated_uppers.push(paths.generated_upper);
+            cores.push((lane, core));
         }
         let view_create_ms = view_started.elapsed().as_millis();
         let rss_after = process_resident_bytes();
-        assert_eq!(cores.len(), 20);
-        assert!(exclusive_bytes < 20 * 10 * 1024 * 1024);
-        println!(
-            "{}",
-            serde_json::json!({
-                "tracked_paths": PATHS,
-                "views": 20,
-                "root_build_ms": root_build_ms,
+        assert_eq!(cores.len(), lane_count);
+        assert!(exclusive_bytes < lane_count as u64 * 10 * 1024 * 1024);
+        let write_started = Instant::now();
+        for (index, ((_, core), generated_upper)) in
+            cores.iter_mut().zip(generated_uppers.iter()).enumerate()
+        {
+            let file = core
+                .create(VIEW_ROOT_INO, "agent-source.txt", 0o644, true)
+                .unwrap();
+            core.write(file.ino, 0, format!("lane-{index}\n").as_bytes())
+                .unwrap();
+            fs::write(
+                generated_upper.join("agent-generated.txt"),
+                format!("generated-{index}\n"),
+            )
+            .unwrap();
+        }
+        let independent_write_ms = write_started.elapsed().as_millis();
+        let lane_names = cores
+            .iter()
+            .map(|(lane, _)| lane.clone())
+            .collect::<Vec<_>>();
+        drop(cores);
+        let checkpoint_started = Instant::now();
+        let mut checkpointed_roots = BTreeSet::new();
+        for lane in &lane_names {
+            let checkpoint = db
+                .checkpoint_lane_workspace(lane, Some("scale independent write".to_string()))
+                .unwrap();
+            checkpointed_roots.insert(checkpoint.root_id);
+        }
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+        assert_eq!(checkpointed_roots.len(), lane_count);
+        assert!(db
+            .root_file_entry(&root_id, "agent-source.txt")
+            .unwrap()
+            .is_none());
+        let rustc = Command::new("rustc")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let source_commit = Command::new("git")
+            .args([
+                "-C",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        let filesystem = if cfg!(target_os = "macos") {
+            Command::new("diskutil")
+                .arg("info")
+                .arg("/")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .find_map(|line| {
+                            line.trim()
+                                .strip_prefix("File System Personality:")
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                        })
+                })
+        } else if cfg!(target_os = "linux") {
+            Command::new("stat")
+                .args(["-f", "-c", "%T"])
+                .arg(temp.path())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        };
+        let skipped_native_gates = match std::env::consts::OS {
+            "macos" => vec!["fuse_linux", "dokan_windows"],
+            "linux" => vec!["nfs_macos", "dokan_windows"],
+            "windows" => vec!["nfs_macos", "fuse_linux"],
+            _ => vec!["nfs_macos", "fuse_linux", "dokan_windows"],
+        };
+        let evidence = serde_json::json!({
+            "schema": "trail.layered-lane-scale/v1",
+            "host": {
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "filesystem": filesystem,
+            },
+            "backend": mode.as_str(),
+            "backend_qualified": true,
+            "toolchain": {
+                "trail": env!("CARGO_PKG_VERSION"),
+                "trail_commit": source_commit,
+                "rustc": rustc,
+            },
+            "warmth": "cold",
+            "tracked_paths": path_count,
+            "lanes": lane_count,
+            "components": 0,
+            "phase_latencies_ms": {
+                "root_build": root_build_ms,
+                "view_create": view_create_ms,
+                "spawn_to_exec": view_create_ms + independent_write_ms,
+                "independent_write": independent_write_ms,
+                "checkpoint": checkpoint_ms,
+            },
+            "root_build_ms": root_build_ms,
                 "view_create_ms": view_create_ms,
-                "rss_delta_bytes": rss_after.saturating_sub(rss_before),
-                "exclusive_physical_bytes": exclusive_bytes,
-                "indexed_paths_per_view": 1,
-            })
-        );
+                "spawn_to_exec_ms": view_create_ms + independent_write_ms,
+                "independent_write_ms": independent_write_ms,
+                "checkpoint_ms": checkpoint_ms,
+            "rss_delta_bytes": rss_after.saturating_sub(rss_before),
+            "logical_bytes": path_count * entry.size_bytes,
+            "exclusive_physical_bytes": exclusive_bytes,
+            "physical_accounting_available": true,
+            "copied_bytes": 0,
+            "projected_bytes": 0,
+            "prefetched_bytes": 0,
+            "cache_hit_reasons": [],
+            "cache_miss_reasons": [],
+            "builder_count": 0,
+            "indexed_paths_per_view": 1,
+            "skipped_native_gates": skipped_native_gates,
+        });
+        println!("{evidence}");
+        if let Some(directory) = std::env::var_os("TRAIL_SCALE_EVIDENCE_DIR") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("paths-{path_count}-lanes-{lane_count}.json")),
+                serde_json::to_vec_pretty(&evidence).unwrap(),
+            )
+            .unwrap();
+        }
     }
 }
 

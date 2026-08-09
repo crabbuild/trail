@@ -116,20 +116,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: ./scripts/install-dokany.ps1
       - shell: pwsh
         run: |
           cmake --version
           cargo test -p trail windows_arguments_follow_command_line_to_argv_w_quoting -- --nocapture
           cargo test -p trail windows_recipe_publication_rejects_hard_link_aliases -- --nocapture
-          $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
-          cargo test -p trail real_windows_cmake_build_and_clean_stay_lane_private -- --nocapture
-          cargo test -p trail real_windows_python_venvs_embed_lane_paths_and_remain_isolated -- --nocapture
-          cargo test -p trail failed_mounted_initializer_preserves_previous_generation_and_real_uppers -- --nocapture
-          cargo test -p trail killing_mounted_python_initialization_never_exposes_a_partial_generation -- --nocapture
-          cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
-      - run: ./scripts/verify-windows-command-recipe-sandbox.ps1
-      - run: ./scripts/verify-windows-environment-adapter-plugin.ps1
 
   nfs-conformance:
     runs-on: macos-latest
@@ -196,6 +187,13 @@ jobs:
           cargo test -p trail dokan_adapter_runs_shared_mounted_view_suite -- --nocapture
           cargo test -p trail foreground_dokan_mount_stops_through_a_separate_trail_handle -- --nocapture
           cargo test -p trail daemon_owned_dokan_mount_returns_ready_and_unmounts_asynchronously -- --nocapture
+          cargo test -p trail real_windows_cmake_build_and_clean_stay_lane_private -- --nocapture
+          cargo test -p trail real_windows_python_venvs_embed_lane_paths_and_remain_isolated -- --nocapture
+          cargo test -p trail failed_mounted_initializer_preserves_previous_generation_and_real_uppers -- --nocapture
+          cargo test -p trail killing_mounted_python_initialization_never_exposes_a_partial_generation -- --nocapture
+          cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
+      - run: ./scripts/verify-windows-command-recipe-sandbox.ps1
+      - run: ./scripts/verify-windows-environment-adapter-plugin.ps1
 
   million-path-scale:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_scale }}

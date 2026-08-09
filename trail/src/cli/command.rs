@@ -327,20 +327,33 @@ mod tests {
     }
 
     #[test]
-    fn environment_sync_defaults_to_auto_detection_and_accepts_a_component_root() {
-        let cli = Cli::try_parse_from(["trail", "env", "sync", "lane-a", "--path", "apps/web"])
-            .expect("environment sync command should parse");
+    fn environment_sync_component_defaults_to_auto_detection() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "env",
+            "sync",
+            "component",
+            "web",
+            "--lane",
+            "lane-a",
+            "--path",
+            "apps/web",
+        ])
+        .expect("environment sync command should parse");
 
         let Command::Env(EnvironmentCommand {
-            command: EnvironmentSubcommand::Sync(args),
+            command:
+                EnvironmentSubcommand::Sync(EnvironmentSyncCommand {
+                    command: EnvironmentSyncSubcommand::Component(args),
+                }),
         }) = cli.command
         else {
             panic!("expected environment sync command");
         };
-        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.lane.as_deref(), Some("lane-a"));
         assert_eq!(args.adapter, "auto");
         assert_eq!(args.path.as_deref(), Some("apps/web"));
-        assert_eq!(args.component, None);
+        assert_eq!(args.component, "web");
     }
 
     #[test]
@@ -349,6 +362,9 @@ mod tests {
             "trail",
             "env",
             "sync",
+            "component",
+            "python",
+            "--lane",
             "lane-a",
             "--adapter",
             "example/python@1",
@@ -356,28 +372,35 @@ mod tests {
         .expect("environment sync command should parse");
 
         let Command::Env(EnvironmentCommand {
-            command: EnvironmentSubcommand::Sync(args),
+            command:
+                EnvironmentSubcommand::Sync(EnvironmentSyncCommand {
+                    command: EnvironmentSyncSubcommand::Component(args),
+                }),
         }) = cli.command
         else {
             panic!("expected environment sync command");
         };
         assert_eq!(args.adapter, "example/python@1");
         assert_eq!(args.path, None);
-        assert_eq!(args.component, None);
+        assert_eq!(args.component, "python");
     }
 
     #[test]
     fn environment_sync_all_accepts_a_discovery_root() {
-        let cli = Cli::try_parse_from(["trail", "env", "sync-all", "lane-a", "--path", "apps"])
-            .expect("environment sync-all command should parse");
+        let cli = Cli::try_parse_from(["trail", "env", "sync", "all", "lane-a", "--path", "apps"])
+            .expect("environment sync all command should parse");
         let Command::Env(EnvironmentCommand {
-            command: EnvironmentSubcommand::SyncAll(args),
+            command:
+                EnvironmentSubcommand::Sync(EnvironmentSyncCommand {
+                    command: EnvironmentSyncSubcommand::All(args),
+                }),
         }) = cli.command
         else {
-            panic!("expected environment sync-all command");
+            panic!("expected environment sync all command");
         };
-        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.lane.as_deref(), Some("lane-a"));
         assert_eq!(args.path.as_deref(), Some("apps"));
+        assert!(Cli::try_parse_from(["trail", "env", "sync-all", "lane-a"]).is_err());
     }
 
     #[test]

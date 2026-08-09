@@ -75,6 +75,17 @@ pub enum WorkdirBackend {
     Virtual,
 }
 
+/// Platform capability evidence used before admitting an automatic layered lane.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayeredBackendPrerequisiteReport {
+    pub platform: String,
+    pub backend: Option<String>,
+    pub required_service: String,
+    pub mount_root: Option<String>,
+    pub qualified: bool,
+    pub remediation: Option<String>,
+}
+
 impl WorkdirBackend {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -153,6 +164,35 @@ pub struct LaneSpawnReport {
     pub materialization: Option<MaterializationReport>,
     pub sparse_paths: Vec<String>,
     pub transparent_cow_available: bool,
+    pub backend_prerequisites: LayeredBackendPrerequisiteReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_inheritance: Option<EnvironmentInheritanceReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentOutputInheritanceDecisionReport {
+    pub component_id: String,
+    pub output_name: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub decision: EnvironmentComponentDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_id: Option<String>,
+    pub storage_identity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentInheritanceReport {
+    pub parent_lane_id: String,
+    pub parent_generation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_generation_id: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub outputs: Vec<EnvironmentOutputInheritanceDecisionReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -380,12 +420,193 @@ pub struct EnvironmentComponentStateReport {
     pub updated_at: i64,
 }
 
+/// Storage and mutation semantics for one adapter-owned environment output.
+///
+/// The policy is framework-neutral: adapters describe whether bytes are
+/// immutable, seeded with a private copy-on-write upper, lane-private, or
+/// disposable. Trail owns the corresponding publication and mount behavior.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentOutputPolicy {
+    ImmutableShared,
+    #[default]
+    ImmutableSeedPrivate,
+    WritablePrivate,
+    Disposable,
+}
+
+impl EnvironmentOutputPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ImmutableShared => "immutable_shared",
+            Self::ImmutableSeedPrivate => "immutable_seed_private",
+            Self::WritablePrivate => "writable_private",
+            Self::Disposable => "disposable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "immutable_shared" => Some(Self::ImmutableShared),
+            "immutable_seed_private" => Some(Self::ImmutableSeedPrivate),
+            "writable_private" => Some(Self::WritablePrivate),
+            "disposable" => Some(Self::Disposable),
+            _ => None,
+        }
+    }
+
+    pub fn has_immutable_layer(self) -> bool {
+        matches!(self, Self::ImmutableShared | Self::ImmutableSeedPrivate)
+    }
+
+    pub fn has_private_upper(self) -> bool {
+        matches!(
+            self,
+            Self::ImmutableSeedPrivate | Self::WritablePrivate | Self::Disposable
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentReuseMode {
+    None,
+    #[default]
+    Exact,
+    Compatible,
+}
+
+impl EnvironmentReuseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Exact => "exact",
+            Self::Compatible => "compatible",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "exact" => Some(Self::Exact),
+            "compatible" => Some(Self::Compatible),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentSharingScope {
+    Lane,
+    #[default]
+    Workspace,
+    Host,
+}
+
+impl EnvironmentSharingScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lane => "lane",
+            Self::Workspace => "workspace",
+            Self::Host => "host",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "lane" => Some(Self::Lane),
+            "workspace" => Some(Self::Workspace),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentPublicationTrigger {
+    #[default]
+    Never,
+    Manual,
+    OnSync,
+    SuccessfulGate,
+}
+
+impl EnvironmentPublicationTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Manual => "manual",
+            Self::OnSync => "on_sync",
+            Self::SuccessfulGate => "successful_gate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "never" => Some(Self::Never),
+            "manual" => Some(Self::Manual),
+            "on_sync" => Some(Self::OnSync),
+            "successful_gate" => Some(Self::SuccessfulGate),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentComponentDecision {
+    Reused,
+    Built,
+    Private,
+    Rejected,
+    Failed,
+}
+
+impl EnvironmentComponentDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Built => "built",
+            Self::Private => "private",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentRebuildReason {
+    Missing,
+    InputChanged,
+    UpstreamChanged,
+    ToolChanged,
+    PolicyChanged,
+    PlatformChanged,
+    Corrupt,
+    Revoked,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentGenerationOutputReport {
     pub name: String,
-    pub policy: String,
+    pub policy: EnvironmentOutputPolicy,
+    #[serde(default)]
+    pub reuse: EnvironmentReuseMode,
+    #[serde(default)]
+    pub scope: EnvironmentSharingScope,
+    #[serde(default)]
+    pub publish: EnvironmentPublicationTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     pub storage_identity: String,
     pub layer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_id: Option<String>,
     pub mount_path: String,
     pub layer_subpath: String,
 }
@@ -624,7 +845,12 @@ pub struct EnvironmentPlanOutputReport {
     pub name: String,
     pub output_path: String,
     pub mount_path: String,
-    pub policy: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub reuse: EnvironmentReuseMode,
+    pub scope: EnvironmentSharingScope,
+    pub publish: EnvironmentPublicationTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -660,6 +886,41 @@ pub struct EnvironmentPlanReport {
 pub struct EnvironmentSyncReport {
     pub generation: EnvironmentGenerationReport,
     pub layers: Vec<WorkspaceLayerReport>,
+    #[serde(default)]
+    pub decisions: Vec<EnvironmentCacheDecisionReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentCacheDecisionReport {
+    pub component_id: String,
+    pub desired_key: String,
+    pub storage_identity: Option<String>,
+    pub decision: EnvironmentComponentDecision,
+    pub decision_source: String,
+    pub rebuild_reason: Option<EnvironmentRebuildReason>,
+    #[serde(default)]
+    pub identity_edges: Vec<EnvironmentStaleChangeReport>,
+    pub bytes_avoided: Option<u64>,
+    pub bytes_written: Option<u64>,
+}
+
+/// Durable result of turning one quiesced lane-private output into a reusable
+/// immutable layer. The private source remains in place after publication.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPromotionReport {
+    pub publication_id: String,
+    pub lane_id: String,
+    pub view_id: String,
+    pub component_id: String,
+    pub output_name: String,
+    pub trigger: EnvironmentPublicationTrigger,
+    pub phase: String,
+    pub predecessor_generation_id: String,
+    pub successor_generation_id: String,
+    pub source_root: ObjectId,
+    pub output_identity: String,
+    pub manifest_object_id: String,
+    pub layer: WorkspaceLayerReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -746,6 +1007,26 @@ pub struct ManagedExecutionPhaseReceipt {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentHotPathEntry {
+    pub layer_id: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnvironmentPrefetchReport {
+    pub matched: bool,
+    pub cancelled: bool,
+    pub entries_considered: u64,
+    pub entries_prefetched: u64,
+    pub bytes_prefetched: u64,
+    pub entry_limit: u64,
+    pub byte_limit: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1219,5 +1500,62 @@ mod workdir_mode_tests {
         assert_eq!(report.clone_count, 0);
         assert_eq!(report.physical_sharing, PhysicalSharing::Unknown);
         assert_eq!(report.physical_sharing_evidence, "");
+    }
+
+    #[test]
+    fn environment_artifact_contract_enums_are_stable_and_reject_unknown_values() {
+        for (policy, wire) in [
+            (EnvironmentOutputPolicy::ImmutableShared, "immutable_shared"),
+            (
+                EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                "immutable_seed_private",
+            ),
+            (EnvironmentOutputPolicy::WritablePrivate, "writable_private"),
+            (EnvironmentOutputPolicy::Disposable, "disposable"),
+        ] {
+            assert_eq!(policy.as_str(), wire);
+            assert_eq!(EnvironmentOutputPolicy::parse(wire), Some(policy));
+            assert_eq!(serde_json::to_value(policy).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<EnvironmentOutputPolicy>(wire.into()).unwrap(),
+                policy
+            );
+        }
+        assert_eq!(EnvironmentOutputPolicy::parse("shared_mutable"), None);
+        assert!(
+            serde_json::from_value::<EnvironmentOutputPolicy>("shared_mutable".into()).is_err()
+        );
+
+        for (mode, wire) in [
+            (EnvironmentReuseMode::None, "none"),
+            (EnvironmentReuseMode::Exact, "exact"),
+            (EnvironmentReuseMode::Compatible, "compatible"),
+        ] {
+            assert_eq!(mode.as_str(), wire);
+            assert_eq!(EnvironmentReuseMode::parse(wire), Some(mode));
+        }
+        for (scope, wire) in [
+            (EnvironmentSharingScope::Lane, "lane"),
+            (EnvironmentSharingScope::Workspace, "workspace"),
+            (EnvironmentSharingScope::Host, "host"),
+        ] {
+            assert_eq!(scope.as_str(), wire);
+            assert_eq!(EnvironmentSharingScope::parse(wire), Some(scope));
+        }
+        for (trigger, wire) in [
+            (EnvironmentPublicationTrigger::Never, "never"),
+            (EnvironmentPublicationTrigger::Manual, "manual"),
+            (EnvironmentPublicationTrigger::OnSync, "on_sync"),
+            (
+                EnvironmentPublicationTrigger::SuccessfulGate,
+                "successful_gate",
+            ),
+        ] {
+            assert_eq!(trigger.as_str(), wire);
+            assert_eq!(EnvironmentPublicationTrigger::parse(wire), Some(trigger));
+        }
+        assert!(EnvironmentReuseMode::parse("unsafe").is_none());
+        assert!(EnvironmentSharingScope::parse("organization").is_none());
+        assert!(EnvironmentPublicationTrigger::parse("always").is_none());
     }
 }

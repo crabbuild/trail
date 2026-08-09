@@ -50,18 +50,19 @@ generation activation. The first built-ins are:
 selectors, component kind, discovery markers, implementation provenance, stability, and
 description without probing the repository or host tools. Discovery obtains candidate
 manifest names from that metadata rather than a central ecosystem filename list.
-`trail env sync <lane>` auto-detects an unambiguous adapter, while `--adapter` resolves
-one component explicitly. `trail env discover` enumerates nested component proposals
+`trail env sync component <component> --lane <lane>` resolves one component
+explicitly, while `trail env discover` enumerates nested component proposals
 without launching ecosystem tools or repository code; installed plugin planners run only
-inside the capability-free sandbox. `trail env sync-all` builds every
+inside the capability-free sandbox. `trail env sync all [<lane>]` builds every
 proposal before atomically activating all mounts as one generation. `trail env status`
 reports logical component identity separately from adapter identity. CLI, HTTP/OpenAPI,
 MCP, and Rust APIs share this state. Existing `trail deps` behavior remains a Node
 compatibility surface.
 
 Command recipes and v1/v2 plugins may declare stable logical component dependencies.
-`sync-all` validates missing nodes, duplicate/self edges, complete cycles, and mount
-collisions before running a command; it then builds in deterministic topological order.
+`sync all` validates missing nodes, duplicate/self edges, complete cycles, and mount
+collisions before running a command; it then runs a bounded deterministic ready queue,
+building independent nodes concurrently and returning canonical topological order.
 Legacy `depends_on` and protocol-v1 dependencies mean `build_requires`. Protocol v2 and
 repository recipes can explicitly select `build_requires`, `runtime_requires`,
 `binds_after`, or `invalidates_with`. Trail adds upstream keys for `build_requires` and
@@ -71,17 +72,17 @@ key. Replacing a runtime/order-only provider atomically advances that generation
 while leaving the consumer ready. Replanning an identity-bearing upstream makes only
 identity descendants stale with an exact edge-level explanation. A single
 component sync requires every dependency to be ready in the lane and points users to
-`sync-all` otherwise; replacing an upstream component alone immediately marks mounted
+`sync all` otherwise; replacing an upstream component alone immediately marks mounted
 identity descendants stale without rewriting the dependency keys they were built against.
 `env graph` renders that finalized desired graph through CLI, Rust, HTTP/OpenAPI, and
 MCP before synchronization, including topological indices, component keys, output
 ownership, and exact upstream-key edges without publishing artifacts. CLI, HTTP, and MCP
 page by target node with `offset`, `limit`, total node/edge counts, and `next_offset`;
 the Rust API also exposes the complete in-process graph.
-A repository-wide `sync-all` also treats absence as desired state: components removed
+A repository-wide `env sync all` also treats absence as desired state: components removed
 from discovery are unbound with crash-recoverable upper resets in the same activation,
 and deleting the final component creates an inspectable empty generation. A scoped
-`sync-all --path` never retires components outside that scope.
+`env sync all --path` never retires components outside that scope.
 
 ### Lane fork inheritance
 
@@ -250,7 +251,7 @@ The authoring loop is:
 trail env discover <lane>
 trail env graph <lane>
 trail env plan <lane> --component api.protobuf
-trail env sync <lane> --component api.protobuf
+trail env sync component api.protobuf --lane <lane>
 trail env status <lane>
 ```
 
@@ -302,7 +303,7 @@ trail env plugin install path/to/package
 trail env adapters
 trail env discover <lane>
 trail env plan <lane> --adapter namespace/name@1
-trail env sync <lane> --adapter namespace/name@1
+trail env sync component <component> --lane <lane> --adapter namespace/name@1
 trail env plugin remove namespace/name@1
 ```
 
@@ -726,7 +727,7 @@ expansion, and `trail/command@1` components. Each command component currently re
   `build_requires`) or typed `[[component.edge]]` entries with `component` and `type`;
   supported types are `build_requires`, `runtime_requires`, `binds_after`, and
   `invalidates_with`, and every target must be present in the same discovered graph for
-  `sync-all`;
+  `env sync all`;
 - exact file/directory inputs or repository-relative globs, all with `role = "identity"`
   and `format = "bytes"`;
 - between one and 32 named `kind = "generated"` outputs using
@@ -741,7 +742,10 @@ expansion, and `trail/command@1` components. Each command component currently re
 and grants before execution. On macOS the command runs under `sandbox-exec`. On Linux a
 fresh Trail helper applies a hard-requirement Landlock filesystem allowlist and a
 seccomp filter that denies socket, namespace, kernel-module, ptrace, BPF, io_uring, and
-related escape syscalls before executing the selected program. On Windows the helper
+related escape syscalls before executing the selected program. Dynamically linked Linux
+programs receive an additional exact read/execute grant for the bounded, canonical ELF
+interpreter declared by `PT_INTERP`; system library hierarchies remain read-only and
+non-executable. On Windows the helper
 creates an ephemeral capability-free AppContainer, grants its SID read/execute access to
 the staged root and modify access only to output/HOME/tmp, launches the exact executable
 suspended, assigns it to a kill-on-close Job Object with an active-process limit of one,
@@ -754,7 +758,7 @@ verifier covering successful publication and reuse plus denied host reads, undec
 writes, network, child processes, and shells; that native runner, rather than a
 cross-compile, is the release evidence for AppContainer and Dokan integration.
 When several command components share a root, `--component <id>` selects one for
-`env plan` or `env sync`; `env sync-all` continues to compose every non-conflicting
+`env plan` or `env sync component`; `env sync all` continues to compose every non-conflicting
 component atomically in deterministic dependency order.
 
 ### Includes and profiles
@@ -994,7 +998,7 @@ ownership, generation provenance, mounted-view classification, and crash recover
 build inside the lane:
 
 ```sh
-trail env sync <lane> --adapter trail/cmake-build@1
+trail env sync component cmake.build --lane <lane> --adapter trail/cmake-build@1
 trail lane exec <lane> -- cmake -S . -B build -G Ninja
 trail lane exec <lane> -- cmake --build build
 ```
@@ -1030,7 +1034,7 @@ the directory across a compatible re-sync. Synchronization automatically runs
 `python -m venv --without-pip .venv` at the lane's final mountpoint:
 
 ```sh
-trail env sync <lane> --adapter trail/python-venv@1
+trail env sync component python.venv --lane <lane> --adapter trail/python-venv@1
 # Optionally let a lockfile-aware tool populate the initialized private path:
 trail lane exec <lane> -- uv sync --frozen
 ```
@@ -1048,7 +1052,7 @@ Real Linux/FUSE, macOS/NFS, and Windows/Dokan conformance creates two virtual
 environments, verifies that `sys.prefix` identifies each mounted lane, mutates one
 environment, and requires the other lane to remain unchanged. It also verifies that a
 compatible re-sync preserves the private environment and creates no shared layer.
-Additional native fixtures cover multi-component `sync-all`, initializer failure,
+Additional native fixtures cover multi-component `env sync all`, initializer failure,
 undeclared source writes, kill-point recovery, and abandoned-candidate cleanup.
 
 Sharing interpreter distributions and wheel/download content safely remains a separate

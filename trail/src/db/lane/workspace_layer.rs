@@ -1,6 +1,7 @@
-use super::workdir::{PreparedLayerMountReset, ViewCore};
+use super::workdir::{classify_view_path, PreparedLayerMountReset, ViewCore, ViewPathClass};
 use super::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 
 const LAYER_BUILD_LEASE_SECS: i64 = 300;
@@ -64,8 +65,14 @@ pub(crate) struct EnvironmentLayerActivation {
 pub(crate) struct EnvironmentLayerOutputActivation {
     pub(crate) name: String,
     pub(crate) mount_path: String,
-    pub(crate) policy: String,
+    pub(crate) policy: EnvironmentOutputPolicy,
+    pub(crate) reuse: EnvironmentReuseMode,
+    pub(crate) scope: EnvironmentSharingScope,
+    pub(crate) publish: EnvironmentPublicationTrigger,
+    pub(crate) gate: Option<String>,
     pub(crate) binding_identity: String,
+    pub(crate) manifest_object_id: Option<String>,
+    pub(crate) publication_id: Option<String>,
     /// Staged initial content for a replaced writable-private output. None
     /// means preserve the compatible lane-private directory in place.
     pub(crate) private_seed: Option<PathBuf>,
@@ -84,12 +91,31 @@ struct WorkspaceLayerManifest {
     adapter: String,
     adapter_version: u32,
     logical_bytes: u64,
+    #[serde(default)]
+    entry_count: u64,
+    #[serde(default)]
+    entry_pages: Vec<String>,
+    #[serde(default)]
     entries: BTreeMap<String, WorkspaceLayerEntry>,
     platform: String,
     architecture: String,
     portability_scope: String,
     producer_version: String,
     created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceLayerManifestPage {
+    version: u16,
+    entries: BTreeMap<String, WorkspaceLayerEntry>,
+}
+
+fn workspace_layer_manifest_entry_count(manifest: &WorkspaceLayerManifest) -> u64 {
+    if manifest.entry_pages.is_empty() && manifest.entry_count == 0 {
+        manifest.entries.len() as u64
+    } else {
+        manifest.entry_count
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,11 +164,573 @@ std::thread_local! {
 }
 
 impl Trail {
+    /// Publish a declared manual lane-private output as an immutable cache layer.
+    /// The view must be idle; the mutation barrier remains held from the source
+    /// identity check through the completed snapshot.
+    pub fn promote_workspace_environment_output(
+        &self,
+        lane: &str,
+        component_id: &str,
+        output_name: &str,
+    ) -> Result<EnvironmentPromotionReport> {
+        let mutation_authority = crate::db::change_ledger::command_authority_enabled()
+            || crate::db::workspace_lock_is_owned_by_current_process(&self.db_dir);
+        let _lock = if mutation_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
+        self.promote_workspace_environment_output_with_evidence(
+            lane,
+            component_id,
+            output_name,
+            EnvironmentPublicationTrigger::Manual,
+            None,
+            None,
+        )
+    }
+
+    fn promote_workspace_environment_output_with_evidence(
+        &self,
+        lane: &str,
+        component_id: &str,
+        output_name: &str,
+        expected_trigger: EnvironmentPublicationTrigger,
+        expected_gate: Option<&str>,
+        producer_receipt: Option<&serde_json::Value>,
+    ) -> Result<EnvironmentPromotionReport> {
+        validate_ref_segment(lane)?;
+        super::workspace_environment::validate_environment_component_identity(component_id)?;
+        if output_name.is_empty() || output_name.len() > 128 {
+            return Err(Error::InvalidInput(
+                "invalid environment output name".to_string(),
+            ));
+        }
+        self.recover_workspace_layer_publications()?;
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "lane `{lane}` does not have a layered workspace view"
+            ))
+        })?;
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref())
+            && process_matches_start_token(pid, token)
+        {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{}` has an active writer; stop or unmount it before promotion",
+                view.view_id
+            )));
+        }
+        let _barrier = ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?;
+        let branch = self.lane_branch(lane)?;
+        let head = self.get_ref(&branch.ref_name)?;
+        if head.root_id != view.base_root {
+            return Err(Error::InvalidInput(
+                "lane source changed after the active workspace view was prepared; synchronize the view before promotion"
+                    .to_string(),
+            ));
+        }
+        let predecessor = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id=?1",
+                params![&view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::InvalidInput("lane has no active environment generation".to_string())
+            })?;
+        let (policy, reuse, scope, trigger, gate, binding_identity, mount_path, component_key) =
+            self.conn
+                .query_row(
+                    "SELECT o.policy,o.reuse_mode,o.sharing_scope,o.publication_trigger,
+                            o.publication_gate,o.binding_identity,o.mount_path,s.attached_key
+                     FROM environment_component_output_bindings o
+                     JOIN environment_component_states s
+                       ON s.view_id=o.view_id AND s.component_id=o.component_id
+                     WHERE o.view_id=?1 AND o.component_id=?2 AND o.output_name=?3
+                       AND s.status='ready'",
+                    params![&view.view_id, component_id, output_name],
+                    |row| {
+                        Ok((
+                            row.get::<_, EnvironmentOutputPolicy>(0)?,
+                            row.get::<_, EnvironmentReuseMode>(1)?,
+                            row.get::<_, EnvironmentSharingScope>(2)?,
+                            row.get::<_, EnvironmentPublicationTrigger>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "lane `{lane}` has no ready output `{component_id}/{output_name}`"
+                    ))
+                })?;
+        if policy != EnvironmentOutputPolicy::WritablePrivate
+            || reuse != EnvironmentReuseMode::None
+            || scope != EnvironmentSharingScope::Lane
+        {
+            return Err(Error::InvalidInput(
+                "only a declared writable_private lane output can be promoted".to_string(),
+            ));
+        }
+        if trigger != expected_trigger || gate.as_deref() != expected_gate {
+            return Err(Error::InvalidInput(format!(
+                "output `{component_id}/{output_name}` publication evidence does not match its declared trigger/gate"
+            )));
+        }
+        let component_key = component_key.ok_or_else(|| {
+            Error::Corrupt("ready environment component has no attached key".to_string())
+        })?;
+        let source = safe_join(Path::new(&view.generated_upper), &mount_path)?;
+        let source_metadata = fs::symlink_metadata(&source).map_err(|error| {
+            Error::InvalidInput(format!(
+                "private output `{}` is unavailable for promotion: {error}",
+                source.display()
+            ))
+        })?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+            return Err(Error::InvalidPath {
+                path: source.to_string_lossy().into_owned(),
+                reason: "private output must be a real directory".to_string(),
+            });
+        }
+        // Bound the source walk before allocating staging space, then validate
+        // the quiesced snapshot again so publication never trusts a pre-copy
+        // check alone.
+        validate_promotable_output_tree(&source)?;
+        let output_identity = sha256_hex(
+            format!(
+                "environment-output-promotion-v1:{component_key}:{output_name}:{binding_identity}:{}",
+                head.root_id.0
+            )
+            .as_bytes(),
+        );
+        let publication_id = format!(
+            "envpub_{}",
+            &sha256_hex(
+                format!(
+                    "{}:{predecessor}:{component_id}:{output_name}:{output_identity}:{}",
+                    view.view_id,
+                    now_nanos()
+                )
+                .as_bytes()
+            )[..32]
+        );
+        let staging_relative = format!("cache/publications/{publication_id}");
+        let staging_path = safe_join(&self.db_dir, &staging_relative)?;
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO workspace_layer_publications(
+                 publication_id,view_id,predecessor_generation_id,successor_generation_id,
+                 component_id,output_name,source_root,output_identity,trigger,gate_name,
+                 producer_receipt_json,phase,owner_pid,owner_start_token,staging_path,
+                 created_at,updated_at)
+             VALUES(?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,'prepared',?11,?12,?13,?14,?14)",
+            params![
+                &publication_id,
+                &view.view_id,
+                &predecessor,
+                component_id,
+                output_name,
+                head.root_id.0,
+                &output_identity,
+                trigger.as_str(),
+                &gate,
+                producer_receipt.map(serde_json::to_vec).transpose()?,
+                std::process::id(),
+                current_process_start_token(),
+                staging_relative,
+                now
+            ],
+        )?;
+        let layer_key = WorkspaceLayerKeyV1 {
+            kind: "generated".to_string(),
+            adapter: "environment-output-promotion".to_string(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([
+                ("source_root".to_string(), head.root_id.0.clone()),
+                ("component_key".to_string(), component_key),
+                ("output_name".to_string(), output_name.to_string()),
+                ("output_identity".to_string(), output_identity.clone()),
+                ("policy".to_string(), "immutable_seed_private".to_string()),
+            ]),
+            tool_versions: BTreeMap::new(),
+            platform: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            portability_scope: "workspace".to_string(),
+            strategy: "quiesced-private-output-promotion-v1".to_string(),
+        };
+
+        let published = (|| -> Result<EnvironmentPromotionReport> {
+            // The view is idle and its exclusive mutation barrier is held.
+            // Durably flush the selected private tree before taking the owned
+            // snapshot so every backend enters publication at the same fence.
+            sync_layer_tree(&source)?;
+            copy_layer_tree(&source, &staging_path)?;
+            self.conn.execute(
+                "UPDATE workspace_layer_publications SET phase='snapshotted',updated_at=?1 WHERE publication_id=?2 AND phase='prepared'",
+                params![now_ts(), &publication_id],
+            )?;
+            validate_promotable_output_tree(&staging_path)?;
+            self.conn.execute(
+                "UPDATE workspace_layer_publications SET phase='validated',updated_at=?1 WHERE publication_id=?2 AND phase='snapshotted'",
+                params![now_ts(), &publication_id],
+            )?;
+            let layer = self.publish_workspace_layer_from_directory_under_write_lock(
+                &layer_key,
+                &staging_path,
+            )?;
+            let manifest_object_id = self.conn.query_row(
+                "SELECT manifest_object_id FROM workspace_layers WHERE layer_id=?1 AND state='ready'",
+                params![&layer.layer_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            self.conn.execute(
+                "UPDATE workspace_layer_publications SET phase='published',manifest_object_id=?1,
+                 layer_id=?2,logical_bytes=?3,physical_bytes=?4,updated_at=?5
+                 WHERE publication_id=?6 AND phase='validated'",
+                params![
+                    &manifest_object_id,
+                    &layer.layer_id,
+                    layer.logical_bytes,
+                    layer.physical_bytes,
+                    now_ts(),
+                    &publication_id
+                ],
+            )?;
+
+            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let activation = (|| -> Result<String> {
+                let active = self.conn.query_row(
+                    "SELECT generation_id FROM environment_view_generations WHERE view_id=?1",
+                    params![&view.view_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                if active != predecessor {
+                    return Err(Error::InvalidInput(
+                        "active environment generation changed during promotion".to_string(),
+                    ));
+                }
+                self.conn.execute(
+                    "UPDATE environment_component_output_bindings
+                     SET manifest_object_id=?1,publication_id=?2,updated_at=?3
+                     WHERE view_id=?4 AND component_id=?5 AND output_name=?6
+                       AND binding_identity=?7",
+                    params![
+                        &manifest_object_id,
+                        &publication_id,
+                        now_ts(),
+                        &view.view_id,
+                        component_id,
+                        output_name,
+                        &binding_identity
+                    ],
+                )?;
+                let successor = self.record_environment_generation(lane, &view.view_id)?;
+                self.conn.execute(
+                    "UPDATE environment_generation_outputs
+                     SET layer_id=?1,manifest_object_id=?2,publication_id=?3
+                     WHERE generation_id=?4 AND component_id=?5 AND output_name=?6",
+                    params![
+                        &layer.layer_id,
+                        &manifest_object_id,
+                        &publication_id,
+                        &successor,
+                        component_id,
+                        output_name
+                    ],
+                )?;
+                self.conn.execute(
+                    "UPDATE workspace_layer_publications SET phase='activated',successor_generation_id=?1,
+                     updated_at=?2,finished_at=?2 WHERE publication_id=?3 AND phase='published'",
+                    params![&successor, now_ts(), &publication_id],
+                )?;
+                Ok(successor)
+            })();
+            let successor = match activation {
+                Ok(successor) => {
+                    self.conn.execute_batch("COMMIT;")?;
+                    successor
+                }
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
+            };
+            if staging_path.is_dir() {
+                let _ = fs::remove_dir_all(&staging_path);
+            }
+            Ok(EnvironmentPromotionReport {
+                publication_id: publication_id.clone(),
+                lane_id: branch.lane_id.clone(),
+                view_id: view.view_id.clone(),
+                component_id: component_id.to_string(),
+                output_name: output_name.to_string(),
+                trigger,
+                phase: "activated".to_string(),
+                predecessor_generation_id: predecessor.clone(),
+                successor_generation_id: successor,
+                source_root: head.root_id.clone(),
+                output_identity: output_identity.clone(),
+                manifest_object_id,
+                layer,
+            })
+        })();
+        if let Err(error) = &published {
+            let _ = self.conn.execute(
+                "UPDATE workspace_layer_publications SET phase='failed',error_code='promotion_failed',
+                 error_message=?1,updated_at=?2,finished_at=?2
+                 WHERE publication_id=?3 AND phase NOT IN ('activated','recovered')",
+                params![error.to_string(), now_ts(), &publication_id],
+            );
+        }
+        published
+    }
+
+    pub(crate) fn promote_successful_gate_environment_outputs(
+        &self,
+        lane: &str,
+        gate_name: &str,
+        producer_receipt: &serde_json::Value,
+    ) -> Result<Vec<EnvironmentPromotionReport>> {
+        let mutation_authority = crate::db::change_ledger::command_authority_enabled()
+            || crate::db::workspace_lock_is_owned_by_current_process(&self.db_dir);
+        let _lock = if mutation_authority {
+            None
+        } else {
+            Some(self.acquire_write_lock()?)
+        };
+        let Some(view) = self.lane_workspace_view(lane)? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.conn.prepare(
+            "SELECT component_id,output_name FROM environment_component_output_bindings
+             WHERE view_id=?1 AND policy='writable_private'
+               AND publication_trigger='successful_gate' AND publication_gate=?2
+             ORDER BY component_id,output_name",
+        )?;
+        let outputs = statement
+            .query_map(params![&view.view_id, gate_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        outputs
+            .into_iter()
+            .map(|(component, output)| {
+                self.promote_workspace_environment_output_with_evidence(
+                    lane,
+                    &component,
+                    &output,
+                    EnvironmentPublicationTrigger::SuccessfulGate,
+                    Some(gate_name),
+                    Some(producer_receipt),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn recover_workspace_layer_publications(&self) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT publication_id,owner_pid,owner_start_token,staging_path,phase
+             FROM workspace_layer_publications
+             WHERE phase IN ('prepared','snapshotted','validated','published')
+             ORDER BY publication_id",
+        )?;
+        let attempts = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (publication_id, pid, token, staging, phase) in attempts {
+            if process_matches_start_token(pid, &token) {
+                continue;
+            }
+            let staging = publication_staging_path(&self.db_dir, &publication_id, &staging)?;
+            if staging.exists() {
+                fs::remove_dir_all(staging)?;
+            }
+            self.conn.execute(
+                "UPDATE workspace_layer_publications SET phase='recovered',
+                 error_code='owner_died',error_message=?1,updated_at=?2,finished_at=?2
+                 WHERE publication_id=?3 AND phase=?4",
+                params![
+                    format!("recovered dead owner before activation from phase {phase}"),
+                    now_ts(),
+                    &publication_id,
+                    &phase
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_workspace_layer_publications_integrity(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT p.publication_id,p.view_id,p.predecessor_generation_id,
+                    p.successor_generation_id,p.trigger,p.gate_name,p.phase,p.staging_path,
+                    p.manifest_object_id,p.layer_id,l.manifest_object_id,l.state,g.view_id
+             FROM workspace_layer_publications p
+             LEFT JOIN workspace_layers l ON l.layer_id=p.layer_id
+             LEFT JOIN environment_generations g ON g.generation_id=p.successor_generation_id
+             ORDER BY p.publication_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut errors = Vec::new();
+        for (
+            id,
+            view_id,
+            predecessor,
+            successor,
+            trigger,
+            gate,
+            phase,
+            staging,
+            manifest,
+            layer,
+            layer_manifest,
+            layer_state,
+            successor_view,
+        ) in rows
+        {
+            if publication_staging_path(&self.db_dir, &id, &staging).is_err() {
+                errors.push(format!("{id}: staging path is not publication-owned"));
+            }
+            if trigger == "successful_gate" && gate.as_deref().unwrap_or_default().is_empty() {
+                errors.push(format!("{id}: successful_gate publication has no gate"));
+            }
+            if trigger != "successful_gate" && gate.is_some() {
+                errors.push(format!("{id}: non-gated publication records a gate"));
+            }
+            if phase == "activated" {
+                if successor.is_none() || manifest.is_none() || layer.is_none() {
+                    errors.push(format!(
+                        "{id}: activated publication lacks successor/layer provenance"
+                    ));
+                }
+                if successor_view.as_deref() != Some(&view_id) {
+                    errors.push(format!(
+                        "{id}: successor generation belongs to another view"
+                    ));
+                }
+                if layer_state.as_deref() != Some("ready") || layer_manifest != manifest {
+                    errors.push(format!(
+                        "{id}: activated layer or manifest is not ready and coherent"
+                    ));
+                }
+                if successor.as_deref() == Some(&predecessor) {
+                    errors.push(format!("{id}: successor generation equals its predecessor"));
+                }
+            } else if successor.is_some() {
+                errors.push(format!(
+                    "{id}: non-activated publication names a successor generation"
+                ));
+            }
+        }
+        Ok(errors)
+    }
+
+    pub(crate) fn validate_workspace_cache_authorities_integrity(&self) -> Result<Vec<String>> {
+        let mut errors = Vec::new();
+        let mut pin_statement = self.conn.prepare(
+            "SELECT p.pin_id,p.layer_id,l.state
+             FROM workspace_layer_pins p LEFT JOIN workspace_layers l ON l.layer_id=p.layer_id
+             WHERE p.expires_at IS NULL OR p.expires_at > unixepoch()
+             ORDER BY p.pin_id",
+        )?;
+        for row in pin_statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (pin_id, layer_id, state) = row?;
+            if state.as_deref() != Some("ready") {
+                errors.push(format!(
+                    "workspace layer pin {pin_id} references non-ready layer {layer_id}"
+                ));
+            }
+        }
+        drop(pin_statement);
+
+        let mut hot_statement = self.conn.prepare(
+            "SELECT hot_set_id,entries_json,entry_count,total_bytes
+             FROM environment_hot_sets ORDER BY hot_set_id",
+        )?;
+        for row in hot_statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })? {
+            let (hot_set_id, encoded, entry_count, total_bytes) = row?;
+            let entries: Vec<EnvironmentHotPathEntry> = match serde_json::from_slice(&encoded) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    errors.push(format!(
+                        "environment hot set {hot_set_id} is invalid: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let actual_bytes = entries
+                .iter()
+                .fold(0_u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+            if entries.len() as u64 != entry_count || actual_bytes != total_bytes {
+                errors.push(format!(
+                    "environment hot set {hot_set_id} accounting does not match its entries"
+                ));
+            }
+            for entry in entries {
+                if normalize_relative_path(&entry.path).is_err() {
+                    errors.push(format!(
+                        "environment hot set {hot_set_id} contains invalid path {}",
+                        entry.path
+                    ));
+                }
+            }
+        }
+        Ok(errors)
+    }
+
     pub(crate) fn inherit_workspace_environment_generation(
         &self,
         parent_lane_id: &str,
         child_lane_id: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<EnvironmentInheritanceReport>> {
         let parent_view = match self.workspace_view_by_lane_id(parent_lane_id)? {
             Some(view) => view,
             None => return Ok(None),
@@ -163,28 +751,21 @@ impl Trail {
             )
             .optional()?
         {
-            return Ok(Some(existing));
+            let _ = existing;
+            return Ok(None);
         }
         let parent_generation = self
             .conn
             .query_row(
-                "SELECT g.generation_id,g.source_root,g.specification_digest
+                "SELECT g.generation_id,g.specification_digest
                  FROM environment_view_generations active
                  JOIN environment_generations g ON g.generation_id=active.generation_id
                  WHERE active.view_id=?1 AND g.state='active'",
                 [&parent_view.view_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        let Some((parent_generation_id, parent_source_root, parent_specification_digest)) =
-            parent_generation
-        else {
+        let Some((parent_generation_id, parent_specification_digest)) = parent_generation else {
             self.insert_lane_event(
                 child_lane_id,
                 "lane_environment_inheritance",
@@ -198,21 +779,6 @@ impl Trail {
             )?;
             return Ok(None);
         };
-        if parent_source_root != child_view.base_root.0 {
-            self.insert_lane_event(
-                child_lane_id,
-                "lane_environment_inheritance",
-                None,
-                None,
-                &serde_json::json!({
-                    "parent_lane_id": parent_lane_id,
-                    "parent_generation_id": parent_generation_id,
-                    "status": "skipped",
-                    "reason": "source_root_mismatch"
-                }),
-            )?;
-            return Ok(None);
-        }
         let desired = self
             .workspace_environment_graph(child_lane_id, None)
             .ok()
@@ -269,75 +835,101 @@ impl Trail {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut inherited = Vec::new();
-        let mut decisions = Vec::new();
+        let mut decisions = Vec::<EnvironmentOutputInheritanceDecisionReport>::new();
         for component in candidates {
-            let mut rejection = None;
+            let mut component_rejection = None;
             if let Some(planned) = desired.get(&component.component_id) {
                 if planned.adapter_identity != component.adapter_identity {
-                    rejection = Some("adapter_identity_mismatch");
+                    component_rejection = Some("adapter_identity_mismatch");
                 } else if planned.kind != component.kind {
-                    rejection = Some("component_kind_mismatch");
+                    component_rejection = Some("component_kind_mismatch");
                 } else if planned.component_key != component.component_key {
-                    rejection = Some("component_key_mismatch");
-                } else if planned
-                    .outputs
-                    .iter()
-                    .any(|output| !output.policy.starts_with("immutable"))
-                {
-                    rejection = Some("output_policy_is_not_immutable");
+                    component_rejection = Some("component_key_mismatch");
                 }
             } else if !desired.is_empty() {
-                rejection = Some("component_not_discovered_in_child");
+                component_rejection = Some("component_not_discovered_in_child");
             }
-            if rejection.is_none() {
-                let mutable_outputs = self.conn.query_row(
-                    "SELECT COUNT(*) FROM environment_generation_outputs
-                     WHERE generation_id=?1 AND component_id=?2
-                       AND policy NOT LIKE 'immutable%'",
-                    params![&parent_generation_id, &component.component_id],
-                    |row| row.get::<_, i64>(0),
+
+            let outputs = {
+                let mut statement = self.conn.prepare(
+                    "SELECT output_name,policy,storage_identity,layer_id
+                     FROM environment_generation_outputs
+                     WHERE generation_id=?1 AND component_id=?2 ORDER BY output_name",
                 )?;
-                if mutable_outputs != 0 {
-                    rejection = Some("parent_output_policy_is_not_immutable");
-                }
+                statement
+                    .query_map(
+                        params![&parent_generation_id, &component.component_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, EnvironmentOutputPolicy>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let mut reusable_output = false;
+            for (output_name, policy, storage_identity, layer_id) in outputs {
+                let mut rejection = component_rejection;
+                let decision = if !policy.has_immutable_layer() {
+                    rejection = Some("fresh_lane_private_upper");
+                    EnvironmentComponentDecision::Private
+                } else if rejection.is_some() {
+                    EnvironmentComponentDecision::Rejected
+                } else if let Some(layer_id) = layer_id.as_deref() {
+                    match self.verify_workspace_layer_for_attach(layer_id) {
+                        Ok(layer)
+                            if inheritable_workspace_layer_scope(&layer.portability_scope) =>
+                        {
+                            reusable_output = true;
+                            EnvironmentComponentDecision::Reused
+                        }
+                        Ok(_) => {
+                            rejection = Some("unsupported_portability_scope");
+                            EnvironmentComponentDecision::Rejected
+                        }
+                        Err(_) => {
+                            rejection = Some("layer_verification_failed");
+                            EnvironmentComponentDecision::Rejected
+                        }
+                    }
+                } else {
+                    rejection = Some("immutable_output_has_no_layer");
+                    EnvironmentComponentDecision::Rejected
+                };
+                decisions.push(EnvironmentOutputInheritanceDecisionReport {
+                    component_id: component.component_id.clone(),
+                    output_name,
+                    policy,
+                    decision,
+                    reason: rejection.map(str::to_string),
+                    layer_id,
+                    storage_identity,
+                });
             }
-            if rejection.is_none()
-                && let Some(layer_id) = component.layer_id.as_deref()
-            {
-                match self.verify_workspace_layer_for_attach(layer_id) {
-                    Ok(layer) if inheritable_workspace_layer_scope(&layer.portability_scope) => {}
-                    Ok(_) => rejection = Some("unsupported_portability_scope"),
-                    Err(_) => rejection = Some("layer_verification_failed"),
-                }
-            }
-            let compatible = rejection.is_none();
-            decisions.push(serde_json::json!({
-                "component_id": component.component_id,
-                "adapter_identity": component.adapter_identity,
-                "component_key": component.component_key,
-                "layer_id": component.layer_id,
-                "status": if compatible { "inherited" } else { "rejected" },
-                "reason": rejection
-            }));
-            if compatible {
+            if reusable_output {
                 inherited.push(component);
             }
         }
         if inherited.is_empty() {
+            let report = EnvironmentInheritanceReport {
+                parent_lane_id: parent_lane_id.to_string(),
+                parent_generation_id: parent_generation_id.clone(),
+                child_generation_id: None,
+                status: "skipped".to_string(),
+                reason: Some("no_compatible_outputs".to_string()),
+                outputs: decisions,
+            };
             self.insert_lane_event(
                 child_lane_id,
                 "lane_environment_inheritance",
                 None,
                 None,
-                &serde_json::json!({
-                    "parent_lane_id": parent_lane_id,
-                    "parent_generation_id": parent_generation_id,
-                    "status": "skipped",
-                    "reason": "no_compatible_components",
-                    "components": decisions
-                }),
+                &serde_json::to_value(&report)?,
             )?;
-            return Ok(None);
+            return Ok(Some(report));
         }
 
         let generation_id = format!(
@@ -420,10 +1012,12 @@ impl Trail {
                 )?;
                 self.conn.execute(
                     "INSERT INTO environment_generation_outputs(
-                         generation_id,component_id,output_name,policy,storage_identity,
-                         layer_id,mount_path,layer_subpath)
-                     SELECT ?1,component_id,output_name,policy,storage_identity,
-                            layer_id,mount_path,layer_subpath
+                         generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+                         publication_trigger,publication_gate,storage_identity,layer_id,
+                         manifest_object_id,publication_id,mount_path,layer_subpath)
+                     SELECT ?1,component_id,output_name,policy,reuse_mode,sharing_scope,
+                            publication_trigger,publication_gate,storage_identity,layer_id,
+                            manifest_object_id,publication_id,mount_path,layer_subpath
                      FROM environment_generation_outputs
                      WHERE generation_id=?2 AND component_id=?3
                        AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
@@ -448,20 +1042,22 @@ impl Trail {
                 return Err(error);
             }
         }
+        let report = EnvironmentInheritanceReport {
+            parent_lane_id: parent_lane_id.to_string(),
+            parent_generation_id: parent_generation_id.clone(),
+            child_generation_id: Some(generation_id.clone()),
+            status: "inherited".to_string(),
+            reason: None,
+            outputs: decisions,
+        };
         self.insert_lane_event(
             child_lane_id,
             "lane_environment_inheritance",
             None,
             None,
-            &serde_json::json!({
-                "parent_lane_id": parent_lane_id,
-                "parent_generation_id": parent_generation_id,
-                "child_generation_id": generation_id,
-                "status": "inherited",
-                "components": decisions
-            }),
+            &serde_json::to_value(&report)?,
         )?;
-        Ok(Some(generation_id))
+        Ok(Some(report))
     }
 
     pub fn workspace_layer_cache_key(&self, key: &WorkspaceLayerKeyV1) -> Result<String> {
@@ -472,6 +1068,18 @@ impl Trail {
     pub(crate) fn build_workspace_layer_singleflight<F>(
         &self,
         key: &WorkspaceLayerKeyV1,
+        builder: F,
+    ) -> Result<WorkspaceLayerReport>
+    where
+        F: FnOnce(&Path) -> Result<PathBuf>,
+    {
+        self.build_workspace_layer_singleflight_with_cancel(key, &AtomicBool::new(false), builder)
+    }
+
+    pub(crate) fn build_workspace_layer_singleflight_with_cancel<F>(
+        &self,
+        key: &WorkspaceLayerKeyV1,
+        cancelled: &AtomicBool,
         builder: F,
     ) -> Result<WorkspaceLayerReport>
     where
@@ -491,6 +1099,11 @@ impl Trail {
         let token = format!("{}:{}", std::process::id(), current_process_start_token());
         let deadline = Instant::now() + Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64);
         let guard = loop {
+            if cancelled.load(AtomicOrdering::Acquire) {
+                return Err(Error::InvalidInput(format!(
+                    "cancelled while waiting for workspace layer key {cache_key}"
+                )));
+            }
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -518,6 +1131,11 @@ impl Trail {
                     if Instant::now() >= deadline {
                         return Err(Error::InvalidInput(format!(
                             "timed out waiting for workspace layer key {cache_key}"
+                        )));
+                    }
+                    if cancelled.load(AtomicOrdering::Acquire) {
+                        return Err(Error::InvalidInput(format!(
+                            "cancelled while waiting for workspace layer key {cache_key}"
                         )));
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -561,7 +1179,15 @@ impl Trail {
             }
         };
         self.enforce_workspace_cache_build_quota(&output)?;
-        let report = self.publish_workspace_layer_from_directory(key, &output)?;
+        // Different ready DAG nodes may finish their external builds at the
+        // same time.  Publication is intentionally serialized by the
+        // workspace lock, so a builder waits for that short commit boundary
+        // instead of treating another independent builder as a command
+        // conflict.
+        let report =
+            Self::with_write_lock_wait(Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64), || {
+                self.publish_workspace_layer_from_directory(key, &output)
+            })?;
         make_tree_writable(&build_dir);
         let _ = fs::remove_dir_all(&build_dir);
         drop(guard);
@@ -576,8 +1202,16 @@ impl Trail {
         key: &WorkspaceLayerKeyV1,
         source: &Path,
     ) -> Result<WorkspaceLayerReport> {
-        let cache_key = self.workspace_layer_cache_key(key)?;
         let _lock = self.acquire_write_lock()?;
+        self.publish_workspace_layer_from_directory_under_write_lock(key, source)
+    }
+
+    fn publish_workspace_layer_from_directory_under_write_lock(
+        &self,
+        key: &WorkspaceLayerKeyV1,
+        source: &Path,
+    ) -> Result<WorkspaceLayerReport> {
+        let cache_key = self.workspace_layer_cache_key(key)?;
         let layer_id = format!("layer_{}", &cache_key[..32]);
         let final_path = self.db_dir.join("cache/layers").join(&layer_id);
         if let Some(report) = self.workspace_layer_by_cache_key(&cache_key)? {
@@ -647,6 +1281,25 @@ impl Trail {
             test_crash_point("layer_after_staging_sync");
             let entries = scan_layer_entries(&staging, true)?;
             let logical_bytes = entries.values().map(|entry| entry.size_bytes).sum();
+            let entry_count = entries.len() as u64;
+            let mut entry_pages = Vec::new();
+            for chunk in entries.iter().collect::<Vec<_>>().chunks(4096) {
+                let page = WorkspaceLayerManifestPage {
+                    version: WORKSPACE_LAYER_MANIFEST_PAGE_VERSION,
+                    entries: chunk
+                        .iter()
+                        .map(|(path, entry)| ((*path).clone(), (*entry).clone()))
+                        .collect(),
+                };
+                entry_pages.push(
+                    self.put_object(
+                        WORKSPACE_LAYER_MANIFEST_PAGE_KIND,
+                        WORKSPACE_LAYER_MANIFEST_PAGE_VERSION,
+                        &page,
+                    )?
+                    .0,
+                );
+            }
             let manifest = WorkspaceLayerManifest {
                 version: WORKSPACE_LAYER_MANIFEST_VERSION,
                 layer_id: layer_id.clone(),
@@ -656,7 +1309,9 @@ impl Trail {
                 adapter: key.adapter.clone(),
                 adapter_version: key.adapter_version,
                 logical_bytes,
-                entries,
+                entry_count,
+                entry_pages,
+                entries: BTreeMap::new(),
                 platform: key.platform.clone(),
                 architecture: key.architecture.clone(),
                 portability_scope: key.portability_scope.clone(),
@@ -675,7 +1330,7 @@ impl Trail {
                 manifest_object_id: manifest_id.0.clone(),
                 logical_bytes,
                 physical_bytes: physical,
-                entry_count: manifest.entries.len() as u64,
+                entry_count,
             };
             write_file_atomic(
                 &workspace_layer_marker_path(&final_path),
@@ -705,7 +1360,7 @@ impl Trail {
                     final_path.to_string_lossy(),
                     logical_bytes as i64,
                     physical as i64,
-                    manifest.entries.len() as i64,
+                    entry_count as i64,
                     now_ts(),
                     cache_key,
                 ],
@@ -755,6 +1410,22 @@ impl Trail {
                 )));
             }
         }
+        let minimum_free = self.config().workspace_views.cache_min_free_bytes;
+        if minimum_free > 0 {
+            let cache_root = self.db_dir.join("cache");
+            fs::create_dir_all(&cache_root)?;
+            let available = workspace_available_bytes(&cache_root)?.ok_or_else(|| {
+                Error::InvalidInput(
+                    "free-space accounting is unavailable on this host; set workspace_views.cache_min_free_bytes to 0 or use a supported filesystem"
+                        .to_string(),
+                )
+            })?;
+            if available.saturating_sub(output_bytes) < minimum_free {
+                return Err(Error::InvalidInput(format!(
+                    "publishing this workspace layer would leave fewer than the configured {minimum_free} free bytes; run `trail cache gc --dry-run` to inspect reclaimable data"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -773,10 +1444,11 @@ impl Trail {
                 marker_path.display()
             )));
         }
-        let manifest: WorkspaceLayerManifest = self.get_object(
+        let mut manifest: WorkspaceLayerManifest = self.get_object(
             WORKSPACE_LAYER_MANIFEST_KIND,
             &ObjectId(marker.manifest_object_id.clone()),
         )?;
+        self.hydrate_workspace_layer_manifest(&mut manifest)?;
         let actual = scan_layer_entries(final_path, false)?;
         let manifest_key_matches = manifest
             .layer_key
@@ -885,12 +1557,84 @@ impl Trail {
         Ok(rows)
     }
 
+    pub(crate) fn workspace_layer_object_roots(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT manifest_object_id FROM workspace_layers
+             WHERE manifest_object_id IS NOT NULL ORDER BY layer_id",
+        )?;
+        let manifests = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut roots = Vec::new();
+        for manifest_id in manifests {
+            let manifest: WorkspaceLayerManifest = self.get_object(
+                WORKSPACE_LAYER_MANIFEST_KIND,
+                &ObjectId(manifest_id.clone()),
+            )?;
+            roots.push(manifest_id);
+            roots.extend(manifest.entry_pages);
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
+    pub fn pin_workspace_layer(
+        &self,
+        pin_id: &str,
+        layer_id: &str,
+        reason: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        if pin_id.is_empty()
+            || pin_id.len() > 128
+            || !pin_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(Error::InvalidInput(
+                "workspace layer pin ID must be 1-128 ASCII letters, digits, '.', '_', or '-'"
+                    .to_string(),
+            ));
+        }
+        if reason.trim().is_empty() || reason.len() > 512 {
+            return Err(Error::InvalidInput(
+                "workspace layer pin reason must be 1-512 bytes".to_string(),
+            ));
+        }
+        if expires_at.is_some_and(|expires_at| expires_at <= now_ts()) {
+            return Err(Error::InvalidInput(
+                "workspace layer pin expiration must be in the future".to_string(),
+            ));
+        }
+        self.verify_workspace_layer_for_attach(layer_id)?;
+        let _lock = self.acquire_write_lock()?;
+        self.conn.execute(
+            "INSERT INTO workspace_layer_pins(pin_id,layer_id,reason,expires_at,created_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(pin_id) DO UPDATE SET layer_id=excluded.layer_id,
+              reason=excluded.reason,expires_at=excluded.expires_at,created_at=excluded.created_at",
+            params![pin_id, layer_id, reason, expires_at, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unpin_workspace_layer(&self, pin_id: &str) -> Result<bool> {
+        let _lock = self.acquire_write_lock()?;
+        Ok(self.conn.execute(
+            "DELETE FROM workspace_layer_pins WHERE pin_id=?1",
+            params![pin_id],
+        )? != 0)
+    }
+
     pub(crate) fn workspace_reclaimable_cache_bytes(&self) -> Result<u64> {
         let layer_bytes = self.conn.query_row(
             "SELECT COALESCE(SUM(COALESCE(l.physical_bytes, 0)), 0) FROM workspace_layers l \
              WHERE l.state != 'building'
                AND NOT EXISTS (SELECT 1 FROM workspace_view_layers b WHERE b.layer_id = l.layer_id)
-               AND NOT EXISTS (SELECT 1 FROM environment_generation_components g WHERE g.layer_id = l.layer_id)",
+               AND NOT EXISTS (SELECT 1 FROM environment_generation_components g WHERE g.layer_id = l.layer_id)
+               AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications p WHERE p.layer_id = l.layer_id AND p.phase IN ('published','activated'))
+               AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins p WHERE p.layer_id = l.layer_id AND (p.expires_at IS NULL OR p.expires_at > unixepoch()))",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -916,7 +1660,9 @@ impl Trail {
             let mut stmt = self.conn.prepare(
                 "SELECT l.layer_id, l.storage_path, COALESCE(l.physical_bytes, 0), l.last_used_at, l.state, \
                         (EXISTS(SELECT 1 FROM workspace_view_layers b WHERE b.layer_id = l.layer_id)
-                         OR EXISTS(SELECT 1 FROM environment_generation_components g WHERE g.layer_id = l.layer_id)) \
+                         OR EXISTS(SELECT 1 FROM environment_generation_components g WHERE g.layer_id = l.layer_id)
+                         OR EXISTS(SELECT 1 FROM workspace_layer_publications p WHERE p.layer_id = l.layer_id AND p.phase IN ('published','activated'))
+                         OR EXISTS(SELECT 1 FROM workspace_layer_pins p WHERE p.layer_id = l.layer_id AND (p.expires_at IS NULL OR p.expires_at > unixepoch()))) \
                  FROM workspace_layers l ORDER BY l.last_used_at ASC, l.layer_id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -1044,11 +1790,25 @@ impl Trail {
                 .then_with(|| left.entry.id.cmp(&right.entry.id))
         });
         let max_bytes = self.config().workspace_views.cache_max_bytes;
+        let minimum_free = self.config().workspace_views.cache_min_free_bytes;
+        let pressure_bytes = if minimum_free == 0 {
+            0
+        } else {
+            workspace_available_bytes(&cache_root)?
+                .map(|available| minimum_free.saturating_sub(available))
+                .unwrap_or(0)
+        };
         let mut projected_bytes = cache_physical_bytes_before;
+        let mut pressure_reclaimed = 0_u64;
         let mut selected = Vec::new();
         for candidate in found {
-            if candidate.retention_expired || (max_bytes > 0 && projected_bytes > max_bytes) {
+            if candidate.retention_expired
+                || (max_bytes > 0 && projected_bytes > max_bytes)
+                || pressure_reclaimed < pressure_bytes
+            {
                 projected_bytes = projected_bytes.saturating_sub(candidate.entry.physical_bytes);
+                pressure_reclaimed =
+                    pressure_reclaimed.saturating_add(candidate.entry.physical_bytes);
                 selected.push(candidate.entry);
             }
         }
@@ -1068,6 +1828,10 @@ impl Trail {
         }
 
         let _lock = self.acquire_write_lock()?;
+        self.conn.execute(
+            "DELETE FROM workspace_layer_pins WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now_ts()],
+        )?;
         let trash = cache_root.join("trash");
         fs::create_dir_all(&trash).map_err(|err| {
             Error::InvalidInput(format!(
@@ -1082,7 +1846,9 @@ impl Trail {
             if candidate.kind == "layer" {
                 let pinned = self.conn.query_row(
                     "SELECT (EXISTS(SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                             OR EXISTS(SELECT 1 FROM environment_generation_components WHERE layer_id = ?1))",
+                             OR EXISTS(SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
+                             OR EXISTS(SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
+                             OR EXISTS(SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch())))",
                     params![candidate.id],
                     |row| row.get::<_, i64>(0),
                 )? != 0;
@@ -1102,7 +1868,9 @@ impl Trail {
                     self.conn.execute(
                         "UPDATE workspace_layers SET state = 'deleting' WHERE layer_id = ?1
                          AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)",
+                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
                         params![candidate.id],
                     )?;
                     make_layer_root_writable(&path)?;
@@ -1132,7 +1900,9 @@ impl Trail {
                     if let Err(err) = self.conn.execute(
                         "DELETE FROM workspace_layers WHERE layer_id = ?1
                          AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)",
+                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
                         params![candidate.id],
                     ) {
                         let _ = fs::rename(&trash_path, &path);
@@ -1149,7 +1919,9 @@ impl Trail {
                     self.conn.execute(
                         "DELETE FROM workspace_layers WHERE layer_id = ?1
                          AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)",
+                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
+                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
                         params![candidate.id],
                     )?;
                     remove_workspace_layer_trash_entries(&trash, &candidate.id)?;
@@ -1319,7 +2091,7 @@ impl Trail {
             || manifest.cache_key != report.cache_key
             || manifest.adapter != report.adapter
             || manifest.logical_bytes != report.logical_bytes
-            || manifest.entries.len() as u64 != report.entry_count
+            || workspace_layer_manifest_entry_count(&manifest) != report.entry_count
             || manifest.portability_scope != report.portability_scope
         {
             report.state = "corrupt".to_string();
@@ -1368,7 +2140,10 @@ impl Trail {
                     .physical_bytes
                     .is_none_or(|bytes| bytes == marker.physical_bytes)
         });
-        if stamp_matches && marker_matches && manifest.entries.len() as u64 == report.entry_count {
+        if stamp_matches
+            && marker_matches
+            && workspace_layer_manifest_entry_count(&manifest) == report.entry_count
+        {
             return Ok(report);
         }
         self.verify_workspace_layer(layer_id)
@@ -1377,8 +2152,9 @@ impl Trail {
     /// Perform an explicit complete verification of every layer entry and
     /// refresh the bounded attach-tier stamp only after all hashes match.
     pub fn verify_workspace_layer(&self, layer_id: &str) -> Result<WorkspaceLayerReport> {
-        let (mut report, manifest_id, manifest) =
+        let (mut report, manifest_id, mut manifest) =
             self.workspace_layer_verification_record(layer_id)?;
+        self.hydrate_workspace_layer_manifest(&mut manifest)?;
         let actual = scan_layer_entries(Path::new(&report.storage_path), false)?;
         if manifest.entries != actual {
             report.state = "corrupt".to_string();
@@ -1389,6 +2165,52 @@ impl Trail {
         let _ = write_workspace_layer_verification_stamp(&report, &manifest_id);
         let _ = write_workspace_layer_publish_marker_from_report(&report, &manifest_id);
         Ok(report)
+    }
+
+    fn hydrate_workspace_layer_manifest(
+        &self,
+        manifest: &mut WorkspaceLayerManifest,
+    ) -> Result<()> {
+        if manifest.entry_pages.is_empty() {
+            return Ok(());
+        }
+        if !manifest.entries.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{}` mixes inline and paged manifest entries",
+                manifest.layer_id
+            )));
+        }
+        let mut previous = None::<String>;
+        for page_id in &manifest.entry_pages {
+            let page: WorkspaceLayerManifestPage = self.get_object(
+                WORKSPACE_LAYER_MANIFEST_PAGE_KIND,
+                &ObjectId(page_id.clone()),
+            )?;
+            if page.version != WORKSPACE_LAYER_MANIFEST_PAGE_VERSION || page.entries.len() > 4096 {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{}` has an invalid manifest page",
+                    manifest.layer_id
+                )));
+            }
+            for (path, entry) in page.entries {
+                if previous.as_ref().is_some_and(|prior| prior >= &path)
+                    || manifest.entries.insert(path.clone(), entry).is_some()
+                {
+                    return Err(Error::Corrupt(format!(
+                        "workspace layer `{}` manifest pages are not globally sorted and unique",
+                        manifest.layer_id
+                    )));
+                }
+                previous = Some(path);
+            }
+        }
+        if manifest.entries.len() as u64 != manifest.entry_count {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{}` manifest page count does not match its root",
+                manifest.layer_id
+            )));
+        }
+        Ok(())
     }
 
     pub fn attach_workspace_layer(
@@ -1452,8 +2274,14 @@ impl Trail {
                 outputs: vec![EnvironmentLayerOutputActivation {
                     name: "primary".to_string(),
                     mount_path: mount_path.to_string(),
-                    policy: "immutable_seed_private".to_string(),
+                    policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    reuse: EnvironmentReuseMode::Exact,
+                    scope: EnvironmentSharingScope::Workspace,
+                    publish: EnvironmentPublicationTrigger::OnSync,
+                    gate: None,
                     binding_identity: layer_id.to_string(),
+                    manifest_object_id: None,
+                    publication_id: None,
                     private_seed: None,
                     layer_subpath: String::new(),
                 }],
@@ -1808,8 +2636,9 @@ impl Trail {
                         activation.component_id, output.name
                     )));
                 }
-                match output.policy.as_str() {
-                    "immutable_seed_private" => {
+                match output.policy {
+                    EnvironmentOutputPolicy::ImmutableShared
+                    | EnvironmentOutputPolicy::ImmutableSeedPrivate => {
                         let layer = layer.as_ref().ok_or_else(|| {
                             Error::Corrupt(format!(
                                 "environment component `{}` immutable output `{}` has no layer",
@@ -1836,7 +2665,8 @@ impl Trail {
                             )));
                         }
                     }
-                    "writable_private" => {
+                    EnvironmentOutputPolicy::WritablePrivate
+                    | EnvironmentOutputPolicy::Disposable => {
                         if layer.is_some() || !layer_subpath.is_empty() {
                             return Err(Error::Corrupt(format!(
                                 "environment component `{}` writable-private output `{}` must not reference an immutable layer",
@@ -1854,12 +2684,6 @@ impl Trail {
                             )));
                         }
                     }
-                    other => {
-                        return Err(Error::InvalidInput(format!(
-                            "environment component `{}` output `{}` has unsupported policy `{other}`",
-                            activation.component_id, output.name
-                        )));
-                    }
                 }
                 for (owner, existing) in &mount_paths {
                     if mount_paths_overlap(&mount_path, existing) {
@@ -1874,8 +2698,14 @@ impl Trail {
                     name: output.name.clone(),
                     mount_path,
                     layer_subpath,
-                    policy: output.policy.clone(),
+                    policy: output.policy,
+                    reuse: output.reuse,
+                    scope: output.scope,
+                    publish: output.publish,
+                    gate: output.gate.clone(),
                     binding_identity: output.binding_identity.clone(),
+                    manifest_object_id: output.manifest_object_id.clone(),
+                    publication_id: output.publication_id.clone(),
                     private_seed: output.private_seed.clone(),
                 });
             }
@@ -1913,13 +2743,15 @@ impl Trail {
         }
         for (component, layer, outputs, previous_bindings) in &resolved {
             for output in outputs {
-                if output.policy == "writable_private"
-                    && output.private_seed.is_none()
+                if matches!(
+                    output.policy,
+                    EnvironmentOutputPolicy::WritablePrivate | EnvironmentOutputPolicy::Disposable
+                ) && output.private_seed.is_none()
                     && previous_bindings
                         .iter()
                         .any(|(mount, _, policy, binding_identity)| {
                             mount == &output.mount_path
-                                && policy == &output.policy
+                                && policy == output.policy.as_str()
                                 && binding_identity == &output.binding_identity
                         })
                 {
@@ -1933,7 +2765,11 @@ impl Trail {
                     }
                     continue;
                 }
-                let prepared = if output.policy == "writable_private" {
+                let private_only = matches!(
+                    output.policy,
+                    EnvironmentOutputPolicy::WritablePrivate | EnvironmentOutputPolicy::Disposable
+                );
+                let prepared = if private_only {
                     core.prepare_declared_private_mount_path(
                         &output.mount_path,
                         &component.kind,
@@ -1956,7 +2792,7 @@ impl Trail {
                     Ok(reset) => {
                         let install = if let Some(seed) = &output.private_seed {
                             reset.install_private_directory(seed)
-                        } else if output.policy == "writable_private" {
+                        } else if private_only {
                             core.ensure_declared_private_mount_path(
                                 &output.mount_path,
                                 &component.kind,
@@ -2269,7 +3105,7 @@ impl Trail {
                     }
                 }
                 for output in outputs {
-                    if output.policy == "immutable_seed_private" {
+                    if output.policy.has_immutable_layer() {
                         let layer = layer.as_ref().ok_or_else(|| {
                             Error::Corrupt(format!(
                                 "immutable output `{}` lost its layer during activation",
@@ -2288,16 +3124,24 @@ impl Trail {
                     }
                     self.conn.execute(
                         "INSERT INTO environment_component_output_bindings
-                         (view_id, component_id, output_name, mount_path, layer_subpath, policy, binding_identity, kind, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                         (view_id, component_id, output_name, mount_path, layer_subpath, policy,
+                          reuse_mode, sharing_scope, publication_trigger, publication_gate,
+                          binding_identity, manifest_object_id, publication_id, kind, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                         params![
                             &view.view_id,
                             &component.component_id,
                             &output.name,
                             &output.mount_path,
                             &output.layer_subpath,
-                            &output.policy,
+                            output.policy.as_str(),
+                            output.reuse.as_str(),
+                            output.scope.as_str(),
+                            output.publish.as_str(),
+                            &output.gate,
                             &output.binding_identity,
+                            &output.manifest_object_id,
+                            &output.publication_id,
                             &component.kind,
                             now_ts()
                         ],
@@ -2352,7 +3196,7 @@ impl Trail {
                 .filter(|component| !replaced_component_ids.contains(*component))
             {
                 let reason = format!(
-                    "an upstream environment dependency changed; run `trail env sync-all {lane}`"
+                    "an upstream environment dependency changed; run `trail env sync all {lane}`"
                 );
                 self.conn.execute(
                     "UPDATE environment_component_states
@@ -2752,7 +3596,9 @@ impl Trail {
             };
             component.dependencies = dependencies;
             let mut output_stmt = self.conn.prepare(
-                "SELECT b.output_name, b.policy, b.binding_identity, l.layer_id,
+                "SELECT b.output_name, b.policy, b.reuse_mode, b.sharing_scope,
+                        b.publication_trigger, b.publication_gate, b.binding_identity,
+                        l.layer_id, b.manifest_object_id, b.publication_id,
                         b.mount_path, b.layer_subpath
                  FROM environment_component_output_bindings b
                  LEFT JOIN workspace_view_layers l
@@ -2765,10 +3611,16 @@ impl Trail {
                     Ok(EnvironmentGenerationOutputReport {
                         name: row.get(0)?,
                         policy: row.get(1)?,
-                        storage_identity: row.get(2)?,
-                        layer_id: row.get(3)?,
-                        mount_path: row.get(4)?,
-                        layer_subpath: row.get(5)?,
+                        reuse: row.get(2)?,
+                        scope: row.get(3)?,
+                        publish: row.get(4)?,
+                        gate: row.get(5)?,
+                        storage_identity: row.get(6)?,
+                        layer_id: row.get(7)?,
+                        manifest_object_id: row.get(8)?,
+                        publication_id: row.get(9)?,
+                        mount_path: row.get(10)?,
+                        layer_subpath: row.get(11)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2877,15 +3729,23 @@ impl Trail {
             for output in &component.outputs {
                 self.conn.execute(
                     "INSERT INTO environment_generation_outputs
-                     (generation_id, component_id, output_name, policy, storage_identity, layer_id, mount_path, layer_subpath)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (generation_id, component_id, output_name, policy, reuse_mode,
+                      sharing_scope, publication_trigger, publication_gate, storage_identity,
+                      layer_id, manifest_object_id, publication_id, mount_path, layer_subpath)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         &generation_id,
                         &component.component_id,
                         &output.name,
-                        &output.policy,
+                        output.policy.as_str(),
+                        output.reuse.as_str(),
+                        output.scope.as_str(),
+                        output.publish.as_str(),
+                        &output.gate,
                         &output.storage_identity,
                         &output.layer_id,
+                        &output.manifest_object_id,
+                        &output.publication_id,
                         &output.mount_path,
                         &output.layer_subpath
                     ],
@@ -3708,7 +4568,7 @@ fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &target)?;
+            clone_or_copy_projected_file(entry.path(), &target)?;
             preserve_layer_mode(entry.path(), &target)?;
         } else if kind.is_symlink() {
             let link = fs::read_link(entry.path())?;
@@ -3726,6 +4586,89 @@ fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn workspace_available_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::InvalidPath {
+        path: path.to_string_lossy().into_owned(),
+        reason: "filesystem path contains a NUL byte".to_string(),
+    })?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `encoded` is a live NUL-terminated path and `stats` points to
+    // writable storage for exactly one `statvfs` result.
+    let status = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+    if status != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: a zero return from `statvfs` initializes the complete structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok(Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize)))
+}
+
+#[cfg(not(unix))]
+fn workspace_available_bytes(_path: &Path) -> Result<Option<u64>> {
+    Ok(None)
+}
+
+fn validate_promotable_output_tree(source: &Path) -> Result<()> {
+    const MAX_ENTRIES: usize = 1_000_000;
+    const MAX_SECRET_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+    let mut entries = 0_usize;
+    for entry in walkdir::WalkDir::new(source).follow_links(false) {
+        let entry = entry.map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if entry.path() == source {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_ENTRIES {
+            return Err(Error::InvalidInput(format!(
+                "environment output promotion exceeds the {MAX_ENTRIES}-entry validation limit"
+            )));
+        }
+        let relative = normalize_relative_path(
+            &entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|_| Error::Corrupt("promotion entry escaped source root".to_string()))?
+                .to_string_lossy(),
+        )?;
+        if matches!(
+            classify_view_path(&relative),
+            ViewPathClass::Secret | ViewPathClass::Internal
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "environment output promotion rejected protected or secret path `{relative}`"
+            )));
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() && metadata.len() <= MAX_SECRET_SCAN_BYTES {
+            let bytes = fs::read(entry.path())?;
+            if let Ok(text) = std::str::from_utf8(&bytes)
+                && contains_sensitive_text(text)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "environment output promotion secret scan rejected `{relative}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn publication_staging_path(db_dir: &Path, publication_id: &str, stored: &str) -> Result<PathBuf> {
+    let expected = format!("cache/publications/{publication_id}");
+    if stored != expected {
+        return Err(Error::InvalidPath {
+            path: stored.to_string(),
+            reason: "publication staging path is not the exact attempt-owned relative path"
+                .to_string(),
+        });
+    }
+    safe_join(db_dir, stored)
 }
 
 fn scan_layer_entries(
@@ -4006,6 +4949,90 @@ mod tests {
     }
 
     #[test]
+    fn canonical_artifact_key_covers_every_declared_identity_dimension() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let baseline = WorkspaceLayerKeyV1 {
+            kind: "compiler-results".to_string(),
+            adapter: "trail/example@2".to_string(),
+            adapter_version: 2,
+            inputs: BTreeMap::from([
+                ("contract_version".to_string(), "2".to_string()),
+                ("adapter_implementation".to_string(), "impl-a".to_string()),
+                (
+                    "adapter_distribution_digest".to_string(),
+                    "dist-a".to_string(),
+                ),
+                ("declared_input:src".to_string(), "merkle-a".to_string()),
+                ("dependency:upstream".to_string(), "upstream-a".to_string()),
+                ("command_argv".to_string(), "argv-a".to_string()),
+                ("command_cwd".to_string(), "cwd-a".to_string()),
+                ("identity_environment".to_string(), "env-a".to_string()),
+                ("output_contract".to_string(), "output-a".to_string()),
+                (
+                    "validation_contract".to_string(),
+                    "validation-a".to_string(),
+                ),
+            ]),
+            tool_versions: BTreeMap::from([("compiler".to_string(), "tool-a".to_string())]),
+            platform: "platform-a".to_string(),
+            architecture: "architecture-a".to_string(),
+            portability_scope: "workspace".to_string(),
+            strategy: "reuse-exact-policy-a".to_string(),
+        };
+        let baseline_key = db.workspace_layer_cache_key(&baseline).unwrap();
+        assert_eq!(
+            baseline_key,
+            db.workspace_layer_cache_key(&baseline.clone()).unwrap()
+        );
+
+        let mut variants = Vec::new();
+        for input in baseline.inputs.keys() {
+            let mut variant = baseline.clone();
+            variant
+                .inputs
+                .insert(input.clone(), format!("changed-{input}"));
+            variants.push((format!("input:{input}"), variant));
+        }
+        let mut variant = baseline.clone();
+        variant.kind = "generated".to_string();
+        variants.push(("kind".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.adapter = "trail/other@2".to_string();
+        variants.push(("adapter".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.adapter_version = 3;
+        variants.push(("adapter_version".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant
+            .tool_versions
+            .insert("compiler".to_string(), "tool-b".to_string());
+        variants.push(("tool_identity".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.platform = "platform-b".to_string();
+        variants.push(("platform".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.architecture = "architecture-b".to_string();
+        variants.push(("architecture".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.portability_scope = "host".to_string();
+        variants.push(("portability_scope".to_string(), variant));
+        let mut variant = baseline.clone();
+        variant.strategy = "reuse-compatible-policy-b".to_string();
+        variants.push(("reuse_and_policy".to_string(), variant));
+
+        for (dimension, variant) in variants {
+            assert_ne!(
+                baseline_key,
+                db.workspace_layer_cache_key(&variant).unwrap(),
+                "identity dimension `{dimension}` did not alter the canonical key"
+            );
+        }
+    }
+
+    #[test]
     fn inheritance_accepts_every_builtin_immutable_layer_scope() {
         for scope in [
             "platform",
@@ -4044,6 +5071,8 @@ mod tests {
             adapter: "node".to_string(),
             adapter_version: 1,
             logical_bytes: 0,
+            entry_count: 0,
+            entry_pages: Vec::new(),
             entries: BTreeMap::new(),
             platform: "legacy".to_string(),
             architecture: "legacy".to_string(),
@@ -4053,8 +5082,86 @@ mod tests {
         };
         let mut value = serde_json::to_value(manifest).unwrap();
         value.as_object_mut().unwrap().remove("layer_key");
+        value.as_object_mut().unwrap().remove("entry_count");
+        value.as_object_mut().unwrap().remove("entry_pages");
         let decoded: WorkspaceLayerManifest = serde_json::from_value(value).unwrap();
         assert!(decoded.layer_key.is_none());
+    }
+
+    #[test]
+    fn paged_layer_manifest_is_sorted_verifiable_and_object_gc_reachable() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        for index in 0..4_097_u32 {
+            fs::write(
+                source.path().join(format!("entry-{index:05}.txt")),
+                format!("{index}\n"),
+            )
+            .unwrap();
+        }
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), source.path())
+            .unwrap();
+        assert_eq!(layer.entry_count, 4_097);
+        assert_eq!(db.workspace_layer_object_roots().unwrap().len(), 3);
+        db.gc(false).unwrap();
+        db.verify_workspace_layer(&layer.layer_id).unwrap();
+    }
+
+    #[test]
+    fn dead_publication_owner_is_recovered_and_corrupt_activation_is_reported() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let staging = db.db_dir.join("cache/publications/envpub_dead");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("owned"), "staging").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO workspace_layer_publications(
+                     publication_id,view_id,predecessor_generation_id,component_id,output_name,
+                     source_root,output_identity,trigger,phase,owner_pid,owner_start_token,
+                     staging_path,created_at,updated_at)
+                 VALUES('envpub_dead','view_dead','envgen_parent','component','output',
+                        'root','identity','manual','prepared',?1,'dead:test',?2,1,1)",
+                params![u32::MAX, "cache/publications/envpub_dead"],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT phase FROM workspace_layer_publications WHERE publication_id='envpub_dead'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "recovered"
+        );
+        reopened
+            .conn
+            .execute(
+                "UPDATE workspace_layer_publications SET phase='activated',
+                 successor_generation_id='envgen_missing',layer_id='layer_missing',
+                 manifest_object_id='object_missing' WHERE publication_id='envpub_dead'",
+                [],
+            )
+            .unwrap();
+        let errors = reopened
+            .validate_workspace_layer_publications_integrity()
+            .unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("successor generation")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("not ready and coherent")));
     }
 
     #[test]
@@ -4108,8 +5215,14 @@ mod tests {
                 outputs: vec![EnvironmentLayerOutputActivation {
                     name: "output".to_string(),
                     mount_path: mount_path.to_string(),
-                    policy: "writable_private".to_string(),
+                    policy: EnvironmentOutputPolicy::WritablePrivate,
+                    reuse: EnvironmentReuseMode::None,
+                    scope: EnvironmentSharingScope::Lane,
+                    publish: EnvironmentPublicationTrigger::Never,
+                    gate: None,
                     binding_identity: format!("private-{component}-{revision}"),
+                    manifest_object_id: None,
+                    publication_id: None,
                     private_seed: Some(seed.to_path_buf()),
                     layer_subpath: String::new(),
                 }],
@@ -4284,8 +5397,14 @@ mod tests {
                 outputs: vec![EnvironmentLayerOutputActivation {
                     name: "output".to_string(),
                     mount_path: mount_path.to_string(),
-                    policy: "writable_private".to_string(),
+                    policy: EnvironmentOutputPolicy::WritablePrivate,
+                    reuse: EnvironmentReuseMode::None,
+                    scope: EnvironmentSharingScope::Lane,
+                    publish: EnvironmentPublicationTrigger::Never,
+                    gate: None,
                     binding_identity: format!("private-{component}-{revision}"),
+                    manifest_object_id: None,
+                    publication_id: None,
                     private_seed: Some(seed.to_path_buf()),
                     layer_subpath: String::new(),
                 }],
@@ -5078,6 +6197,46 @@ mod tests {
     }
 
     #[test]
+    fn singleflight_waiters_cancel_and_dead_owners_are_fenced() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let key = key();
+        let cache_key = db.workspace_layer_cache_key(&key).unwrap();
+        let lock_dir = db.db_dir.join("cache/staging/locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock = lock_dir.join(format!("{cache_key}.lock"));
+        fs::write(
+            &lock,
+            format!("{}:{}", std::process::id(), current_process_start_token()),
+        )
+        .unwrap();
+        let cancelled = AtomicBool::new(true);
+        let error = db
+            .build_workspace_layer_singleflight_with_cancel(&key, &cancelled, |_| {
+                panic!("a cancelled waiter must not invoke the builder")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled while waiting"));
+
+        fs::write(&lock, "4294967295:dead-owner").unwrap();
+        let report = db
+            .build_workspace_layer_singleflight(&key, |build_dir| {
+                let output = build_dir.join("output");
+                fs::create_dir_all(&output).unwrap();
+                fs::write(output.join("artifact"), "recovered\n").unwrap();
+                Ok(output)
+            })
+            .unwrap();
+        assert_eq!(report.state, "ready");
+        assert_eq!(
+            fs::read_to_string(Path::new(&report.storage_path).join("artifact")).unwrap(),
+            "recovered\n"
+        );
+    }
+
+    #[test]
     fn publish_recovery_adopts_atomic_tree_without_touching_source_upper() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("README.md"), "root\n").unwrap();
@@ -5186,6 +6345,19 @@ mod tests {
                 params![layer.layer_id],
             )
             .unwrap();
+        db.pin_workspace_layer(
+            "release-evidence",
+            &layer.layer_id,
+            "retain for review",
+            None,
+        )
+        .unwrap();
+        let explicitly_pinned = db.workspace_cache_gc(true, Some(0)).unwrap();
+        assert!(!explicitly_pinned
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == layer.layer_id));
+        assert!(db.unpin_workspace_layer("release-evidence").unwrap());
         let preview = db.workspace_cache_gc(true, Some(0)).unwrap();
         assert!(preview
             .candidates

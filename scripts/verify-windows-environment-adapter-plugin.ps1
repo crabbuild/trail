@@ -179,8 +179,8 @@ max_response_bytes = 1048576
     if ($plan.capabilities.sandbox -ne "windows-appcontainer-job" -or $plan.capabilities.network -ne "deny") {
         throw "Windows plugin plan did not report denied-by-default AppContainer capabilities"
     }
-    $first = (& $trail --workspace $workspace --json env sync plugin-a --adapter example/copy@1) | ConvertFrom-Json
-    $second = (& $trail --workspace $workspace --json env sync plugin-b --adapter example/copy@1) | ConvertFrom-Json
+    $first = (& $trail --workspace $workspace --json env sync all plugin-a) | ConvertFrom-Json
+    $second = (& $trail --workspace $workspace --json env sync all plugin-b) | ConvertFrom-Json
     $firstLayer = $first.layers[0]
     $secondLayer = $second.layers[0]
     if ($firstLayer.layer_id -ne $secondLayer.layer_id) { throw "Windows plugins did not reuse one layer" }
@@ -212,8 +212,8 @@ max_response_bytes = 1048576
     if ($cachePlan.caches.Count -ne 1 -or $cachePlan.caches[0].access -ne "host_exclusive" -or $cachePlan.caches[0].protocol -ne "content_store") {
         throw "Windows cache plugin plan lost its conservative cache contract"
     }
-    $cacheA = (& $trail --workspace $workspace --json env sync plugin-a --adapter example/cache@1) | ConvertFrom-Json
-    $cacheB = (& $trail --workspace $workspace --json env sync plugin-b --adapter example/cache@1) | ConvertFrom-Json
+    $cacheA = (& $trail --workspace $workspace --json env sync all plugin-a) | ConvertFrom-Json
+    $cacheB = (& $trail --workspace $workspace --json env sync all plugin-b) | ConvertFrom-Json
     $cacheANamespace = $cacheA.generation.components[0].caches[0].namespace_id
     $cacheBNamespace = $cacheB.generation.components[0].caches[0].namespace_id
     if ($cacheANamespace -ne $cacheBNamespace) { throw "Windows cache plugin lanes did not reuse one namespace" }
@@ -226,7 +226,7 @@ max_response_bytes = 1048576
     if ($counter -ne "2") { throw "Windows cache plugin namespace did not retain both executions" }
     & $trail --workspace $workspace lane exec plugin-a -- cmd.exe /d /c "echo escape>cache.adapter" | Out-Null
     & $trail --workspace $workspace lane checkpoint plugin-a -m "attempt plugin cache namespace escape" | Out-Null
-    Assert-TrailFails { & $trail --workspace $workspace env sync plugin-a --adapter example/cache@1 } "Windows plugin cache write escaped its namespace"
+    Assert-TrailFails { & $trail --workspace $workspace env sync all plugin-a } "Windows plugin cache write escaped its namespace"
     if (Test-Path -LiteralPath (Join-Path $workspace ".trail/cache/namespaces/plugin-cache-escape")) {
         throw "Windows plugin cache escape created a sibling namespace entry"
     }
@@ -244,8 +244,8 @@ max_response_bytes = 1048576
     if ($mountedPlan.commands.Count -ne 1 -or $mountedPlan.commands[0].phase -ne "mounted_initialization") {
         throw "Windows mounted plugin did not report exactly one mounted action"
     }
-    $mountedA = (& $trail --workspace $workspace --json env sync plugin-mounted-a --adapter example/mounted@1) | ConvertFrom-Json
-    $mountedB = (& $trail --workspace $workspace --json env sync plugin-mounted-b --adapter example/mounted@1) | ConvertFrom-Json
+    $mountedA = (& $trail --workspace $workspace --json env sync all plugin-mounted-a) | ConvertFrom-Json
+    $mountedB = (& $trail --workspace $workspace --json env sync all plugin-mounted-b) | ConvertFrom-Json
     if ($mountedA.layers.Count -ne 0 -or $mountedB.layers.Count -ne 0) {
         throw "Windows mounted plugin unexpectedly published a shared layer"
     }
@@ -260,26 +260,26 @@ max_response_bytes = 1048576
     }
     & $trail --workspace $workspace lane exec plugin-mounted-a -- cmd.exe /d /c "echo lane-a-private>.trail-generated\plugin-mounted\initialized.txt" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not mutate first Windows mounted output" }
-    & $trail --workspace $workspace env sync plugin-mounted-a --adapter example/mounted@1 | Out-Null
+    & $trail --workspace $workspace env sync all plugin-mounted-a | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "compatible Windows mounted resync failed" }
     $preserved = @(& $trail --workspace $workspace lane exec plugin-mounted-a -- cmd.exe /d /c "type .trail-generated\plugin-mounted\initialized.txt")[0].Trim()
     if ($preserved -ne "lane-a-private") { throw "compatible Windows mounted resync replaced private state" }
     & $trail --workspace $workspace lane exec plugin-mounted-a -- cmd.exe /d /c "echo fail>mounted.adapter" | Out-Null
     & $trail --workspace $workspace lane checkpoint plugin-mounted-a -m "fail mounted plugin action" | Out-Null
-    Assert-TrailFails { & $trail --workspace $workspace env sync plugin-mounted-a --adapter example/mounted@1 } "failed Windows mounted action unexpectedly activated"
+    Assert-TrailFails { & $trail --workspace $workspace env sync all plugin-mounted-a } "failed Windows mounted action unexpectedly activated"
     $preserved = @(& $trail --workspace $workspace lane exec plugin-mounted-a -- cmd.exe /d /c "type .trail-generated\plugin-mounted\initialized.txt")[0].Trim()
     if ($preserved -ne "lane-a-private") { throw "failed Windows mounted action replaced its predecessor" }
     & $trail --workspace $workspace lane exec plugin-mounted-b -- cmd.exe /d /c "echo source_write>mounted.adapter" | Out-Null
     & $trail --workspace $workspace lane checkpoint plugin-mounted-b -m "attempt mounted source write" | Out-Null
-    Assert-TrailFails { & $trail --workspace $workspace env sync plugin-mounted-b --adapter example/mounted@1 } "Windows mounted source write escaped its output contract"
+    Assert-TrailFails { & $trail --workspace $workspace env sync all plugin-mounted-b } "Windows mounted source write escaped its output contract"
     & $trail --workspace $workspace lane exec plugin-mounted-b -- cmd.exe /d /c "if exist source-leak.txt (exit /b 9) else (exit /b 0)" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Windows mounted source write leaked into the lane" }
     & $trail --workspace $workspace lane exec plugin-mounted-b -- cmd.exe /d /c "echo source_read>mounted.adapter" | Out-Null
     & $trail --workspace $workspace lane checkpoint plugin-mounted-b -m "attempt undeclared mounted source read" | Out-Null
-    Assert-TrailFails { & $trail --workspace $workspace env sync plugin-mounted-b --adapter example/mounted@1 } "Windows mounted undeclared source read unexpectedly succeeded"
+    Assert-TrailFails { & $trail --workspace $workspace env sync all plugin-mounted-b } "Windows mounted undeclared source read unexpectedly succeeded"
     & $trail --workspace $workspace lane exec plugin-mounted-b -- cmd.exe /d /c "if exist .trail-generated\plugin-mounted\leaked.txt (exit /b 9) else (exit /b 0)" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Windows mounted undeclared source read leaked content" }
-    & $trail --workspace $workspace env sync plugin-mounted-kill --adapter example/mounted@1 | Out-Null
+    & $trail --workspace $workspace env sync all plugin-mounted-kill | Out-Null
     & $trail --workspace $workspace lane exec plugin-mounted-kill -- cmd.exe /d /c "echo kill-predecessor>.trail-generated\plugin-mounted\initialized.txt & echo hang>mounted.adapter" | Out-Null
     & $trail --workspace $workspace lane checkpoint plugin-mounted-kill -m "kill active mounted plugin action" | Out-Null
     $killOut = Join-Path $packages "mounted-kill.stdout"

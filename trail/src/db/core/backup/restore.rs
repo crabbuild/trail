@@ -11,18 +11,27 @@ impl Trail {
         backup_path: impl AsRef<Path>,
         force: bool,
     ) -> Result<BackupRestoreReport> {
-        fs::create_dir_all(workspace_root.as_ref())?;
-        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
-        recover_restore_publication(&workspace_root)?;
+        restore_step(
+            "create restore workspace",
+            fs::create_dir_all(workspace_root.as_ref()).map_err(Error::from),
+        )?;
+        let workspace_root = restore_step(
+            "canonicalize restore workspace",
+            canonicalize_lossless(workspace_root.as_ref()),
+        )?;
+        restore_step(
+            "recover prior restore publication",
+            recover_restore_publication(&workspace_root),
+        )?;
         let backup_path = absolute_path(backup_path.as_ref())?;
-        let verification = Self::verify_backup(&backup_path)?;
+        let verification = restore_step("verify backup", Self::verify_backup(&backup_path))?;
         if !verification.valid {
             return Err(Error::Corrupt(format!(
                 "backup verification failed: {}",
                 verification.errors.join("; ")
             )));
         }
-        let manifest = read_backup_manifest(&backup_path)?;
+        let manifest = restore_step("read backup manifest", read_backup_manifest(&backup_path))?;
         let db_dir = workspace_root.join(".trail");
         let replaced_existing = db_dir.exists();
         if replaced_existing {
@@ -40,27 +49,41 @@ impl Trail {
         } else {
             (0, 0)
         };
-        let temp_dir = sibling_stage(&db_dir, "restore-stage")?;
+        let temp_dir = restore_step(
+            "allocate restore stage",
+            sibling_stage(&db_dir, "restore-stage"),
+        )?;
 
         let restore_result = (|| -> Result<(u64, crate::model::FsckReport)> {
-            fs::create_dir_all(temp_dir.join("index"))?;
-            fs::write(temp_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
-            fs::write(
-                temp_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE),
-                [],
+            restore_step(
+                "create restore stage structure",
+                (|| -> Result<()> {
+                    fs::create_dir_all(temp_dir.join("index"))?;
+                    fs::write(temp_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+                    fs::write(
+                        temp_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE),
+                        [],
+                    )?;
+                    fs::create_dir_all(temp_dir.join("refs/branches"))?;
+                    fs::create_dir_all(temp_dir.join("refs/lanes"))?;
+                    fs::copy(backup_path.join(CONFIG_FILE), temp_dir.join(CONFIG_FILE))?;
+                    fs::copy(backup_path.join(HEAD_FILE), temp_dir.join(HEAD_FILE))?;
+                    fs::copy(
+                        backup_sqlite_path(&backup_path),
+                        temp_dir.join(DB_RELATIVE_PATH),
+                    )?;
+                    copy_dir_recursive(
+                        &backup_path.join("worktrees"),
+                        &temp_dir.join("worktrees"),
+                    )?;
+                    secure_restored_db_dir(&temp_dir)
+                })(),
             )?;
-            fs::create_dir_all(temp_dir.join("refs/branches"))?;
-            fs::create_dir_all(temp_dir.join("refs/lanes"))?;
-            fs::copy(backup_path.join(CONFIG_FILE), temp_dir.join(CONFIG_FILE))?;
-            fs::copy(backup_path.join(HEAD_FILE), temp_dir.join(HEAD_FILE))?;
-            fs::copy(
-                backup_sqlite_path(&backup_path),
-                temp_dir.join(DB_RELATIVE_PATH),
-            )?;
-            copy_dir_recursive(&backup_path.join("worktrees"), &temp_dir.join("worktrees"))?;
-            secure_restored_db_dir(&temp_dir)?;
             let restored_conn = Connection::open(temp_dir.join(DB_RELATIVE_PATH))?;
-            let filesystem_identity = fresh_restored_filesystem_identity(&workspace_root)?;
+            let filesystem_identity = restore_step(
+                "capture restored filesystem identity",
+                fresh_restored_filesystem_identity(&workspace_root),
+            )?;
             let scope_root = restored_scope_root(&workspace_root);
             rotate_restored_scopes(
                 &restored_conn,
@@ -72,17 +95,26 @@ impl Trail {
             drop(restored_conn);
             test_crash_point("restore_after_ledger_rotation");
 
-            let mut db = super::open_staged_copy(&workspace_root, &temp_dir)?;
+            let mut db = restore_step(
+                "open validated restore stage",
+                super::open_staged_copy(&workspace_root, &temp_dir),
+            )?;
             let rewritten_workdirs = {
-                let _lock = db.acquire_write_lock()?;
-                let rewritten = db.rewrite_restored_lane_workdir_paths()?;
-                db.drain_pending_path_index_derived_repairs_from_restore_stage(&db_dir)?;
+                let _lock = restore_step("lock restore stage", db.acquire_write_lock())?;
+                let rewritten = restore_step(
+                    "rewrite restored lane workdirs",
+                    db.rewrite_restored_lane_workdir_paths(),
+                )?;
+                restore_step(
+                    "drain restored path-index repairs",
+                    db.drain_pending_path_index_derived_repairs_from_restore_stage(&db_dir),
+                )?;
                 rewritten
             };
             test_crash_point("restore_after_staged_workdir_rewrite");
-            db.recover_after_open()?;
+            restore_step("recover restore stage", db.recover_after_open())?;
             test_crash_point("restore_after_staged_recovery");
-            let fsck = db.fsck()?;
+            let fsck = restore_step("fsck restore stage", db.fsck())?;
             if !fsck.errors.is_empty() {
                 return Err(Error::Corrupt(format!(
                     "restored backup failed fsck: {}",
@@ -99,7 +131,7 @@ impl Trail {
             }
             drop(db);
             test_crash_point("restore_after_staged_checkpoint");
-            sync_tree_bottom_up(&temp_dir)?;
+            restore_step("sync restore stage", sync_tree_bottom_up(&temp_dir))?;
             test_crash_point("restore_after_staged_sync");
             Ok((rewritten_workdirs, fsck))
         })();
@@ -110,15 +142,17 @@ impl Trail {
                 return Err(err);
             }
         };
-        let (publication, restored_trailignore) =
-            match RestorePublication::prepare(&workspace_root, &temp_dir, &backup_path, force) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let _ = remove_any(&temp_dir);
-                    return Err(error);
-                }
-            };
-        publication.publish()?;
+        let (publication, restored_trailignore) = match restore_step(
+            "prepare restore publication",
+            RestorePublication::prepare(&workspace_root, &temp_dir, &backup_path, force),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = remove_any(&temp_dir);
+                return Err(error);
+            }
+        };
+        restore_step("publish restore stage", publication.publish())?;
         Ok(BackupRestoreReport {
             workspace: workspace_root.to_string_lossy().to_string(),
             db_dir: db_dir.to_string_lossy().to_string(),
@@ -133,6 +167,16 @@ impl Trail {
             checked_texts: fsck.checked_texts,
         })
     }
+}
+
+fn restore_step<T>(label: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Io(source) => Error::Io(std::io::Error::new(
+            source.kind(),
+            format!("{label}: {source}"),
+        )),
+        other => other,
+    })
 }
 
 fn secure_restored_db_dir(db_dir: &Path) -> Result<()> {
@@ -195,7 +239,7 @@ fn fresh_restored_filesystem_identity(workspace_root: &Path) -> Result<Vec<u8>> 
     }
     #[cfg(windows)]
     {
-        let platform = windows_file_identity(workspace_root)?;
+        let platform = windows_directory_identity(workspace_root)?;
         identity.extend_from_slice(&platform.volume_serial_number.to_be_bytes());
         identity.extend_from_slice(&platform.file_index.to_be_bytes());
     }

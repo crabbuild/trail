@@ -124,7 +124,7 @@ run_capture "$logs/agent-b-spawn.json" "$trail_bin" --workspace "$workspace" lan
   --from agent-a --workdir-mode "$workdir_mode" --format json
 # The first child attachment may report sync_all=succeeded while reusing the
 # already-published layers. It must not run a compiler or package install.
-run_capture_json "$logs/agent-b-sync.json" "$trail_bin" --workspace "$workspace" env sync-all agent-b --format json
+run_capture_json "$logs/agent-b-sync.json" "$trail_bin" --workspace "$workspace" env sync all agent-b --format json
 if grep -Eq 'Compiling trail-env-fixture|added 1 package' \
   "$logs/agent-b-sync.json" "$logs/agent-b-sync.stderr"; then
   printf 'error: Agent B rebuilt or reinstalled instead of reusing Agent A layers\n' >&2
@@ -153,7 +153,7 @@ run_capture "$logs/agent-b-generation.json" "$trail_bin" --workspace "$workspace
 say "Agent C inherits Agent B's generation and starts"
 run_capture "$logs/agent-c-spawn.json" "$trail_bin" --workspace "$workspace" lane spawn agent-c \
   --from agent-b --workdir-mode "$workdir_mode" --format json
-run_capture_json "$logs/agent-c-sync.json" "$trail_bin" --workspace "$workspace" env sync-all agent-c --format json
+run_capture_json "$logs/agent-c-sync.json" "$trail_bin" --workspace "$workspace" env sync all agent-c --format json
 if grep -Eq 'Compiling trail-env-fixture|added 1 package' \
   "$logs/agent-c-sync.json" "$logs/agent-c-sync.stderr"; then
   printf 'error: Agent C rebuilt or reinstalled instead of reusing Agent B layers\n' >&2

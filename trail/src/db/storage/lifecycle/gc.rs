@@ -146,6 +146,10 @@ impl Trail {
 
         self.collect_lane_event_object_refs(&mut reachable, &mut errors)?;
 
+        for object_id in self.workspace_layer_object_roots()? {
+            reachable.insert(object_id);
+        }
+
         let mut stmt = self.conn.prepare("SELECT object_id FROM anchors")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {

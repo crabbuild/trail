@@ -330,6 +330,16 @@ pub(super) fn tools() -> Value {
             }), vec!["lane"])
         },
         {
+            "name": "trail.env_promote",
+            "title": "Promote Environment Output",
+            "description": "Snapshot and publish one quiesced manual private output, then atomically activate a successor generation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "component": { "type": "string" },
+                "output": { "type": "string" }
+            }), vec!["lane", "component", "output"])
+        },
+        {
             "name": "trail.env_runtime_status",
             "title": "Environment Runtime Status",
             "description": "Show persisted container, network, volume, port, lifecycle, and health state for the active lane generation without contacting a provider.",

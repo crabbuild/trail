@@ -8,7 +8,18 @@ CARGO_HOME_DIR=${TRAIL_DOCKER_CARGO_HOME:-/cargo-home}
 CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-fuse-cow-cargo}
 TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-fuse-cow-target}
 
-docker run --rm --privileged \
+for attempt in 1 2 3; do
+  if docker pull "$IMAGE"; then
+    break
+  fi
+  if [[ $attempt -eq 3 ]]; then
+    printf 'failed to pull %s after %d attempts\n' "$IMAGE" "$attempt" >&2
+    exit 1
+  fi
+  sleep "$((attempt * 5))"
+done
+
+docker run --rm --pull=never --privileged \
   -v "$ROOT":/work \
   -v "$CARGO_CACHE_VOLUME":"$CARGO_HOME_DIR" \
   -v "$TARGET_CACHE_VOLUME":"$TARGET_DIR" \

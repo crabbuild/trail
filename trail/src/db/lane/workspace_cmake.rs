@@ -124,6 +124,10 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
                 output_path: "private/build".to_string(),
                 mount_path,
                 policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                reuse: EnvironmentReuseMode::None,
+                scope: EnvironmentSharingScope::Lane,
+                publish: EnvironmentPublicationTrigger::Never,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason:
@@ -218,7 +222,10 @@ mod tests {
             .plan_workspace_environment("cmake", "trail/cmake-build@1", None)
             .unwrap();
         assert!(plan.commands.is_empty());
-        assert_eq!(plan.outputs[0].policy, "writable_private");
+        assert_eq!(
+            plan.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
         assert!(plan.tools.contains_key("cmake-executable"));
         let report = db
             .sync_workspace_environment_component("cmake", "trail/cmake-build@1", None, None)
@@ -226,7 +233,7 @@ mod tests {
         assert!(report.layers.is_empty());
         assert_eq!(
             report.generation.components[0].outputs[0].policy,
-            "writable_private"
+            EnvironmentOutputPolicy::WritablePrivate
         );
         assert!(report.generation.components[0].outputs[0]
             .layer_id

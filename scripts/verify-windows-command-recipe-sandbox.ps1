@@ -75,8 +75,8 @@ portability = "host"
     if ($plan.capabilities.sandbox -ne "windows-appcontainer-job") {
         throw "plan did not report the Windows AppContainer sandbox"
     }
-    $first = (& $trail --workspace $successRoot --json env sync recipe-a --adapter command) | ConvertFrom-Json
-    $second = (& $trail --workspace $successRoot --json env sync recipe-b --adapter command) | ConvertFrom-Json
+    $first = (& $trail --workspace $successRoot --json env sync all recipe-a) | ConvertFrom-Json
+    $second = (& $trail --workspace $successRoot --json env sync all recipe-b) | ConvertFrom-Json
     $firstLayer = $first.layers[0]
     $secondLayer = $second.layers[0]
     if ($firstLayer.layer_id -ne $secondLayer.layer_id) { throw "identical Windows recipes did not reuse one layer" }
@@ -87,7 +87,7 @@ portability = "host"
     $privateRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-private-" + [guid]::NewGuid())
     Write-Recipe $privateRoot @("tar.exe", "-cf", "generated/out.tar", "input.txt") "writable_private"
     New-RecipeLane $privateRoot
-    $private = (& $trail --workspace $privateRoot --json env sync recipe-a --adapter command) | ConvertFrom-Json
+    $private = (& $trail --workspace $privateRoot --json env sync all recipe-a) | ConvertFrom-Json
     if ($private.layers.Count -ne 0) { throw "writable-private Windows recipe manufactured a shared layer" }
     $privateOutput = $private.generation.components[0].outputs[0]
     if ($privateOutput.policy -ne "writable_private" -or $null -ne $privateOutput.layer_id) {
@@ -95,7 +95,7 @@ portability = "host"
     }
     & $trail --workspace $privateRoot lane exec recipe-a -- cmd.exe /d /c "echo private-mutation>.trail-generated\copy\private.txt"
     if ($LASTEXITCODE -ne 0) { throw "could not mutate writable-private Windows output" }
-    & $trail --workspace $privateRoot env sync recipe-a --adapter command | Out-Null
+    & $trail --workspace $privateRoot env sync all recipe-a | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not resynchronize writable-private Windows output" }
     & $trail --workspace $privateRoot lane exec recipe-a -- cmd.exe /d /c "findstr private-mutation .trail-generated\copy\private.txt>nul"
     if ($LASTEXITCODE -ne 0) { throw "writable-private Windows state was not preserved" }
@@ -114,8 +114,8 @@ portability = "host"
     New-RecipeLane $multiRoot
     & $trail --workspace $multiRoot lane spawn recipe-b --from main --workdir-mode dokan-cow | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "multi-output second lane spawn failed" }
-    $multiFirst = (& $trail --workspace $multiRoot --json env sync recipe-a --adapter command) | ConvertFrom-Json
-    $multiSecond = (& $trail --workspace $multiRoot --json env sync recipe-b --adapter command) | ConvertFrom-Json
+    $multiFirst = (& $trail --workspace $multiRoot --json env sync all recipe-a) | ConvertFrom-Json
+    $multiSecond = (& $trail --workspace $multiRoot --json env sync all recipe-b) | ConvertFrom-Json
     $multiFirstLayer = $multiFirst.layers[0]
     $multiSecondLayer = $multiSecond.layers[0]
     if ($multiFirstLayer.layer_id -ne $multiSecondLayer.layer_id) {
@@ -142,12 +142,12 @@ portability = "host"
     $readRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-read-" + [guid]::NewGuid())
     Write-Recipe $readRoot @("tar.exe", "-cf", "generated/out.tar", $outside)
     New-RecipeLane $readRoot
-    Assert-TrailFails { & $trail --workspace $readRoot env sync recipe-a --adapter command } "restricted Windows recipe unexpectedly read an undeclared host file"
+    Assert-TrailFails { & $trail --workspace $readRoot env sync all recipe-a } "restricted Windows recipe unexpectedly read an undeclared host file"
 
     $writeRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-write-" + [guid]::NewGuid())
     Write-Recipe $writeRoot @("tar.exe", "-cf", "escape.tar", "input.txt")
     New-RecipeLane $writeRoot
-    Assert-TrailFails { & $trail --workspace $writeRoot env sync recipe-a --adapter command } "restricted Windows recipe unexpectedly wrote outside its declared output"
+    Assert-TrailFails { & $trail --workspace $writeRoot env sync all recipe-a } "restricted Windows recipe unexpectedly wrote outside its declared output"
 
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -159,7 +159,7 @@ portability = "host"
         $networkRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-network-" + [guid]::NewGuid())
         Write-Recipe $networkRoot @("curl.exe", "--fail", "--max-time", "2", "http://127.0.0.1:$port/", "-o", "generated/network.txt")
         New-RecipeLane $networkRoot
-        Assert-TrailFails { & $trail --workspace $networkRoot env sync recipe-a --adapter command } "restricted Windows recipe unexpectedly used a network socket"
+        Assert-TrailFails { & $trail --workspace $networkRoot env sync all recipe-a } "restricted Windows recipe unexpectedly used a network socket"
     }
     finally {
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
@@ -168,9 +168,9 @@ portability = "host"
     $childRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-child-" + [guid]::NewGuid())
     Write-Recipe $childRoot @("forfiles.exe", "/P", ".", "/M", "input.txt", "/C", "cmd /c echo child>generated\child.txt")
     New-RecipeLane $childRoot
-    & $trail --workspace $childRoot --json env sync recipe-a --adapter command *> $null
+    & $trail --workspace $childRoot --json env sync all recipe-a *> $null
     if ($LASTEXITCODE -eq 0) {
-        $childLayer = (& $trail --workspace $childRoot --json env sync recipe-a --adapter command) | ConvertFrom-Json
+        $childLayer = (& $trail --workspace $childRoot --json env sync all recipe-a) | ConvertFrom-Json
         if (Test-Path -LiteralPath (Join-Path $childLayer.layers[0].storage_path "child.txt") -PathType Leaf) {
             throw "restricted Windows recipe unexpectedly launched a child process"
         }

@@ -313,6 +313,10 @@ impl Trail {
                 output_path: format!("{project}/node_modules"),
                 mount_path,
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason:

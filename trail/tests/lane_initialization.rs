@@ -238,6 +238,10 @@ fn http_duplicate_spawn_conflict_returns_shared_identity_details() {
     );
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn http_deferred_materialized_spawn_completes_without_owner() {
     struct AuthorityOverride;
@@ -316,6 +320,10 @@ fn mcp_duplicate_spawn_conflict_returns_shared_identity_details() {
     );
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn equivalent_spawn_requests_share_one_canonical_initialization_identity() {
     let mut fixture = LaneInitializationFixture::new();
@@ -353,6 +361,10 @@ fn equivalent_spawn_requests_share_one_canonical_initialization_identity() {
     assert!(replay.committed);
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn long_lived_handle_reads_sparse_lanes_created_by_cli_processes() {
     let mut fixture = LaneInitializationFixture::new();
@@ -419,6 +431,10 @@ fn long_lived_handle_reads_sparse_lanes_created_by_cli_processes() {
     }
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn different_sparse_paths_conflict_with_the_reserved_identity() {
     let mut fixture = LaneInitializationFixture::new();
@@ -452,6 +468,10 @@ fn different_sparse_paths_conflict_with_the_reserved_identity() {
     assert_initialization_conflict(error, "sparse-conflict", &first.request_fingerprint);
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn relative_and_canonical_destinations_share_one_canonical_identity() {
     let mut fixture = LaneInitializationFixture::new();
@@ -489,6 +509,10 @@ fn relative_and_canonical_destinations_share_one_canonical_identity() {
     assert!(replay.resumed);
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn different_explicit_destinations_conflict_with_the_reserved_identity() {
     let mut fixture = LaneInitializationFixture::new();
@@ -710,6 +734,10 @@ fn lane_ref_without_initialization_row_fails_stably_without_reserving_or_repairi
     }
 }
 
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 #[test]
 fn virtual_retains_source_operation_while_materialized_replaces_it() {
     let mut virtual_fixture = LaneInitializationFixture::new();

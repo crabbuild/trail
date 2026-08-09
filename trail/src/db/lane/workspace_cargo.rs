@@ -274,6 +274,10 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
                 output_path,
                 mount_path,
                 policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
                 create_if_missing: false,
             }],
             stale_reason:

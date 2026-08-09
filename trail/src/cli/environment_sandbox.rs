@@ -1,8 +1,9 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::io;
+    use std::fs::{self, File};
+    use std::io::{self, Read, Seek, SeekFrom};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -21,6 +22,7 @@ mod linux {
         home: PathBuf,
         temporary: PathBuf,
         program: PathBuf,
+        interpreter: Option<PathBuf>,
         args: Vec<OsString>,
     }
 
@@ -154,6 +156,7 @@ mod linux {
             .map_err(|error| format!("cannot canonicalize sandbox temporary directory: {error}"))?;
         let program = fs::canonicalize(&program)
             .map_err(|error| format!("cannot canonicalize sandbox program: {error}"))?;
+        let interpreter = elf_interpreter(&program)?;
         for (kind, paths) in [("input", &reads), ("output", &outputs)] {
             for path in paths {
                 if path.starts_with(&root) {
@@ -176,8 +179,132 @@ mod linux {
             home,
             temporary,
             program,
+            interpreter,
             args: arguments.collect(),
         })
+    }
+
+    fn elf_interpreter(program: &Path) -> Result<Option<PathBuf>, String> {
+        const ELF_HEADER_SIZE: usize = 64;
+        const PROGRAM_HEADER_SIZE: usize = 56;
+        const PT_INTERP: u32 = 3;
+        const MAX_PROGRAM_HEADERS: u16 = 256;
+        const MAX_INTERPRETER_BYTES: u64 = 4096;
+
+        fn field<const N: usize>(header: &[u8], offset: usize) -> Result<[u8; N], String> {
+            let bytes = header
+                .get(offset..offset + N)
+                .ok_or_else(|| "ELF header field is out of bounds".to_string())?;
+            let mut field = [0_u8; N];
+            field.copy_from_slice(bytes);
+            Ok(field)
+        }
+
+        let mut file = File::open(program).map_err(|error| {
+            format!(
+                "cannot inspect sandbox executable `{}`: {error}",
+                program.display()
+            )
+        })?;
+        let length = file
+            .metadata()
+            .map_err(|error| format!("cannot stat sandbox executable: {error}"))?
+            .len();
+        let mut header = [0_u8; ELF_HEADER_SIZE];
+        file.read_exact(&mut header).map_err(|error| {
+            format!(
+                "sandbox executable `{}` is not a complete ELF64 file: {error}",
+                program.display()
+            )
+        })?;
+        if &header[..4] != b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+            return Err(format!(
+                "sandbox executable `{}` must be a little-endian ELF64 binary; scripts and interpreters are denied",
+                program.display()
+            ));
+        }
+        let program_headers_offset = u64::from_le_bytes(field::<8>(&header, 32)?);
+        let program_header_size = u16::from_le_bytes(field::<2>(&header, 54)?);
+        let program_header_count = u16::from_le_bytes(field::<2>(&header, 56)?);
+        if usize::from(program_header_size) < PROGRAM_HEADER_SIZE
+            || program_header_count > MAX_PROGRAM_HEADERS
+        {
+            return Err(format!(
+                "sandbox executable `{}` has unsupported ELF program headers",
+                program.display()
+            ));
+        }
+        let table_bytes = u64::from(program_header_size)
+            .checked_mul(u64::from(program_header_count))
+            .and_then(|size| program_headers_offset.checked_add(size))
+            .ok_or_else(|| "ELF program header table overflowed".to_string())?;
+        if table_bytes > length {
+            return Err(format!(
+                "sandbox executable `{}` has an out-of-bounds ELF program header table",
+                program.display()
+            ));
+        }
+        let mut program_header = vec![0_u8; usize::from(program_header_size)];
+        for index in 0..program_header_count {
+            let offset = program_headers_offset + u64::from(index) * u64::from(program_header_size);
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(&mut program_header))
+                .map_err(|error| format!("cannot read ELF program header: {error}"))?;
+            if u32::from_le_bytes(field::<4>(&program_header, 0)?) != PT_INTERP {
+                continue;
+            }
+            let interpreter_offset = u64::from_le_bytes(field::<8>(&program_header, 8)?);
+            let interpreter_size = u64::from_le_bytes(field::<8>(&program_header, 32)?);
+            let interpreter_end = interpreter_offset
+                .checked_add(interpreter_size)
+                .ok_or_else(|| "ELF interpreter range overflowed".to_string())?;
+            if interpreter_size < 2
+                || interpreter_size > MAX_INTERPRETER_BYTES
+                || interpreter_end > length
+            {
+                return Err(format!(
+                    "sandbox executable `{}` has an invalid ELF interpreter range",
+                    program.display()
+                ));
+            }
+            let mut bytes = vec![
+                0_u8;
+                usize::try_from(interpreter_size)
+                    .map_err(|_| "ELF interpreter path is too large".to_string())?
+            ];
+            file.seek(SeekFrom::Start(interpreter_offset))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|error| format!("cannot read ELF interpreter: {error}"))?;
+            if bytes.last() != Some(&0) || bytes[..bytes.len() - 1].contains(&0) {
+                return Err(format!(
+                    "sandbox executable `{}` has a malformed ELF interpreter path",
+                    program.display()
+                ));
+            }
+            bytes.pop();
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            if !path.is_absolute() {
+                return Err(format!(
+                    "sandbox executable `{}` has a non-absolute ELF interpreter",
+                    program.display()
+                ));
+            }
+            let path = fs::canonicalize(&path).map_err(|error| {
+                format!(
+                    "cannot resolve ELF interpreter `{}` for sandbox executable `{}`: {error}",
+                    path.display(),
+                    program.display()
+                )
+            })?;
+            if !path.is_file() {
+                return Err(format!(
+                    "ELF interpreter `{}` is not a file",
+                    path.display()
+                ));
+            }
+            return Ok(Some(path));
+        }
+        Ok(None)
     }
 
     fn apply_landlock(invocation: &SandboxInvocation) -> Result<(), String> {
@@ -299,6 +426,19 @@ mod linux {
                 read_execute_file,
             ))
             .map_err(|error| format!("cannot allow selected sandbox executable: {error}"))?;
+        if let Some(interpreter) = &invocation.interpreter {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    PathFd::new(interpreter).map_err(|error| {
+                        format!(
+                            "cannot open sandbox ELF interpreter `{}`: {error}",
+                            interpreter.display()
+                        )
+                    })?,
+                    read_execute_file,
+                ))
+                .map_err(|error| format!("cannot allow sandbox ELF interpreter: {error}"))?;
+        }
         for path in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
             if Path::new(path).exists() {
                 ruleset = ruleset
@@ -486,6 +626,54 @@ mod linux {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     compile_error!("Trail's Linux recipe sandbox supports x86_64 and aarch64 only");
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::ffi::OsStrExt;
+
+        #[test]
+        fn elf_interpreter_is_bounded_and_canonicalized() {
+            const HEADER_SIZE: usize = 64;
+            const PROGRAM_HEADER_SIZE: usize = 56;
+
+            let temp = tempfile::tempdir().unwrap();
+            let interpreter = temp.path().join("loader");
+            fs::write(&interpreter, b"loader fixture").unwrap();
+            let interpreter = fs::canonicalize(interpreter).unwrap();
+            let mut interpreter_bytes = interpreter.as_os_str().as_bytes().to_vec();
+            interpreter_bytes.push(0);
+
+            let interpreter_offset = HEADER_SIZE + PROGRAM_HEADER_SIZE;
+            let mut elf = vec![0_u8; interpreter_offset + interpreter_bytes.len()];
+            elf[..4].copy_from_slice(b"\x7fELF");
+            elf[4] = 2;
+            elf[5] = 1;
+            elf[32..40].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+            elf[54..56].copy_from_slice(&(PROGRAM_HEADER_SIZE as u16).to_le_bytes());
+            elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+            elf[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&3_u32.to_le_bytes());
+            elf[HEADER_SIZE + 8..HEADER_SIZE + 16]
+                .copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
+            elf[HEADER_SIZE + 32..HEADER_SIZE + 40]
+                .copy_from_slice(&(interpreter_bytes.len() as u64).to_le_bytes());
+            elf[interpreter_offset..].copy_from_slice(&interpreter_bytes);
+            let program = temp.path().join("program");
+            fs::write(&program, elf).unwrap();
+
+            assert_eq!(elf_interpreter(&program).unwrap(), Some(interpreter));
+        }
+
+        #[test]
+        fn elf_interpreter_rejects_scripts() {
+            let temp = tempfile::tempdir().unwrap();
+            let program = temp.path().join("script");
+            fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+
+            let error = elf_interpreter(&program).unwrap_err();
+            assert!(error.contains("not a complete ELF64 file"));
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

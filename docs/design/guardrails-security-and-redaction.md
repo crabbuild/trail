@@ -1,5 +1,11 @@
 # Guardrails, Security, and Redaction
 
+Private-output promotion is confined to a declared lane-owned generated upper.
+Trail holds the view mutation barrier, snapshots into an attempt-owned staging
+directory, rejects protected paths, escaping links, special files, excessive
+entry counts, and secret-bearing text, then validates the snapshot again before
+publishing. It never shares a live writable directory between lanes.
+
 This design section is advanced/internal. It describes Trail's local safety mechanisms for paths, ignored files, guardrail decisions, daemon auth, and sensitive metadata redaction.
 
 ## Safety Model

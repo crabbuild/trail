@@ -1,5 +1,14 @@
 # Storage and Indexing
 
+Environment layer manifests and their sorted page objects are authoritative
+content-addressed objects rooted by `workspace_layers`. Object GC preserves the
+root and every page. `workspace_layer_publications` records private-output
+promotion phases and producer evidence; doctor, fsck, backup, restore, and
+schema validation treat those rows as authoritative schema-v1 state. Because
+backup archives exclude workspace cache bytes and mounted views, restore keeps
+publication history but closes attachable attempts as `recovered` and clears
+their layer/generation links.
+
 This design section is advanced/internal. It describes the current storage architecture and index maintenance paths.
 
 ## Storage Overview

@@ -175,6 +175,11 @@ pub(super) fn lane_paths() -> Value {
                 openapi_path_param("lane_or_id", "string")
             ], Some("DependencySyncRequest"), "EnvironmentSyncReport", true)
         },
+        "/v1/lanes/{lane_or_id}/environment/promote": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentPromote", "Promote environment output", "Snapshot and publish one quiesced manual private output, then atomically activate a successor generation.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("EnvironmentPromoteRequest"), "EnvironmentPromotionReport", true)
+        },
         "/v1/lanes/{lane_or_id}/environment/runtime/status": {
             "get": openapi_operation_with_response_schema("laneEnvironmentRuntimeStatus", "Environment runtime status", "Return persisted container, network, volume, port, lifecycle, and health state without contacting the runtime provider.", vec![
                 openapi_path_param("lane_or_id", "string")

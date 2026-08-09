@@ -5,6 +5,15 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Changed
+
+- Changed omitted lane workdir mode to lazy qualified transparent `auto`.
+- Replaced the old environment sync spellings with `trail env sync all` and
+  `trail env sync component`.
+- Added framework-neutral output policy, reuse, scope, publication, cache
+  decision, and rebuild provenance.
+- Added journaled `trail env promote` publication of quiesced private outputs.
+
 ### Fixed
 
 - Concurrent materialized-lane initialization now retries short SQLite WAL

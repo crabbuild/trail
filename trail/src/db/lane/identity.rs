@@ -41,9 +41,22 @@ impl Trail {
             // Backups do not contain `.trail/views`. Invalidate every view and
             // its derived environment state before normal open recovery can
             // inspect source-workspace absolute paths from the copied SQLite
-            // store. A lane can create a fresh view in the restored workspace.
+            // store. Backups also exclude performance cache bytes, so retain
+            // publication attempts as non-attachable recovery provenance and
+            // discard layer/cache authorities. A lane can create a fresh view
+            // and generation in the restored workspace.
             self.conn.execute_batch(
-                "DELETE FROM environment_secret_access_audit
+                "UPDATE workspace_layer_publications
+                   SET phase='recovered', successor_generation_id=NULL,
+                       manifest_object_id=NULL, layer_id=NULL,
+                       error_code='backup_restore_cache_invalidated',
+                       error_message='backup restore excluded workspace cache bytes',
+                       updated_at=unixepoch(), finished_at=unixepoch()
+                   WHERE phase IN ('prepared','snapshotted','validated','published','activated');
+                 DELETE FROM environment_hot_access_sessions;
+                 DELETE FROM environment_hot_sets;
+                 DELETE FROM workspace_layer_pins;
+                 DELETE FROM environment_secret_access_audit
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
                  DELETE FROM environment_generation_runtime_secrets
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
@@ -72,6 +85,7 @@ impl Trail {
                  DELETE FROM environment_component_states;
                  DELETE FROM workspace_environment_states;
                  DELETE FROM workspace_view_layers;
+                 DELETE FROM workspace_layers;
                  DELETE FROM workspace_git_shadows;
                  DELETE FROM workspace_views;",
             )?;

@@ -85,7 +85,7 @@ proposal together:
 ```sh
 trail env discover <lane>
 trail env plan <lane>
-trail env sync-all <lane>
+trail env sync all <lane>
 trail env generation <lane>
 ```
 
@@ -96,9 +96,9 @@ synchronization. Repository-defined `trail/command@1` components may be declared
 seccomp, or a capability-free Windows AppContainer constrained by a one-process Job
 Object, and fails closed when the required native enforcement is unavailable.
 If discovery reports multiple components at one root, pass `--component <id>` to
-`env plan` or `env sync`, or use `env sync-all` to activate the whole environment.
+`env plan` or `env sync component`, or use `env sync all` to activate the whole environment.
 
-`sync-all` builds components before changing mounts; activation advances one durable
+`sync all` builds components before changing mounts; activation advances one durable
 generation or leaves the predecessor authoritative.
 
 ## Materialized Workdir Changes

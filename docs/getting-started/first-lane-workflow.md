@@ -16,7 +16,7 @@ cd /path/to/project
 # Run once if this project is not initialized yet.
 trail init --working-tree
 
-trail lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main
 trail lane status docs-lane
 ```
 
@@ -70,13 +70,13 @@ trail lane spawn docs-lane --from main --no-materialize
 Create a materialized workdir:
 
 ```sh
-trail lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main
 ```
 
 Materialize only selected paths:
 
 ```sh
-trail lane spawn docs-lane --from main --materialize=true --paths docs README.md
+trail lane spawn docs-lane --from main --paths docs README.md
 ```
 
 ## Structured Patch Flow

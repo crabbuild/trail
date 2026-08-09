@@ -60,7 +60,7 @@ fn publish_staged_tree_with_exchange(
     test_crash_point("backup_restore_after_staging_sync");
 
     if !target.exists() {
-        fs::rename(stage, target)?;
+        rename_publication_entry(stage, target)?;
         sync_directory_strict(parent)?;
         test_crash_point("backup_restore_after_atomic_publish");
         return Ok(None);
@@ -86,6 +86,15 @@ pub(super) fn remove_retained_tree(path: Option<PathBuf>, parent: &Path) -> Resu
 }
 
 pub(super) fn remove_any(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return retry_windows_publication_mutation(|| remove_any_once(path));
+    }
+    #[cfg(not(windows))]
+    remove_any_once(path)
+}
+
+fn remove_any_once(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -97,6 +106,38 @@ pub(super) fn remove_any(path: &Path) -> Result<()> {
         fs::remove_file(path)?;
     }
     Ok(())
+}
+
+pub(super) fn rename_publication_entry(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return retry_windows_publication_mutation(|| {
+            fs::rename(source, destination).map_err(Error::from)
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn retry_windows_publication_mutation(mut operation: impl FnMut() -> Result<()>) -> Result<()> {
+    let mut delay = Duration::from_millis(2);
+    for attempt in 0..9 {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(Error::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 8 =>
+            {
+                sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded Windows publication retry loop always returns")
 }
 
 pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {

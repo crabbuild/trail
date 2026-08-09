@@ -52,12 +52,57 @@ pub(super) enum EnvironmentSubcommand {
     Explain(EnvironmentExplainArgs),
     /// Preview the normalized component key, actions, outputs, and capabilities without executing.
     Plan(EnvironmentSyncArgs),
-    /// Prepare shared and/or writable-private outputs and attach one component atomically.
-    Sync(EnvironmentSyncArgs),
-    /// Prepare all discovered components, then activate one atomic generation.
-    SyncAll(EnvironmentDiscoverArgs),
+    /// Converge all desired components or one named component.
+    Sync(EnvironmentSyncCommand),
+    /// Publish one quiesced manual private output as a reusable immutable layer.
+    Promote(EnvironmentPromoteArgs),
     /// Inspect, reconcile, or stop lane-private runtime services.
     Runtime(EnvironmentRuntimeCommand),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentPromoteArgs {
+    pub(super) lane: String,
+    pub(super) component: String,
+    pub(super) output: String,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentSyncCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentSyncSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentSyncSubcommand {
+    /// Prepare all discovered components, then activate one atomic generation.
+    All(EnvironmentSyncAllArgs),
+    /// Prepare one component and its required dependency closure.
+    Component(EnvironmentSyncComponentArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentSyncAllArgs {
+    /// Lane name. Omit only inside exactly one mounted or managed lane context.
+    pub(super) lane: Option<String>,
+    /// Restrict discovery to one source-relative component root.
+    #[arg(long, value_name = "ROOT")]
+    pub(super) path: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentSyncComponentArgs {
+    /// Stable logical component ID from `trail env discover`.
+    pub(super) component: String,
+    /// Lane name. Omit only inside exactly one mounted or managed lane context.
+    #[arg(long)]
+    pub(super) lane: Option<String>,
+    /// Versioned environment adapter identity.
+    #[arg(long, default_value = "auto")]
+    pub(super) adapter: String,
+    /// Adapter component root relative to the lane source root.
+    #[arg(long, value_name = "ROOT")]
+    pub(super) path: Option<String>,
 }
 
 #[derive(Args)]

@@ -373,6 +373,10 @@ impl Drop for MaterializationRelease {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn authority_off_distinct_materializations_overlap_without_workspace_lock() {
     const WORKERS: usize = 2;
     let temp = tempfile::tempdir().unwrap();
@@ -443,6 +447,10 @@ fn authority_off_distinct_materializations_overlap_without_workspace_lock() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn authority_on_claim_reaches_materialization_before_workspace_lock() {
     struct AuthorityOverride;
     impl Drop for AuthorityOverride {
@@ -548,6 +556,10 @@ fn crash_and_resume(boundary: &str) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn identical_spawn_resumes_at_every_durable_crash_cut() {
     for boundary in [
         "after_reservation",
@@ -562,6 +574,10 @@ fn identical_spawn_resumes_at_every_durable_crash_cut() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn dead_process_owner_is_taken_over_and_replays_after_every_crash_cut() {
     for boundary in [
         "repair_after_ref_mirror",
@@ -614,6 +630,10 @@ fn dead_process_owner_is_taken_over_and_replays_after_every_crash_cut() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn dead_associated_owner_is_atomically_taken_over_for_repair() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -805,6 +825,10 @@ fn lost_owner_fence_restarts_claim_and_replay_internally() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn stale_owner_cannot_transition_after_generation_takeover() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -894,6 +918,10 @@ fn stale_owner_cannot_transition_after_generation_takeover() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn pre_association_rollback_retains_materialized_state_and_releases_exact_owner() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -931,6 +959,10 @@ fn pre_association_rollback_retains_materialized_state_and_releases_exact_owner(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn stale_owner_cannot_publish_lane_spawn_event_after_takeover() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -1000,6 +1032,10 @@ fn stale_owner_cannot_publish_lane_spawn_event_after_takeover() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn live_and_unknown_associated_owner_timeout_preserves_fence_and_side_effects() {
     let temp = tempfile::tempdir().unwrap();
     initialize_workspace(temp.path());
@@ -1106,6 +1142,10 @@ fn live_and_unknown_associated_owner_timeout_preserves_fence_and_side_effects() 
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn concurrent_ownerless_repair_publishes_one_event_and_replays_idempotently() {
     const REPAIRERS: usize = 8;
     let (temp, db, journal) = ownerless_materialized_repair_fixture("ownerless-repair");
@@ -1161,6 +1201,10 @@ fn associated_ownerless_repair_completes_observer_ready() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn failed_claimed_repair_persists_error_and_releases_exact_owner() {
     let (temp, mut db, _journal) = ownerless_materialized_repair_fixture("failed-repair-owner");
     let sqlite = temp.path().join(".trail/index/trail.sqlite");
@@ -1244,6 +1288,10 @@ fn transparent_cow_view_failure_persists_repair_and_replays_without_owner() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn deferred_materialized_spawn_releases_owner_before_resume() {
     struct AuthorityOverride;
     impl Drop for AuthorityOverride {
@@ -1286,6 +1334,10 @@ fn deferred_materialized_spawn_releases_owner_before_resume() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn io_failures_never_advance_past_or_delete_the_durable_artifact() {
     for (boundary, disk_full) in [
         ("workdir_write", true),
@@ -1584,6 +1636,10 @@ fn concurrent_identical_spawn_requests_replay_one_committed_result() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn concurrent_identical_processes_replay_one_committed_result() {
     const CALLERS: usize = 16;
     let temp = tempfile::tempdir().unwrap();
@@ -1648,6 +1704,10 @@ fn concurrent_identical_processes_replay_one_committed_result() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "descriptor-relative materialization authority is not implemented on Windows"
+)]
 fn sixty_four_unrelated_initializations_reach_observer_ready_without_owners() {
     struct AuthorityOverride;
     impl Drop for AuthorityOverride {

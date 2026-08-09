@@ -1,5 +1,11 @@
 # Performance and Scale Benchmarks
 
+Run `scripts/verify-layered-lane-scale.sh` with a unique external
+`CARGO_TARGET_DIR` and `TRAIL_SCALE_EVIDENCE_DIR` beneath `/Volumes/Workspace`.
+It executes deterministic 10k/1-lane, 100k/5-lane, and 1M/20-lane fixtures and
+writes one JSON evidence file per experiment. A platform whose native backend
+gate was not run remains unverified; a skipped result is never passing evidence.
+
 Use the CLI scale benchmark to verify large-repo and agent orchestration behavior before treating a change as production ready.
 
 ## CI Smoke

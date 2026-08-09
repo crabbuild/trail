@@ -187,6 +187,18 @@ pub(crate) fn set_config_value(
             config.workspace_views.cache_max_bytes = parse_config_u64(key, value, true)?;
             Ok(())
         }
+        "workspace_views.cache_min_free_bytes" => {
+            config.workspace_views.cache_min_free_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.prefetch_max_bytes" => {
+            config.workspace_views.prefetch_max_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.prefetch_max_entries" => {
+            config.workspace_views.prefetch_max_entries = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
         _ => Err(Error::InvalidInput(format!("unknown config key `{key}`"))),
     }
 }

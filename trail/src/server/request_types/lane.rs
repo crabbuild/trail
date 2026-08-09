@@ -202,6 +202,13 @@ pub(crate) struct EnvironmentSyncRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentPromoteRequest {
+    pub(crate) component: String,
+    pub(crate) output: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CacheGcRequest {
     #[serde(default)]
     pub(crate) dry_run: bool,

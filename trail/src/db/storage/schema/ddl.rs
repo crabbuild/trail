@@ -175,7 +175,13 @@ CREATE TABLE environment_component_output_bindings (
                 mount_path TEXT NOT NULL,
                 layer_subpath TEXT NOT NULL DEFAULT '',
                 policy TEXT NOT NULL DEFAULT 'immutable_seed_private',
+                reuse_mode TEXT NOT NULL DEFAULT 'exact',
+                sharing_scope TEXT NOT NULL DEFAULT 'workspace',
+                publication_trigger TEXT NOT NULL DEFAULT 'on_sync',
+                publication_gate TEXT,
                 binding_identity TEXT NOT NULL DEFAULT '',
+                manifest_object_id TEXT,
+                publication_id TEXT,
                 kind TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (view_id, component_id, output_name),
@@ -275,8 +281,14 @@ CREATE TABLE environment_generation_outputs (
                 component_id TEXT NOT NULL,
                 output_name TEXT NOT NULL,
                 policy TEXT NOT NULL DEFAULT 'immutable_seed_private',
+                reuse_mode TEXT NOT NULL DEFAULT 'exact',
+                sharing_scope TEXT NOT NULL DEFAULT 'workspace',
+                publication_trigger TEXT NOT NULL DEFAULT 'on_sync',
+                publication_gate TEXT,
                 storage_identity TEXT NOT NULL,
                 layer_id TEXT,
+                manifest_object_id TEXT,
+                publication_id TEXT,
                 mount_path TEXT NOT NULL,
                 layer_subpath TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (generation_id, component_id, output_name),
@@ -375,6 +387,51 @@ CREATE TABLE environment_sync_attempts (
                 started_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 finished_at INTEGER
+            );
+CREATE TABLE environment_cache_decisions (
+                decision_id TEXT PRIMARY KEY,
+                attempt_id TEXT,
+                view_id TEXT NOT NULL,
+                component_id TEXT NOT NULL,
+                desired_key TEXT NOT NULL,
+                storage_identity TEXT,
+                decision TEXT NOT NULL,
+                decision_source TEXT NOT NULL,
+                rebuild_reason TEXT,
+                identity_edges_json BLOB NOT NULL,
+                bytes_avoided INTEGER,
+                bytes_written INTEGER,
+                created_at INTEGER NOT NULL
+            );
+CREATE TABLE environment_hot_access_sessions (
+                session_id TEXT PRIMARY KEY,
+                execution_id TEXT NOT NULL UNIQUE,
+                view_id TEXT NOT NULL,
+                command_fingerprint TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                component_identities_json BLOB NOT NULL,
+                manifest_identities_json BLOB NOT NULL,
+                owner_pid INTEGER NOT NULL,
+                owner_start_token TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('recording','succeeded','failed','published')),
+                entries_json BLOB NOT NULL,
+                entry_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+CREATE TABLE environment_hot_sets (
+                hot_set_id TEXT PRIMARY KEY,
+                command_fingerprint TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                component_identities_json BLOB NOT NULL,
+                manifest_identities_json BLOB NOT NULL,
+                entries_json BLOB NOT NULL,
+                entry_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (command_fingerprint, generation_id)
             );
 CREATE TABLE environment_view_generations (
                 view_id TEXT PRIMARY KEY,
@@ -890,6 +947,40 @@ CREATE TABLE workspace_layers (
                 last_used_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
+CREATE TABLE workspace_layer_publications (
+                publication_id TEXT PRIMARY KEY,
+                view_id TEXT NOT NULL,
+                predecessor_generation_id TEXT NOT NULL,
+                successor_generation_id TEXT,
+                component_id TEXT NOT NULL,
+                output_name TEXT NOT NULL,
+                source_root TEXT NOT NULL,
+                output_identity TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                gate_name TEXT,
+                producer_receipt_json BLOB,
+                phase TEXT NOT NULL CHECK (phase IN
+                    ('prepared','snapshotted','validated','published','activated','failed','recovered')),
+                owner_pid INTEGER NOT NULL,
+                owner_start_token TEXT NOT NULL,
+                staging_path TEXT NOT NULL,
+                manifest_object_id TEXT,
+                layer_id TEXT,
+                logical_bytes INTEGER,
+                physical_bytes INTEGER,
+                error_code TEXT,
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                finished_at INTEGER
+            );
+CREATE TABLE workspace_layer_pins (
+                pin_id TEXT PRIMARY KEY,
+                layer_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
 CREATE TABLE workspace_view_layers (
                 view_id TEXT NOT NULL,
                 layer_id TEXT NOT NULL,
@@ -961,6 +1052,10 @@ CREATE INDEX anchors_line_idx ON anchors(line_id, created_at);
 CREATE INDEX conflict_resolution_suggestions_signature_idx ON conflict_resolution_suggestions(signature, created_at);
 CREATE INDEX environment_cache_namespaces_lru_idx
                 ON environment_cache_namespaces(last_used_at, namespace_id);
+CREATE INDEX environment_cache_decisions_view_created_idx
+                ON environment_cache_decisions(view_id, created_at, decision_id);
+CREATE INDEX environment_cache_decisions_key_created_idx
+                ON environment_cache_decisions(desired_key, created_at, decision_id);
 CREATE INDEX environment_component_dependencies_dependency_idx
                 ON environment_component_dependencies(view_id, dependency_component_id, component_id);
 CREATE INDEX environment_component_states_adapter_idx
@@ -981,6 +1076,10 @@ CREATE INDEX environment_generation_runtime_secrets_status_idx
                 ON environment_generation_runtime_secrets(status, updated_at, generation_id);
 CREATE INDEX environment_generations_view_state_idx
                 ON environment_generations(view_id, state, generation_sequence);
+CREATE INDEX environment_hot_access_sessions_view_idx
+                ON environment_hot_access_sessions(view_id, status, updated_at);
+CREATE INDEX environment_hot_sets_updated_idx
+                ON environment_hot_sets(updated_at, hot_set_id);
 CREATE INDEX environment_secret_access_audit_generation_idx
                 ON environment_secret_access_audit(generation_id, created_at);
 CREATE UNIQUE INDEX environment_sync_attempts_running_view_idx
@@ -1073,6 +1172,12 @@ CREATE INDEX operations_session_created_idx ON operations(session_id, created_at
 CREATE INDEX pending_path_index_derived_repairs_root_idx
                 ON pending_path_index_derived_repairs(new_root);
 CREATE INDEX workspace_layers_state_used_idx ON workspace_layers(state, last_used_at);
+CREATE INDEX workspace_layer_publications_phase_updated_idx
+                ON workspace_layer_publications(phase, updated_at, publication_id);
+CREATE INDEX workspace_layer_publications_layer_idx
+                ON workspace_layer_publications(layer_id, publication_id);
+CREATE INDEX workspace_layer_pins_layer_idx
+                ON workspace_layer_pins(layer_id, expires_at, pin_id);
 CREATE INDEX workspace_view_layers_layer_idx ON workspace_view_layers(layer_id);
 CREATE INDEX workspace_views_status_idx ON workspace_views(status, updated_at);
 "#;

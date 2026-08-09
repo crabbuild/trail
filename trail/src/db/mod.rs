@@ -2263,8 +2263,7 @@ fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
 fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
     Error::SchemaReinitializeRequired {
         found: err.to_string(),
-        guidance: "back up this workspace, then run `trail init --force` to create schema v1"
-            .into(),
+        guidance: "back up this workspace, then run `trail init --force --from-git` to create a fresh schema-v1 workspace from Git-tracked files".into(),
     }
 }
 
@@ -2277,6 +2276,8 @@ const MESSAGE_OBJECT_VERSION: u16 = 1;
 const ANCHOR_OBJECT_VERSION: u16 = 1;
 const WORKSPACE_LAYER_MANIFEST_KIND: &str = "workspace_layer_manifest";
 const WORKSPACE_LAYER_MANIFEST_VERSION: u16 = 1;
+const WORKSPACE_LAYER_MANIFEST_PAGE_KIND: &str = "workspace_layer_manifest_page";
+const WORKSPACE_LAYER_MANIFEST_PAGE_VERSION: u16 = 1;
 const OBJECT_CACHE_MAX_ENTRIES: usize = 4096;
 const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ORDER_KEY_STEP: u64 = 1024;
@@ -4001,6 +4002,22 @@ fn parse_workspace_lock_owner(record: &str) -> Option<ParsedWorkspaceLockOwner> 
     WorkspaceLockOwner::parse(record)
         .map(ParsedWorkspaceLockOwner::V2)
         .or_else(|| LegacyWorkspaceLockOwner::parse(record).map(ParsedWorkspaceLockOwner::V1))
+}
+
+pub(crate) fn workspace_lock_is_owned_by_current_process(db_dir: &Path) -> bool {
+    let Ok(record) = fs::read_to_string(db_dir.join("lock")) else {
+        return false;
+    };
+    let Some(owner) = parse_workspace_lock_owner(&record) else {
+        return false;
+    };
+    match owner {
+        ParsedWorkspaceLockOwner::V1(owner) => owner.pid == std::process::id(),
+        ParsedWorkspaceLockOwner::V2(owner) => {
+            owner.pid == std::process::id()
+                && current_executable_identity().is_ok_and(|id| id == owner.executable_identity)
+        }
+    }
 }
 
 fn current_executable_identity() -> std::io::Result<String> {

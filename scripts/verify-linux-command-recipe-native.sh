@@ -3,8 +3,44 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
-cargo build -p trail
-trail="${CARGO_TARGET_DIR:-${repo_root}/target}/debug/trail"
+ci_tmpdir=""
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
+  : "${GITHUB_WORKSPACE:?GitHub Actions did not provide GITHUB_WORKSPACE}"
+  ci_tmpdir="${GITHUB_WORKSPACE}/.trail-ci-recipe-${GITHUB_RUN_ID:-run}-${GITHUB_JOB:-job}"
+  mkdir -p "${ci_tmpdir}"
+  TMPDIR="${ci_tmpdir}"
+  export TMPDIR
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUNNER_TEMP}/trail-command-recipe-target}"
+  export CARGO_TARGET_DIR
+  case "${CARGO_TARGET_DIR}" in
+    "${RUNNER_TEMP}"/*) ;;
+    *) printf 'GitHub Actions CARGO_TARGET_DIR must be beneath RUNNER_TEMP\n' >&2; exit 2 ;;
+  esac
+else
+  : "${CARGO_TARGET_DIR:?set a unique CARGO_TARGET_DIR beneath /Volumes/Workspace/crabbuild-target}"
+  case "${CARGO_TARGET_DIR}" in
+    /Volumes/Workspace/crabbuild-target/*) ;;
+    *) printf 'CARGO_TARGET_DIR must be beneath /Volumes/Workspace/crabbuild-target\n' >&2; exit 2 ;;
+  esac
+fi
+cargo build -p trail --locked
+trail="${CARGO_TARGET_DIR}/debug/trail"
+
+cleanup() {
+  cd /
+  for root in "${success_root:-}" "${private_root:-}" "${multi_root:-}" \
+    "${host_read_root:-}" "${write_root:-}" "${network_root:-}" "${shell_root:-}"; do
+    if [[ -n "${root}" ]]; then
+      chmod -R u+w "${root}" 2>/dev/null || true
+      rm -rf "${root}"
+    fi
+  done
+  if [[ -n "${ci_tmpdir}" ]]; then
+    rmdir "${ci_tmpdir}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 write_spec() {
   local root="$1"
@@ -59,8 +95,8 @@ new_lane_workspace "${success_root}"
 "${trail}" --workspace "${success_root}" lane spawn recipe-b --from main --workdir-mode fuse-cow >/dev/null
 plan="$("${trail}" --workspace "${success_root}" --json env plan recipe-a --adapter command)"
 grep -q "linux-landlock-seccomp" <<<"${plan}"
-first="$("${trail}" --workspace "${success_root}" --json env sync recipe-a --adapter command)"
-second="$("${trail}" --workspace "${success_root}" --json env sync recipe-b --adapter command)"
+first="$("${trail}" --workspace "${success_root}" --json env sync all recipe-a)"
+second="$("${trail}" --workspace "${success_root}" --json env sync all recipe-b)"
 first_layer="$(sed -n "s/.*\"layer_id\": \"\([^\"]*\)\".*/\1/p" <<<"${first}" | head -1)"
 second_layer="$(sed -n "s/.*\"layer_id\": \"\([^\"]*\)\".*/\1/p" <<<"${second}" | head -1)"
 storage_path="$(sed -n "s/.*\"storage_path\": \"\([^\"]*\)\".*/\1/p" <<<"${first}" | head -1)"
@@ -71,7 +107,7 @@ cmp "${success_root}/input.txt" "${storage_path}/copied.txt"
 private_root="$(mktemp -d)"
 TRAIL_RECIPE_POLICY=writable_private write_spec "${private_root}" cp input.txt generated/copied.txt
 new_lane_workspace "${private_root}"
-private_sync="$("${trail}" --workspace "${private_root}" --json env sync recipe-a --adapter command)"
+private_sync="$("${trail}" --workspace "${private_root}" --json env sync all recipe-a)"
 python3 -c '
 import json, sys
 report = json.load(sys.stdin)
@@ -82,7 +118,7 @@ assert output["layer_id"] is None, output
 ' <<<"${private_sync}"
 "${trail}" --workspace "${private_root}" lane exec recipe-a -- \
   sh -c 'printf private-mutation >.trail-generated/copy/copied.txt'
-"${trail}" --workspace "${private_root}" env sync recipe-a --adapter command >/dev/null
+"${trail}" --workspace "${private_root}" env sync all recipe-a >/dev/null
 "${trail}" --workspace "${private_root}" lane exec recipe-a -- \
   sh -c 'grep -q private-mutation .trail-generated/copy/copied.txt'
 
@@ -100,8 +136,8 @@ new_lane_workspace "${multi_root}"
 "${trail}" --workspace "${multi_root}" lane spawn recipe-b --from main --workdir-mode fuse-cow >/dev/null
 multi_plan="$("${trail}" --workspace "${multi_root}" --json env plan recipe-a --adapter command)"
 test "$(grep -c '"output_path"' <<<"${multi_plan}")" -ge 3
-multi_first="$("${trail}" --workspace "${multi_root}" --json env sync-all recipe-a)"
-multi_second="$("${trail}" --workspace "${multi_root}" --json env sync recipe-b --adapter command)"
+multi_first="$("${trail}" --workspace "${multi_root}" --json env sync all recipe-a)"
+multi_second="$("${trail}" --workspace "${multi_root}" --json env sync all recipe-b)"
 multi_first_layer="$(sed -n "s/.*\"layer_id\": \"\([^\"]*\)\".*/\1/p" <<<"${multi_first}" | head -1)"
 multi_second_layer="$(sed -n "s/.*\"layer_id\": \"\([^\"]*\)\".*/\1/p" <<<"${multi_second}" | head -1)"
 multi_storage="$(sed -n "s/.*\"storage_path\": \"\([^\"]*\)\".*/\1/p" <<<"${multi_first}" | head -1)"
@@ -116,7 +152,7 @@ test "${multi_first_layer}" = "${multi_second_layer}"
 host_read_root="$(mktemp -d)"
 write_spec "${host_read_root}" cp /etc/passwd generated/copied.txt
 new_lane_workspace "${host_read_root}"
-if "${trail}" --workspace "${host_read_root}" env sync recipe-a --adapter command >/dev/null 2>&1; then
+if "${trail}" --workspace "${host_read_root}" env sync all recipe-a >/dev/null 2>&1; then
   echo "restricted recipe unexpectedly read /etc/passwd" >&2
   exit 1
 fi
@@ -124,7 +160,7 @@ fi
 write_root="$(mktemp -d)"
 write_spec "${write_root}" cp input.txt escape.txt
 new_lane_workspace "${write_root}"
-if "${trail}" --workspace "${write_root}" env sync recipe-a --adapter command >/dev/null 2>&1; then
+if "${trail}" --workspace "${write_root}" env sync all recipe-a >/dev/null 2>&1; then
   echo "restricted recipe unexpectedly wrote outside its declared output" >&2
   exit 1
 fi
@@ -132,7 +168,7 @@ fi
 network_root="$(mktemp -d)"
 write_spec "${network_root}" curl --fail --max-time 1 http://127.0.0.1:9 -o generated/network.txt
 new_lane_workspace "${network_root}"
-if "${trail}" --workspace "${network_root}" env sync recipe-a --adapter command >/dev/null 2>&1; then
+if "${trail}" --workspace "${network_root}" env sync all recipe-a >/dev/null 2>&1; then
   echo "restricted recipe unexpectedly used a network socket" >&2
   exit 1
 fi

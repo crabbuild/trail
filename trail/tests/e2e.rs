@@ -17,9 +17,9 @@ use rusqlite::Connection;
 use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
-    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, MaterializationFallbackReason,
-    ObjectId, OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
-    WorkdirBackend, WorktreeRoot, WorktreeState, WORKTREE_ROOT_KIND,
+    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, ObjectId, OperationKind,
+    PatchDocument, ShowResult, TextContent, TextRepresentation, Trail, WorkdirBackend,
+    WorktreeRoot, WorktreeState, WORKTREE_ROOT_KIND,
 };
 
 fn git_available() -> bool {
@@ -10750,7 +10750,7 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
             serde_json::json!({
                 "name": "api-branch-lane",
                 "from_ref": "main",
-                "materialize": true
+                "workdir_mode": "portable-copy"
             }),
         ),
     );
@@ -11679,7 +11679,12 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
             serde_json::json!({"adapter": "trail/oci-image@1"}),
         ),
     );
-    assert_eq!(sync.status, 200);
+    assert_eq!(
+        sync.status,
+        200,
+        "{:?}",
+        sync.body_json::<serde_json::Value>()
+    );
     let sync: serde_json::Value = sync.body_json().unwrap();
     assert!(sync["layers"].as_array().unwrap().is_empty());
     assert!(sync["generation"]["components"][0]["outputs"]
@@ -12055,6 +12060,9 @@ source = "generated"
 target = ".trail-generated/private"
 policy = "writable_private"
 portability = "host"
+reuse = "none"
+scope = "lane"
+publish = "manual"
 "#,
     )
     .unwrap();
@@ -12115,10 +12123,7 @@ portability = "host"
     );
     assert!(mcp["generation"]["components"][0]["outputs"][0]["layer_id"].is_null());
 
-    let cli = run_trail_json(
-        temp.path(),
-        &["env", "sync", "private-cli", "--adapter", "trail/command@1"],
-    );
+    let cli = run_trail_json(temp.path(), &["env", "sync", "all", "private-cli"]);
     assert!(cli["layers"].as_array().unwrap().is_empty());
     assert_eq!(
         cli["generation"]["components"][0]["outputs"][0]["policy"],
@@ -12132,10 +12137,13 @@ portability = "host"
             ["content"]["application/json"]["schema"]["$ref"],
         "#/components/schemas/EnvironmentSyncReport"
     );
-    assert_eq!(
+    assert!(
         openapi["components"]["schemas"]["EnvironmentGenerationOutputReport"]["properties"]
-            ["policy"]["enum"][1],
-        "writable_private"
+            ["policy"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "writable_private")
     );
     assert_eq!(
         openapi["components"]["schemas"]["EnvironmentPlanReport"]["properties"]["dependencies"]
@@ -12146,6 +12154,215 @@ portability = "host"
         openapi["components"]["schemas"]["EnvironmentGenerationComponentReport"]["properties"]
             ["dependencies"]["items"]["$ref"],
         "#/components/schemas/EnvironmentGenerationDependencyReport"
+    );
+
+    let promoted_http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/private-http/environment/promote",
+            serde_json::json!({"component": "generated.private", "output": "private"}),
+        ),
+    );
+    assert_eq!(promoted_http.status, 200);
+    let promoted_http: serde_json::Value = promoted_http.body_json().unwrap();
+    assert_eq!(promoted_http["phase"], "activated");
+    assert_ne!(
+        promoted_http["predecessor_generation_id"],
+        promoted_http["successor_generation_id"]
+    );
+
+    let promoted_mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_promote",
+                "arguments": {
+                    "lane": "private-mcp",
+                    "component": "generated.private",
+                    "output": "private"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(promoted_mcp["result"]["isError"], false);
+    assert_eq!(
+        promoted_mcp["result"]["structuredContent"]["phase"],
+        "activated"
+    );
+
+    let promoted_cli = run_trail_json(
+        temp.path(),
+        &[
+            "env",
+            "promote",
+            "private-cli",
+            "generated.private",
+            "private",
+        ],
+    );
+    assert_eq!(promoted_cli["phase"], "activated");
+
+    let cli_generation = db
+        .active_environment_generation("private-cli")
+        .unwrap()
+        .unwrap();
+    let private_view = db.lane_workspace_view("private-cli").unwrap().unwrap();
+    let private_output =
+        PathBuf::from(private_view.generated_upper).join(".trail-generated/private");
+    fs::write(private_output.join(".env"), "TOKEN=must-not-persist\n").unwrap();
+    let secret_error = db
+        .promote_workspace_environment_output("private-cli", "generated.private", "private")
+        .unwrap_err();
+    assert!(secret_error.to_string().contains("secret"));
+    assert_eq!(
+        db.active_environment_generation("private-cli")
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        cli_generation.generation_id
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        fs::remove_file(private_output.join(".env")).unwrap();
+        symlink("../../outside", private_output.join("escape-link")).unwrap();
+        let link_error = db
+            .promote_workspace_environment_output("private-cli", "generated.private", "private")
+            .unwrap_err();
+        assert!(link_error.to_string().contains("symlink escapes"));
+        fs::remove_file(private_output.join("escape-link")).unwrap();
+    }
+
+    let backup_root = tempfile::tempdir().unwrap();
+    let backup = backup_root.path().join("promotion-backup");
+    db.create_backup(&backup, false).unwrap();
+    let restored = tempfile::tempdir().unwrap();
+    Trail::restore_backup(restored.path(), &backup, false).unwrap();
+    let restored_db = Trail::open(restored.path()).unwrap();
+    assert!(restored_db
+        .lane_workspace_view("private-http")
+        .unwrap()
+        .is_none());
+    assert!(restored_db.fsck().unwrap().errors.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_gate_promotes_only_exact_successful_environment_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "gate input\n").unwrap();
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[[component]]
+id = "generated.gated"
+adapter = "trail/command@1"
+root = "."
+kind = "generated"
+
+[[component.input]]
+path = "input.txt"
+role = "identity"
+format = "bytes"
+
+[component.build]
+command = ["cp", "input.txt", "generated/copied.txt"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.output]]
+name = "gated"
+source = "generated"
+target = ".trail-generated/gated"
+policy = "writable_private"
+portability = "host"
+reuse = "none"
+scope = "lane"
+publish = "successful_gate"
+gate = "build"
+"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else {
+        LaneWorkdirMode::FuseCow
+    };
+    for lane in ["gate-pass", "gate-fail"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            mode.clone(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        db.sync_all_workspace_environments(lane, None).unwrap();
+    }
+    let pass_before = db
+        .active_environment_generation("gate-pass")
+        .unwrap()
+        .unwrap()
+        .generation_id;
+    let passed = db
+        .run_lane_test_with_options(
+            "gate-pass",
+            vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            None,
+            30,
+            LaneGateOptions {
+                suite: Some("build".to_string()),
+                score: None,
+                threshold: None,
+            },
+        )
+        .unwrap();
+    assert!(passed.success);
+    let pass_after = db
+        .active_environment_generation("gate-pass")
+        .unwrap()
+        .unwrap();
+    assert_ne!(pass_after.generation_id, pass_before);
+    assert!(pass_after.components[0].outputs[0].publication_id.is_some());
+
+    let fail_before = db
+        .active_environment_generation("gate-fail")
+        .unwrap()
+        .unwrap()
+        .generation_id;
+    let failed = db
+        .run_lane_test_with_options(
+            "gate-fail",
+            vec!["sh".to_string(), "-c".to_string(), "exit 9".to_string()],
+            None,
+            30,
+            LaneGateOptions {
+                suite: Some("build".to_string()),
+                score: None,
+                threshold: None,
+            },
+        )
+        .unwrap();
+    assert!(!failed.success);
+    assert_eq!(
+        db.active_environment_generation("gate-fail")
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        fail_before
     );
 }
 
@@ -13320,7 +13537,8 @@ fn cli_daemon_url_routes_hot_lane_commands() {
             "mat-rpc",
             "--from",
             "main",
-            "--materialize",
+            "--workdir-mode",
+            "portable-copy",
         ],
     );
     let materialized_workdir = materialized["workdir"].as_str().unwrap();
@@ -22370,12 +22588,21 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         temp.path(),
         &["lane", "spawn", "default-bot", "--from", "main"],
     );
-    assert!(default_spawn["workdir"].is_null());
-    assert_eq!(default_spawn["requested_workdir_mode"], "virtual");
-    assert_eq!(default_spawn["workdir_mode"], "virtual");
-    assert_eq!(default_spawn["workdir_backend"], "virtual");
+    assert!(default_spawn["workdir"].is_string());
+    assert_eq!(default_spawn["requested_workdir_mode"], "auto");
+    #[cfg(target_os = "macos")]
+    assert_eq!(default_spawn["workdir_mode"], "nfs-cow");
+    #[cfg(target_os = "linux")]
+    assert_eq!(default_spawn["workdir_mode"], "fuse-cow");
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    assert_eq!(default_spawn["workdir_mode"], "dokan-cow");
+    assert!(matches!(
+        default_spawn["workdir_backend"].as_str(),
+        Some("nfs" | "fuse" | "dokan")
+    ));
+    assert!(default_spawn["materialization"].is_null());
     assert_eq!(default_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-    assert_eq!(default_spawn["transparent_cow_available"], false);
+    assert_eq!(default_spawn["transparent_cow_available"], true);
 
     let cli_workdir = workdir_parent.path().join("cli-bot");
     let cli_spawn = run_trail_json(
@@ -22388,9 +22615,11 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             "main",
             "--workdir",
             cli_workdir.to_str().unwrap(),
+            "--workdir-mode",
+            "native-cow",
         ],
     );
-    assert_eq!(cli_spawn["requested_workdir_mode"], "auto");
+    assert_eq!(cli_spawn["requested_workdir_mode"], "native-cow");
     assert_eq!(cli_spawn["workdir_mode"], "native-cow");
     assert_eq!(cli_spawn["workdir_backend"], "clone");
     assert_eq!(cli_spawn["materialization"]["copied_files"], 0);
@@ -22557,7 +22786,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     let persisted_workdir = db.lane_workdir("cli-bot").unwrap();
     assert_eq!(
         persisted_workdir.requested_workdir_mode,
-        LaneWorkdirMode::Auto
+        LaneWorkdirMode::NativeCow
     );
     assert_eq!(persisted_workdir.workdir_mode, LaneWorkdirMode::NativeCow);
     assert_eq!(
@@ -23403,7 +23632,10 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
     let spawned = db
         .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
-    assert_eq!(spawned.requested_workdir_mode, LaneWorkdirMode::Auto);
+    assert_eq!(
+        spawned.requested_workdir_mode,
+        LaneWorkdirMode::PortableCopy
+    );
     assert_eq!(spawned.workdir_mode, LaneWorkdirMode::PortableCopy);
     assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Copy));
     assert_eq!(
@@ -23411,7 +23643,7 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
             .materialization
             .as_ref()
             .and_then(|report| report.fallback_reason),
-        Some(MaterializationFallbackReason::NativeSourceUnavailable)
+        None
     );
     let workdir = PathBuf::from(spawned.workdir.unwrap());
 
@@ -23442,10 +23674,7 @@ fn auto_reports_mixed_when_portable_restart_can_clone_only_clean_files() {
     assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Mixed));
     assert_eq!(report.cloned_files, 1);
     assert_eq!(report.copied_files, 1);
-    assert_eq!(
-        report.fallback_reason,
-        Some(MaterializationFallbackReason::NativeSourceUnavailable)
-    );
+    assert_eq!(report.fallback_reason, None);
     let workdir = PathBuf::from(spawned.workdir.unwrap());
     assert_eq!(
         fs::read_to_string(workdir.join("clean.txt")).unwrap(),

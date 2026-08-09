@@ -15,7 +15,8 @@ such as Claude Code, Codex, or Cursor.
 ## Core Commands
 
 ```sh
-trail lane spawn doc-bot --from main --materialize=true
+trail lane spawn doc-bot --from main
+trail env sync all doc-bot
 trail lane workdir doc-bot
 trail lane status doc-bot
 trail lane diff doc-bot --patch
@@ -41,7 +42,7 @@ Create one lane per task, use its workdir for normal tools, then record,
 review, and merge the lane:
 
 ```sh
-trail lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main
 LANE_DIR="$(trail lane workdir docs-lane)"
 cd "$LANE_DIR"
 # Edit files or run an external coding agent here.
@@ -118,13 +119,26 @@ event.
 turns use one lifecycle:
 
 ```text
-resolve → discover/plan → sync-all → reconcile → mount → execute
+resolve → discover/plan → sync all → reconcile → mount → execute
         → checkpoint source → dispose runtime → unmount
 ```
 
 Each phase emits a `managed_execution_phase` lane event. Command failure does
 not skip source checkpointing or cleanup. Dependency, generated, scratch,
 secret, and Trail-internal paths stay outside the recorded source change.
+
+Omitting `--workdir-mode` creates a lazy `auto` layered lane on a qualified
+native transparent backend. Spawn does not copy source or execute ecosystem
+tools. The first managed command converges the desired environment; exact
+immutable layers can be attached while each lane receives fresh writable
+uppers. Trail fails with prerequisite remediation instead of silently copying
+a large repository when no qualified backend is available.
+
+`trail env sync all [<lane>]` explicitly prewarms every desired component.
+`trail env sync component <component> [--lane <lane>]` repairs one component.
+When the lane is omitted, Trail accepts only an authenticated
+`TRAIL_LANE`/`TRAIL_VIEW` pair or containment by exactly one mounted view; it
+never guesses by recency. See [Large-repository lane environments](large-repository-environments.md).
 
 ## Code Facts Used
 

@@ -2,10 +2,10 @@ use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use super::workspace_environment::{
-    resolve_workspace_tool_executable, ResolvedWorkspaceTool, WorkspaceEnvironmentAdapterMetadata,
-    WorkspaceEnvironmentCommand, WorkspaceEnvironmentDependency, WorkspaceEnvironmentEdgeType,
-    WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy,
-    WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    resolve_workspace_tool_executable, validate_environment_output_contract, ResolvedWorkspaceTool,
+    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCommand,
+    WorkspaceEnvironmentDependency, WorkspaceEnvironmentEdgeType, WorkspaceEnvironmentInput,
+    WorkspaceEnvironmentOutput, WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
 };
 use super::*;
 
@@ -194,8 +194,16 @@ struct RecipeOutput {
     name: Option<String>,
     source: String,
     target: String,
-    #[serde(default = "default_private_seed_policy")]
-    policy: String,
+    #[serde(default)]
+    policy: EnvironmentOutputPolicy,
+    #[serde(default)]
+    reuse: Option<EnvironmentReuseMode>,
+    #[serde(default)]
+    scope: Option<EnvironmentSharingScope>,
+    #[serde(default)]
+    publish: Option<EnvironmentPublicationTrigger>,
+    #[serde(default)]
+    gate: Option<String>,
     #[serde(default = "default_host_portability")]
     portability: String,
 }
@@ -224,10 +232,6 @@ fn default_identity_role() -> String {
 
 fn default_bytes_format() -> String {
     "bytes".to_string()
-}
-
-fn default_private_seed_policy() -> String {
-    "immutable_seed_private".to_string()
 }
 
 fn default_host_portability() -> String {
@@ -632,16 +636,31 @@ impl Trail {
         let mut output_paths = Vec::<(String, String)>::new();
         let mut portability = None;
         for (index, output) in component.outputs.iter().enumerate() {
-            let policy = match output.policy.as_str() {
-                "immutable_seed_private" => WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
-                "writable_private" => WorkspaceEnvironmentOutputPolicy::WritablePrivate,
-                _ => {
-                    return Err(Error::InvalidInput(format!(
-                        "command component `{}` output policy must be `immutable_seed_private` or `writable_private`",
-                        component.id
-                    )));
-                }
+            let policy = output.policy;
+            let (default_reuse, default_scope, default_publish) = if policy.has_immutable_layer() {
+                (
+                    EnvironmentReuseMode::Exact,
+                    EnvironmentSharingScope::Workspace,
+                    EnvironmentPublicationTrigger::OnSync,
+                )
+            } else {
+                (
+                    EnvironmentReuseMode::None,
+                    EnvironmentSharingScope::Lane,
+                    EnvironmentPublicationTrigger::Never,
+                )
             };
+            let reuse = output.reuse.unwrap_or(default_reuse);
+            let scope = output.scope.unwrap_or(default_scope);
+            let publish = output.publish.unwrap_or(default_publish);
+            validate_environment_output_contract(
+                policy,
+                reuse,
+                scope,
+                publish,
+                output.gate.as_deref(),
+                false,
+            )?;
             if output.portability != "host" && output.portability != "platform" {
                 return Err(Error::InvalidInput(format!(
                     "command component `{}` output portability must be `host` or `platform`",
@@ -688,6 +707,10 @@ impl Trail {
                 output_path: format!("project/{output_repository_path}"),
                 mount_path,
                 policy,
+                reuse,
+                scope,
+                publish,
+                gate: output.gate.clone(),
                 create_if_missing: true,
             });
         }
@@ -700,6 +723,10 @@ impl Trail {
                         &output.output_path,
                         &output.mount_path,
                         output.policy.as_str(),
+                        output.reuse.as_str(),
+                        output.scope.as_str(),
+                        output.publish.as_str(),
+                        &output.gate,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -1714,7 +1741,7 @@ command = ["cp", "input.txt", "out-b/value.txt"]
         assert!(error
             .to_string()
             .contains("requires `b`, which is not attached"));
-        assert!(error.to_string().contains("env sync-all graph"));
+        assert!(error.to_string().contains("env sync all graph"));
 
         let missing = chain.replace("depends_on = [\"b\"]", "depends_on = [\"missing\"]");
         let (_workspace, db) = open_recipe_graph(&missing);
@@ -2082,13 +2109,16 @@ portability = "host"
         let plan = db
             .plan_workspace_environment("private-a", RECIPE_ADAPTER_IDENTITY, None)
             .unwrap();
-        assert_eq!(plan.outputs[0].policy, "writable_private");
+        assert_eq!(
+            plan.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
         let first = db
             .sync_workspace_environment_component("private-a", RECIPE_ADAPTER_IDENTITY, None, None)
             .unwrap();
         assert!(first.layers.is_empty());
         let output = &first.generation.components[0].outputs[0];
-        assert_eq!(output.policy, "writable_private");
+        assert_eq!(output.policy, EnvironmentOutputPolicy::WritablePrivate);
         assert!(output.layer_id.is_none());
         assert!(output.storage_identity.starts_with("private_"));
         assert!(db.list_workspace_layers().unwrap().is_empty());
@@ -2166,6 +2196,84 @@ portability = "host"
             b"declared input\n"
         );
         drop(mounted);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn manual_private_output_promotion_is_journaled_and_preserves_private_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), "promotion input\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v1"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "generated.promotable"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt" }]
+outputs = [{ name = "result", source = "out", target = ".trail-generated/promotable", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual" }]
+
+[component.build]
+command = ["cp", "input.txt", "out/value.txt"]
+network = "deny"
+scripts = "deny"
+"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "promotion",
+            Some("main"),
+            LaneWorkdirMode::NfsCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let synchronized = db
+            .sync_all_workspace_environments("promotion", None)
+            .unwrap();
+        let predecessor = synchronized.generation.generation_id;
+        let view = db.lane_workspace_view("promotion").unwrap().unwrap();
+        let private_file =
+            Path::new(&view.generated_upper).join(".trail-generated/promotable/value.txt");
+        fs::write(&private_file, "lane-private promoted bytes\n").unwrap();
+
+        let promoted = db
+            .promote_workspace_environment_output("promotion", "generated.promotable", "result")
+            .unwrap();
+        assert_eq!(promoted.phase, "activated");
+        assert_eq!(promoted.predecessor_generation_id, predecessor);
+        assert_ne!(promoted.successor_generation_id, predecessor);
+        assert_eq!(
+            fs::read_to_string(&private_file).unwrap(),
+            "lane-private promoted bytes\n"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&promoted.layer.storage_path).join("value.txt")).unwrap(),
+            "lane-private promoted bytes\n"
+        );
+        let generation = db
+            .active_environment_generation("promotion")
+            .unwrap()
+            .unwrap();
+        let output = &generation.components[0].outputs[0];
+        assert_eq!(
+            output.publication_id.as_deref(),
+            Some(promoted.publication_id.as_str())
+        );
+        assert_eq!(
+            output.layer_id.as_deref(),
+            Some(promoted.layer.layer_id.as_str())
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2528,8 +2636,14 @@ portability = "host"
                 outputs: vec![EnvironmentLayerOutputActivation {
                     name: "alpha".to_string(),
                     mount_path: ".trail-generated/alpha".to_string(),
-                    policy: "immutable_seed_private".to_string(),
+                    policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    reuse: EnvironmentReuseMode::Exact,
+                    scope: EnvironmentSharingScope::Workspace,
+                    publish: EnvironmentPublicationTrigger::OnSync,
+                    gate: None,
                     binding_identity: first.layers[0].layer_id.clone(),
+                    manifest_object_id: None,
+                    publication_id: None,
                     private_seed: None,
                     layer_subpath: "outputs/0000".to_string(),
                 }],

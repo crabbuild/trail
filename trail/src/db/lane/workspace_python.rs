@@ -182,6 +182,10 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 output_path: "private/venv".to_string(),
                 mount_path,
                 policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                reuse: EnvironmentReuseMode::None,
+                scope: EnvironmentSharingScope::Lane,
+                publish: EnvironmentPublicationTrigger::Never,
+                gate: None,
                 create_if_missing: true,
             }],
             stale_reason:
@@ -353,7 +357,10 @@ mod tests {
             ["-m", "venv", "--without-pip", ".venv"]
         );
         assert_eq!(plan.outputs[0].mount_path, ".venv");
-        assert_eq!(plan.outputs[0].policy, "writable_private");
+        assert_eq!(
+            plan.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
         assert_eq!(
             plan.inputs
                 .iter()
@@ -378,7 +385,7 @@ mod tests {
             .unwrap();
         assert!(synchronized.layers.is_empty());
         let output = &synchronized.generation.components[0].outputs[0];
-        assert_eq!(output.policy, "writable_private");
+        assert_eq!(output.policy, EnvironmentOutputPolicy::WritablePrivate);
         assert!(output.layer_id.is_none());
         assert!(db.list_workspace_layers().unwrap().is_empty());
         assert!(db

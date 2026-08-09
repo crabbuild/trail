@@ -724,6 +724,8 @@ impl Trail {
         self.recover_materialization_stages()?;
         self.recover_workspace_views()?;
         self.recover_workspace_environment_sync_attempts()?;
+        self.recover_environment_hot_access_sessions()?;
+        self.recover_workspace_layer_publications()?;
         self.recover_workspace_runtime_leases()?;
         Ok(())
     }
@@ -1530,6 +1532,13 @@ mod schema_handoff_tests {
             );
             release_and_wait(children, &initial_go);
             assert_eq!(validation_count(&counter), 1);
+            let retired_sidecar = if suffix.is_empty() {
+                None
+            } else {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                File::open(PathBuf::from(sidecar)).ok()
+            };
             drop(writer);
 
             let lock = acquire_workspace_lock(&db_dir).unwrap();
@@ -1540,7 +1549,8 @@ mod schema_handoff_tests {
             } else {
                 let mut sidecar = db_path.as_os_str().to_os_string();
                 sidecar.push(suffix);
-                match fs::remove_file(PathBuf::from(sidecar)) {
+                let sidecar = PathBuf::from(sidecar);
+                match fs::remove_file(&sidecar) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => panic!("failed to rotate {suffix}: {error}"),
@@ -1559,6 +1569,7 @@ mod schema_handoff_tests {
                 before_file, after_file,
                 "{suffix} generation did not change"
             );
+            drop(retired_sidecar);
             drop(lock);
 
             let fresh_go = root.path().join(format!("{index}-fresh-go"));
