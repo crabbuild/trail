@@ -109,6 +109,8 @@ jobs:
         run: cargo check -p trail
       - name: Test
         run: cargo test -p trail
+        env:
+          RUST_TEST_THREADS: "1"
       - name: Scale Benchmark Syntax
         run: bash -n scripts/cli-scale-bench.sh
       - name: Scale Threshold Checker Tests
