@@ -1532,10 +1532,16 @@ mod schema_handoff_tests {
             );
             release_and_wait(children, &initial_go);
             assert_eq!(validation_count(&counter), 1);
+            let retired_sidecar = if suffix.is_empty() {
+                None
+            } else {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                File::open(PathBuf::from(sidecar)).ok()
+            };
             drop(writer);
 
             let lock = acquire_workspace_lock(&db_dir).unwrap();
-            let mut retired_sidecar = None;
             if suffix.is_empty() {
                 let replacement = db_path.with_extension("validation-replacement");
                 fs::copy(&db_path, &replacement).unwrap();
@@ -1544,7 +1550,6 @@ mod schema_handoff_tests {
                 let mut sidecar = db_path.as_os_str().to_os_string();
                 sidecar.push(suffix);
                 let sidecar = PathBuf::from(sidecar);
-                retired_sidecar = File::open(&sidecar).ok();
                 match fs::remove_file(&sidecar) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
