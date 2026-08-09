@@ -16,6 +16,7 @@ on:
       - "scripts/verify-environment-adapter-plugin.sh"
       - "scripts/verify-artifact-adapter-conformance.sh"
       - "scripts/verify-artifact-real-tool-gates.sh"
+      - "scripts/verify-artifact-native-cow-matrix.py"
       - "scripts/verify-windows-environment-adapter-plugin.ps1"
       - "trail-environment-adapter-sdk/**"
       - ".github/workflows/layered-workspaces.yml"
@@ -106,6 +107,19 @@ jobs:
       - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - name: Qualify CAS-backed FUSE artifact lifecycle
+        run: >-
+          python3 scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/fuse-linux.json"
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-fuse-linux
+          path: ${{ runner.temp }}/artifact-native-cow/fuse-linux.json
+          if-no-files-found: error
 
   rust-cache-isolation:
     runs-on: ubuntu-latest
@@ -195,6 +209,19 @@ jobs:
       - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - name: Qualify CAS-backed NFS artifact lifecycle
+        run: >-
+          python3 scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/nfs-macos.json"
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-nfs-macos
+          path: ${{ runner.temp }}/artifact-native-cow/nfs-macos.json
+          if-no-files-found: error
 
   nfs-framework-bench:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_macos_framework_bench }}
@@ -227,6 +254,20 @@ jobs:
           cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
       - run: ./scripts/verify-windows-command-recipe-sandbox.ps1
       - run: ./scripts/verify-windows-environment-adapter-plugin.ps1
+      - name: Qualify CAS-backed Dokan artifact lifecycle
+        shell: pwsh
+        run: >-
+          python scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/dokan-windows.json"
+        env:
+          TRAIL_RUN_DOKAN_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-dokan-windows
+          path: ${{ runner.temp }}/artifact-native-cow/dokan-windows.json
+          if-no-files-found: error
 
   million-path-scale:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_scale }}

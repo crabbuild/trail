@@ -23,6 +23,27 @@ smoke tests. Run them through the `Layered Workspace Native Gates` workflow's
 directories have enough space and time. CI uploads the six checked JSON reports
 even when a later correctness gate fails.
 
+For native artifact qualification, run the owning-host matrix with the native
+backend gate enabled. For example, macOS uses:
+
+```sh
+TRAIL_RUN_NFS_COW_TESTS=1 \
+CARGO_TARGET_DIR=/Volumes/Workspace/crabbuild-target/trail-native-cow \
+python3 scripts/verify-artifact-native-cow-matrix.py \
+  --output /Volumes/Workspace/trail-native-cow-evidence/nfs-macos.json
+```
+
+The report is deliberately compositional. The platform adapter owns mounted
+immutable lookup, copy-up, and whiteout semantics; Trail's shared CAS lifecycle
+owns inheritance, verified materialization/repair, promotion, source export,
+retirement, recovery, and accounting. Every check runs on the same owning host,
+and the report labels these scopes separately. It passes only when exactly one
+test executes for every required check. The other platform backends are emitted
+as `unverified` with `reason=not_owning_platform`; reports from their owning-host
+jobs are required before claiming those backends. The layered-workspaces CI
+workflow uploads Linux FUSE and macOS NFS reports on pull requests and an
+explicitly dispatched Dokan report on Windows.
+
 Use the CLI scale benchmark to verify large-repo and agent orchestration behavior before treating a change as production ready.
 
 ## CI Smoke
