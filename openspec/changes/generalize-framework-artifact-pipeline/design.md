@@ -191,6 +191,15 @@ Backends consume content in two ways:
 - lazy NFS/FUSE/Dokan projections resolve manifest entries and materialize requested file content on demand;
 - backends requiring real directories use a verified materialization cache keyed by tree root and backend compatibility.
 
+Implementation status: the shared backend-neutral workspace core resolves
+verified artifact-tree bindings one directory object at a time, serves file
+ranges from only the overlapping blob/chunks, and materializes only a selected
+file for copy-up. It treats the CAS manifest as authoritative over any legacy
+layer directory and preserves existing upper/whiteout behavior. Native FUSE,
+NFS, and Dokan acceptance tests exercise the same nonexistent-materialization
+fixture; owning-host gates remain the authority for platform qualification.
+Tree-root/backend-keyed reusable real-directory caches remain task 6.2.
+
 Materialization can use safe platform clone/reflink facilities or immutable content copying. Hard links are allowed only where mode and ownership invariants cannot mutate the content object. Materialization amplification is reported separately and is reclaimable without invalidating an artifact.
 
 The current `.trail/cache/layers/<layer-id>` layout remains an implementation compatibility surface during rollout, but after CAS activation it contains only verified materialization state and sidecars. Doctor/fsck must detect legacy authoritative-layer layouts versus CAS-backed layouts exactly.

@@ -1,4 +1,6 @@
 use super::*;
+use crate::db::lane::workspace_artifact::ArtifactLazyEntry;
+use crate::ids::ArtifactTreeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
@@ -129,6 +131,22 @@ pub(crate) struct ViewCore {
 struct CachedImmutableReadFile {
     file: File,
     attr: ViewNodeAttr,
+}
+
+#[derive(Clone, Debug)]
+enum LayerEntryResolution {
+    Artifact {
+        entry: ArtifactLazyEntry,
+        tree_id: ArtifactTreeId,
+        artifact_path: String,
+        layer_id: Option<String>,
+        layer_relative_path: String,
+    },
+    Materialized {
+        path: PathBuf,
+        layer_id: Option<String>,
+        layer_relative_path: String,
+    },
 }
 
 const LAYER_MOUNT_RESET_INTENT_VERSION: u16 = 2;
@@ -418,11 +436,8 @@ impl ViewCore {
     fn layer_resolution(
         &self,
         path: &str,
-    ) -> std::result::Result<Option<(PathBuf, Option<String>, String)>, i32> {
+    ) -> std::result::Result<Option<LayerEntryResolution>, i32> {
         for binding in &self.layers {
-            let Some(storage_path) = &binding.storage_path else {
-                continue;
-            };
             let suffix = if path == binding.mount_path {
                 Some("")
             } else {
@@ -430,6 +445,42 @@ impl ViewCore {
                     .and_then(|suffix| suffix.strip_prefix('/'))
             };
             let Some(suffix) = suffix else {
+                continue;
+            };
+            if let Some(tree_id) = &binding.artifact_tree_id {
+                let artifact_path = match (binding.artifact_subpath.as_str(), suffix) {
+                    ("", "") => String::new(),
+                    (prefix, "") => prefix.to_string(),
+                    ("", suffix) => suffix.to_string(),
+                    (prefix, suffix) => format!("{prefix}/{suffix}"),
+                };
+                if let Some(entry) = self
+                    .db
+                    .artifact_tree_lazy_entry(tree_id, &artifact_path)
+                    .map_err(|_| EIO)?
+                {
+                    #[cfg(windows)]
+                    let entry = match entry {
+                        ArtifactLazyEntry::Symlink { target } => self
+                            .db
+                            .artifact_tree_lazy_follow_symlink(tree_id, &artifact_path, &target)
+                            .map_err(|_| EIO)?
+                            .ok_or(EIO)?,
+                        entry => entry,
+                    };
+                    return Ok(Some(LayerEntryResolution::Artifact {
+                        entry,
+                        tree_id: tree_id.clone(),
+                        artifact_path,
+                        layer_id: binding.layer_id.clone(),
+                        layer_relative_path: suffix.to_string(),
+                    }));
+                }
+                // A verified CAS shadow is authoritative. Never expose an
+                // extra path found only in a stale materialization cache.
+                continue;
+            }
+            let Some(storage_path) = &binding.storage_path else {
                 continue;
             };
             let candidate = if suffix.is_empty() {
@@ -449,19 +500,13 @@ impl ViewCore {
                     return Err(EPERM);
                 }
             }
-            return Ok(Some((
-                candidate,
-                binding.layer_id.clone(),
-                suffix.to_string(),
-            )));
+            return Ok(Some(LayerEntryResolution::Materialized {
+                path: candidate,
+                layer_id: binding.layer_id.clone(),
+                layer_relative_path: suffix.to_string(),
+            }));
         }
         Ok(None)
-    }
-
-    fn layer_path(&self, path: &str) -> std::result::Result<Option<PathBuf>, i32> {
-        Ok(self
-            .layer_resolution(path)?
-            .map(|(candidate, _, _)| candidate))
     }
 
     fn record_hot_layer_access(&mut self, layer_id: &str, path: &str, size_bytes: u64) {
@@ -489,11 +534,19 @@ impl ViewCore {
     }
 
     fn layer_directory_exists(&self, path: &str) -> std::result::Result<bool, i32> {
-        if self
-            .layer_path(path)?
-            .is_some_and(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()))
-        {
-            return Ok(true);
+        if let Some(resolution) = self.layer_resolution(path)? {
+            match resolution {
+                LayerEntryResolution::Artifact {
+                    entry: ArtifactLazyEntry::Directory { .. },
+                    ..
+                } => return Ok(true),
+                LayerEntryResolution::Materialized { path, .. }
+                    if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) =>
+                {
+                    return Ok(true);
+                }
+                _ => {}
+            }
         }
         let prefix = if path.is_empty() {
             String::new()
@@ -610,15 +663,27 @@ impl ViewCore {
             }
             return Ok(None);
         }
-        if let Some(layer_path) = self.layer_path(path)? {
-            let metadata = fs::symlink_metadata(layer_path).map_err(io_errno)?;
+        if let Some(layer) = self.layer_resolution(path)? {
+            if let LayerEntryResolution::Artifact { entry, .. } = layer {
+                return Ok(Some(match entry {
+                    ArtifactLazyEntry::Directory { .. } => ViewNodeKind::Directory,
+                    ArtifactLazyEntry::File { .. } => ViewNodeKind::File,
+                    ArtifactLazyEntry::Symlink { .. } => ViewNodeKind::Symlink,
+                }));
+            }
+            let LayerEntryResolution::Materialized {
+                path: layer_path, ..
+            } = layer
+            else {
+                unreachable!()
+            };
+            let metadata = fs::symlink_metadata(&layer_path).map_err(io_errno)?;
             if metadata.file_type().is_symlink() {
                 #[cfg(unix)]
                 return Ok(Some(ViewNodeKind::Symlink));
                 #[cfg(windows)]
                 {
-                    let metadata =
-                        fs::metadata(self.layer_path(path)?.ok_or(ENOENT)?).map_err(io_errno)?;
+                    let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
                     return Ok(if metadata.is_dir() {
                         Some(ViewNodeKind::Directory)
                     } else if metadata.is_file() {
@@ -685,7 +750,40 @@ impl ViewCore {
                 modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             });
         }
-        if let Some(layer_path) = self.layer_path(path)? {
+        if let Some(layer) = self.layer_resolution(path)? {
+            if let LayerEntryResolution::Artifact { entry, .. } = layer {
+                return Ok(match entry {
+                    ArtifactLazyEntry::File {
+                        mode, size_bytes, ..
+                    } => ViewNodeAttr {
+                        ino,
+                        kind,
+                        mode,
+                        size: size_bytes,
+                        modified: SystemTime::UNIX_EPOCH,
+                    },
+                    ArtifactLazyEntry::Symlink { ref target } => ViewNodeAttr {
+                        ino,
+                        kind,
+                        mode: 0o777,
+                        size: target.len() as u64,
+                        modified: SystemTime::UNIX_EPOCH,
+                    },
+                    ArtifactLazyEntry::Directory { .. } => ViewNodeAttr {
+                        ino,
+                        kind,
+                        mode: 0o755,
+                        size: 0,
+                        modified: SystemTime::UNIX_EPOCH,
+                    },
+                });
+            }
+            let LayerEntryResolution::Materialized {
+                path: layer_path, ..
+            } = layer
+            else {
+                unreachable!()
+            };
             let metadata = if kind == ViewNodeKind::Symlink {
                 fs::symlink_metadata(layer_path)
             } else {
@@ -770,11 +868,30 @@ impl ViewCore {
                 names.insert(name.to_string());
             }
         }
-        if let Some(layer_dir) = self.layer_path(&path)?
-            && let Ok(dir) = fs::read_dir(layer_dir)
-        {
-            for entry in dir.flatten() {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
+        if let Some(layer) = self.layer_resolution(&path)? {
+            match layer {
+                LayerEntryResolution::Artifact {
+                    entry: ArtifactLazyEntry::Directory { .. },
+                    tree_id,
+                    artifact_path,
+                    ..
+                } => {
+                    for (name, _) in self
+                        .db
+                        .artifact_tree_lazy_children(&tree_id, &artifact_path)
+                        .map_err(|_| EIO)?
+                    {
+                        names.insert(name);
+                    }
+                }
+                LayerEntryResolution::Materialized { path, .. } => {
+                    if let Ok(dir) = fs::read_dir(path) {
+                        for entry in dir.flatten() {
+                            names.insert(entry.file_name().to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                LayerEntryResolution::Artifact { .. } => {}
             }
         }
         for class in [
@@ -833,34 +950,66 @@ impl ViewCore {
             let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
             bytes.truncate(read);
             Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
-        } else if let Some((layer_path, layer_id, layer_relative_path)) =
-            self.layer_resolution(&path)?
-        {
-            let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
-            if !metadata.is_file() {
-                return Err(EISDIR);
-            }
-            let file = File::open(layer_path).map_err(io_errno)?;
-            let mut bytes = vec![0; count as usize];
-            let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
-            bytes.truncate(read);
-            if let Some(layer_id) = layer_id {
-                self.record_hot_layer_access(&layer_id, &layer_relative_path, metadata.len());
-            }
-            self.immutable_read_files.insert(
-                ino,
-                CachedImmutableReadFile {
-                    file,
-                    attr: ViewNodeAttr {
+        } else if let Some(layer) = self.layer_resolution(&path)? {
+            match layer {
+                LayerEntryResolution::Artifact {
+                    entry:
+                        ArtifactLazyEntry::File {
+                            node_id,
+                            size_bytes,
+                            ..
+                        },
+                    layer_id,
+                    layer_relative_path,
+                    ..
+                } => {
+                    let bytes = self
+                        .db
+                        .artifact_file_read_range(&node_id, offset, count)
+                        .map_err(|_| EIO)?;
+                    if let Some(layer_id) = layer_id {
+                        self.record_hot_layer_access(&layer_id, &layer_relative_path, size_bytes);
+                    }
+                    let eof = offset.saturating_add(bytes.len() as u64) >= size_bytes;
+                    Ok((bytes, eof))
+                }
+                LayerEntryResolution::Artifact { .. } => Err(EISDIR),
+                LayerEntryResolution::Materialized {
+                    path: layer_path,
+                    layer_id,
+                    layer_relative_path,
+                } => {
+                    let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
+                    if !metadata.is_file() {
+                        return Err(EISDIR);
+                    }
+                    let file = File::open(layer_path).map_err(io_errno)?;
+                    let mut bytes = vec![0; count as usize];
+                    let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
+                    bytes.truncate(read);
+                    if let Some(layer_id) = layer_id {
+                        self.record_hot_layer_access(
+                            &layer_id,
+                            &layer_relative_path,
+                            metadata.len(),
+                        );
+                    }
+                    self.immutable_read_files.insert(
                         ino,
-                        kind: ViewNodeKind::File,
-                        mode: copy_up_mode(&metadata),
-                        size: metadata.len(),
-                        modified: SystemTime::UNIX_EPOCH,
-                    },
-                },
-            );
-            Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
+                        CachedImmutableReadFile {
+                            file,
+                            attr: ViewNodeAttr {
+                                ino,
+                                kind: ViewNodeKind::File,
+                                mode: copy_up_mode(&metadata),
+                                size: metadata.len(),
+                                modified: SystemTime::UNIX_EPOCH,
+                            },
+                        },
+                    );
+                    Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
+                }
+            }
         } else {
             let entry = self.lower_file(&path)?.ok_or(ENOENT)?;
             let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
@@ -903,8 +1052,16 @@ impl ViewCore {
             validate_view_symlink_target(&path, &target)?;
             return Ok(target);
         }
-        let layer_path = self.layer_path(&path)?.ok_or(ENOENT)?;
-        let target = fs::read_link(layer_path).map_err(io_errno)?;
+        let target = match self.layer_resolution(&path)?.ok_or(ENOENT)? {
+            LayerEntryResolution::Artifact {
+                entry: ArtifactLazyEntry::Symlink { target },
+                ..
+            } => PathBuf::from(target),
+            LayerEntryResolution::Materialized { path, .. } => {
+                fs::read_link(path).map_err(io_errno)?
+            }
+            LayerEntryResolution::Artifact { .. } => return Err(EINVAL),
+        };
         validate_view_symlink_target(&path, &target)?;
         Ok(target)
     }
@@ -1056,37 +1213,60 @@ impl ViewCore {
             .map_err(|_| EIO)?;
         self.ensure_upper_parent(path)?;
         if created_upper {
+            let layer = self.layer_resolution(path)?;
             let visible_size = if truncate {
                 0
-            } else if let Some(layer_path) = self.layer_path(path)? {
-                fs::metadata(layer_path).map_err(io_errno)?.len()
             } else {
-                self.lower_file(path)?
-                    .map(|entry| entry.size_bytes)
-                    .unwrap_or(0)
+                match &layer {
+                    Some(LayerEntryResolution::Artifact {
+                        entry: ArtifactLazyEntry::File { size_bytes, .. },
+                        ..
+                    }) => *size_bytes,
+                    Some(LayerEntryResolution::Materialized { path, .. }) => {
+                        fs::metadata(path).map_err(io_errno)?.len()
+                    }
+                    Some(LayerEntryResolution::Artifact { .. }) => return Err(EINVAL),
+                    None => self
+                        .lower_file(path)?
+                        .map(|entry| entry.size_bytes)
+                        .unwrap_or(0),
+                }
             };
             self.enforce_mutation_quota(path, Some(visible_size), true)?;
             if !truncate {
-                if let Some(layer_path) = self.layer_path(path)? {
-                    clone_or_copy_projected_file(&layer_path, &upper).map_err(|_| EIO)?;
-                    let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
-                    set_file_mode(&upper, copy_up_mode(&metadata)).map_err(io_errno)?;
-                } else {
-                    let entry = self.lower_file(path)?;
-                    if let Some(entry) = entry {
-                        let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
-                        clone_or_copy_projected_file(&projection, &upper).map_err(|_| EIO)?;
-                        set_file_mode(
-                            &upper,
-                            if entry.executable {
-                                0o755
-                            } else {
-                                entry.mode & 0o777
-                            },
-                        )
-                        .map_err(io_errno)?;
-                    } else {
-                        File::create(&upper).map_err(io_errno)?;
+                match layer {
+                    Some(LayerEntryResolution::Artifact {
+                        entry: ArtifactLazyEntry::File { node_id, .. },
+                        ..
+                    }) => {
+                        self.db
+                            .materialize_artifact_file(&node_id, &upper)
+                            .map_err(|_| EIO)?;
+                    }
+                    Some(LayerEntryResolution::Materialized {
+                        path: layer_path, ..
+                    }) => {
+                        clone_or_copy_projected_file(&layer_path, &upper).map_err(|_| EIO)?;
+                        let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
+                        set_file_mode(&upper, copy_up_mode(&metadata)).map_err(io_errno)?;
+                    }
+                    Some(LayerEntryResolution::Artifact { .. }) => return Err(EINVAL),
+                    None => {
+                        if let Some(entry) = self.lower_file(path)? {
+                            let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
+                            clone_or_copy_projected_file(&projection, &upper).map_err(|_| EIO)?;
+                            set_file_mode(
+                                &upper,
+                                if entry.executable {
+                                    0o755
+                                } else {
+                                    entry.mode & 0o777
+                                },
+                            )
+                            .map_err(io_errno)?;
+                        } else {
+                            File::create(&upper).map_err(io_errno)?;
+                        }
                     }
                 }
             } else {
@@ -1306,7 +1486,7 @@ impl ViewCore {
         if kind == ViewNodeKind::Directory && !self.children(ino)?.is_empty() {
             return Err(ENOTEMPTY);
         }
-        let hides_lower = self.layer_path(&path)?.is_some()
+        let hides_lower = self.layer_resolution(&path)?.is_some()
             || self.layer_directory_exists(&path)?
             || self.lower_file(&path)?.is_some()
             || self.lower_directory_exists(&path)?;
@@ -1734,12 +1914,27 @@ impl ViewCore {
     }
 
     fn copy_lower_file(&self, source: &str, target: &str) -> std::result::Result<(), i32> {
-        if let Some(layer_path) = self.layer_path(source)? {
+        if let Some(layer) = self.layer_resolution(source)? {
             self.ensure_upper_parent(target)?;
             let target_path = self.upper_path(target)?;
-            clone_or_copy_projected_file(&layer_path, &target_path).map_err(|_| EIO)?;
-            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
-            set_file_mode(&target_path, copy_up_mode(&metadata)).map_err(io_errno)?;
+            match layer {
+                LayerEntryResolution::Artifact {
+                    entry: ArtifactLazyEntry::File { node_id, .. },
+                    ..
+                } => {
+                    self.db
+                        .materialize_artifact_file(&node_id, &target_path)
+                        .map_err(|_| EIO)?;
+                }
+                LayerEntryResolution::Materialized {
+                    path: layer_path, ..
+                } => {
+                    clone_or_copy_projected_file(&layer_path, &target_path).map_err(|_| EIO)?;
+                    let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+                    set_file_mode(&target_path, copy_up_mode(&metadata)).map_err(io_errno)?;
+                }
+                LayerEntryResolution::Artifact { .. } => return Err(EINVAL),
+            }
             self.sync_copied_file(&target_path)?;
             return Ok(());
         }
@@ -1850,29 +2045,103 @@ impl ViewCore {
 
     fn merge_lower_subtree_into_upper(&self, root: &str) -> std::result::Result<(), i32> {
         fs::create_dir_all(self.upper_path(root)?).map_err(io_errno)?;
-        if let Some(layer_root) = self.layer_path(root)? {
-            for entry in walkdir::WalkDir::new(&layer_root).follow_links(false) {
-                let entry = entry.map_err(|_| EIO)?;
-                if entry.path() == layer_root {
-                    continue;
+        if let Some(layer) = self.layer_resolution(root)? {
+            match layer {
+                LayerEntryResolution::Artifact {
+                    entry: ArtifactLazyEntry::Directory { .. },
+                    tree_id,
+                    artifact_path,
+                    ..
+                } => {
+                    self.merge_artifact_subtree_into_upper(&tree_id, &artifact_path, root, 0)?;
                 }
-                let suffix = entry.path().strip_prefix(&layer_root).map_err(|_| EIO)?;
-                let logical =
-                    normalize_relative_path(&Path::new(root).join(suffix).to_string_lossy())
+                LayerEntryResolution::Materialized {
+                    path: layer_root, ..
+                } => {
+                    for entry in walkdir::WalkDir::new(&layer_root).follow_links(false) {
+                        let entry = entry.map_err(|_| EIO)?;
+                        if entry.path() == layer_root {
+                            continue;
+                        }
+                        let suffix = entry.path().strip_prefix(&layer_root).map_err(|_| EIO)?;
+                        let logical = normalize_relative_path(
+                            &Path::new(root).join(suffix).to_string_lossy(),
+                        )
                         .map_err(|_| EINVAL)?;
-                if entry.file_type().is_dir() {
-                    fs::create_dir_all(self.upper_path(&logical)?).map_err(io_errno)?;
-                } else if entry.file_type().is_file()
-                    || (entry.file_type().is_symlink()
-                        && fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
-                {
-                    self.copy_lower_file(&logical, &logical)?;
+                        if entry.file_type().is_dir() {
+                            fs::create_dir_all(self.upper_path(&logical)?).map_err(io_errno)?;
+                        } else if entry.file_type().is_file()
+                            || (entry.file_type().is_symlink()
+                                && fs::metadata(entry.path())
+                                    .is_ok_and(|metadata| metadata.is_file()))
+                        {
+                            self.copy_lower_file(&logical, &logical)?;
+                        }
+                    }
                 }
+                LayerEntryResolution::Artifact { .. } => return Err(ENOTDIR),
             }
         }
         for path in self.lower_selection(root)?.into_keys() {
             if !self.is_whiteouted(&path) && self.upper_metadata(&path).is_none() {
                 self.copy_lower_file(&path, &path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_artifact_subtree_into_upper(
+        &self,
+        tree_id: &ArtifactTreeId,
+        artifact_root: &str,
+        logical_root: &str,
+        depth: usize,
+    ) -> std::result::Result<(), i32> {
+        if depth > 256 {
+            return Err(EIO);
+        }
+        let children = self
+            .db
+            .artifact_tree_lazy_children(tree_id, artifact_root)
+            .map_err(|_| EIO)?;
+        for (name, entry) in children {
+            let artifact_path = if artifact_root.is_empty() {
+                name.clone()
+            } else {
+                format!("{artifact_root}/{name}")
+            };
+            let logical_path = if logical_root.is_empty() {
+                name
+            } else {
+                format!("{logical_root}/{name}")
+            };
+            if self.is_whiteouted(&logical_path) || self.upper_metadata(&logical_path).is_some() {
+                continue;
+            }
+            let upper = self.upper_path(&logical_path)?;
+            match entry {
+                ArtifactLazyEntry::Directory { .. } => {
+                    fs::create_dir_all(&upper).map_err(io_errno)?;
+                    self.merge_artifact_subtree_into_upper(
+                        tree_id,
+                        &artifact_path,
+                        &logical_path,
+                        depth + 1,
+                    )?;
+                }
+                ArtifactLazyEntry::File { node_id, .. } => {
+                    self.ensure_upper_parent(&logical_path)?;
+                    self.db
+                        .materialize_artifact_file(&node_id, &upper)
+                        .map_err(|_| EIO)?;
+                    self.sync_copied_file(&upper)?;
+                }
+                ArtifactLazyEntry::Symlink { target } => {
+                    let target = PathBuf::from(target);
+                    validate_view_symlink_target(&logical_path, &target)?;
+                    self.ensure_upper_parent(&logical_path)?;
+                    create_view_symlink(&target, &upper).map_err(io_errno)?;
+                }
             }
         }
         Ok(())
@@ -2518,6 +2787,92 @@ mod tests {
     }
 
     #[test]
+    fn artifact_manifest_layer_is_lazy_cow_without_materialized_directory() {
+        let (temp, db, root, upper) = fixture();
+        let source = temp.path().join("artifact-source");
+        fs::create_dir_all(source.join("payload/pkg")).unwrap();
+        fs::write(source.join("payload/pkg/index.js"), b"shared artifact\n").unwrap();
+        fs::write(source.join("payload/pkg/tool.sh"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            source.join("payload/pkg/tool.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("index.js", source.join("payload/pkg/current.js")).unwrap();
+        let tree_id = {
+            let _lock = db.acquire_write_lock().unwrap();
+            db.ingest_artifact_tree_under_write_lock(&source).unwrap().0
+        };
+        let missing_cache = temp.path().join("never-materialized-layer");
+        let binding = WorkspaceLayerBinding {
+            binding_identity: "lazy-artifact-layer".into(),
+            layer_id: Some("lazy-artifact-layer".into()),
+            mount_path: "node_modules".into(),
+            storage_path: Some(missing_cache.clone()),
+            artifact_tree_id: Some(tree_id.clone()),
+            artifact_subpath: "payload".into(),
+            kind: "dependency".into(),
+            priority: 100,
+        };
+        let mut view = ViewCore::new_lazy_with_ephemeral_bindings(
+            Trail::open(db.workspace_root()).unwrap(),
+            upper.clone(),
+            root.clone(),
+            vec![binding.clone()],
+        )
+        .unwrap();
+
+        let modules = view.lookup(VIEW_ROOT_INO, "node_modules").unwrap();
+        let pkg = view.lookup(modules, "pkg").unwrap();
+        let index = view.lookup(pkg, "index.js").unwrap();
+        assert_eq!(view.read(index, 7, 8).unwrap().0, b"artifact");
+        assert!(view.lookup(pkg, "tool.sh").is_ok());
+        assert_eq!(view.attr("node_modules/pkg/tool.sh").unwrap().mode, 0o755);
+        let link = view.lookup(pkg, "current.js").unwrap();
+        assert_eq!(view.readlink(link).unwrap(), PathBuf::from("index.js"));
+        assert!(!missing_cache.exists());
+
+        view.write(index, 0, b"private").unwrap();
+        assert_eq!(
+            fs::read(
+                ViewUpperLayout::from_source_upper(upper.clone())
+                    .generated_upper
+                    .join("node_modules/pkg/index.js")
+            )
+            .unwrap(),
+            b"privateartifact\n"
+        );
+        view.remove(pkg, "tool.sh").unwrap();
+        assert!(view
+            .node_kind("node_modules/pkg/tool.sh")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            db.artifact_tree_lazy_entry(&tree_id, "payload/pkg/tool.sh")
+                .unwrap(),
+            Some(ArtifactLazyEntry::File { .. })
+        ));
+        drop(view);
+
+        let mut reopened = ViewCore::new_lazy_with_ephemeral_bindings(
+            Trail::open(db.workspace_root()).unwrap(),
+            upper,
+            root,
+            vec![binding],
+        )
+        .unwrap();
+        let modules = reopened.lookup(VIEW_ROOT_INO, "node_modules").unwrap();
+        let pkg = reopened.lookup(modules, "pkg").unwrap();
+        let index = reopened.lookup(pkg, "index.js").unwrap();
+        assert_eq!(reopened.read(index, 0, 64).unwrap().0, b"privateartifact\n");
+        assert!(reopened
+            .node_kind("node_modules/pkg/tool.sh")
+            .unwrap()
+            .is_none());
+        assert!(!missing_cache.exists());
+    }
+
+    #[test]
     fn interrupted_layer_reset_restores_private_upper_and_whiteouts_when_binding_did_not_commit() {
         let (_temp, db, root, upper) = fixture();
         let layout = ViewUpperLayout::from_source_upper(upper.clone());
@@ -2581,6 +2936,8 @@ mod tests {
             layer_id: None,
             mount_path: "build".to_string(),
             storage_path: None,
+            artifact_tree_id: None,
+            artifact_subpath: String::new(),
             kind: "generated".to_string(),
             priority: 100,
         }];

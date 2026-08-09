@@ -21,6 +21,9 @@ All notable changes to Trail are documented in this file. Trail follows
   use a bounded SQLite wait during short WAL publication overlap.
 - Environment discovery now reports marker-recognized plugins that do not support the
   current host as typed `unsupported` proposals without launching plugin code.
+- Native lane views now resolve verified immutable artifact manifests lazily, read only
+  requested blob/chunk ranges, and materialize only touched files during copy-up while
+  preserving shared FUSE, NFS, and Dokan upper/whiteout semantics.
 
 ### Changed
 

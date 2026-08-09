@@ -51,10 +51,10 @@ Trail already has the right starting points:
 - Persistent lane uppers, whiteouts, workdir manifests, sessions, turns,
   checkpoints, gates, readiness, merge queues, and safe Git apply.
 
-The current overlay implementations expose one Trail root as a lower layer and
-one lane directory as an upper layer. They do not expose ignored dependencies or
-generated artifacts, eagerly load the root file map, and implement overlapping
-filesystem behavior separately for FUSE, NFS, and Dokan.
+The shared `ViewCore` now exposes a lazy Trail root plus immutable environment
+artifact manifests as lower layers and class-specific lane directories as
+uppers. FUSE, NFS, and Dokan are protocol adapters over those common lookup,
+ranged-read, copy-up, whiteout, rename, and directory semantics.
 
 This design evolves that foundation into a **layered lane workspace**:
 
@@ -227,23 +227,19 @@ The transparent COW modes already establish several correct invariants:
 - Mount failure is explicit rather than silently becoming a full copy.
 - macOS NFS mount state is persisted for stale-mount recovery.
 
-The principal gaps are:
+The remaining principal gaps are:
 
-1. The lower layer includes only files in the Trail root. Default-ignored paths
-   such as `node_modules` and `target` are neither visible nor shared.
-2. Overlay mounts load the complete root into memory rather than using lazy
-   lookup and directory iteration.
-3. Lower-file reads materialize complete file contents into memory.
-4. FUSE, NFS, and Dokan contain separate implementations of lookup, copy-up,
-   whiteout, rename, and directory behavior.
-5. A single upper mixes source changes with generated and dependency changes.
-6. Checkpoint detection still relies partly on manifests or scans instead of an
+1. Verified real-directory materialization caches do not yet have a tree-root
+   and backend-compatibility identity, independent eviction, or accounting.
+2. Git-root lower-file reads still use a complete-file projection cache; CAS
+   artifact files use direct bounded blob/chunk ranges and materialize only the
+   selected file during copy-up.
+3. Checkpoint detection still relies partly on manifests or scans instead of an
    explicit per-view mutation set.
-7. Mount lifetime is tied mainly to a terminal agent process; editor workflows
+4. Mount lifetime is tied mainly to a terminal agent process; editor workflows
    need daemon-owned or foreground persistent mounts.
-8. The view has no Git compatibility metadata.
-9. There is no layer cache lifecycle, key model, quota, pinning, accounting, or
-   integrity verification.
+5. The view has no Git compatibility metadata.
+6. Layer cache lifecycle, quota, pinning, and accounting remain incomplete.
 
 ## Architectural Principles
 

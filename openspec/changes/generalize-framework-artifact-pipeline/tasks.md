@@ -48,7 +48,7 @@
 
 ## 6. CAS-Backed COW, Recovery, Reachability, and Space
 
-- [ ] 6.1 Add manifest-backed lazy lookup/materialization to NFS, FUSE, and Dokan integration without changing existing lower/upper/whiteout semantics
+- [x] 6.1 Add manifest-backed lazy lookup/materialization to NFS, FUSE, and Dokan integration without changing existing lower/upper/whiteout semantics
 - [ ] 6.2 Add verified materialization caches keyed by tree root/backend compatibility with safe clone/reflink/copy policy and no mutable alias to authoritative content
 - [ ] 6.3 Extend fork compatibility to verify desired key, artifact envelope, tree integrity, adapter/package trust, portability, scope, and backend support while preserving fresh mutable identities
 - [x] 6.4 Extend workspace-open recovery, doctor, and fsck for incomplete CAS attempts, corrupt/missing objects, orphan materializations, legacy versus CAS-backed layouts, and exact repair guidance

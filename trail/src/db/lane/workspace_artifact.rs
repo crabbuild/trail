@@ -47,6 +47,24 @@ pub(crate) struct ArtifactFlatEntry {
     pub(crate) symlink_target: Option<String>,
 }
 
+/// One path resolved directly from an immutable artifact manifest. Directory
+/// and file identities remain available so callers can continue traversal or
+/// read/copy only the selected file without projecting the complete tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactLazyEntry {
+    Directory {
+        node_id: ArtifactTreeId,
+    },
+    File {
+        node_id: ArtifactFileId,
+        mode: u32,
+        size_bytes: u64,
+    },
+    Symlink {
+        target: String,
+    },
+}
+
 impl Trail {
     /// Publish or deliberately refresh one resolver-produced snapshot.
     ///
@@ -1801,6 +1819,280 @@ impl Trail {
         Ok(entries)
     }
 
+    pub(crate) fn artifact_tree_lazy_entry(
+        &self,
+        tree_id: &ArtifactTreeId,
+        relative_path: &str,
+    ) -> Result<Option<ArtifactLazyEntry>> {
+        let tree = self.verified_artifact_tree_root(tree_id)?;
+        if relative_path.is_empty() {
+            return Ok(Some(ArtifactLazyEntry::Directory {
+                node_id: tree.root_directory_id,
+            }));
+        }
+        let relative_path = normalize_relative_path(relative_path)?;
+        let mut directory_id = tree.root_directory_id;
+        let mut segments = relative_path.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            let directory = self.verified_artifact_directory(&directory_id)?;
+            let Ok(index) = directory
+                .entries
+                .binary_search_by(|entry| entry.name.as_str().cmp(segment))
+            else {
+                return Ok(None);
+            };
+            let target = directory.entries[index].target.clone();
+            if segments.peek().is_some() {
+                match target {
+                    ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                        directory_id = node_id;
+                    }
+                    ArtifactDirectoryEntryTargetV1::File { .. }
+                    | ArtifactDirectoryEntryTargetV1::Symlink { .. } => return Ok(None),
+                }
+            } else {
+                return self.artifact_lazy_entry_from_target(target).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn artifact_tree_lazy_children(
+        &self,
+        tree_id: &ArtifactTreeId,
+        relative_path: &str,
+    ) -> Result<Vec<(String, ArtifactLazyEntry)>> {
+        let Some(ArtifactLazyEntry::Directory { node_id }) =
+            self.artifact_tree_lazy_entry(tree_id, relative_path)?
+        else {
+            return Ok(Vec::new());
+        };
+        let directory = self.verified_artifact_directory(&node_id)?;
+        directory
+            .entries
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    entry.name,
+                    self.artifact_lazy_entry_from_target(entry.target)?,
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn artifact_tree_lazy_follow_symlink(
+        &self,
+        tree_id: &ArtifactTreeId,
+        link_path: &str,
+        target: &str,
+    ) -> Result<Option<ArtifactLazyEntry>> {
+        let mut path = resolve_artifact_symlink_path(link_path, target)?;
+        for _ in 0..40 {
+            let Some(entry) = self.artifact_tree_lazy_entry(tree_id, &path)? else {
+                return Ok(None);
+            };
+            match entry {
+                ArtifactLazyEntry::Symlink { target } => {
+                    path = resolve_artifact_symlink_path(&path, &target)?;
+                }
+                entry => return Ok(Some(entry)),
+            }
+        }
+        Err(Error::Corrupt(format!(
+            "artifact symlink `{link_path}` exceeds the resolution bound"
+        )))
+    }
+
+    pub(crate) fn artifact_file_read_range(
+        &self,
+        file_id: &ArtifactFileId,
+        offset: u64,
+        count: u32,
+    ) -> Result<Vec<u8>> {
+        let file = self.verified_artifact_file(file_id)?;
+        if offset >= file.size_bytes || count == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(u64::from(count)).min(file.size_bytes);
+        match file.content {
+            ArtifactFileContentV1::Blob { blob_id } => {
+                let blob: ArtifactBlobV1 = self.get_artifact_cas_object(
+                    &blob_id.0,
+                    ARTIFACT_BLOB_KIND,
+                    ARTIFACT_BLOB_VERSION,
+                )?;
+                let (actual, _) = encode_artifact_blob(blob.clone())?;
+                if actual != blob_id || blob.bytes.len() as u64 != file.size_bytes {
+                    return Err(Error::Corrupt(
+                        "artifact blob identity or file-size edge is invalid".into(),
+                    ));
+                }
+                Ok(blob.bytes[offset as usize..end as usize].to_vec())
+            }
+            ArtifactFileContentV1::Chunks { chunk_list_id } => {
+                let list: ArtifactChunkListV1 = self.get_artifact_cas_object(
+                    &chunk_list_id.0,
+                    ARTIFACT_CHUNK_LIST_KIND,
+                    ARTIFACT_CHUNK_LIST_VERSION,
+                )?;
+                let (actual, _) = encode_artifact_chunk_list(list.clone())?;
+                if actual != chunk_list_id
+                    || list.file_size_bytes != file.size_bytes
+                    || list.file_sha256 != file.content_sha256
+                {
+                    return Err(Error::Corrupt(
+                        "artifact chunk-list identity or file edge is invalid".into(),
+                    ));
+                }
+                let mut output = Vec::with_capacity((end - offset) as usize);
+                let mut chunk_start = 0u64;
+                for chunk_ref in list.chunks {
+                    let chunk_end = chunk_start
+                        .checked_add(chunk_ref.size_bytes)
+                        .ok_or_else(|| Error::Corrupt("artifact chunk range overflow".into()))?;
+                    if chunk_end > offset && chunk_start < end {
+                        let chunk: ArtifactChunkV1 = self.get_artifact_cas_object(
+                            &chunk_ref.chunk_id.0,
+                            ARTIFACT_CHUNK_KIND,
+                            ARTIFACT_CHUNK_VERSION,
+                        )?;
+                        let (actual, _) = encode_artifact_chunk(chunk.clone())?;
+                        if actual != chunk_ref.chunk_id
+                            || chunk.bytes.len() as u64 != chunk_ref.size_bytes
+                        {
+                            return Err(Error::Corrupt(
+                                "artifact chunk identity or size edge is invalid".into(),
+                            ));
+                        }
+                        let selected_start = offset.saturating_sub(chunk_start) as usize;
+                        let selected_end = end.min(chunk_end).saturating_sub(chunk_start) as usize;
+                        output.extend_from_slice(&chunk.bytes[selected_start..selected_end]);
+                    }
+                    chunk_start = chunk_end;
+                    if chunk_start >= end {
+                        break;
+                    }
+                }
+                if output.len() as u64 != end - offset {
+                    return Err(Error::Corrupt(
+                        "artifact ranged read did not cover the requested file extent".into(),
+                    ));
+                }
+                Ok(output)
+            }
+        }
+    }
+
+    pub(crate) fn materialize_artifact_file(
+        &self,
+        file_id: &ArtifactFileId,
+        destination: &Path,
+    ) -> Result<u32> {
+        let file = self.verified_artifact_file(file_id)?;
+        self.verify_artifact_file_content(&file)?;
+        let materialized = (|| -> Result<()> {
+            // Stream bounded ranges so copy-up never allocates a complete
+            // large artifact file. The complete digest was verified before
+            // publication.
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            let mut offset = 0u64;
+            while offset < file.size_bytes {
+                let part = self.artifact_file_read_range(file_id, offset, 4 * 1024 * 1024)?;
+                if part.is_empty() {
+                    return Err(Error::Corrupt(
+                        "artifact file materialization made no progress".into(),
+                    ));
+                }
+                output.write_all(&part)?;
+                offset += part.len() as u64;
+            }
+            output.sync_all()?;
+            set_artifact_materialized_mode(destination, file.mode)?;
+            Ok(())
+        })();
+        if let Err(error) = materialized {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+        Ok(file.mode)
+    }
+
+    fn verified_artifact_tree_root(&self, tree_id: &ArtifactTreeId) -> Result<ArtifactTreeRootV1> {
+        let tree: ArtifactTreeRootV1 = self.get_artifact_cas_object(
+            &tree_id.0,
+            ARTIFACT_TREE_ROOT_KIND,
+            ARTIFACT_TREE_ROOT_VERSION,
+        )?;
+        let (actual, _) = encode_artifact_tree_root(tree.clone())?;
+        if actual != *tree_id {
+            return Err(Error::Corrupt(format!(
+                "artifact tree root `{tree_id}` has conflicting encoded identity"
+            )));
+        }
+        Ok(tree)
+    }
+
+    fn verified_artifact_directory(
+        &self,
+        directory_id: &ArtifactTreeId,
+    ) -> Result<ArtifactDirectoryNodeV1> {
+        let directory: ArtifactDirectoryNodeV1 = self.get_artifact_cas_object(
+            &directory_id.0,
+            ARTIFACT_DIRECTORY_NODE_KIND,
+            ARTIFACT_DIRECTORY_NODE_VERSION,
+        )?;
+        let (actual, canonical) = encode_artifact_directory_node(directory.clone())?;
+        if actual != *directory_id || from_cbor::<ArtifactDirectoryNodeV1>(&canonical)? != directory
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact directory `{directory_id}` has conflicting encoded identity"
+            )));
+        }
+        Ok(directory)
+    }
+
+    fn verified_artifact_file(&self, file_id: &ArtifactFileId) -> Result<ArtifactFileNodeV1> {
+        let file: ArtifactFileNodeV1 = self.get_artifact_cas_object(
+            &file_id.0,
+            ARTIFACT_FILE_NODE_KIND,
+            ARTIFACT_FILE_NODE_VERSION,
+        )?;
+        let (actual, _) = encode_artifact_file_node(file.clone())?;
+        if actual != *file_id {
+            return Err(Error::Corrupt(format!(
+                "artifact file `{file_id}` has conflicting encoded identity"
+            )));
+        }
+        Ok(file)
+    }
+
+    fn artifact_lazy_entry_from_target(
+        &self,
+        target: ArtifactDirectoryEntryTargetV1,
+    ) -> Result<ArtifactLazyEntry> {
+        match target {
+            ArtifactDirectoryEntryTargetV1::Directory { node_id } => {
+                Ok(ArtifactLazyEntry::Directory { node_id })
+            }
+            ArtifactDirectoryEntryTargetV1::File { node_id } => {
+                let file = self.verified_artifact_file(&node_id)?;
+                Ok(ArtifactLazyEntry::File {
+                    node_id,
+                    mode: file.mode,
+                    size_bytes: file.size_bytes,
+                })
+            }
+            ArtifactDirectoryEntryTargetV1::Symlink { target } => {
+                validate_artifact_symlink_target(&target)?;
+                Ok(ArtifactLazyEntry::Symlink { target })
+            }
+        }
+    }
+
     pub(crate) fn put_legacy_artifact_envelope_under_write_lock(
         &self,
         layer_key: &WorkspaceLayerKeyV1,
@@ -3496,10 +3788,21 @@ fn validate_artifact_symlink_target(target: &str) -> Result<()> {
 }
 
 fn validate_artifact_symlink_within_tree(parent: &str, target: &str) -> Result<()> {
+    let link_path = if parent.is_empty() {
+        "link".to_string()
+    } else {
+        format!("{parent}/link")
+    };
+    resolve_artifact_symlink_path(&link_path, target).map(|_| ())
+}
+
+fn resolve_artifact_symlink_path(link_path: &str, target: &str) -> Result<String> {
     validate_artifact_symlink_target(target)?;
+    let parent = link_path.rsplit_once('/').map_or("", |(parent, _)| parent);
     let mut components = parent
         .split('/')
         .filter(|component| !component.is_empty())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     for component in Path::new(target).components() {
         match component {
@@ -3509,7 +3812,7 @@ fn validate_artifact_symlink_within_tree(parent: &str, target: &str) -> Result<(
                     reason: "artifact symlink target must be valid Unicode".into(),
                 })?;
                 validate_artifact_entry_name(component)?;
-                components.push(component);
+                components.push(component.to_string());
             }
             Component::CurDir => {}
             Component::ParentDir => {
@@ -3528,7 +3831,7 @@ fn validate_artifact_symlink_within_tree(parent: &str, target: &str) -> Result<(
             }
         }
     }
-    Ok(())
+    Ok(components.join("/"))
 }
 
 fn ensure_artifact_file_unchanged(
@@ -4560,6 +4863,75 @@ mod tests {
             .chunks
             .iter()
             .all(|chunk| chunk.size_bytes <= ARTIFACT_CHUNK_MAX_BYTES as u64));
+    }
+
+    #[test]
+    fn artifact_manifest_lazy_lookup_and_ranged_reads_do_not_require_full_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("nested")).unwrap();
+        let large = deterministic_benchmark_bytes(6 * 1024 * 1024);
+        fs::write(source.path().join("nested/large.bin"), &large).unwrap();
+        fs::write(source.path().join("small.txt"), b"small artifact\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../small.txt", source.path().join("nested/link")).unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+
+        assert!(matches!(
+            db.artifact_tree_lazy_entry(&tree_id, "nested").unwrap(),
+            Some(ArtifactLazyEntry::Directory { .. })
+        ));
+        let Some(ArtifactLazyEntry::File {
+            node_id,
+            mode,
+            size_bytes,
+        }) = db
+            .artifact_tree_lazy_entry(&tree_id, "nested/large.bin")
+            .unwrap()
+        else {
+            panic!("large artifact path must resolve lazily");
+        };
+        assert_eq!(mode, 0o644);
+        assert_eq!(size_bytes, large.len() as u64);
+        assert!(db
+            .artifact_tree_lazy_entry(&tree_id, "nested/missing")
+            .unwrap()
+            .is_none());
+        let children = db.artifact_tree_lazy_children(&tree_id, "nested").unwrap();
+        assert!(children.iter().any(|(name, _)| name == "large.bin"));
+        #[cfg(unix)]
+        assert!(children.iter().any(|(name, entry)| {
+            name == "link" && matches!(entry, ArtifactLazyEntry::Symlink { .. })
+        }));
+
+        let file = db.verified_artifact_file(&node_id).unwrap();
+        let ArtifactFileContentV1::Chunks { chunk_list_id } = file.content else {
+            panic!("large lazy-read fixture must be chunked");
+        };
+        let list: ArtifactChunkListV1 = db
+            .get_artifact_cas_object(
+                &chunk_list_id.0,
+                ARTIFACT_CHUNK_LIST_KIND,
+                ARTIFACT_CHUNK_LIST_VERSION,
+            )
+            .unwrap();
+        assert!(list.chunks.len() > 1);
+        let first_size = list.chunks[0].size_bytes;
+        let last = list.chunks.last().unwrap().chunk_id.clone();
+        db.conn
+            .execute(
+                "UPDATE artifact_objects SET kind='intentionally-unavailable-test-chunk' \
+                 WHERE artifact_id=?1",
+                params![last.0],
+            )
+            .unwrap();
+        let count = u32::try_from(first_size.min(64 * 1024)).unwrap();
+        assert_eq!(
+            db.artifact_file_read_range(&node_id, 0, count).unwrap(),
+            large[..count as usize]
+        );
     }
 
     #[test]

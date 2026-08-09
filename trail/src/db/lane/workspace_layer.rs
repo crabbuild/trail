@@ -1,5 +1,6 @@
 use super::workdir::{classify_view_path, PreparedLayerMountReset, ViewCore, ViewPathClass};
 use super::*;
+use crate::ids::ArtifactTreeId;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
@@ -52,6 +53,12 @@ pub(crate) struct WorkspaceLayerBinding {
     pub(crate) layer_id: Option<String>,
     pub(crate) mount_path: String,
     pub(crate) storage_path: Option<PathBuf>,
+    /// Verified artifact tree backing this immutable layer. Native workspace
+    /// backends prefer this manifest-backed view and retain `storage_path` as
+    /// a compatibility/materialization-cache fallback.
+    pub(crate) artifact_tree_id: Option<ArtifactTreeId>,
+    /// Path inside `artifact_tree_id` mounted at `mount_path`.
+    pub(crate) artifact_subpath: String,
     pub(crate) kind: String,
     #[allow(dead_code)]
     pub(crate) priority: i64,
@@ -4912,9 +4919,12 @@ impl Trail {
         source_upper: &Path,
     ) -> Result<Vec<WorkspaceLayerBinding>> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.layer_id, b.mount_path, l.storage_path, b.source_path, l.kind, b.priority \
+            "SELECT l.layer_id, b.mount_path, l.storage_path, b.source_path, l.kind, b.priority, \
+                    s.tree_root_id \
              FROM workspace_views v JOIN workspace_view_layers b ON b.view_id = v.view_id \
              JOIN workspace_layers l ON l.layer_id = b.layer_id \
+             LEFT JOIN workspace_layer_artifact_shadows s \
+               ON s.layer_id = l.layer_id AND s.state = 'verified' \
              WHERE v.source_upper = ?1 AND b.read_only = 1 AND l.state = 'ready' \
              ORDER BY length(b.mount_path) DESC, b.priority DESC",
         )?;
@@ -4927,6 +4937,7 @@ impl Trail {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(Error::from)?
@@ -4934,7 +4945,23 @@ impl Trail {
         let mut bindings = rows
             .into_iter()
             .map(
-                |(layer_id, mount_path, storage_path, source_path, kind, priority)| {
+                |(
+                    layer_id,
+                    mount_path,
+                    storage_path,
+                    source_path,
+                    kind,
+                    priority,
+                    artifact_tree_id,
+                )| {
+                    let artifact_tree_id = artifact_tree_id
+                        .map(ArtifactTreeId::parse)
+                        .transpose()
+                        .map_err(|reason| {
+                            Error::Corrupt(format!(
+                                "workspace layer `{layer_id}` has invalid artifact tree identity: {reason}"
+                            ))
+                        })?;
                     let storage_path = if source_path.is_empty() {
                         PathBuf::from(storage_path)
                     } else {
@@ -4945,6 +4972,8 @@ impl Trail {
                         layer_id: Some(layer_id),
                         mount_path,
                         storage_path: Some(storage_path),
+                        artifact_tree_id,
+                        artifact_subpath: source_path,
                         kind,
                         priority,
                     })
@@ -4965,6 +4994,8 @@ impl Trail {
                     layer_id: None,
                     mount_path: row.get(1)?,
                     storage_path: None,
+                    artifact_tree_id: None,
+                    artifact_subpath: String::new(),
                     kind: row.get(2)?,
                     priority: 100,
                 })

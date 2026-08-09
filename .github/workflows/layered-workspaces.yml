@@ -62,6 +62,9 @@ jobs:
       - run: cargo test -p trail fuse_adapter_runs_shared_mounted_view_suite -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail fuse_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
       - run: cargo test -p trail real_cmake_configure_build_and_clean_stay_lane_private -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
@@ -132,6 +135,9 @@ jobs:
       - run: cargo test -p trail nfs_adapter_runs_shared_mounted_view_suite -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
       - run: cargo test -p trail real_nfs_mount_records_new_modified_and_renamed_files -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
@@ -185,6 +191,7 @@ jobs:
         run: |
           $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
           cargo test -p trail dokan_adapter_runs_shared_mounted_view_suite -- --nocapture
+          cargo test -p trail dokan_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
           cargo test -p trail foreground_dokan_mount_stops_through_a_separate_trail_handle -- --nocapture
           cargo test -p trail daemon_owned_dokan_mount_returns_ready_and_unmounts_asynchronously -- --nocapture
           cargo test -p trail real_windows_cmake_build_and_clean_stay_lane_private -- --nocapture

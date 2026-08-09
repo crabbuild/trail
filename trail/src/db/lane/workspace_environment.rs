@@ -3382,6 +3382,8 @@ impl Trail {
                     layer_id: layer_id.map(str::to_string),
                     mount_path: output.mount_path.clone(),
                     storage_path,
+                    artifact_tree_id: None,
+                    artifact_subpath: String::new(),
                     kind: plan.kind.clone(),
                     priority: 100,
                 });
