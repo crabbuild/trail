@@ -268,6 +268,26 @@ before non-dry-run apply.
 - `trail.lane_rewind`
 - `trail.lane_remove`
 
+## Lane Environments and Artifacts
+
+- `trail.env_resolve`
+- `trail.env_resolve_all`
+- `trail.artifact_space`
+- `trail.artifact_inspect`
+- `trail.artifact_reachability`
+- `trail.artifact_verify`
+- `trail.artifact_quarantine_list`
+- `trail.artifact_quarantine_show`
+- `trail.artifact_quarantine_resolve`
+- `trail.env_source_export`
+
+Resolve tools are open-world writes because a reviewed host-owned resolver may
+execute an exact external package-manager command. Artifact space, inspection,
+reachability, verification, and quarantine queries are guarded read-only calls.
+Quarantine resolution and source export are destructive writes because they
+change retained artifact policy or normal lane source state. Every tool returns
+the same typed report serialized by Rust, CLI JSON/NDJSON, and HTTP.
+
 ## Sessions, Approvals, Runs, Leases, Anchors
 
 - `trail.session_start`
@@ -387,15 +407,21 @@ table.
 
 ## Resources
 
-Static resources include workspace status, doctor, lanes, merge queue,
+Static resources include workspace status, doctor, lanes, artifact space,
+artifact quarantines, merge queue,
 conflicts, OpenAPI, documentation, and agent task dashboard resources:
+`trail://workspace/artifacts/space`,
+`trail://workspace/artifact-quarantines`,
 `trail://workspace/agent-tasks`,
 `trail://workspace/agent-tasks/latest/review`,
 `trail://workspace/agent-tasks/latest/review-data`,
 `trail://workspace/agent-tasks/latest/changes`,
 `trail://workspace/agent-tasks/latest/files`, and
 `trail://workspace/agent-tasks/latest/focus`. Resource templates cover
-individual agent task review-data/review/changes/file/report/focus dashboards, lanes, lane
+individual artifact envelopes at
+`trail://workspace/artifacts/{artifact_id}`, individual quarantines at
+`trail://workspace/artifact-quarantines/{quarantine_id}`, agent task
+review-data/review/changes/file/report/focus dashboards, lanes, lane
 review packets, sessions, turns, conflicts, approvals, run states, and trace
 spans.
 

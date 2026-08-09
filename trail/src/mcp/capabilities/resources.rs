@@ -17,6 +17,20 @@ pub(crate) fn resources_templates_list_result() -> Value {
 pub(crate) fn resource_templates() -> Value {
     json!([
         {
+            "uriTemplate": RESOURCE_ARTIFACT_TEMPLATE,
+            "name": "artifact",
+            "title": "Artifact Inspection",
+            "description": "Read one artifact envelope, content identity, attestation, trust, verification, quarantine, and storage report.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_ARTIFACT_QUARANTINE_TEMPLATE,
+            "name": "artifact-quarantine",
+            "title": "Artifact Quarantine",
+            "description": "Read one durable artifact nondeterminism quarantine and its retained evidence.",
+            "mimeType": "application/json"
+        },
+        {
             "uriTemplate": RESOURCE_AGENT_SUMMARY_TEMPLATE,
             "name": "agent-task-summary",
             "title": "Agent Task Summary",
@@ -243,6 +257,20 @@ pub(crate) fn resources() -> Value {
             "name": "lanes",
             "title": "Lanes",
             "description": "Current lane branches and lifecycle metadata.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_ARTIFACT_SPACE,
+            "name": "artifact-space",
+            "title": "Artifact Space",
+            "description": "CAS-aware logical, authoritative, shared, materialized, private, and reclaimable storage accounting.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_ARTIFACT_QUARANTINES,
+            "name": "artifact-quarantines",
+            "title": "Artifact Quarantines",
+            "description": "List durable artifact nondeterminism quarantines and their explicit recovery commands.",
             "mimeType": "application/json"
         },
         {

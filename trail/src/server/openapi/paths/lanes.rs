@@ -10,6 +10,37 @@ pub(super) fn lane_paths() -> Value {
         "/v1/environment/adapters": {
             "get": openapi_operation_with_response_schema("environmentAdapterCatalog", "Workspace environment adapters", "List registered adapters and their side-effect-free discovery metadata, provenance, and stability.", vec![], None, "EnvironmentAdapterCatalogReport", true)
         },
+        "/v1/artifacts/space": {
+            "get": openapi_operation_with_response_schema("artifactSpace", "Artifact storage accounting", "Report CAS-aware logical, authoritative, shared, materialized, private, and reclaimable storage.", vec![], None, "ArtifactSpaceReportV1", true)
+        },
+        "/v1/artifacts/{artifact_id}": {
+            "get": openapi_operation_with_response_schema("artifactInspect", "Inspect artifact", "Inspect one artifact envelope, content identity, bindings, attestations, quarantine state, reachability, and storage.", vec![
+                openapi_path_param("artifact_id", "string")
+            ], None, "ArtifactInspectionReportV1", true)
+        },
+        "/v1/artifacts/{artifact_id}/reachability": {
+            "get": openapi_operation_with_response_schema("artifactReachability", "Inspect artifact reachability", "Trace the authoritative content objects reachable from one artifact envelope.", vec![
+                openapi_path_param("artifact_id", "string")
+            ], None, "ArtifactContentReachabilityReportV1", true)
+        },
+        "/v1/artifacts/{artifact_id}/verify": {
+            "post": openapi_operation_with_response_schema("artifactVerify", "Verify artifact", "Verify one artifact at attach, sample, full, or reproduce level.", vec![
+                openapi_path_param("artifact_id", "string")
+            ], Some("ArtifactVerifyRequest"), "ArtifactVerificationReportV1", true)
+        },
+        "/v1/artifact-quarantines": {
+            "get": openapi_operation_with_response_schema("artifactQuarantineList", "List artifact quarantines", "List durable artifact nondeterminism quarantines.", vec![], None, "ArtifactQuarantineListReportV1", true)
+        },
+        "/v1/artifact-quarantines/{quarantine_id}": {
+            "get": openapi_operation_with_response_schema("artifactQuarantineShow", "Show artifact quarantine", "Show one quarantine and its retained divergence evidence.", vec![
+                openapi_path_param("quarantine_id", "string")
+            ], None, "ArtifactQuarantineRecordV1", true)
+        },
+        "/v1/artifact-quarantines/{quarantine_id}/resolve": {
+            "post": openapi_operation_with_response_schema("artifactQuarantineResolve", "Resolve artifact quarantine", "Apply one explicit audited quarantine resolution without relabeling artifact bytes.", vec![
+                openapi_path_param("quarantine_id", "string")
+            ], Some("ArtifactQuarantineResolveRequest"), "ArtifactQuarantineResolutionReportV1", true)
+        },
         "/v1/lanes": {
             "get": openapi_operation("laneList", "List lanes", "List lane branches with metadata and branch state.", vec![], None, true),
             "post": lane_spawn_operation()
@@ -135,6 +166,21 @@ pub(super) fn lane_paths() -> Value {
                 openapi_path_param("lane_or_id", "string"),
                 openapi_query("path", "string")
             ], None, "EnvironmentDiscoveryReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/resolve": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentResolve", "Resolve workspace environment component", "Run the authorized host-owned resolver for one component or reuse its pinned immutable snapshot.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("EnvironmentResolveRequest"), "ArtifactResolutionComponentReportV1", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/resolve-all": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentResolveAll", "Resolve all workspace environment components", "Resolve every incomplete component in deterministic graph order or reuse pinned immutable snapshots.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("EnvironmentResolveAllRequest"), "ArtifactResolutionBatchReportV1", true)
+        },
+        "/v1/lanes/{lane_or_id}/environment/source-export": {
+            "post": openapi_operation_with_response_schema("laneEnvironmentSourceExport", "Export generated source", "Revalidate and export a declared artifact subtree through normal lane source guardrails and checkpoint semantics.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("ArtifactSourceExportRequest"), "ArtifactSourceExportExecutionReportV1", true)
         },
         "/v1/lanes/{lane_or_id}/environment/graph": {
             "get": openapi_operation_with_response_schema("laneEnvironmentGraph", "Desired environment graph", "Return the validated component DAG, deterministic topological order, output ownership, component keys, and ordering/invalidation edges without executing tools or mutating state.", vec![

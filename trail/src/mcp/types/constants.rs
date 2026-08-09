@@ -4,6 +4,8 @@ pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub(crate) const RESOURCE_STATUS: &str = "trail://workspace/status";
 pub(crate) const RESOURCE_DOCTOR: &str = "trail://workspace/doctor";
 pub(crate) const RESOURCE_LANES: &str = "trail://workspace/lanes";
+pub(crate) const RESOURCE_ARTIFACT_SPACE: &str = "trail://workspace/artifacts/space";
+pub(crate) const RESOURCE_ARTIFACT_QUARANTINES: &str = "trail://workspace/artifact-quarantines";
 pub(crate) const RESOURCE_LANE_MERGE_QUEUE: &str = "trail://workspace/lane-merge-queue";
 pub(crate) const RESOURCE_CONFLICTS: &str = "trail://workspace/conflicts";
 pub(crate) const RESOURCE_OPENAPI: &str = "trail://workspace/openapi";
@@ -82,6 +84,9 @@ pub(crate) const RESOURCE_CONFLICT_TEMPLATE: &str = "trail://workspace/conflicts
 pub(crate) const RESOURCE_APPROVAL_TEMPLATE: &str = "trail://workspace/approvals/{approval_id}";
 pub(crate) const RESOURCE_RUN_TEMPLATE: &str = "trail://workspace/runs/{run_id}";
 pub(crate) const RESOURCE_SPAN_TEMPLATE: &str = "trail://workspace/spans/{span_id}";
+pub(crate) const RESOURCE_ARTIFACT_TEMPLATE: &str = "trail://workspace/artifacts/{artifact_id}";
+pub(crate) const RESOURCE_ARTIFACT_QUARANTINE_TEMPLATE: &str =
+    "trail://workspace/artifact-quarantines/{quarantine_id}";
 
 pub(crate) const PROMPT_LANE_TASK: &str = "trail.lane_task";
 pub(crate) const PROMPT_REVIEW_LANE: &str = "trail.review_lane";

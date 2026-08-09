@@ -103,7 +103,7 @@
 
 - [x] 11.1 Add shared library operations/reports for resolve, artifact inspect/verify/quarantine, source export, content reachability, and CAS-aware space while retaining existing env grammar
 - [x] 11.2 Add CLI help, deterministic plain output, human rendering, JSON/NDJSON, exit categories, ambiguity behavior, and exact recovery commands for new operations
-- [ ] 11.3 Add aligned HTTP routes/OpenAPI schemas and MCP tools/resources/risk annotations backed by the same library operations and reports
+- [x] 11.3 Add aligned HTTP routes/OpenAPI schemas and MCP tools/resources/risk annotations backed by the same library operations and reports
 - [ ] 11.4 Extend managed exec/test/eval/agent/ACP preparation with explicit missing-resolution policy, pinned identities, sealing decisions, and finalization receipts
 - [ ] 11.5 Build behavior-based conformance fixtures shared by built-ins, plugins, and repository v2 for discovery through collection and emit machine-readable certification reports
 - [ ] 11.6 Add real-tool gates for dependency resolution, compiled incremental output, framework/bundler composition, path-bound private state, external metadata, custom pipeline, and source export

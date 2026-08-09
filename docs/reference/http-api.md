@@ -4,6 +4,9 @@ Environment sync reports include per-component cache decisions, storage
 identity, rebuild reason, exact changed identity edges, and byte accounting.
 `POST /v1/lanes/{lane_or_id}/environment/promote` accepts `component` and
 `output` and returns the durable publication and successor-generation report.
+Artifact resolution, inspection, verification, quarantine, reachability,
+workspace accounting, and source export routes serialize the same public Rust
+report types used by CLI JSON/NDJSON and MCP structured content.
 Lane spawn reports include the shared layered-backend prerequisite report.
 
 The daemon serves JSON HTTP routes under `/v1`.
@@ -115,6 +118,9 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
+| POST | `/v1/lanes/{lane_or_id}/environment/resolve` | Resolve or reuse one pinned component snapshot. Body: `component`, optional `path` and `refresh`. |
+| POST | `/v1/lanes/{lane_or_id}/environment/resolve-all` | Resolve or reuse every incomplete component snapshot. Body: optional `path` and `refresh`. |
+| POST | `/v1/lanes/{lane_or_id}/environment/source-export` | Export one declared generated-source subtree through normal lane source writes. Body: `component` and `export`. |
 
 Patch requests accept either native `edits` or compatibility `files`; provide
 one non-empty array, not both.
@@ -157,6 +163,23 @@ allows `dry_run=true` preflight. A non-dry-run merge into the workspace default
 branch requires `direct=true`; otherwise enqueue with
 `POST /v1/lanes/merges/queue`
 and run the queue. The former branch-scoped `merge-lane` endpoint was removed.
+
+## Artifact Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/v1/artifacts/space` | CAS-aware workspace artifact accounting. |
+| GET | `/v1/artifacts/{artifact_id}` | Inspect one artifact envelope and its bindings, attestations, quarantine, reachability, and storage evidence. |
+| GET | `/v1/artifacts/{artifact_id}/reachability` | Summarize authoritative objects reachable from one envelope. |
+| POST | `/v1/artifacts/{artifact_id}/verify` | Verify at `attach`, `sample`, `full`, or `reproduce` level. |
+| GET | `/v1/artifact-quarantines` | List active and resolved nondeterminism quarantines. |
+| GET | `/v1/artifact-quarantines/{quarantine_id}` | Show retained divergence evidence. |
+| POST | `/v1/artifact-quarantines/{quarantine_id}/resolve` | Apply `retain_private`, `accept_incumbent`, `accept_candidate`, or `retire_all`. |
+
+Resolution executes only a host-owned plan with pinned source and tool
+identity. `refresh: false` reuses an existing valid snapshot; wall-clock time
+alone never advances dependencies. Source export is an explicit guarded source
+mutation and is distinct from artifact promotion or mounting.
 
 ## Collaboration Routes
 

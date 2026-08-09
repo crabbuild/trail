@@ -2,6 +2,236 @@ use serde_json::{json, Value};
 
 pub(super) fn lane_schemas() -> Value {
     json!({
+        "EnvironmentResolveRequest": {
+            "type": "object",
+            "required": ["component"],
+            "properties": {
+                "component": { "type": "string" },
+                "path": { "type": ["string", "null"] },
+                "refresh": { "type": "boolean", "default": false }
+            }
+        },
+        "EnvironmentResolveAllRequest": {
+            "type": "object",
+            "properties": {
+                "path": { "type": ["string", "null"] },
+                "refresh": { "type": "boolean", "default": false }
+            }
+        },
+        "ArtifactVerifyRequest": {
+            "type": "object",
+            "required": ["level"],
+            "properties": {
+                "level": { "type": "string", "enum": ["attach", "sample", "full", "reproduce"] }
+            }
+        },
+        "ArtifactQuarantineResolveRequest": {
+            "type": "object",
+            "required": ["resolution"],
+            "properties": {
+                "resolution": { "type": "string", "enum": ["retain_private", "accept_incumbent", "accept_candidate", "retire_all"] }
+            }
+        },
+        "ArtifactSourceExportRequest": {
+            "type": "object",
+            "required": ["component", "export"],
+            "properties": {
+                "component": { "type": "string" },
+                "export": { "type": "string" }
+            }
+        },
+        "ArtifactStorageAccountingReport": {
+            "type": "object",
+            "required": ["logical_bytes", "unique_authoritative_bytes", "cross_artifact_shared_bytes", "materialized_bytes", "lane_private_bytes", "prefetched_bytes", "demand_loaded_bytes", "reclaimable_bytes", "unknown_bytes", "accounting"],
+            "additionalProperties": false,
+            "properties": {
+                "logical_bytes": { "type": "integer", "minimum": 0 },
+                "unique_authoritative_bytes": { "type": "integer", "minimum": 0 },
+                "cross_artifact_shared_bytes": { "type": "integer", "minimum": 0 },
+                "materialized_bytes": { "type": "integer", "minimum": 0 },
+                "lane_private_bytes": { "type": "integer", "minimum": 0 },
+                "prefetched_bytes": { "type": "integer", "minimum": 0 },
+                "demand_loaded_bytes": { "type": "integer", "minimum": 0 },
+                "reclaimable_bytes": { "type": "integer", "minimum": 0 },
+                "unknown_bytes": { "type": "integer", "minimum": 0 },
+                "accounting": { "type": "string" }
+            }
+        },
+        "ArtifactReachabilityKindReportV1": {
+            "type": "object",
+            "required": ["kind", "object_count", "encoded_bytes"],
+            "additionalProperties": false,
+            "properties": {
+                "kind": { "type": "string" },
+                "object_count": { "type": "integer", "minimum": 0 },
+                "encoded_bytes": { "type": "integer", "minimum": 0 }
+            }
+        },
+        "ArtifactContentReachabilityReportV1": {
+            "type": "object",
+            "required": ["envelope_id", "tree_root_id", "object_count", "encoded_bytes", "logical_bytes", "by_kind", "complete", "recovery_commands"],
+            "additionalProperties": false,
+            "properties": {
+                "envelope_id": { "type": "string" },
+                "tree_root_id": { "type": "string" },
+                "object_count": { "type": "integer", "minimum": 0 },
+                "encoded_bytes": { "type": "integer", "minimum": 0 },
+                "logical_bytes": { "type": "integer", "minimum": 0 },
+                "by_kind": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactReachabilityKindReportV1" } },
+                "complete": { "type": "boolean" },
+                "recovery_commands": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ArtifactGenerationBindingReportV1": {
+            "type": "object",
+            "required": ["binding_id", "generation_id", "component_id", "output_name", "desired_key", "envelope_id", "tree_root_id", "binding_identity", "created_at"],
+            "additionalProperties": false,
+            "properties": {
+                "binding_id": { "type": "string" },
+                "generation_id": { "type": "string" },
+                "component_id": { "type": "string" },
+                "output_name": { "type": "string" },
+                "desired_key": { "type": "string" },
+                "envelope_id": { "type": "string" },
+                "tree_root_id": { "type": "string" },
+                "binding_identity": { "type": "string" },
+                "created_at": { "type": "integer" }
+            }
+        },
+        "ArtifactQuarantineRecordV1": {
+            "type": "object",
+            "required": ["quarantine_id", "trust_scope", "desired_key", "incumbent_envelope_id", "candidate_envelope_id", "reason_code", "evidence_object_id", "state", "resolution", "created_at", "resolved_at"],
+            "additionalProperties": false,
+            "properties": {
+                "quarantine_id": { "type": "string" },
+                "trust_scope": { "type": "string" },
+                "desired_key": { "type": "string" },
+                "incumbent_envelope_id": { "type": ["string", "null"] },
+                "candidate_envelope_id": { "type": "string" },
+                "reason_code": { "type": "string" },
+                "evidence_object_id": { "type": "string" },
+                "state": { "type": "string" },
+                "resolution": { "type": ["string", "null"] },
+                "created_at": { "type": "integer" },
+                "resolved_at": { "type": ["integer", "null"] }
+            }
+        },
+        "ArtifactQuarantineListReportV1": {
+            "type": "object",
+            "required": ["active_count", "resolved_count", "quarantines"],
+            "additionalProperties": false,
+            "properties": {
+                "active_count": { "type": "integer", "minimum": 0 },
+                "resolved_count": { "type": "integer", "minimum": 0 },
+                "quarantines": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactQuarantineRecordV1" } }
+            }
+        },
+        "ArtifactQuarantineResolutionReportV1": {
+            "type": "object",
+            "required": ["quarantine", "affected_envelopes", "recovery_commands"],
+            "additionalProperties": false,
+            "properties": {
+                "quarantine": { "$ref": "#/components/schemas/ArtifactQuarantineRecordV1" },
+                "affected_envelopes": { "type": "array", "items": { "type": "string" } },
+                "recovery_commands": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ArtifactSpaceReportV1": {
+            "type": "object",
+            "required": ["scope", "envelope_count", "active_quarantine_count", "storage"],
+            "additionalProperties": false,
+            "properties": {
+                "scope": { "type": "string" },
+                "envelope_count": { "type": "integer", "minimum": 0 },
+                "active_quarantine_count": { "type": "integer", "minimum": 0 },
+                "storage": { "$ref": "#/components/schemas/ArtifactStorageAccountingReport" }
+            }
+        },
+        "ArtifactInspectionReportV1": {
+            "type": "object",
+            "required": ["envelope_id", "object_id", "desired_key", "tree_root_id", "state", "verification_state", "trust_state", "quarantine_state", "envelope", "bindings", "attestations", "quarantines", "reachability", "storage", "recovery_commands"],
+            "additionalProperties": false,
+            "properties": {
+                "envelope_id": { "type": "string" },
+                "object_id": { "type": "string" },
+                "desired_key": { "type": "string" },
+                "tree_root_id": { "type": "string" },
+                "state": { "type": "string" },
+                "verification_state": { "type": "string" },
+                "trust_state": { "type": "string" },
+                "quarantine_state": { "type": "string" },
+                "envelope": { "$ref": "#/components/schemas/JsonValue" },
+                "bindings": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactGenerationBindingReportV1" } },
+                "attestations": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "quarantines": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactQuarantineRecordV1" } },
+                "reachability": { "$ref": "#/components/schemas/ArtifactContentReachabilityReportV1" },
+                "storage": { "$ref": "#/components/schemas/ArtifactStorageAccountingReport" },
+                "recovery_commands": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ArtifactVerificationReportV1": {
+            "type": "object",
+            "required": ["envelope_id", "level", "desired_key", "tree_root_id", "envelope_state", "verification_state", "trust_state", "quarantine_state", "content_identity_valid", "tree_integrity_valid", "validation_receipts_valid", "attestations_valid", "valid", "diagnostics", "recovery_commands", "reachability", "storage"],
+            "additionalProperties": false,
+            "properties": {
+                "envelope_id": { "type": "string" },
+                "level": { "type": "string", "enum": ["attach", "sample", "full", "reproduce"] },
+                "desired_key": { "type": "string" },
+                "tree_root_id": { "type": "string" },
+                "envelope_state": { "type": "string" },
+                "verification_state": { "type": "string" },
+                "trust_state": { "type": "string" },
+                "quarantine_state": { "type": "string" },
+                "content_identity_valid": { "type": "boolean" },
+                "tree_integrity_valid": { "type": "boolean" },
+                "validation_receipts_valid": { "type": "boolean" },
+                "attestations_valid": { "type": "boolean" },
+                "reproduction_evidence_valid": { "type": ["boolean", "null"] },
+                "valid": { "type": "boolean" },
+                "diagnostics": { "type": "array", "items": { "type": "string" } },
+                "recovery_commands": { "type": "array", "items": { "type": "string" } },
+                "reachability": { "$ref": "#/components/schemas/ArtifactContentReachabilityReportV1" },
+                "storage": { "$ref": "#/components/schemas/ArtifactStorageAccountingReport" }
+            }
+        },
+        "ArtifactResolutionComponentReportV1": {
+            "type": "object",
+            "required": ["component_id", "proposal_key", "source_root", "snapshot_id", "snapshot", "decision", "refresh_requested"],
+            "additionalProperties": false,
+            "properties": {
+                "component_id": { "type": "string" },
+                "proposal_key": { "type": "string" },
+                "source_root": { "type": "string" },
+                "snapshot_id": { "type": "string" },
+                "snapshot": { "$ref": "#/components/schemas/JsonValue" },
+                "decision": { "type": "string", "enum": ["resolved", "reused", "refreshed"] },
+                "refresh_requested": { "type": "boolean" },
+                "attempt": { "$ref": "#/components/schemas/JsonValue" }
+            }
+        },
+        "ArtifactResolutionBatchReportV1": {
+            "type": "object",
+            "required": ["source_root", "refresh_requested", "components"],
+            "additionalProperties": false,
+            "properties": {
+                "source_root": { "type": "string" },
+                "refresh_requested": { "type": "boolean" },
+                "components": { "type": "array", "items": { "$ref": "#/components/schemas/ArtifactResolutionComponentReportV1" } }
+            }
+        },
+        "ArtifactSourceExportExecutionReportV1": {
+            "type": "object",
+            "required": ["plan", "operation", "root_id", "changed_paths", "checkpointed", "git_handoff"],
+            "additionalProperties": false,
+            "properties": {
+                "plan": { "$ref": "#/components/schemas/JsonValue" },
+                "operation": { "type": "string" },
+                "root_id": { "type": "string" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
+                "checkpointed": { "type": "boolean" },
+                "git_handoff": { "type": "array", "items": { "type": "string" } }
+            }
+        },
         "LaneRemoveReport": {
             "type": "object",
             "required": ["lane_id", "ref_name", "removed_workdir", "forced"],

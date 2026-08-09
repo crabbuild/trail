@@ -2390,6 +2390,41 @@ fn environment_resolve_cli_executes_and_reuses_a_real_cargo_snapshot() {
     assert_eq!(second["snapshot_id"], first["snapshot_id"]);
     assert!(second.get("attempt").is_none());
 
+    let mut db = Trail::open(temp.path()).unwrap();
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/cargo-resolve-cli/environment/resolve",
+            serde_json::json!({"component": "cargo-target-seed"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http: serde_json::Value = http.body_json().unwrap();
+    assert_eq!(http["decision"], "reused");
+    assert_eq!(http["snapshot_id"], first["snapshot_id"]);
+    assert_eq!(http["snapshot"], first["snapshot"]);
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 57,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_resolve",
+                "arguments": {
+                    "lane": "cargo-resolve-cli",
+                    "component": "cargo-target-seed"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], http);
+    assert!(!temp.path().join("Cargo.lock").exists());
+
     let missing = Command::new(trail_bin())
         .arg("--workspace")
         .arg(temp.path())
@@ -11768,6 +11803,202 @@ fn manifest_only_environment_discovery_has_cli_http_mcp_and_openapi_parity() {
         component["properties"]["status"]["enum"],
         serde_json::json!(["ready", "resolvable", "blocked", "unsupported", "ambiguous"])
     );
+}
+
+#[test]
+fn artifact_lifecycle_http_mcp_resources_and_openapi_are_aligned() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "artifact reports\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+
+    let expected_space = serde_json::to_value(db.workspace_artifact_space().unwrap()).unwrap();
+    let http_space = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/artifacts/space", serde_json::Value::Null),
+    );
+    assert_eq!(http_space.status, 200);
+    assert_eq!(
+        http_space.body_json::<serde_json::Value>().unwrap(),
+        expected_space
+    );
+
+    let mcp_space = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 50,
+            "method": "tools/call",
+            "params": {"name": "trail.artifact_space", "arguments": {}}
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_space["result"]["isError"], false);
+    assert_eq!(mcp_space["result"]["structuredContent"], expected_space);
+
+    let space_resource = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "resources/read",
+            "params": {"uri": "trail://workspace/artifacts/space"}
+        }),
+    )
+    .unwrap();
+    let space_resource: serde_json::Value = serde_json::from_str(
+        space_resource["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(space_resource, expected_space);
+
+    let expected_quarantines =
+        serde_json::to_value(db.artifact_quarantine_list_report().unwrap()).unwrap();
+    let http_quarantines = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/artifact-quarantines", serde_json::Value::Null),
+    );
+    assert_eq!(http_quarantines.status, 200);
+    assert_eq!(
+        http_quarantines.body_json::<serde_json::Value>().unwrap(),
+        expected_quarantines
+    );
+    let mcp_quarantines = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 52,
+            "method": "tools/call",
+            "params": {"name": "trail.artifact_quarantine_list", "arguments": {}}
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        mcp_quarantines["result"]["structuredContent"],
+        expected_quarantines
+    );
+    let quarantine_resource = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "resources/read",
+            "params": {"uri": "trail://workspace/artifact-quarantines"}
+        }),
+    )
+    .unwrap();
+    let quarantine_resource: serde_json::Value = serde_json::from_str(
+        quarantine_resource["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(quarantine_resource, expected_quarantines);
+
+    let resources = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 54,
+            "method": "resources/list",
+            "params": {}
+        }),
+    )
+    .unwrap();
+    let resources = resources["result"]["resources"].as_array().unwrap();
+    assert!(resources
+        .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/artifacts/space"));
+    assert!(resources
+        .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/artifact-quarantines"));
+    let templates = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 55,
+            "method": "resources/templates/list",
+            "params": {}
+        }),
+    )
+    .unwrap();
+    let templates = templates["result"]["resourceTemplates"].as_array().unwrap();
+    assert!(templates.iter().any(|template| {
+        template["uriTemplate"] == "trail://workspace/artifacts/{artifact_id}"
+    }));
+    assert!(templates.iter().any(|template| {
+        template["uriTemplate"] == "trail://workspace/artifact-quarantines/{quarantine_id}"
+    }));
+
+    let tools = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 56,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .unwrap();
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    for (name, read_only, destructive, open_world) in [
+        ("trail.env_resolve", false, false, true),
+        ("trail.env_resolve_all", false, false, true),
+        ("trail.artifact_space", true, false, false),
+        ("trail.artifact_inspect", true, false, false),
+        ("trail.artifact_reachability", true, false, false),
+        ("trail.artifact_verify", true, false, false),
+        ("trail.artifact_quarantine_list", true, false, false),
+        ("trail.artifact_quarantine_show", true, false, false),
+        ("trail.artifact_quarantine_resolve", false, true, false),
+        ("trail.env_source_export", false, true, false),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], read_only, "{name}");
+        assert_eq!(
+            tool["annotations"]["destructiveHint"], destructive,
+            "{name}"
+        );
+        assert_eq!(tool["annotations"]["openWorldHint"], open_world, "{name}");
+    }
+
+    let openapi = trail::server::openapi_spec();
+    for path in [
+        "/v1/artifacts/space",
+        "/v1/artifacts/{artifact_id}",
+        "/v1/artifacts/{artifact_id}/reachability",
+        "/v1/artifacts/{artifact_id}/verify",
+        "/v1/artifact-quarantines",
+        "/v1/artifact-quarantines/{quarantine_id}",
+        "/v1/artifact-quarantines/{quarantine_id}/resolve",
+        "/v1/lanes/{lane_or_id}/environment/resolve",
+        "/v1/lanes/{lane_or_id}/environment/resolve-all",
+        "/v1/lanes/{lane_or_id}/environment/source-export",
+    ] {
+        assert!(
+            openapi["paths"].get(path).is_some(),
+            "missing OpenAPI path {path}"
+        );
+    }
+    for schema in [
+        "ArtifactResolutionComponentReportV1",
+        "ArtifactResolutionBatchReportV1",
+        "ArtifactInspectionReportV1",
+        "ArtifactVerificationReportV1",
+        "ArtifactContentReachabilityReportV1",
+        "ArtifactSpaceReportV1",
+        "ArtifactQuarantineListReportV1",
+        "ArtifactQuarantineRecordV1",
+        "ArtifactQuarantineResolutionReportV1",
+        "ArtifactSourceExportExecutionReportV1",
+    ] {
+        assert!(
+            openapi["components"]["schemas"].get(schema).is_some(),
+            "missing OpenAPI schema {schema}"
+        );
+    }
 }
 
 #[test]

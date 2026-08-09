@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::{ArtifactQuarantineResolutionV1, ArtifactVerificationLevelV1};
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LaneSpawnArgs {
@@ -230,6 +232,71 @@ pub(crate) struct EnvironmentSyncArgs {
     pub(crate) component: Option<String>,
     #[serde(default, alias = "component_root")]
     pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentResolveArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(alias = "component_id")]
+    pub(crate) component: String,
+    #[serde(default, alias = "component_root")]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentResolveAllArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default, alias = "component_root")]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactIdArgs {
+    #[serde(alias = "artifact_id", alias = "envelope_id")]
+    pub(crate) artifact: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactVerifyArgs {
+    #[serde(alias = "artifact_id", alias = "envelope_id")]
+    pub(crate) artifact: String,
+    pub(crate) level: ArtifactVerificationLevelV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactQuarantineArgs {
+    #[serde(alias = "quarantine_id")]
+    pub(crate) quarantine: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactQuarantineResolveArgs {
+    #[serde(alias = "quarantine_id")]
+    pub(crate) quarantine: String,
+    pub(crate) resolution: ArtifactQuarantineResolutionV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactSourceExportArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(alias = "component_id")]
+    pub(crate) component: String,
+    #[serde(alias = "export_name")]
+    pub(crate) export: String,
 }
 
 #[derive(Debug, Deserialize)]

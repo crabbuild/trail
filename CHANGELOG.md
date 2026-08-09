@@ -7,6 +7,11 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added HTTP/OpenAPI and MCP tool/resource parity for environment resolution,
+  artifact inspection/verification/reachability/accounting, quarantine
+  list/show/resolve, and explicit generated-source export. All transports use
+  the shared Rust reports, and MCP operations declare read-only, destructive,
+  or open-world risk consistently.
 - Added `trail env resolve all|component`, artifact inspect/verify/quarantine,
   and explicit source-export CLI workflows with exact discovery recovery argv,
   deterministic human/plain rendering, JSON/NDJSON reports, and stable failure

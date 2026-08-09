@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::{ArtifactQuarantineResolutionV1, ArtifactVerificationLevelV1};
+
 use super::default_completed_status;
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +207,47 @@ pub(crate) struct EnvironmentSyncRequest {
 pub(crate) struct EnvironmentPromoteRequest {
     pub(crate) component: String,
     pub(crate) output: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentResolveAllRequest {
+    #[serde(default, alias = "component_root")]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentResolveRequest {
+    #[serde(alias = "component_id")]
+    pub(crate) component: String,
+    #[serde(default, alias = "component_root")]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactVerifyRequest {
+    pub(crate) level: ArtifactVerificationLevelV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactQuarantineResolveRequest {
+    pub(crate) resolution: ArtifactQuarantineResolutionV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactSourceExportRequest {
+    #[serde(alias = "component_id")]
+    pub(crate) component: String,
+    #[serde(alias = "export_name")]
+    pub(crate) export: String,
 }
 
 #[derive(Debug, Deserialize)]

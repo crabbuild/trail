@@ -321,6 +321,91 @@ pub(super) fn tools() -> Value {
             }), vec!["lane"])
         },
         {
+            "name": "trail.env_resolve",
+            "title": "Resolve Workspace Environment",
+            "description": "Run one exact host-validated resolver plan against pinned source and publish or reuse its immutable snapshot.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "component": { "type": "string" },
+                "path": { "type": "string" },
+                "refresh": { "type": "boolean", "default": false }
+            }), vec!["lane", "component"])
+        },
+        {
+            "name": "trail.env_resolve_all",
+            "title": "Resolve All Workspace Environments",
+            "description": "Resolve or reuse every managed dependency snapshot in deterministic discovery order.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "path": { "type": "string" },
+                "refresh": { "type": "boolean", "default": false }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.artifact_space",
+            "title": "Workspace Artifact Space",
+            "description": "Report CAS-aware logical, unique, shared, materialized, private, and reclaimable workspace artifact bytes.",
+            "inputSchema": object_schema(json!({}), vec![])
+        },
+        {
+            "name": "trail.artifact_inspect",
+            "title": "Inspect Artifact",
+            "description": "Inspect one immutable artifact envelope with bindings, trust, quarantine, reachability, and storage evidence.",
+            "inputSchema": object_schema(json!({
+                "artifact": { "type": "string" }
+            }), vec!["artifact"])
+        },
+        {
+            "name": "trail.artifact_reachability",
+            "title": "Artifact Reachability",
+            "description": "Return a bounded object-kind and byte summary for one artifact's durable CAS graph.",
+            "inputSchema": object_schema(json!({
+                "artifact": { "type": "string" }
+            }), vec!["artifact"])
+        },
+        {
+            "name": "trail.artifact_verify",
+            "title": "Verify Artifact",
+            "description": "Verify one artifact at attach, sample, full, or reproducibility-evidence depth.",
+            "inputSchema": object_schema(json!({
+                "artifact": { "type": "string" },
+                "level": { "type": "string", "enum": ["attach", "sample", "full", "reproduce"] }
+            }), vec!["artifact", "level"])
+        },
+        {
+            "name": "trail.artifact_quarantine_list",
+            "title": "List Artifact Quarantines",
+            "description": "List active and resolved divergent-producer quarantine evidence.",
+            "inputSchema": object_schema(json!({}), vec![])
+        },
+        {
+            "name": "trail.artifact_quarantine_show",
+            "title": "Show Artifact Quarantine",
+            "description": "Show one durable artifact quarantine record.",
+            "inputSchema": object_schema(json!({
+                "quarantine": { "type": "string" }
+            }), vec!["quarantine"])
+        },
+        {
+            "name": "trail.artifact_quarantine_resolve",
+            "title": "Resolve Artifact Quarantine",
+            "description": "Resolve divergent-producer evidence through one explicit retention or acceptance policy.",
+            "inputSchema": object_schema(json!({
+                "quarantine": { "type": "string" },
+                "resolution": { "type": "string", "enum": ["retain_private", "accept_incumbent", "accept_candidate", "retire_all"] }
+            }), vec!["quarantine", "resolution"])
+        },
+        {
+            "name": "trail.env_source_export",
+            "title": "Export Artifact Source",
+            "description": "Explicitly export one declared artifact subtree through ordinary guarded lane source writes.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "component": { "type": "string" },
+                "export": { "type": "string" }
+            }), vec!["lane", "component", "export"])
+        },
+        {
             "name": "trail.env_sync_all",
             "title": "Synchronize All Workspace Environments",
             "description": "Build every discovered component first, then atomically activate all mounts as one environment generation.",
