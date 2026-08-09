@@ -6771,8 +6771,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fixture_artifact_pipeline_runs_resolution_v2_cas_cow_export_retirement_and_collection() {
+    #[derive(Clone, Copy)]
+    struct ArtifactConformanceProfile {
+        producer_family: &'static str,
+        adapter_identity: &'static str,
+        distribution_digest: &'static str,
+        adapter_protocol: &'static str,
+        trust_scope: &'static str,
+        trust_tier: ArtifactProducerTrustTierV1,
+    }
+
+    fn run_artifact_pipeline_conformance_fixture(
+        profile: ArtifactConformanceProfile,
+    ) -> ArtifactAdapterCertificationReportV1 {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("fixture.input"), "fixture input\n").unwrap();
         fs::write(
@@ -6869,7 +6880,7 @@ validation = "path-contract"
                         proposal_key: "fixture.pipeline:proposal-v1".into(),
                         source_root: source_root.clone(),
                         component_id: "fixture.pipeline".into(),
-                        adapter_identity: "trail.fixture/common-artifact@1".into(),
+                        adapter_identity: profile.adapter_identity.into(),
                         policy_identity: "fixture-policy-v1".into(),
                         program: "fixture-resolver".into(),
                         resolved_program: resolver.to_string_lossy().into_owned(),
@@ -6923,10 +6934,10 @@ validation = "path-contract"
         let desired_material = ArtifactDesiredKeyMaterialV2 {
             version: 2,
             component_id: "fixture.pipeline".into(),
-            adapter_identity: "trail.fixture/common-artifact@1".into(),
+            adapter_identity: profile.adapter_identity.into(),
             adapter_implementation_version: "1".into(),
-            adapter_distribution_digest: "builtin:fixture-common-artifact-v1".into(),
-            adapter_protocol: "trail.environment-adapter/fixture-v3".into(),
+            adapter_distribution_digest: profile.distribution_digest.into(),
+            adapter_protocol: profile.adapter_protocol.into(),
             resolution_snapshot_id: Some(resolution.snapshot_id.clone()),
             source_closure: ArtifactSourceClosureV2 {
                 normalizer_version: "source-paths/v1".into(),
@@ -6980,13 +6991,20 @@ validation = "path-contract"
             abi: "host".into(),
             portability_certified: true,
             portability_scope: "workspace".into(),
-            trust_scope: "builtin".into(),
+            trust_scope: profile.trust_scope.into(),
             network_policy: "deny".into(),
             script_policy: ArtifactScriptPolicyV1::Deny,
             sandbox_policy: "native-deny-by-default".into(),
         };
         let desired_key =
-            super::super::workspace_artifact::artifact_desired_key_v2(desired_material).unwrap();
+            super::super::workspace_artifact::artifact_desired_key_v2(desired_material.clone())
+                .unwrap();
+        let mut invalidated_material = desired_material;
+        invalidated_material.target = "fixture-invalidated".into();
+        let invalidated_key =
+            super::super::workspace_artifact::artifact_desired_key_v2(invalidated_material)
+                .unwrap();
+        assert_ne!(desired_key, invalidated_key);
 
         let candidate = tempfile::tempdir().unwrap();
         fs::create_dir_all(candidate.path().join("artifact/generated-client")).unwrap();
@@ -7056,13 +7074,17 @@ validation = "path-contract"
                     output_name: "generated".into(),
                     output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
                     portability_scope: "workspace".into(),
-                    trust_scope: "builtin".into(),
+                    trust_scope: profile.trust_scope.into(),
                     secret_taint: ArtifactSecretTaintV1::Clear,
-                    resolution_snapshot_id: Some(resolution.snapshot_id),
-                    validation_receipt_ids: vec![validation_receipt_id],
+                    resolution_snapshot_id: Some(resolution.snapshot_id.clone()),
+                    validation_receipt_ids: vec![validation_receipt_id.clone()],
                 },
             )
             .unwrap();
+        let reopened = Trail::open(workspace.path()).unwrap();
+        let reopened_artifact = reopened.inspect_artifact(&envelope_id).unwrap();
+        assert_eq!(reopened_artifact.tree_root_id, tree_root_id);
+        drop(reopened);
         db.replace_declared_workspace_layers_at_source(
             "fixture",
             &[EnvironmentLayerActivation {
@@ -7082,10 +7104,10 @@ validation = "path-contract"
                     layer_subpath: "artifact".into(),
                 }],
                 component_id: "fixture.pipeline".into(),
-                adapter_identity: "trail.fixture/common-artifact@1".into(),
+                adapter_identity: profile.adapter_identity.into(),
                 adapter_version: 1,
                 implementation_version: "1".into(),
-                distribution_digest: "builtin:fixture-common-artifact-v1".into(),
+                distribution_digest: profile.distribution_digest.into(),
                 kind: "generated".into(),
                 dependencies: Vec::new(),
                 caches: Vec::new(),
@@ -7189,6 +7211,85 @@ validation = "path-contract"
                 .unwrap(),
             0
         );
+        let evidence = [
+            ("discovery", format!("producer:{}", profile.producer_family)),
+            ("resolution", "exact_snapshot:published".to_string()),
+            ("identity", "desired_key:canonical_v2".to_string()),
+            ("validation", "required_receipt:passed".to_string()),
+            ("sealing", "envelope_tree:bound_and_reopened".to_string()),
+            ("cow", "private_upper:lower_unchanged".to_string()),
+            ("recovery", "reopen:artifact_authority_valid".to_string()),
+            ("invalidation", "changed_target:changes_key".to_string()),
+            ("export", "source_export:checkpointed".to_string()),
+            ("retirement", "generation_bindings:released".to_string()),
+            ("collection", "artifact_envelope:collected".to_string()),
+        ];
+        let report = ArtifactAdapterCertificationReportV1 {
+            schema: "trail.artifact-adapter-certification/v1".into(),
+            producer_family: profile.producer_family.into(),
+            adapter_identity: profile.adapter_identity.into(),
+            trust_tier: profile.trust_tier,
+            status: ArtifactAdapterConformanceStatusV1::Passed,
+            authority_effect: "evidence_only".into(),
+            checks: evidence
+                .into_iter()
+                .map(|(stage, evidence)| ArtifactAdapterConformanceCheckV1 {
+                    stage: stage.into(),
+                    applicable: true,
+                    status: ArtifactAdapterConformanceStatusV1::Passed,
+                    evidence: vec![evidence],
+                })
+                .collect(),
+        };
+        report.validate().unwrap();
+        report
+    }
+
+    #[test]
+    fn builtins_plugins_and_repository_v2_share_artifact_pipeline_conformance() {
+        let reports = [
+            ArtifactConformanceProfile {
+                producer_family: "builtin",
+                adapter_identity: "trail.fixture/builtin@1",
+                distribution_digest: "builtin:fixture-v1",
+                adapter_protocol: "trail.environment-adapter/v3",
+                trust_scope: "builtin",
+                trust_tier: ArtifactProducerTrustTierV1::ReviewedBuiltin,
+            },
+            ArtifactConformanceProfile {
+                producer_family: "plugin_v3",
+                adapter_identity: "example/fixture-plugin@1",
+                distribution_digest: "sha256:fixture-plugin-v1",
+                adapter_protocol: "trail.environment-adapter/v3",
+                trust_scope: "plugin-local",
+                trust_tier: ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+            },
+            ArtifactConformanceProfile {
+                producer_family: "repository_v2",
+                adapter_identity: "trail/command@1",
+                distribution_digest: "repository:trail.environment/v2",
+                adapter_protocol: "trail.environment/v2",
+                trust_scope: "repository",
+                trust_tier: ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            },
+        ]
+        .map(run_artifact_pipeline_conformance_fixture);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.producer_family.as_str())
+                .collect::<Vec<_>>(),
+            ["builtin", "plugin_v3", "repository_v2"]
+        );
+        let encoded = serde_json::to_string(&reports).unwrap();
+        assert!(!encoded.contains(workspace_secret_probe()));
+        if let Some(path) = std::env::var_os("TRAIL_ARTIFACT_CERTIFICATION_OUTPUT") {
+            fs::write(path, format!("{encoded}\n")).unwrap();
+        }
+    }
+
+    fn workspace_secret_probe() -> &'static str {
+        "credential-value-never-store"
     }
 
     #[test]

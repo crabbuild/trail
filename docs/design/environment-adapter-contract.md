@@ -488,6 +488,26 @@ filesystem, network, shell, and child-process sandbox. Ed25519 publisher signatu
 the host trust store authenticate local packages today. Signed catalogs, independent
 certification attestations, and WASI transport remain distribution work.
 
+The framework-neutral artifact fixture runs reviewed-built-in, local protocol-v3
+plugin, and repository-v2 producer profiles through the same host-owned stages:
+discovery normalization, explicit resolution, desired identity, validation, sealing,
+COW isolation, reopen recovery, invalidation, source export, lane retirement, and
+last-reference collection. It emits `trail.artifact-adapter-certification/v1` JSON with
+one canonical check per stage. A required skip or failure keeps the report unverified;
+the report always carries `authority_effect = "evidence_only"` and cannot elevate a
+plugin trust tier or grant publication capability.
+
+Run the deterministic fixture and write its machine-readable report with:
+
+```sh
+CARGO_TARGET_DIR=/Volumes/Workspace/crabbuild-target/trail-<checkout> \
+  scripts/verify-artifact-adapter-conformance.sh /absolute/path/certification.json
+```
+
+This synthetic common-contract evidence complements, but does not replace, real-tool
+and native NFS/FUSE/Dokan qualification. Those unavailable gates remain explicitly
+unverified.
+
 ## Design principles
 
 1. One contract covers package managers, compilers, build systems, containers, services,

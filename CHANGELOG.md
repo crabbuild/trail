@@ -7,6 +7,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added one behavior-based artifact conformance fixture for reviewed built-ins, local
+  protocol-v3 plugins, and repository-v2 producers, plus a deterministic evidence-only
+  JSON certification report covering discovery through last-reference collection.
 - Managed exec, test, eval, terminal-agent, and materialized ACP execution now fail
   before launch when an environment requires explicit resolution, pin exact source,
   snapshot, generation, and artifact-binding identities, and return additive

@@ -1174,6 +1174,114 @@ pub struct ManagedExecutionFinalizationReceipt {
     pub errors: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactAdapterConformanceStatusV1 {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAdapterConformanceCheckV1 {
+    pub stage: String,
+    pub applicable: bool,
+    pub status: ArtifactAdapterConformanceStatusV1,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAdapterCertificationReportV1 {
+    pub schema: String,
+    pub producer_family: String,
+    pub adapter_identity: String,
+    pub trust_tier: ArtifactProducerTrustTierV1,
+    pub status: ArtifactAdapterConformanceStatusV1,
+    pub authority_effect: String,
+    pub checks: Vec<ArtifactAdapterConformanceCheckV1>,
+}
+
+impl ArtifactAdapterCertificationReportV1 {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.schema != "trail.artifact-adapter-certification/v1" {
+            return Err("unsupported artifact adapter certification schema".to_string());
+        }
+        if self.authority_effect != "evidence_only" {
+            return Err("artifact adapter certification cannot grant authority".to_string());
+        }
+        if self.producer_family.is_empty()
+            || self.producer_family.len() > 64
+            || self.adapter_identity.is_empty()
+            || self.adapter_identity.len() > 256
+        {
+            return Err("artifact adapter certification identity is empty or oversized".to_string());
+        }
+        let expected = [
+            "discovery",
+            "resolution",
+            "identity",
+            "validation",
+            "sealing",
+            "cow",
+            "recovery",
+            "invalidation",
+            "export",
+            "retirement",
+            "collection",
+        ];
+        if self.checks.len() != expected.len()
+            || self
+                .checks
+                .iter()
+                .zip(expected)
+                .any(|(check, expected)| check.stage != expected)
+        {
+            return Err("artifact adapter certification checks are not complete and canonical"
+                .to_string());
+        }
+        for check in &self.checks {
+            if check.evidence.is_empty()
+                || check.evidence.len() > 32
+                || check
+                    .evidence
+                    .iter()
+                    .any(|item| item.is_empty() || item.len() > 512)
+            {
+                return Err(format!(
+                    "artifact adapter certification stage `{}` has empty or oversized evidence",
+                    check.stage
+                ));
+            }
+            if !check
+                .evidence
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            {
+                return Err(format!(
+                    "artifact adapter certification stage `{}` evidence is not canonical",
+                    check.stage
+                ));
+            }
+            if check.applicable
+                && check.status != ArtifactAdapterConformanceStatusV1::Passed
+                && self.status == ArtifactAdapterConformanceStatusV1::Passed
+            {
+                return Err(format!(
+                    "artifact adapter certification cannot pass while required stage `{}` is not passed",
+                    check.stage
+                ));
+            }
+            if !check.applicable && check.status != ArtifactAdapterConformanceStatusV1::Skipped {
+                return Err(format!(
+                    "non-applicable artifact adapter certification stage `{}` must be skipped",
+                    check.stage
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedExecutionPhaseReceipt {
     pub phase: String,
@@ -1730,6 +1838,56 @@ mod workdir_mode_tests {
             value["finalization"]["sealing_decisions"][0]["decision"],
             "retain_private_delta"
         );
+    }
+
+    #[test]
+    fn artifact_adapter_certification_is_complete_canonical_and_evidence_only() {
+        let stages = [
+            "discovery",
+            "resolution",
+            "identity",
+            "validation",
+            "sealing",
+            "cow",
+            "recovery",
+            "invalidation",
+            "export",
+            "retirement",
+            "collection",
+        ];
+        let report = ArtifactAdapterCertificationReportV1 {
+            schema: "trail.artifact-adapter-certification/v1".into(),
+            producer_family: "plugin_v3".into(),
+            adapter_identity: "example/fixture@1".into(),
+            trust_tier: ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+            status: ArtifactAdapterConformanceStatusV1::Passed,
+            authority_effect: "evidence_only".into(),
+            checks: stages
+                .into_iter()
+                .map(|stage| ArtifactAdapterConformanceCheckV1 {
+                    stage: stage.into(),
+                    applicable: true,
+                    status: ArtifactAdapterConformanceStatusV1::Passed,
+                    evidence: vec![format!("fixture:{stage}")],
+                })
+                .collect(),
+        };
+        report.validate().unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["status"], "passed");
+        assert_eq!(value["authority_effect"], "evidence_only");
+        assert_eq!(value["checks"][0]["stage"], "discovery");
+        assert_eq!(value["checks"][10]["stage"], "collection");
+
+        let mut skipped = report.clone();
+        skipped.checks[5].status = ArtifactAdapterConformanceStatusV1::Skipped;
+        assert!(skipped.validate().unwrap_err().contains("required stage `cow`"));
+        let mut authority = report;
+        authority.authority_effect = "certified_signed_plugin".into();
+        assert!(authority
+            .validate()
+            .unwrap_err()
+            .contains("cannot grant authority"));
     }
 
     #[test]
