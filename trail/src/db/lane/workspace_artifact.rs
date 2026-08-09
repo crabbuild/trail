@@ -47,8 +47,41 @@ pub(crate) struct ArtifactResolutionAttemptFailure<'a> {
     pub(crate) contacted_authorities: Vec<String>,
     pub(crate) stdout: &'a [u8],
     pub(crate) stderr: &'a [u8],
+    pub(crate) stdout_original_bytes: Option<u64>,
+    pub(crate) stderr_original_bytes: Option<u64>,
     pub(crate) redactions: &'a [Vec<u8>],
     pub(crate) cancelled: bool,
+}
+
+pub(crate) struct ArtifactResolutionExecutorFailure {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) contacted_authorities: Vec<String>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_original_bytes: u64,
+    pub(crate) stderr_original_bytes: u64,
+    pub(crate) redactions: Vec<Vec<u8>>,
+    pub(crate) cancelled: bool,
+}
+
+pub(crate) type ArtifactResolutionExecutorResult =
+    std::result::Result<ArtifactResolutionCandidateV1, Box<ArtifactResolutionExecutorFailure>>;
+
+impl ArtifactResolutionExecutorFailure {
+    pub(crate) fn from_error(code: &str, error: impl std::fmt::Display) -> Box<Self> {
+        Box::new(Self {
+            code: code.to_string(),
+            message: error.to_string(),
+            contacted_authorities: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_original_bytes: 0,
+            stderr_original_bytes: 0,
+            redactions: Vec::new(),
+            cancelled: false,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,10 +136,26 @@ impl Trail {
         request: ArtifactResolutionRequestV1,
         refresh: bool,
     ) -> Result<ArtifactResolutionComponentReportV1> {
-        let ArtifactResolutionRequestV1 {
-            mut plan,
-            candidate,
-        } = request;
+        let ArtifactResolutionRequestV1 { plan, candidate } = request;
+        self.resolve_artifact_component_with_executor(plan, refresh, |_, _| Ok(candidate))
+    }
+
+    /// Run one host-owned resolver inside the same durable attempt that later
+    /// validates and publishes its candidate. Process launch and candidate
+    /// production failures therefore retain the same fenced recovery evidence
+    /// as malformed or rejected candidates.
+    pub(crate) fn resolve_artifact_component_with_executor<F>(
+        &self,
+        mut plan: ArtifactResolutionPlanV1,
+        refresh: bool,
+        executor: F,
+    ) -> Result<ArtifactResolutionComponentReportV1>
+    where
+        F: FnOnce(
+            &ArtifactResolutionPlanV1,
+            &ArtifactResolutionAttemptFence,
+        ) -> ArtifactResolutionExecutorResult,
+    {
         normalize_artifact_resolution_plan(&mut plan)?;
         self.validate_artifact_resolution_plan_pins(&plan)?;
         if !plan.credential_handles.is_empty() {
@@ -145,6 +194,29 @@ impl Trail {
         }
 
         let (fence, _) = self.begin_artifact_resolution_attempt(plan.clone())?;
+        let candidate = match executor(&plan, &fence) {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                let attempt = self.finish_artifact_resolution_attempt_failure(
+                    &fence,
+                    ArtifactResolutionAttemptFailure {
+                        code: &failure.code,
+                        message: &failure.message,
+                        contacted_authorities: failure.contacted_authorities,
+                        stdout: &failure.stdout,
+                        stderr: &failure.stderr,
+                        stdout_original_bytes: Some(failure.stdout_original_bytes),
+                        stderr_original_bytes: Some(failure.stderr_original_bytes),
+                        redactions: &failure.redactions,
+                        cancelled: failure.cancelled,
+                    },
+                )?;
+                return Err(Error::InvalidInput(format!(
+                    "artifact resolution attempt `{}` failed during resolver execution: {}",
+                    attempt.attempt_id, failure.message
+                )));
+            }
+        };
         let ArtifactResolutionCandidateV1 {
             snapshot_bytes,
             resolved_identities,
@@ -164,6 +236,8 @@ impl Trail {
                     contacted_authorities,
                     stdout: &stdout,
                     stderr: &stderr,
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: &redactions,
                     cancelled: false,
                 },
@@ -183,6 +257,8 @@ impl Trail {
                     contacted_authorities: Vec::new(),
                     stdout: &stdout,
                     stderr: &stderr,
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: &redactions,
                     cancelled: false,
                 },
@@ -204,6 +280,8 @@ impl Trail {
                     contacted_authorities: Vec::new(),
                     stdout: &stdout,
                     stderr: &stderr,
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: &redactions,
                     cancelled: false,
                 },
@@ -233,6 +311,8 @@ impl Trail {
                         contacted_authorities: Vec::new(),
                         stdout: &stdout,
                         stderr: &stderr,
+                        stdout_original_bytes: None,
+                        stderr_original_bytes: None,
                         redactions: &redactions,
                         cancelled: false,
                     },
@@ -541,13 +621,19 @@ impl Trail {
         validate_resolution_text(failure.message, "failure message")?;
         let authority_evidence =
             normalized_resolution_authority_evidence(&plan, failure.contacted_authorities)?;
-        let (stdout_object_id, _) = self.put_artifact_resolution_capture(
+        let (stdout_object_id, _) = self.put_artifact_resolution_capture_observed(
             failure.stdout,
+            failure
+                .stdout_original_bytes
+                .unwrap_or_else(|| u64::try_from(failure.stdout.len()).unwrap_or(u64::MAX)),
             plan.limits.stdout_bytes,
             failure.redactions,
         )?;
-        let (stderr_object_id, _) = self.put_artifact_resolution_capture(
+        let (stderr_object_id, _) = self.put_artifact_resolution_capture_observed(
             failure.stderr,
+            failure
+                .stderr_original_bytes
+                .unwrap_or_else(|| u64::try_from(failure.stderr.len()).unwrap_or(u64::MAX)),
             plan.limits.stderr_bytes,
             failure.redactions,
         )?;
@@ -1267,15 +1353,30 @@ impl Trail {
         limit: u64,
         redactions: &[Vec<u8>],
     ) -> Result<(Option<ObjectId>, bool)> {
+        self.put_artifact_resolution_capture_observed(
+            bytes,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            limit,
+            redactions,
+        )
+    }
+
+    fn put_artifact_resolution_capture_observed(
+        &self,
+        bytes: &[u8],
+        original_bytes: u64,
+        limit: u64,
+        redactions: &[Vec<u8>],
+    ) -> Result<(Option<ObjectId>, bool)> {
         if bytes.is_empty() {
             return Ok((None, false));
         }
         let redacted = redact_resolution_bytes(bytes, redactions);
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        let truncated = redacted.len() > limit;
+        let truncated = original_bytes > limit as u64 || redacted.len() > limit;
         let capture = ArtifactResolutionCaptureV1 {
             version: ARTIFACT_RESOLUTION_PLAN_VERSION,
-            original_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            original_bytes,
             truncated,
             bytes: redacted[..redacted.len().min(limit)].to_vec(),
         };
@@ -5012,6 +5113,23 @@ impl Trail {
         let snapshot = self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, &snapshot_id)?;
         validate_artifact_resolution_snapshot(&snapshot)?;
         Ok(Some((snapshot_id, snapshot)))
+    }
+
+    pub(crate) fn has_current_artifact_resolution_snapshot(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+        adapter_identity: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM artifact_resolution_snapshots
+                 WHERE source_root=?1 AND component_id=?2 AND adapter_identity=?3
+                   AND state='current' AND verification_state='verified'
+             )",
+            params![source_root.0, component_id, adapter_identity],
+            |row| row.get::<_, bool>(0),
+        )?)
     }
 
     pub(crate) fn artifact_resolution_snapshot_content(
@@ -9080,6 +9198,8 @@ mod tests {
                     contacted_authorities: vec!["index.crates.io:443".into()],
                     stdout: b"stdout credential-value-never-store",
                     stderr: b"stderr credential-value-never-store",
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: std::slice::from_ref(&secret),
                     cancelled: true,
                 },
@@ -9146,6 +9266,8 @@ mod tests {
                     contacted_authorities: vec![],
                     stdout: b"output",
                     stderr: b"",
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: &[],
                     cancelled: false,
                 },
@@ -9163,6 +9285,8 @@ mod tests {
                     contacted_authorities: vec![],
                     stdout: b"0123456789abcdef",
                     stderr: b"",
+                    stdout_original_bytes: None,
+                    stderr_original_bytes: None,
                     redactions: &[],
                     cancelled: false,
                 },

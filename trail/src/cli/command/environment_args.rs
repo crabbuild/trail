@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 
 #[derive(Args)]
 pub(super) struct DepsCommand {
@@ -52,12 +52,155 @@ pub(super) enum EnvironmentSubcommand {
     Explain(EnvironmentExplainArgs),
     /// Preview the normalized component key, actions, outputs, and capabilities without executing.
     Plan(EnvironmentSyncArgs),
+    /// Produce or deliberately refresh immutable dependency-resolution snapshots.
+    Resolve(EnvironmentResolveCommand),
     /// Converge all desired components or one named component.
     Sync(EnvironmentSyncCommand),
+    /// Inspect and verify immutable artifacts or resolve quarantine evidence.
+    Artifact(EnvironmentArtifactCommand),
+    /// Explicitly write a declared generated-source export into lane source.
+    Source(EnvironmentSourceCommand),
     /// Publish one quiesced manual private output as a reusable immutable layer.
     Promote(EnvironmentPromoteArgs),
     /// Inspect, reconcile, or stop lane-private runtime services.
     Runtime(EnvironmentRuntimeCommand),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentResolveCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentResolveSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentResolveSubcommand {
+    /// Resolve every incomplete component in deterministic discovery order.
+    All(EnvironmentResolveAllArgs),
+    /// Resolve one stable component ID from `trail env discover`.
+    Component(EnvironmentResolveComponentArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentResolveAllArgs {
+    /// Lane name. Omit only inside exactly one mounted or managed lane context.
+    pub(super) lane: Option<String>,
+    /// Restrict discovery to one source-relative component root.
+    #[arg(long, value_name = "ROOT")]
+    pub(super) path: Option<String>,
+    /// Deliberately rerun the resolver and supersede its current snapshot.
+    #[arg(long)]
+    pub(super) refresh: bool,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentResolveComponentArgs {
+    /// Stable logical component ID from `trail env discover`.
+    pub(super) component: String,
+    /// Lane name. Omit only inside exactly one mounted or managed lane context.
+    #[arg(long)]
+    pub(super) lane: Option<String>,
+    /// Select one source-relative root when the component ID is ambiguous.
+    #[arg(long, value_name = "ROOT")]
+    pub(super) path: Option<String>,
+    /// Deliberately rerun the resolver and supersede its current snapshot.
+    #[arg(long)]
+    pub(super) refresh: bool,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentArtifactSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentArtifactSubcommand {
+    /// Inspect one artifact envelope and its bindings, trust, and storage evidence.
+    Inspect(EnvironmentArtifactIdArgs),
+    /// Verify one artifact at an explicit evidence level.
+    Verify(EnvironmentArtifactVerifyArgs),
+    /// Manage durable divergent-producer quarantine evidence.
+    Quarantine(EnvironmentArtifactQuarantineCommand),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactIdArgs {
+    /// Content-derived artifact envelope ID.
+    pub(super) artifact: String,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(super) enum EnvironmentArtifactVerificationLevelArg {
+    Attach,
+    Sample,
+    Full,
+    Reproduce,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactVerifyArgs {
+    /// Content-derived artifact envelope ID.
+    pub(super) artifact: String,
+    /// Evidence depth: attach, sample, full, or reproduce.
+    #[arg(long, value_enum)]
+    pub(super) level: EnvironmentArtifactVerificationLevelArg,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactQuarantineCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentArtifactQuarantineSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentArtifactQuarantineSubcommand {
+    /// List active and resolved quarantine records deterministically.
+    List,
+    /// Show one quarantine record and its immutable evidence identity.
+    Show(EnvironmentArtifactQuarantineIdArgs),
+    /// Resolve one active quarantine through an explicit policy choice.
+    Resolve(EnvironmentArtifactQuarantineResolveArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactQuarantineIdArgs {
+    pub(super) quarantine: String,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(super) enum EnvironmentArtifactQuarantineResolutionArg {
+    RetainPrivate,
+    AcceptIncumbent,
+    AcceptCandidate,
+    RetireAll,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentArtifactQuarantineResolveArgs {
+    pub(super) quarantine: String,
+    #[arg(long, value_enum)]
+    pub(super) resolution: EnvironmentArtifactQuarantineResolutionArg,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentSourceCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentSourceSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentSourceSubcommand {
+    /// Export one declared artifact subtree through ordinary guarded source writes.
+    Export(EnvironmentSourceExportArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentSourceExportArgs {
+    pub(super) lane: String,
+    #[arg(long, value_name = "ID")]
+    pub(super) component: String,
+    #[arg(long, value_name = "NAME")]
+    pub(super) export: String,
 }
 
 #[derive(Args)]

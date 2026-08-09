@@ -7,6 +7,12 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added `trail env resolve all|component`, artifact inspect/verify/quarantine,
+  and explicit source-export CLI workflows with exact discovery recovery argv,
+  deterministic human/plain rendering, JSON/NDJSON reports, and stable failure
+  exits. Reviewed built-in resolvers execute exact offline argv in isolated
+  staging and retain fenced failure evidence; restricted repository/plugin
+  resolver launch still fails closed pending its native sandbox integration.
 - Added shared Rust artifact operations and serializable reports for envelope inspection,
   attach/sample/full/reproducibility-evidence verification, generation bindings,
   quarantine list/show/resolve, bounded content reachability, and CAS-aware workspace and

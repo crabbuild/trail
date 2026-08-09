@@ -13,6 +13,13 @@ const MAX_ENVIRONMENT_RECOVERY_ACTIONS: usize = 16;
 const MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS: usize = 64;
 const PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS: u64 = 30;
+const MAX_RESOLVER_SOURCE_ENTRIES: u64 = 1_000_000;
+const MAX_RESOLVER_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+struct BoundedResolverPipe {
+    bytes: Vec<u8>,
+    original_bytes: u64,
+}
 
 /// One repository file that the host projects into an adapter-owned staging
 /// directory. Adapters describe the mapping; they never receive writable
@@ -1057,6 +1064,19 @@ impl Trail {
                     ),
                 });
             }
+            for action in &mut component.recovery_actions {
+                if action.code == "resolve_component" {
+                    action.command = Some(vec![
+                        "trail".into(),
+                        "env".into(),
+                        "resolve".into(),
+                        "component".into(),
+                        component.component_id.clone(),
+                        "--lane".into(),
+                        lane.to_string(),
+                    ]);
+                }
+            }
             normalize_environment_component_proposal(component)?;
         }
         for duplicate in components.windows(2) {
@@ -1078,6 +1098,460 @@ impl Trail {
             source_root: head.root_id,
             components,
             conflicts,
+        })
+    }
+
+    /// Resolve one discovered component by running its host-validated resolver
+    /// plan against an isolated projection of the exact lane source root.
+    pub fn resolve_workspace_environment_component(
+        &self,
+        lane: &str,
+        component_id: &str,
+        component_root: Option<&str>,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionComponentReportV1> {
+        let discovery = self.discover_workspace_environment(lane, component_root)?;
+        let matching = discovery
+            .components
+            .iter()
+            .filter(|component| component.component_id == component_id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1
+            || matching[0].status == EnvironmentComponentProposalStatus::Ambiguous
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is missing or ambiguous; inspect `trail env discover {lane}` and select one component root with `--path`"
+            )));
+        }
+        let component = matching[0];
+        if !matches!(
+            component.status,
+            EnvironmentComponentProposalStatus::Resolvable
+                | EnvironmentComponentProposalStatus::Ready
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is `{}` and has no resolver plan; inspect `trail env discover {lane}`",
+                component.status.as_str()
+            )));
+        }
+        let plan = if component.adapter_identity
+            == super::workspace_recipe::COMMAND_RECIPE_ADAPTER_METADATA.canonical_identity
+        {
+            self.command_recipe_resolution_plan(&discovery.source_root, component_id)?
+        } else if let Some(adapter) = builtin_environment_adapters()
+            .into_iter()
+            .find(|adapter| adapter.identity() == component.adapter_identity)
+        {
+            adapter.resolution_plan(self, &discovery.source_root, &component.component_root)?
+        } else {
+            return Err(Error::InvalidInput(format!(
+                "environment adapter `{}` does not expose a host-executable v3 resolver plan; inspect `trail env discover {lane}`",
+                component.adapter_identity
+            )));
+        }
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "environment component `{component_id}` reported resolvable but produced no resolver plan"
+            ))
+        })?;
+        if component.status == EnvironmentComponentProposalStatus::Ready
+            && self
+                .artifact_resolution_snapshot_for_proposal(&plan.proposal_key)?
+                .is_none()
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is ready from source authority and has no Trail-managed resolver snapshot to reuse"
+            )));
+        }
+        if plan.source_root != discovery.source_root
+            || plan.component_id != component.component_id
+            || plan.adapter_identity != component.adapter_identity
+        {
+            return Err(Error::Corrupt(format!(
+                "environment component `{component_id}` resolver plan disagrees with discovery"
+            )));
+        }
+        let reviewed_builtin = builtin_environment_adapters()
+            .into_iter()
+            .any(|adapter| adapter.identity() == component.adapter_identity);
+        if !reviewed_builtin {
+            return Err(Error::InvalidInput(
+                "resolver execution for repository and plugin components requires the restricted native resolver sandbox, which is not yet wired to this operation; the resolver was not launched"
+                    .to_string(),
+            ));
+        }
+        self.resolve_artifact_component_with_executor(plan, refresh, |plan, fence| {
+            self.execute_reviewed_builtin_resolution_plan(lane, plan, fence)
+        })
+    }
+
+    /// Resolve every currently resolvable component in deterministic discovery
+    /// order. Ready components need no snapshot; incomplete states fail closed
+    /// with the discovery command that explains their recovery.
+    pub fn resolve_all_workspace_environment_components(
+        &self,
+        lane: &str,
+        component_root: Option<&str>,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionBatchReportV1> {
+        let discovery = self.discover_workspace_environment(lane, component_root)?;
+        if !discovery.conflicts.is_empty()
+            || discovery.components.iter().any(|component| {
+                matches!(
+                    component.status,
+                    EnvironmentComponentProposalStatus::Blocked
+                        | EnvironmentComponentProposalStatus::Unsupported
+                        | EnvironmentComponentProposalStatus::Ambiguous
+                )
+            })
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment resolution is incomplete or ambiguous; inspect `trail env discover {lane}`"
+            )));
+        }
+        let mut components = Vec::new();
+        for component in &discovery.components {
+            let requires_resolution = component.status
+                == EnvironmentComponentProposalStatus::Resolvable
+                || (component.status == EnvironmentComponentProposalStatus::Ready
+                    && self.has_current_artifact_resolution_snapshot(
+                        &discovery.source_root,
+                        &component.component_id,
+                        &component.adapter_identity,
+                    )?);
+            if !requires_resolution {
+                continue;
+            }
+            components.push(self.resolve_workspace_environment_component(
+                lane,
+                &component.component_id,
+                Some(&component.component_root),
+                refresh,
+            )?);
+        }
+        Ok(ArtifactResolutionBatchReportV1 {
+            source_root: discovery.source_root,
+            refresh_requested: refresh,
+            components,
+        })
+    }
+
+    fn execute_reviewed_builtin_resolution_plan(
+        &self,
+        lane: &str,
+        plan: &ArtifactResolutionPlanV1,
+        fence: &super::workspace_artifact::ArtifactResolutionAttemptFence,
+    ) -> super::workspace_artifact::ArtifactResolutionExecutorResult {
+        let fail = |code: &str, error: &dyn std::fmt::Display| {
+            super::workspace_artifact::ArtifactResolutionExecutorFailure::from_error(code, error)
+        };
+        if !plan.allowed_authorities.is_empty() || !plan.credential_handles.is_empty() {
+            return Err(fail(
+                "resolver_authority_not_enforceable",
+                &"reviewed built-in resolution currently permits only offline, credential-free plans",
+            ));
+        }
+        let actual_identity = workspace_tool_identity_for_path(Path::new(&plan.resolved_program))
+            .map_err(|error| fail("resolver_tool_identity_failed", &error))?;
+        if actual_identity != plan.executable_identity {
+            return Err(fail(
+                "resolver_tool_identity_changed",
+                &format!(
+                    "resolver executable identity changed after planning: expected `{}`, found `{actual_identity}`",
+                    plan.executable_identity
+                ),
+            ));
+        }
+        let branch = self
+            .lane_branch(lane)
+            .map_err(|error| fail("resolver_source_pin_failed", &error))?;
+        if branch.head_root != plan.source_root {
+            return Err(fail(
+                "resolver_source_changed",
+                &"lane source changed after resolver planning",
+            ));
+        }
+
+        let staging_parent = self
+            .workspace_environment_staging_parent()
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+        let staging = tempfile::Builder::new()
+            .prefix("trail-resolution-")
+            .tempdir_in(staging_parent)
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+        let project = staging.path().join("project");
+        let isolated_home = staging.path().join("home");
+        let isolated_tmp = staging.path().join("tmp");
+        fs::create_dir_all(&project)
+            .and_then(|_| fs::create_dir_all(&isolated_home))
+            .and_then(|_| fs::create_dir_all(&isolated_tmp))
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+
+        let mut source_entries = 0_u64;
+        let mut source_bytes = 0_u64;
+        let mut source_hashes = BTreeMap::new();
+        self.for_each_root_file_chunk(&plan.source_root, 1024, |chunk| {
+            for (path, entry) in chunk {
+                source_entries = source_entries.saturating_add(1);
+                source_bytes = source_bytes.saturating_add(entry.size_bytes);
+                if source_entries > MAX_RESOLVER_SOURCE_ENTRIES
+                    || source_bytes > MAX_RESOLVER_SOURCE_BYTES
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "resolver source projection exceeds {MAX_RESOLVER_SOURCE_ENTRIES} entries or {MAX_RESOLVER_SOURCE_BYTES} bytes"
+                    )));
+                }
+                self.materialize_workspace_environment_input(&project, &path, &entry)?;
+                let projected = safe_join(&project, &path)?;
+                let mut permissions = fs::metadata(&projected)?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&projected, permissions)?;
+                source_hashes.insert(path, entry.content_hash);
+            }
+            Ok(())
+        })
+        .map_err(|error| fail("resolver_source_projection_failed", &error))?;
+
+        let candidate_path = safe_join(&project, &plan.candidate_output)
+            .map_err(|error| fail("resolver_candidate_path_invalid", &error))?;
+        if candidate_path.exists() {
+            return Err(fail(
+                "resolver_candidate_would_replace_source",
+                &format!(
+                    "resolver candidate `{}` already exists in pinned source",
+                    plan.candidate_output
+                ),
+            ));
+        }
+        if let Some(parent) = candidate_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| fail("resolver_candidate_parent_failed", &error))?;
+        }
+        let working_directory = if plan.working_directory == "." {
+            project.clone()
+        } else {
+            safe_join(&project, &plan.working_directory)
+                .map_err(|error| fail("resolver_working_directory_invalid", &error))?
+        };
+        if !working_directory.is_dir() {
+            return Err(fail(
+                "resolver_working_directory_missing",
+                &format!(
+                    "resolver working directory `{}` does not exist",
+                    plan.working_directory
+                ),
+            ));
+        }
+
+        let mut command = Command::new(&plan.resolved_program);
+        command
+            .args(&plan.argv[1..])
+            .current_dir(&working_directory)
+            .env_clear()
+            .env("HOME", &isolated_home)
+            .env("TMPDIR", &isolated_tmp)
+            .env("TMP", &isolated_tmp)
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if plan.program == "cargo" {
+            let rustup_home = std::env::var_os("RUSTUP_HOME").or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup").into_os_string())
+            });
+            if let Some(rustup_home) = rustup_home.filter(|path| Path::new(path).is_dir()) {
+                command.env("RUSTUP_HOME", rustup_home);
+            }
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| fail("resolver_process_spawn_failed", &error))?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(fail(
+                "resolver_capture_failed",
+                &"resolver stdout pipe was not created",
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(fail(
+                "resolver_capture_failed",
+                &"resolver stderr pipe was not created",
+            ));
+        };
+        let stdout_limit = plan.limits.stdout_bytes;
+        let stderr_limit = plan.limits.stderr_bytes;
+        let stdout_reader = thread::spawn(move || read_bounded_resolver_pipe(stdout, stdout_limit));
+        let stderr_reader = thread::spawn(move || read_bounded_resolver_pipe(stderr, stderr_limit));
+        let started = Instant::now();
+        let mut last_heartbeat = started;
+        let timeout = Duration::from_millis(plan.limits.timeout_ms);
+        let (status, timed_out, cancelled) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status, false, false),
+                Ok(None) if started.elapsed() < timeout => {
+                    if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                        let active = match self.heartbeat_artifact_resolution_attempt(fence) {
+                            Ok(active) => active,
+                            Err(error) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return Err(fail("resolver_heartbeat_failed", &error));
+                            }
+                        };
+                        if !active {
+                            let _ = child.kill();
+                            let status = child
+                                .wait()
+                                .map_err(|error| fail("resolver_process_wait_failed", &error))?;
+                            break (status, false, true);
+                        }
+                        last_heartbeat = Instant::now();
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .map_err(|error| fail("resolver_process_wait_failed", &error))?;
+                    break (status, true, false);
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(fail("resolver_process_wait_failed", &error));
+                }
+            }
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| {
+                fail(
+                    "resolver_capture_failed",
+                    &"resolver stdout reader panicked",
+                )
+            })?
+            .map_err(|error| fail("resolver_capture_failed", &error))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| {
+                fail(
+                    "resolver_capture_failed",
+                    &"resolver stderr reader panicked",
+                )
+            })?
+            .map_err(|error| fail("resolver_capture_failed", &error))?;
+        if timed_out
+            || cancelled
+            || !status.success()
+            || stdout.original_bytes > stdout_limit
+            || stderr.original_bytes > stderr_limit
+        {
+            return Err(Box::new(
+                super::workspace_artifact::ArtifactResolutionExecutorFailure {
+                    code: if timed_out {
+                        "resolver_process_timed_out"
+                    } else if cancelled {
+                        "resolver_cancelled"
+                    } else if !status.success() {
+                        "resolver_process_failed"
+                    } else {
+                        "resolver_capture_limit_exceeded"
+                    }
+                    .into(),
+                    message: if timed_out {
+                        format!(
+                            "resolver exceeded its {} ms timeout",
+                            plan.limits.timeout_ms
+                        )
+                    } else if cancelled {
+                        "resolver was cancelled or lost its owner fence".into()
+                    } else if !status.success() {
+                        format!("resolver exited with status {status}")
+                    } else {
+                        "resolver output exceeded its declared capture limit".into()
+                    },
+                    contacted_authorities: Vec::new(),
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                    stdout_original_bytes: stdout.original_bytes,
+                    stderr_original_bytes: stderr.original_bytes,
+                    redactions: Vec::new(),
+                    cancelled,
+                },
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(&candidate_path)
+            .map_err(|error| fail("resolver_candidate_missing", &error))?;
+        if !metadata.file_type().is_file() || metadata.len() > plan.limits.candidate_bytes {
+            return Err(fail(
+                "resolver_candidate_invalid",
+                &format!(
+                    "resolver candidate `{}` is not a bounded regular file",
+                    plan.candidate_output
+                ),
+            ));
+        }
+        let snapshot_bytes = fs::read(&candidate_path)
+            .map_err(|error| fail("resolver_candidate_read_failed", &error))?;
+        for (path, expected_hash) in &source_hashes {
+            let projected = safe_join(&project, path)
+                .map_err(|error| fail("resolver_source_revalidation_failed", &error))?;
+            let actual_hash = sha256_hex(
+                &fs::read(&projected)
+                    .map_err(|error| fail("resolver_source_revalidation_failed", &error))?,
+            );
+            if actual_hash != *expected_hash {
+                return Err(fail(
+                    "resolver_modified_source",
+                    &format!("resolver modified pinned source input `{path}`"),
+                ));
+            }
+        }
+        for entry in walkdir::WalkDir::new(&project).follow_links(false) {
+            let entry = entry.map_err(|error| fail("resolver_output_scan_failed", &error))?;
+            if entry.path() == project || entry.file_type().is_dir() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&project)
+                .map_err(|error| fail("resolver_output_scan_failed", &error))?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative != plan.candidate_output && !source_hashes.contains_key(&relative) {
+                return Err(fail(
+                    "resolver_undeclared_output",
+                    &format!("resolver produced undeclared path `{relative}`"),
+                ));
+            }
+        }
+        let current = self
+            .lane_branch(lane)
+            .map_err(|error| fail("resolver_source_revalidation_failed", &error))?;
+        if current.head_root != plan.source_root {
+            return Err(fail(
+                "resolver_source_changed",
+                &"lane source changed while the resolver was running",
+            ));
+        }
+        Ok(ArtifactResolutionCandidateV1 {
+            snapshot_bytes,
+            resolved_identities: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            contacted_authorities: Vec::new(),
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            redactions: Vec::new(),
         })
     }
 
@@ -5654,6 +6128,30 @@ fn validate_environment_proposal_text(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_bounded_resolver_pipe<R: Read>(
+    mut reader: R,
+    limit: u64,
+) -> std::io::Result<BoundedResolverPipe> {
+    let mut bytes = Vec::with_capacity(usize::try_from(limit.min(64 * 1024)).unwrap_or(0));
+    let mut original_bytes = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        original_bytes = original_bytes.saturating_add(read as u64);
+        let retained = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let remaining = limit.saturating_sub(retained);
+        let keep = read.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        bytes.extend_from_slice(&buffer[..keep]);
+    }
+    Ok(BoundedResolverPipe {
+        bytes,
+        original_bytes,
+    })
+}
+
 fn run_supervised_mounted_plugin_process(
     command: &mut Command,
 ) -> Result<std::process::ExitStatus> {
@@ -8480,7 +8978,18 @@ mod tests {
                 component.status,
                 EnvironmentComponentProposalStatus::Resolvable
             );
-            assert!(component.recovery_actions[0].command.is_none());
+            assert_eq!(
+                component.recovery_actions[0].command,
+                Some(vec![
+                    "trail".into(),
+                    "env".into(),
+                    "resolve".into(),
+                    "component".into(),
+                    component.component_id.clone(),
+                    "--lane".into(),
+                    "manifest-only".into(),
+                ])
+            );
             assert_eq!(component.reasons.len(), 1);
             assert_eq!(component.reasons[0].code, "resolution_snapshot_missing");
             assert_eq!(component.recovery_actions.len(), 1);
@@ -8490,6 +8999,83 @@ mod tests {
         assert!(!workspace.path().join("pnpm-lock.yaml").exists());
         assert!(!workspace.path().join("yarn.lock").exists());
         assert!(!workspace.path().join("bun.lock").exists());
+    }
+
+    #[test]
+    fn host_resolver_executes_cargo_in_isolated_staging_and_reuses_snapshot() {
+        if resolve_workspace_tool_executable("cargo").is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"host-resolver\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "resolve-cargo",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let first = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.decision, ArtifactResolutionDecisionV1::Resolved);
+        assert!(first.attempt.is_some());
+        assert!(!workspace.path().join("Cargo.lock").exists());
+        let second = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.decision, ArtifactResolutionDecisionV1::Reused);
+        assert!(second.attempt.is_none());
+        let refreshed = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(refreshed.decision, ArtifactResolutionDecisionV1::Refreshed);
+        assert_eq!(
+            refreshed.snapshot.predecessor_snapshot_id,
+            Some(first.snapshot_id)
+        );
+        assert!(refreshed.attempt.is_some());
+        let batch = db
+            .resolve_all_workspace_environment_components("resolve-cargo", None, false)
+            .unwrap();
+        assert_eq!(batch.components.len(), 1);
+        assert_eq!(
+            batch.components[0].decision,
+            ArtifactResolutionDecisionV1::Reused
+        );
     }
 
     #[test]

@@ -2253,6 +2253,167 @@ fn ndjson_rejects_single_report_commands_with_a_structured_diagnostic() {
 }
 
 #[test]
+fn environment_artifact_cli_supports_help_plain_json_ndjson_and_stable_errors() {
+    for args in [
+        &["env", "resolve", "--help"][..],
+        &["env", "artifact", "--help"][..],
+        &["env", "source", "export", "--help"][..],
+    ] {
+        let output = Command::new(trail_bin()).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "trail {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let json = run_trail_json(temp.path(), &["env", "artifact", "quarantine", "list"]);
+    assert_eq!(json["active_count"], 0);
+    assert_eq!(json["resolved_count"], 0);
+    assert_eq!(json["quarantines"], serde_json::json!([]));
+
+    let ndjson = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args([
+            "--format",
+            "ndjson",
+            "env",
+            "artifact",
+            "quarantine",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(ndjson.status.success());
+    assert_eq!(
+        ndjson.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1
+    );
+    let ndjson_value: serde_json::Value = serde_json::from_slice(&ndjson.stdout).unwrap();
+    assert_eq!(ndjson_value, json);
+
+    let plain = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["--format", "plain", "env", "artifact", "quarantine", "list"])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("Artifact quarantines"));
+    assert!(plain.contains("Active Count  : 0"));
+
+    let missing = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "env",
+            "artifact",
+            "inspect",
+            "artifact_envelope_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "OBJECT_NOT_FOUND");
+}
+
+#[test]
+fn environment_resolve_cli_executes_and_reuses_a_real_cargo_snapshot() {
+    if !Command::new("cargo")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = \"trail-cli-resolver\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "cargo-resolve-cli",
+        Some("main"),
+        LaneWorkdirMode::Virtual,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    drop(db);
+
+    let first = run_trail_json(
+        temp.path(),
+        &[
+            "env",
+            "resolve",
+            "component",
+            "cargo-target-seed",
+            "--lane",
+            "cargo-resolve-cli",
+        ],
+    );
+    assert_eq!(first["decision"], "resolved");
+    assert!(first["attempt"].is_object());
+    assert!(!temp.path().join("Cargo.lock").exists());
+
+    let second = run_trail_json(
+        temp.path(),
+        &[
+            "env",
+            "resolve",
+            "component",
+            "cargo-target-seed",
+            "--lane",
+            "cargo-resolve-cli",
+        ],
+    );
+    assert_eq!(second["decision"], "reused");
+    assert_eq!(second["snapshot_id"], first["snapshot_id"]);
+    assert!(second.get("attempt").is_none());
+
+    let missing = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "env",
+            "resolve",
+            "component",
+            "missing-component",
+            "--lane",
+            "cargo-resolve-cli",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("trail env discover cargo-resolve-cli"));
+}
+
+#[test]
 fn plain_redirected_and_quiet_output_follow_terminal_policy() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -11552,9 +11713,18 @@ fn manifest_only_environment_discovery_has_cli_http_mcp_and_openapi_parity() {
         .unwrap()
         .iter()
         .all(|component| {
-            component["status"] == "blocked"
+            component["status"] == "resolvable"
                 && component["reasons"][0]["code"] == "resolution_snapshot_missing"
-                && component["recovery_actions"][0]["command"].is_null()
+                && component["recovery_actions"][0]["command"]
+                    == serde_json::json!([
+                        "trail",
+                        "env",
+                        "resolve",
+                        "component",
+                        component["component_id"].as_str().unwrap(),
+                        "--lane",
+                        "manifest-only"
+                    ])
         }));
 
     let http = trail::server::handle_http_request(

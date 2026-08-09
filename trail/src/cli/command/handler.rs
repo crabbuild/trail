@@ -5,7 +5,9 @@ use clap::Parser;
 use super::{render::*, *};
 
 use trail::{
-    acp::AcpRelayOptions, Actor, Error, InitImportMode, LaneGateOptions, OperationKind,
+    acp::AcpRelayOptions, Actor, ArtifactEnvelopeId, ArtifactQuarantineId,
+    ArtifactQuarantineResolutionV1, ArtifactSourceExportAuthorizationV1,
+    ArtifactVerificationLevelV1, Error, InitImportMode, LaneGateOptions, OperationKind,
     PatchDocument, RecordOptions, Result, StructuredErrorEnvelope, Trail,
 };
 
@@ -118,7 +120,7 @@ fn run(cli: Cli) -> Result<()> {
     let command = cli.command;
     if matches!(ctx.format, OutputFormat::Ndjson) && !supports_ndjson(&command) {
         return Err(Error::InvalidInput(
-            "--format ndjson is available only for streaming watch commands; use --format json for a single report"
+            "--format ndjson is available for streaming watch commands and environment artifact lifecycle reports; use --format json for other single reports"
                 .to_string(),
         ));
     }
@@ -229,6 +231,12 @@ fn supports_ndjson(command: &Command) -> bool {
         Command::Lane(LaneCommand {
             command: LaneSubcommand::Watch(args),
         }) => !args.once,
+        Command::Env(EnvironmentCommand {
+            command:
+                EnvironmentSubcommand::Resolve(_)
+                | EnvironmentSubcommand::Artifact(_)
+                | EnvironmentSubcommand::Source(_),
+        }) => true,
         _ => false,
     }
 }
@@ -238,11 +246,15 @@ fn render_specialist<T: serde::Serialize>(
     title: &str,
     report: &T,
 ) -> Result<()> {
-    render_semantic_report(title, report, ctx.json, &ctx.render)
+    if matches!(ctx.format, OutputFormat::Ndjson) {
+        render_ndjson(report)
+    } else {
+        render_semantic_report(title, report, ctx.json, &ctx.render)
+    }
 }
 
 fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentCommand) -> Result<()> {
-    let db = open_db(ctx)?;
+    let mut db = open_db(ctx)?;
     match environment.command {
         EnvironmentSubcommand::Adapters => render_specialist(
             ctx,
@@ -328,6 +340,33 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
                 args.component.as_deref(),
             )?,
         ),
+        EnvironmentSubcommand::Resolve(resolve) => match resolve.command {
+            EnvironmentResolveSubcommand::All(args) => {
+                let lane = resolve_environment_sync_lane(&db, args.lane.as_deref())?;
+                render_specialist(
+                    ctx,
+                    "Resolved environments",
+                    &db.resolve_all_workspace_environment_components(
+                        &lane,
+                        args.path.as_deref(),
+                        args.refresh,
+                    )?,
+                )
+            }
+            EnvironmentResolveSubcommand::Component(args) => {
+                let lane = resolve_environment_sync_lane(&db, args.lane.as_deref())?;
+                render_specialist(
+                    ctx,
+                    "Resolved environment",
+                    &db.resolve_workspace_environment_component(
+                        &lane,
+                        &args.component,
+                        args.path.as_deref(),
+                        args.refresh,
+                    )?,
+                )
+            }
+        },
         EnvironmentSubcommand::Sync(sync) => match sync.command {
             EnvironmentSyncSubcommand::All(args) => {
                 let lane = resolve_environment_sync_lane(&db, args.lane.as_deref())?;
@@ -349,6 +388,98 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
                         Some(&args.component),
                     )?,
                 )
+            }
+        },
+        EnvironmentSubcommand::Artifact(artifact) => match artifact.command {
+            EnvironmentArtifactSubcommand::Inspect(args) => {
+                let artifact = ArtifactEnvelopeId::parse(args.artifact).map_err(|error| {
+                    Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+                })?;
+                render_specialist(ctx, "Artifact", &db.inspect_artifact(&artifact)?)
+            }
+            EnvironmentArtifactSubcommand::Verify(args) => {
+                let artifact = ArtifactEnvelopeId::parse(args.artifact).map_err(|error| {
+                    Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+                })?;
+                let level = match args.level {
+                    EnvironmentArtifactVerificationLevelArg::Attach => {
+                        ArtifactVerificationLevelV1::Attach
+                    }
+                    EnvironmentArtifactVerificationLevelArg::Sample => {
+                        ArtifactVerificationLevelV1::Sample
+                    }
+                    EnvironmentArtifactVerificationLevelArg::Full => {
+                        ArtifactVerificationLevelV1::Full
+                    }
+                    EnvironmentArtifactVerificationLevelArg::Reproduce => {
+                        ArtifactVerificationLevelV1::Reproduce
+                    }
+                };
+                let report = db.verify_artifact(&artifact, level)?;
+                render_specialist(ctx, "Artifact verification", &report)?;
+                if report.valid {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidInput(format!(
+                        "artifact `{artifact}` failed `{}` verification",
+                        level.as_str()
+                    )))
+                }
+            }
+            EnvironmentArtifactSubcommand::Quarantine(quarantine) => match quarantine.command {
+                EnvironmentArtifactQuarantineSubcommand::List => render_specialist(
+                    ctx,
+                    "Artifact quarantines",
+                    &db.artifact_quarantine_list_report()?,
+                ),
+                EnvironmentArtifactQuarantineSubcommand::Show(args) => {
+                    let quarantine =
+                        ArtifactQuarantineId::parse(args.quarantine).map_err(|error| {
+                            Error::InvalidInput(format!("invalid quarantine ID: {error}"))
+                        })?;
+                    render_specialist(
+                        ctx,
+                        "Artifact quarantine",
+                        &db.artifact_quarantine(&quarantine)?,
+                    )
+                }
+                EnvironmentArtifactQuarantineSubcommand::Resolve(args) => {
+                    let quarantine =
+                        ArtifactQuarantineId::parse(args.quarantine).map_err(|error| {
+                            Error::InvalidInput(format!("invalid quarantine ID: {error}"))
+                        })?;
+                    let resolution = match args.resolution {
+                        EnvironmentArtifactQuarantineResolutionArg::RetainPrivate => {
+                            ArtifactQuarantineResolutionV1::RetainPrivate
+                        }
+                        EnvironmentArtifactQuarantineResolutionArg::AcceptIncumbent => {
+                            ArtifactQuarantineResolutionV1::AcceptIncumbent
+                        }
+                        EnvironmentArtifactQuarantineResolutionArg::AcceptCandidate => {
+                            ArtifactQuarantineResolutionV1::AcceptCandidate
+                        }
+                        EnvironmentArtifactQuarantineResolutionArg::RetireAll => {
+                            ArtifactQuarantineResolutionV1::RetireAll
+                        }
+                    };
+                    render_specialist(
+                        ctx,
+                        "Resolved artifact quarantine",
+                        &db.resolve_artifact_quarantine_report(&quarantine, resolution)?,
+                    )
+                }
+            },
+        },
+        EnvironmentSubcommand::Source(source) => match source.command {
+            EnvironmentSourceSubcommand::Export(args) => {
+                let plan = db.plan_artifact_source_export(
+                    &args.lane,
+                    &args.component,
+                    &args.export,
+                    ArtifactSourceExportAuthorizationV1::ExplicitUser,
+                )?;
+                let report = db.execute_artifact_source_export(plan)?;
+                render_specialist(ctx, "Exported artifact source", &report)
             }
         },
         EnvironmentSubcommand::Promote(args) => render_specialist(

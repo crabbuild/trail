@@ -783,6 +783,18 @@ pub enum EnvironmentComponentProposalStatus {
     Ambiguous,
 }
 
+impl EnvironmentComponentProposalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Resolvable => "resolvable",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentProposalReasonReport {
     pub code: String,

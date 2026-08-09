@@ -404,6 +404,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_environment_artifact_lifecycle_commands() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "env",
+            "resolve",
+            "component",
+            "cargo-target:root",
+            "--lane",
+            "lane-a",
+            "--refresh",
+        ])
+        .expect("environment resolve component should parse");
+        let Command::Env(EnvironmentCommand {
+            command:
+                EnvironmentSubcommand::Resolve(EnvironmentResolveCommand {
+                    command: EnvironmentResolveSubcommand::Component(args),
+                }),
+        }) = cli.command
+        else {
+            panic!("expected environment resolve component command");
+        };
+        assert_eq!(args.component, "cargo-target:root");
+        assert_eq!(args.lane.as_deref(), Some("lane-a"));
+        assert!(args.refresh);
+
+        Cli::try_parse_from([
+            "trail",
+            "env",
+            "artifact",
+            "verify",
+            "artifact_envelope_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--level",
+            "full",
+        ])
+        .expect("environment artifact verify should parse");
+        Cli::try_parse_from([
+            "trail",
+            "env",
+            "artifact",
+            "quarantine",
+            "resolve",
+            "artifact_quarantine_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--resolution",
+            "retain-private",
+        ])
+        .expect("environment quarantine resolution should parse");
+        Cli::try_parse_from([
+            "trail",
+            "env",
+            "source",
+            "export",
+            "lane-a",
+            "--component",
+            "generated.types",
+            "--export",
+            "types",
+        ])
+        .expect("environment source export should parse");
+    }
+
+    #[test]
     fn parses_environment_runtime_lifecycle_commands() {
         for (action, expected) in [
             ("status", "status"),

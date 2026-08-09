@@ -1216,6 +1216,28 @@ impl Trail {
         self.plan_command_recipe(source_root, recipe)
     }
 
+    pub(crate) fn command_recipe_resolution_plan(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<Option<ArtifactResolutionPlanV1>> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Ok(None);
+        }
+        Ok(self
+            .compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+            .resolution_plan)
+    }
+
     #[cfg(test)]
     fn compile_repository_artifact_pipeline_v2(
         &self,

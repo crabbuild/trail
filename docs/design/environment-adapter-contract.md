@@ -77,13 +77,15 @@ reports logical component identity separately from adapter identity. CLI, HTTP/O
 MCP, and Rust APIs share this state. Existing `trail deps` behavior remains a Node
 compatibility surface.
 
-The Rust library also has a first common resolution-snapshot boundary:
+The Rust library and CLI share the common resolution-snapshot boundary:
 `resolve_artifact_component` and `resolve_all_artifact_components` accept normalized
 executor candidates, validate pinned source/tool/policy identity, reuse snapshots until
-an explicit refresh, and own durable attempt evidence and publication. This is not yet
-the public `trail env resolve` workflow: resolver process launch, provider integration,
-and CLI/HTTP/MCP operations remain planned. Discovery reports unsupported installed
-plugins from their pinned marker and package metadata without launching the plugin.
+an explicit refresh, and own durable attempt evidence and publication. The public
+`trail env resolve` operation selects the exact discovered component and runs reviewed
+built-in offline, credential-free plans in host-owned isolated staging before entering
+that publication boundary. Restricted repository/plugin resolver execution and aligned
+HTTP/MCP operations remain planned. Discovery reports unsupported installed plugins
+from their pinned marker and package metadata without launching the plugin.
 
 Snapshot consumption also crosses one host-owned verification boundary. Before a
 built-in can plan construction from a stored snapshot, Trail verifies the exact proposal
