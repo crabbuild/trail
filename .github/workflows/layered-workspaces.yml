@@ -14,6 +14,8 @@ on:
       - "scripts/verify-windows-command-recipe-sandbox.ps1"
       - "scripts/verify-macos-nfs-framework-layers.sh"
       - "scripts/verify-environment-adapter-plugin.sh"
+      - "scripts/verify-artifact-adapter-conformance.sh"
+      - "scripts/verify-artifact-real-tool-gates.sh"
       - "scripts/verify-windows-environment-adapter-plugin.ps1"
       - "trail-environment-adapter-sdk/**"
       - ".github/workflows/layered-workspaces.yml"
@@ -50,6 +52,29 @@ jobs:
       - run: cargo test -p trail view_core_ --no-default-features
       - if: ${{ runner.os != 'Windows' }}
         run: cargo test -p trail workspace_layer --no-default-features
+
+  artifact-common-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-artifact-adapter-conformance.sh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-common-contract-target
+
+  artifact-real-tool-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: sudo chmod 666 /dev/fuse
+      - run: node --version && npm --version && cmake --version && python3 --version
+      - run: scripts/verify-artifact-real-tool-gates.sh
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
 
   fuse-conformance:
     runs-on: ubuntu-latest

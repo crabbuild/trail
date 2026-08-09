@@ -106,7 +106,7 @@
 - [x] 11.3 Add aligned HTTP routes/OpenAPI schemas and MCP tools/resources/risk annotations backed by the same library operations and reports
 - [x] 11.4 Extend managed exec/test/eval/agent/ACP preparation with explicit missing-resolution policy, pinned identities, sealing decisions, and finalization receipts
 - [x] 11.5 Build behavior-based conformance fixtures shared by built-ins, plugins, and repository v2 for discovery through collection and emit machine-readable certification reports
-- [ ] 11.6 Add real-tool gates for dependency resolution, compiled incremental output, framework/bundler composition, path-bound private state, external metadata, custom pipeline, and source export
+- [x] 11.6 Add real-tool gates for dependency resolution, compiled incremental output, framework/bundler composition, path-bound private state, external metadata, custom pipeline, and source export
 - [ ] 11.7 Add deterministic 10k/100k/1M-entry and 1/5/20-lane experiments measuring content reuse, materialization amplification, private deltas, phase latency, object count, and skipped evidence
 - [ ] 11.8 Run native CAS-backed isolation/materialization/promotion/export/recovery matrices on NFS, FUSE, and Dokan owning hosts; leave unavailable gates explicitly unverified
 

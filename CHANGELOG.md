@@ -10,6 +10,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Added one behavior-based artifact conformance fixture for reviewed built-ins, local
   protocol-v3 plugins, and repository-v2 producers, plus a deterministic evidence-only
   JSON certification report covering discovery through last-reference collection.
+- Added one blocking Linux real-tool artifact gate covering Cargo and npm resolution,
+  compiled seed reuse, framework composition, Python/CMake private state, external
+  metadata, custom repository pipelines, and guarded source export.
 - Managed exec, test, eval, terminal-agent, and materialized ACP execution now fail
   before launch when an environment requires explicit resolution, pin exact source,
   snapshot, generation, and artifact-binding identities, and return additive

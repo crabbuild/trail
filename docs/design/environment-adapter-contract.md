@@ -508,6 +508,23 @@ This synthetic common-contract evidence complements, but does not replace, real-
 and native NFS/FUSE/Dokan qualification. Those unavailable gates remain explicitly
 unverified.
 
+The blocking Linux real-tool gate maps representative shapes to executable tests:
+
+| Shape | Gate evidence |
+| --- | --- |
+| Dependency resolution/install | Cargo resolver snapshot and npm managed-lock frozen install |
+| Compiled incremental tree | Cargo target seed builds once and is reused |
+| Framework/bundler composition | Node dependencies plus distinct Next.js/Vite build and private-cache components |
+| Path-bound private state | Real Python virtual environments and CMake configure/build trees |
+| External metadata | Bazel/Nix-like verified external-store normalization without fake Trail layers |
+| Custom pipeline | Repository-v2 Maven/Gradle-like and unknown generator components |
+| Source export | CAS subtree export through normal guarded source checkpointing |
+
+Run all gates with `scripts/verify-artifact-real-tool-gates.sh`. A missing
+required executable fails the gate; it is never converted into passing evidence. Native
+mount, multi-lane, and real Next.js/Vite build evidence remains in the owning-platform
+qualification jobs.
+
 ## Design principles
 
 1. One contract covers package managers, compilers, build systems, containers, services,
