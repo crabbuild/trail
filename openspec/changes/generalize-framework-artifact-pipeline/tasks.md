@@ -117,6 +117,6 @@
 - [x] 12.3 Update `trail.environment/v2`, SDK v3, CLI, HTTP, MCP, troubleshooting, doctor/fsck/backup/restore, native prerequisites, and framework composition guidance with executable examples
 - [x] 12.4 Update `CHANGELOG.md`, configuration/completions, protocol compatibility, schema-v1 backup/reinitialization, rollback, and release-evidence policy
 - [x] 12.5 Run `cargo fmt --all -- --check`, workspace check/test, and Clippy with `--locked`, applicable features, and the checkout-specific external `CARGO_TARGET_DIR`
-- [ ] 12.6 Run schema-v1, storage/rebuild/backup/restore, managed execution, environment/inheritance/retirement, CLI/terminal, HTTP/MCP, SDK, changed-path, and applicable native gates
-- [ ] 12.7 Run critical construction, quarantine, publication, activation, and GC tests with both `RUST_TEST_THREADS=1` and the default scheduler
+- [x] 12.6 Run schema-v1, storage/rebuild/backup/restore, managed execution, environment/inheritance/retirement, CLI/terminal, HTTP/MCP, SDK, changed-path, and applicable native gates
+- [x] 12.7 Run critical construction, quarantine, publication, activation, and GC tests with both `RUST_TEST_THREADS=1` and the default scheduler
 - [ ] 12.8 Inspect final diff/status for only intended files, deterministic/bounded contracts, no secret or machine path, no local build artifacts, no external-checkout mutation, and no unsupported platform/performance claim
