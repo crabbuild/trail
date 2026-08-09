@@ -194,6 +194,13 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
                 "SCCACHE_DIR".to_string(),
                 sccache_cache.storage_path.to_string_lossy().into_owned(),
             );
+            // A long-lived sccache server can outlive an attempt-owned temp
+            // directory. Cache I/O loss must degrade to rustc, not fail the
+            // deterministic target-seed build.
+            environment.insert(
+                "SCCACHE_IGNORE_SERVER_IO_ERROR".to_string(),
+                "1".to_string(),
+            );
             tool_versions.insert("sccache".to_string(), sccache_version);
             tool_versions.insert("sccache-executable".to_string(), sccache_tool.identity);
             cache_names.push(sccache_cache.name.clone());

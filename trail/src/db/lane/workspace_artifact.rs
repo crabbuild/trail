@@ -3604,6 +3604,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn process_cpu_micros() -> u64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: getrusage initializes the supplied rusage on success, and
@@ -3616,6 +3617,12 @@ mod tests {
         timeval_micros(usage.ru_utime).saturating_add(timeval_micros(usage.ru_stime))
     }
 
+    #[cfg(not(unix))]
+    fn process_cpu_micros() -> u64 {
+        0
+    }
+
+    #[cfg(unix)]
     fn timeval_micros(value: libc::timeval) -> u64 {
         u64::try_from(value.tv_sec)
             .unwrap_or(0)
