@@ -2788,6 +2788,68 @@ impl Trail {
             .collect()
     }
 
+    pub(crate) fn artifact_generation_bindings_for_generation(
+        &self,
+        generation_id: &str,
+    ) -> Result<Vec<ArtifactGenerationBindingReportV1>> {
+        let mut statement = self.conn.prepare(
+            "SELECT binding_id,generation_id,component_id,output_name,desired_key,
+                    envelope_id,tree_root_id,binding_identity,created_at
+             FROM artifact_generation_bindings WHERE generation_id=?1
+             ORDER BY component_id,output_name,binding_id",
+        )?;
+        let rows = statement
+            .query_map(params![generation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_PUBLIC_ARTIFACT_REPORT_ITEMS {
+            return Err(Error::InvalidInput(format!(
+                "environment generation `{generation_id}` contains {} artifact bindings; maximum is {MAX_PUBLIC_ARTIFACT_REPORT_ITEMS}",
+                rows.len()
+            )));
+        }
+        rows.into_iter()
+            .map(
+                |(
+                    binding_id,
+                    generation_id,
+                    component_id,
+                    output_name,
+                    desired_key,
+                    envelope_id,
+                    tree_root_id,
+                    binding_identity,
+                    created_at,
+                )| {
+                    Ok(ArtifactGenerationBindingReportV1 {
+                        binding_id,
+                        generation_id,
+                        component_id,
+                        output_name,
+                        desired_key,
+                        envelope_id: ArtifactEnvelopeId::parse(envelope_id)
+                            .map_err(Error::Corrupt)?,
+                        tree_root_id: ArtifactTreeId::parse(tree_root_id)
+                            .map_err(Error::Corrupt)?,
+                        binding_identity,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
     fn artifact_object_storage_rows(
         &self,
         object_ids: &BTreeSet<String>,
@@ -5112,6 +5174,45 @@ impl Trail {
         };
         let snapshot = self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, &snapshot_id)?;
         validate_artifact_resolution_snapshot(&snapshot)?;
+        Ok(Some((snapshot_id, snapshot)))
+    }
+
+    pub(crate) fn artifact_resolution_snapshot_for_component(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+        adapter_identity: &str,
+    ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT snapshot_id FROM artifact_resolution_snapshots
+             WHERE source_root=?1 AND component_id=?2 AND adapter_identity=?3
+               AND state='current' AND verification_state='verified'
+             ORDER BY proposal_key LIMIT 2",
+        )?;
+        let snapshot_ids = statement
+            .query_map(
+                params![source_root.0, component_id, adapter_identity],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if snapshot_ids.len() > 1 {
+            return Err(Error::Corrupt(format!(
+                "environment component `{component_id}` has multiple current resolution snapshots for one source root and adapter"
+            )));
+        }
+        let Some(snapshot_id) = snapshot_ids.into_iter().next().map(ObjectId) else {
+            return Ok(None);
+        };
+        let snapshot = self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, &snapshot_id)?;
+        validate_artifact_resolution_snapshot(&snapshot)?;
+        if snapshot.source_root != *source_root
+            || snapshot.component_id != component_id
+            || snapshot.adapter_identity != adapter_identity
+        {
+            return Err(Error::Corrupt(format!(
+                "resolution snapshot `{snapshot_id}` does not match its component lookup"
+            )));
+        }
         Ok(Some((snapshot_id, snapshot)))
     }
 

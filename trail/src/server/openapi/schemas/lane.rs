@@ -308,6 +308,79 @@ pub(super) fn lane_schemas() -> Value {
                 "details": { "$ref": "#/components/schemas/JsonValue" }
             }
         },
+        "ManagedExecutionResolutionPin": {
+            "type": "object",
+            "required": ["component_id", "adapter_identity", "status"],
+            "additionalProperties": false,
+            "properties": {
+                "component_id": { "type": "string" },
+                "adapter_identity": { "type": "string" },
+                "status": { "type": "string", "enum": ["ready", "resolvable", "blocked", "unsupported", "ambiguous"] },
+                "proposal_key": { "type": "string" },
+                "snapshot_id": { "type": "string" },
+                "recovery_command": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ManagedExecutionOutputPin": {
+            "type": "object",
+            "required": ["component_id", "output_name", "component_key", "policy", "storage_identity"],
+            "additionalProperties": false,
+            "properties": {
+                "component_id": { "type": "string" },
+                "output_name": { "type": "string" },
+                "component_key": { "type": "string" },
+                "policy": { "type": "string", "enum": ["immutable_shared", "immutable_seed_private", "writable_private", "disposable"] },
+                "storage_identity": { "type": "string" },
+                "artifact_binding_id": { "type": "string" },
+                "artifact_envelope_id": { "type": "string" },
+                "artifact_tree_root_id": { "type": "string" },
+                "artifact_binding_identity": { "type": "string" }
+            }
+        },
+        "ManagedExecutionPreparationReceipt": {
+            "type": "object",
+            "required": ["source_root", "missing_resolution_policy", "resolution_pins", "output_pins"],
+            "additionalProperties": false,
+            "properties": {
+                "source_root": { "type": "string" },
+                "view_id": { "type": "string" },
+                "view_generation": { "type": "integer", "minimum": 0 },
+                "missing_resolution_policy": { "type": "string", "enum": ["explicit"] },
+                "resolution_pins": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionResolutionPin" } },
+                "environment_generation": { "type": "string" },
+                "output_pins": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionOutputPin" } }
+            }
+        },
+        "ManagedExecutionSealingDecision": {
+            "type": "object",
+            "required": ["component_id", "output_name", "policy", "publication", "decision", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "component_id": { "type": "string" },
+                "output_name": { "type": "string" },
+                "policy": { "type": "string", "enum": ["immutable_shared", "immutable_seed_private", "writable_private", "disposable"] },
+                "publication": { "type": "string", "enum": ["never", "manual", "on_sync", "successful_gate"] },
+                "gate": { "type": "string" },
+                "decision": { "type": "string" },
+                "reason": { "type": "string" }
+            }
+        },
+        "ManagedExecutionFinalizationReceipt": {
+            "type": "object",
+            "required": ["source_root_before", "source_changed", "checkpoint_status", "disposal_status", "unmount_status", "complete", "sealing_decisions", "errors"],
+            "additionalProperties": false,
+            "properties": {
+                "source_root_before": { "type": "string" },
+                "source_root_after": { "type": "string" },
+                "source_changed": { "type": "boolean" },
+                "checkpoint_status": { "type": "string", "enum": ["succeeded", "failed"] },
+                "disposal_status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
+                "unmount_status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
+                "complete": { "type": "boolean" },
+                "sealing_decisions": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionSealingDecision" } },
+                "errors": { "type": "array", "items": { "type": "string" } }
+            }
+        },
         "ManagedExecutionLifecycleReport": {
             "type": "object",
             "required": ["execution_id", "surface", "command_fingerprint", "phases"],
@@ -316,12 +389,14 @@ pub(super) fn lane_schemas() -> Value {
                 "execution_id": { "type": "string" },
                 "surface": { "type": "string", "enum": ["lane_exec", "lane_test", "lane_eval", "terminal_agent", "acp_prompt"] },
                 "command_fingerprint": { "type": "string" },
+                "preparation": { "$ref": "#/components/schemas/ManagedExecutionPreparationReceipt" },
                 "environment_generation": { "type": "string" },
                 "checkpoint": { "$ref": "#/components/schemas/WorkspaceCheckpointReport" },
                 "checkpoint_error": { "type": "string" },
                 "checkpoint_error_code": { "type": "string" },
                 "disposal_error": { "type": "string" },
                 "recorded": { "$ref": "#/components/schemas/LaneRecordReport" },
+                "finalization": { "$ref": "#/components/schemas/ManagedExecutionFinalizationReceipt" },
                 "phases": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionPhaseReceipt" } }
             }
         },

@@ -2313,6 +2313,16 @@ fn validate_recipe_specification_header(
             "environment specification `{path}` must set default_network and default_scripts to `deny`"
         )));
     }
+    if specification
+        .environment
+        .missing_resolution
+        .as_deref()
+        .is_some_and(|policy| policy != "explicit")
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment specification `{path}` missing_resolution must be `explicit`"
+        )));
+    }
     let _environment_name = specification.environment.name.as_deref();
     Ok(schema)
 }
@@ -3197,6 +3207,52 @@ validation = "path-contract"
             compiled.desired_material.adapter_protocol,
             RECIPE_SCHEMA_V2,
             "repository v2 retains its explicit desired-key protocol instead of being relabeled as plugin v3"
+        );
+    }
+
+    #[test]
+    fn v2_schema_rejects_non_explicit_missing_resolution_policy() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+missing_resolution = "automatic"
+
+[[component]]
+id = "custom.pipeline"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+cwd = "."
+
+[[component.output]]
+name = "seed"
+source = "generated"
+target = ".trail-generated/seed"
+policy = "immutable_shared"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#;
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), "input\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            specification,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid input: environment specification `trail.environment.toml` missing_resolution must be `explicit`"
         );
     }
 

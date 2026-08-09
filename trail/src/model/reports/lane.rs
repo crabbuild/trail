@@ -1097,6 +1097,83 @@ pub struct WorkspaceExecReport {
     pub lifecycle: ManagedExecutionLifecycleReport,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedExecutionMissingResolutionPolicy {
+    #[default]
+    Explicit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionResolutionPin {
+    pub component_id: String,
+    pub adapter_identity: String,
+    pub status: EnvironmentComponentProposalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_command: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionOutputPin {
+    pub component_id: String,
+    pub output_name: String,
+    pub component_key: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub storage_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_envelope_id: Option<ArtifactEnvelopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_tree_root_id: Option<ArtifactTreeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_binding_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionPreparationReceipt {
+    pub source_root: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_generation: Option<u64>,
+    pub missing_resolution_policy: ManagedExecutionMissingResolutionPolicy,
+    pub resolution_pins: Vec<ManagedExecutionResolutionPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_generation: Option<String>,
+    pub output_pins: Vec<ManagedExecutionOutputPin>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionSealingDecision {
+    pub component_id: String,
+    pub output_name: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub publication: EnvironmentPublicationTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionFinalizationReceipt {
+    pub source_root_before: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root_after: Option<ObjectId>,
+    pub source_changed: bool,
+    pub checkpoint_status: String,
+    pub disposal_status: String,
+    pub unmount_status: String,
+    pub complete: bool,
+    pub sealing_decisions: Vec<ManagedExecutionSealingDecision>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedExecutionPhaseReceipt {
     pub phase: String,
@@ -1131,6 +1208,8 @@ pub struct ManagedExecutionLifecycleReport {
     pub surface: String,
     pub command_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<ManagedExecutionPreparationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<WorkspaceCheckpointReport>,
@@ -1142,6 +1221,8 @@ pub struct ManagedExecutionLifecycleReport {
     pub disposal_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<LaneRecordReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<ManagedExecutionFinalizationReceipt>,
     pub phases: Vec<ManagedExecutionPhaseReceipt>,
 }
 
@@ -1573,6 +1654,82 @@ mod workdir_mode_tests {
         assert_eq!(value["status"], "ready");
         assert_eq!(value["reasons"], serde_json::json!([]));
         assert_eq!(value["recovery_actions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn managed_execution_receipts_are_additive_and_wire_stable() {
+        let legacy: ManagedExecutionLifecycleReport = serde_json::from_value(
+            serde_json::json!({
+                "execution_id": "exec-legacy",
+                "surface": "lane_exec",
+                "command_fingerprint": "command",
+                "phases": []
+            }),
+        )
+        .unwrap();
+        assert!(legacy.preparation.is_none());
+        assert!(legacy.finalization.is_none());
+
+        let current: ManagedExecutionLifecycleReport = serde_json::from_value(
+            serde_json::json!({
+                "execution_id": "exec-current",
+                "surface": "lane_test",
+                "command_fingerprint": "command",
+                "preparation": {
+                    "source_root": "object_source",
+                    "view_id": "view-1",
+                    "view_generation": 7,
+                    "missing_resolution_policy": "explicit",
+                    "resolution_pins": [{
+                        "component_id": "node",
+                        "adapter_identity": "trail/node@1",
+                        "status": "ready",
+                        "snapshot_id": "object_lock"
+                    }],
+                    "environment_generation": "generation-1",
+                    "output_pins": [{
+                        "component_id": "node",
+                        "output_name": "dependencies",
+                        "component_key": "desired-key",
+                        "policy": "immutable_seed_private",
+                        "storage_identity": "storage-key"
+                    }]
+                },
+                "finalization": {
+                    "source_root_before": "object_source",
+                    "source_root_after": "object_after",
+                    "source_changed": true,
+                    "checkpoint_status": "succeeded",
+                    "disposal_status": "succeeded",
+                    "unmount_status": "succeeded",
+                    "complete": true,
+                    "sealing_decisions": [{
+                        "component_id": "node",
+                        "output_name": "dependencies",
+                        "policy": "immutable_seed_private",
+                        "publication": "never",
+                        "decision": "retain_private_delta",
+                        "reason": "private copy-on-write output is never published"
+                    }],
+                    "errors": []
+                },
+                "phases": []
+            }),
+        )
+        .unwrap();
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(
+            value["preparation"]["missing_resolution_policy"],
+            "explicit"
+        );
+        assert_eq!(
+            value["preparation"]["resolution_pins"][0]["status"],
+            "ready"
+        );
+        assert_eq!(
+            value["finalization"]["sealing_decisions"][0]["decision"],
+            "retain_private_delta"
+        );
     }
 
     #[test]

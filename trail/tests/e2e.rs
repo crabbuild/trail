@@ -11993,6 +11993,11 @@ fn artifact_lifecycle_http_mcp_resources_and_openapi_are_aligned() {
         "ArtifactQuarantineRecordV1",
         "ArtifactQuarantineResolutionReportV1",
         "ArtifactSourceExportExecutionReportV1",
+        "ManagedExecutionResolutionPin",
+        "ManagedExecutionOutputPin",
+        "ManagedExecutionPreparationReceipt",
+        "ManagedExecutionSealingDecision",
+        "ManagedExecutionFinalizationReceipt",
     ] {
         assert!(
             openapi["components"]["schemas"].get(schema).is_some(),

@@ -396,6 +396,21 @@ compiler, lockfile, dependency tree, service image, and policy were active. Dire
 entering a lane shell remains possible, but commands outside `env exec` receive weaker
 reproducibility evidence and readiness can report that distinction.
 
+Managed preparation is fail-closed and does not perform resolution as a side effect.
+It records `missing_resolution_policy = explicit`, the exact source/view/generation,
+the status and verified snapshot identity of every discovered component, and the exact
+artifact envelope/tree binding for every active reusable output. Any non-ready proposal
+terminates preparation with deterministic resolver recovery argv before graph sync or
+command launch.
+
+Finalization records checkpoint, runtime-disposal, and unmount status together with the
+policy-derived decision for each output (`dispose`, retain private state, preserve a
+verified artifact, await a declared publication trigger, or replan). A source-root
+change invalidates every pending seal or promotion decision; it never silently attaches
+the candidate to the post-command source identity. Exec, test, eval, terminal-agent,
+and materialized ACP paths share these typed receipts rather than defining transport-
+specific lifecycle semantics.
+
 ## Filesystem bindings
 
 Bindings are typed rather than encoded as opaque mount arguments:
@@ -875,8 +890,14 @@ The shared Rust operation layer now exposes artifact inspection, attach/sample/f
 reproducibility-evidence verification, quarantine list/show/resolve, bounded content
 reachability, workspace/envelope CAS accounting, resolution reports, and source-export
 reports. CLI, HTTP/OpenAPI, and MCP adapters must project these models directly; they may
-not reinterpret trust, quarantine, reachability, or byte-accounting state. Public
-transport wiring remains a separate implementation step.
+not reinterpret trust, quarantine, reachability, or byte-accounting state. The public
+transport wiring uses those shared operations and report models.
+
+`ManagedExecutionLifecycleReport` includes additive `preparation` and `finalization`
+objects. OpenAPI describes the same resolution pins, output pins, sealing decisions,
+and cleanup status fields emitted by Rust, CLI, and HTTP-facing reports. ACP retains the
+same receipt in its durable prompt-completion or interruption event without changing
+ACP wire frames.
 
 ## Readiness, claims, and Git handoff
 

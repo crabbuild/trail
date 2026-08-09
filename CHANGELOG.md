@@ -7,6 +7,10 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Managed exec, test, eval, terminal-agent, and materialized ACP execution now fail
+  before launch when an environment requires explicit resolution, pin exact source,
+  snapshot, generation, and artifact-binding identities, and return additive
+  preparation/finalization receipts with deterministic sealing and cleanup decisions.
 - Added HTTP/OpenAPI and MCP tool/resource parity for environment resolution,
   artifact inspection/verification/reachability/accounting, quarantine
   list/show/resolve, and explicit generated-source export. All transports use
