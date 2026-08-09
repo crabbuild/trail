@@ -64,6 +64,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Resolver plans now fail before attempt publication when paths, arguments, or declared
   resource limits exceed host ceilings; native command-recipe tests also prove nested
   child execution remains denied.
+- Repository environment parsing now recognizes an explicit `trail.environment/v2`
+  header without changing v1 command semantics, and rejects mixed schema versions across
+  one local include/profile graph.
 
 ### Changed
 

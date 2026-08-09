@@ -9,7 +9,8 @@ use super::workspace_environment::{
 };
 use super::*;
 
-const RECIPE_SCHEMA: &str = "trail.environment/v1";
+const RECIPE_SCHEMA_V1: &str = "trail.environment/v1";
+const RECIPE_SCHEMA_V2: &str = "trail.environment/v2";
 const RECIPE_ADAPTER_IDENTITY: &str = "trail/command@1";
 const RECIPE_SPEC_PATHS: [&str; 2] = ["trail.environment.toml", ".trail/environment.toml"];
 const MAX_RECIPE_SPEC_BYTES: u64 = 1024 * 1024;
@@ -49,6 +50,31 @@ struct CommandRecipe {
     profile_versions: BTreeMap<String, String>,
     defaults: RecipeEnvironment,
     component: RecipeComponent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecipeSchemaVersion {
+    V1,
+    V2,
+}
+
+impl RecipeSchemaVersion {
+    fn parse(value: &str, path: &str) -> Result<Self> {
+        match value {
+            RECIPE_SCHEMA_V1 => Ok(Self::V1),
+            RECIPE_SCHEMA_V2 => Ok(Self::V2),
+            other => Err(Error::InvalidInput(format!(
+                "unsupported environment schema `{other}` in `{path}`; expected `{RECIPE_SCHEMA_V1}` or `{RECIPE_SCHEMA_V2}`"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => RECIPE_SCHEMA_V1,
+            Self::V2 => RECIPE_SCHEMA_V2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -148,6 +174,7 @@ struct ResolvedRecipeProfile {
 
 #[derive(Debug, Default)]
 struct RecipeDocuments {
+    schema: Option<RecipeSchemaVersion>,
     defaults: RecipeEnvironment,
     profiles: BTreeMap<String, RecipeProfile>,
     components: Vec<RecipeComponentDefinition>,
@@ -445,7 +472,10 @@ impl Trail {
                 }
                 targets.insert(target, format!("{}:{name}", component.id));
             }
-            let canonical = serde_json::to_vec(&(RECIPE_SCHEMA, &component, &profile_versions))?;
+            let schema = documents.schema.ok_or_else(|| {
+                Error::Corrupt("environment specification graph lost its schema version".into())
+            })?;
+            let canonical = serde_json::to_vec(&(schema.as_str(), &component, &profile_versions))?;
             recipes.push(CommandRecipe {
                 specification_digest: sha256_hex(&canonical),
                 specification_sources: documents.specification_sources.clone(),
@@ -521,7 +551,18 @@ impl Trail {
         let specification: RecipeSpecification = toml::from_str(&text).map_err(|err| {
             Error::InvalidInput(format!("invalid environment specification `{path}`: {err}"))
         })?;
-        validate_recipe_specification_header(&specification, path)?;
+        let schema = validate_recipe_specification_header(&specification, path)?;
+        if let Some(expected) = documents.schema {
+            if schema != expected {
+                return Err(Error::InvalidInput(format!(
+                    "environment specification `{path}` uses schema `{}` but the root document uses `{}`",
+                    schema.as_str(),
+                    expected.as_str()
+                )));
+            }
+        } else {
+            documents.schema = Some(schema);
+        }
 
         stack.push(path.to_string());
         for include in &specification.include {
@@ -964,13 +1005,8 @@ impl Trail {
 fn validate_recipe_specification_header(
     specification: &RecipeSpecification,
     path: &str,
-) -> Result<()> {
-    if specification.schema != RECIPE_SCHEMA {
-        return Err(Error::InvalidInput(format!(
-            "unsupported environment schema `{}` in `{path}`; expected `{RECIPE_SCHEMA}`",
-            specification.schema
-        )));
-    }
+) -> Result<RecipeSchemaVersion> {
+    let schema = RecipeSchemaVersion::parse(&specification.schema, path)?;
     if specification.environment.default_network != "deny"
         || specification.environment.default_scripts != "deny"
     {
@@ -979,7 +1015,7 @@ fn validate_recipe_specification_header(
         )));
     }
     let _environment_name = specification.environment.name.as_deref();
-    Ok(())
+    Ok(schema)
 }
 
 fn resolve_recipe_include_path(including_path: &str, include: &str) -> Result<String> {
@@ -1583,6 +1619,75 @@ portability = "host"
             vec!["project/generated"]
         );
         assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_v2_schema_preserves_v1_command_recipe_planning() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_recipe_workspace(
+            workspace.path(),
+            &["cp", "input.txt", "generated/copied.txt"],
+        );
+        let path = workspace.path().join("trail.environment.toml");
+        let v1 = fs::read_to_string(&path).unwrap();
+        fs::write(&path, v1.replace(RECIPE_SCHEMA_V1, RECIPE_SCHEMA_V2)).unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].component.adapter, RECIPE_ADAPTER_IDENTITY);
+        let plan = db
+            .command_recipe_plan(&source_root, "generated.copy")
+            .unwrap();
+        assert_eq!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+        );
+        assert_eq!(plan.outputs[0].mount_path, ".trail-generated/copy");
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_document_graph_rejects_mixed_schema_versions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("config")).unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            format!("schema = {RECIPE_SCHEMA_V2:?}\ninclude = [\"config/profile.toml\"]\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("config/profile.toml"),
+            format!("schema = {RECIPE_SCHEMA_V1:?}\n"),
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert!(error.to_string().contains("config/profile.toml"));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V1));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V2));
+    }
+
+    #[test]
+    fn repository_document_rejects_unsupported_schema_with_supported_versions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            "schema = \"trail.environment/v3\"\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V1));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V2));
     }
 
     #[test]

@@ -202,6 +202,14 @@ that needs semantic code can become an isolated plugin; a widely used, fully cer
 plugin can be proposed as a built-in. Component and adapter identities change explicitly
 when semantics change, so promotion never silently reinterprets an existing generation.
 
+Repository documents at `trail.environment.toml` or `.trail/environment.toml` now
+recognize both `trail.environment/v1` and the explicitly opted-in
+`trail.environment/v2` header. Version 1 retains its existing paths, defaults,
+includes/profiles, validation, and normalized identity. Every file in one include graph
+must declare the same version. The v2 header initially accepts the existing restricted
+command shape; v2-only phases and exports are added as typed fields rather than inferred
+from v1 documents.
+
 ### Add a repository adapter without Rust
 
 Use `trail/command@1` when the adapter can be represented as pinned byte inputs, an argv
