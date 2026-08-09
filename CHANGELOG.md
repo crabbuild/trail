@@ -97,6 +97,10 @@ All notable changes to Trail are documented in this file. Trail follows
   canonical v1/v2 projections keep every v3-only authority absent. The SDK adds a v3
   pipeline builder, explicit deny-by-default package capability declarations, detailed
   validation errors, and an artifact-pipeline example adapter.
+- Trail now repeats canonical protocol-v3 validation at the plugin trust boundary,
+  rejecting oversized or unknown data, duplicate IDs, non-normalized paths, input and
+  host pin drift, invalid graph/phase combinations, secret-taint underclaims, and any
+  package/protocol/capability/certification mismatch before normalization.
 
 ### Changed
 

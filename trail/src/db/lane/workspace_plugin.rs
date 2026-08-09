@@ -11,11 +11,12 @@ use trail_environment_adapter_sdk::{
     AdapterCacheAccess, AdapterCacheProtocol, AdapterCommand, AdapterDependencyType,
     AdapterExternalArtifact, AdapterHost, AdapterOperation, AdapterOutput, AdapterOutputPolicy,
     AdapterPackageManifest, AdapterPackageSignature, AdapterPermissions, AdapterPlan,
-    AdapterPlanV2, AdapterPortability, AdapterPublicationTrigger, AdapterPublisherKey,
-    AdapterRequest, AdapterResponse, AdapterResult, AdapterReuseMode, AdapterRuntimeResource,
-    AdapterSharingScope, DiscoveredComponent, PinnedFile, MAX_FRAME_BYTES, PACKAGE_SCHEMA_V1,
-    PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3,
-    TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
+    AdapterPlanV2, AdapterPortability, AdapterProposalStatusV3, AdapterPublicationTrigger,
+    AdapterPublisherKey, AdapterRequest, AdapterRequestV3, AdapterResponse, AdapterResponseV3,
+    AdapterResult, AdapterResultV3, AdapterReuseMode, AdapterRuntimeResource,
+    AdapterSecretCapabilityV3, AdapterSecretTaintV3, AdapterSharingScope, DiscoveredComponent,
+    PinnedFile, MAX_FRAME_BYTES, PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1,
+    PROTOCOL_V2, PROTOCOL_V3, TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
 };
 
 use super::workspace_environment::{
@@ -2280,6 +2281,240 @@ fn validate_discovered_plugin_component(
     validate_plugin_component_id(&component.component_id)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "v3 exchange validation is staged before v3 invocation/normalization is enabled"
+    )
+)]
+pub(super) fn validate_environment_plugin_v3_exchange(
+    plugin: &InstalledEnvironmentPlugin,
+    request: &AdapterRequestV3,
+    response: AdapterResponseV3,
+) -> Result<AdapterResultV3> {
+    if !plugin
+        .manifest
+        .adapter
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3)
+        || request.protocol != PROTOCOL_V3
+        || response.protocol != PROTOCOL_V3
+        || response.request_id != request.request_id
+        || request.adapter_identity != plugin.manifest.adapter.canonical_identity
+        || request.distribution_digest != plugin.distribution_digest
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned a protocol/package/request mismatch for protocol v3",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    request.validate_bounds().map_err(|error| {
+        Error::InvalidInput(format!("invalid protocol-v3 adapter request: {error}"))
+    })?;
+    response.validate_bounds(&request.limits).map_err(|error| {
+        Error::InvalidInput(format!("invalid protocol-v3 adapter response: {error}"))
+    })?;
+
+    let capabilities = &plugin.manifest.adapter.capabilities;
+    let host_evidence = match &request.operation {
+        trail_environment_adapter_sdk::AdapterOperationV3::Plan { host_evidence, .. } => {
+            host_evidence.as_deref()
+        }
+        trail_environment_adapter_sdk::AdapterOperationV3::Propose { .. } => None,
+    };
+    if host_evidence.is_some_and(|evidence| {
+        (!evidence.attestations.is_empty() && !capabilities.host_attestation_evidence)
+            || (!evidence.quarantines.is_empty() && !capabilities.host_quarantine_evidence)
+    }) {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` received host evidence beyond its package declaration",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+
+    match response.result {
+        AdapterResultV3::Error {
+            code,
+            message,
+            recovery_actions: _,
+        } => Err(Error::InvalidInput(format!(
+            "adapter `{}` rejected protocol-v3 request with {}: {}",
+            plugin.manifest.adapter.canonical_identity,
+            redact_sensitive_text(&code),
+            redact_sensitive_text(&message)
+        ))),
+        AdapterResultV3::Proposed { component } => {
+            let trail_environment_adapter_sdk::AdapterOperationV3::Propose {
+                component_root, ..
+            } = &request.operation
+            else {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned a proposal to a non-proposal request",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            };
+            if let Some(proposal) = &component {
+                validate_environment_plugin_v3_proposal(plugin, component_root, proposal)?;
+            }
+            Ok(AdapterResultV3::Proposed { component })
+        }
+        AdapterResultV3::Planned { pipeline } => {
+            let trail_environment_adapter_sdk::AdapterOperationV3::Plan {
+                proposal, files, ..
+            } = &request.operation
+            else {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned a plan to a non-plan request",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            };
+            if pipeline.proposal != **proposal {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` changed the pinned proposal while planning",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            validate_environment_plugin_v3_proposal(
+                plugin,
+                &proposal.component_root,
+                &pipeline.proposal,
+            )?;
+            pipeline.validate_canonical().map_err(|error| {
+                Error::InvalidInput(format!(
+                    "adapter `{}` returned a noncanonical or invalid protocol-v3 pipeline: {error}",
+                    plugin.manifest.adapter.canonical_identity
+                ))
+            })?;
+
+            let mut expected_inputs = files
+                .iter()
+                .map(|pinned| pinned.input.clone())
+                .collect::<Vec<_>>();
+            expected_inputs.sort();
+            if pipeline.inputs != expected_inputs {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` protocol-v3 plan omitted, added, or changed pinned inputs",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            for input in &pipeline.inputs {
+                if normalize_relative_path(&input.path)? != input.path {
+                    return Err(Error::InvalidInput(format!(
+                        "adapter `{}` returned non-normalized input `{}`",
+                        plugin.manifest.adapter.canonical_identity, input.path
+                    )));
+                }
+            }
+            if pipeline.identity.platform != request.host.operating_system
+                || pipeline.identity.architecture != request.host.architecture
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` changed the pinned host identity",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.resolution.is_some() && !capabilities.resolution {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned resolution without package capability",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if !pipeline.source_exports.is_empty() && !capabilities.source_exports {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned source exports without package capability",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.identity.portability_certified
+                && capabilities.certification_ceiling
+                    != trail_environment_adapter_sdk::AdapterCertificationCeiling::PortableArtifact
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` exceeded its package certification ceiling",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.secret_taint == AdapterSecretTaintV3::Clear
+                && (pipeline.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    || pipeline.actions.iter().any(|action| {
+                        action.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    })
+                    || pipeline.resolution.as_ref().is_some_and(|resolution| {
+                        resolution.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    }))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` must conservatively taint a secret-capable protocol-v3 pipeline",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            Ok(AdapterResultV3::Planned { pipeline })
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the staged v3 exchange validator before v3 invocation is enabled"
+    )
+)]
+fn validate_environment_plugin_v3_proposal(
+    plugin: &InstalledEnvironmentPlugin,
+    expected_root: &str,
+    proposal: &trail_environment_adapter_sdk::AdapterComponentProposalV3,
+) -> Result<()> {
+    validate_discovered_plugin_component(
+        plugin,
+        &DiscoveredComponent {
+            component_id: proposal.component_id.clone(),
+            kind: proposal.kind.clone(),
+        },
+    )?;
+    if normalize_plugin_component_root(&proposal.component_root)?
+        != normalize_plugin_component_root(expected_root)?
+        || proposal.proposal_key.trim().is_empty()
+        || contains_sensitive_text(&proposal.proposal_key)
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned an invalid protocol-v3 proposal root or key",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    if proposal.status == AdapterProposalStatusV3::Ready
+        && !proposal.missing_requirements.is_empty()
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned a ready proposal with missing requirements",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    if !strictly_increasing_by(&proposal.missing_requirements, |requirement| {
+        requirement.code.as_str()
+    }) || !strictly_increasing_by(&proposal.recovery_actions, |action| action.code.as_str())
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned duplicate or noncanonical proposal evidence",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the staged v3 proposal validator before v3 invocation is enabled"
+    )
+)]
+fn strictly_increasing_by<'a, T>(values: &'a [T], key: impl Fn(&'a T) -> &'a str) -> bool {
+    values.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
+}
+
 fn validate_plugin_component_id(component_id: &str) -> Result<()> {
     if component_id.is_empty()
         || component_id.len() > 256
@@ -3091,6 +3326,168 @@ mod tests {
         }
     }
 
+    fn valid_v3_exchange() -> (
+        InstalledEnvironmentPlugin,
+        AdapterRequestV3,
+        AdapterResponseV3,
+    ) {
+        use trail_environment_adapter_sdk::{
+            denied_capabilities_v3, AdapterActionLimitsV3, AdapterActionPhaseV3, AdapterActionV3,
+            AdapterCertificationCeiling, AdapterComponentProposalV3, AdapterIdentityContractV3,
+            AdapterInputRoleV3, AdapterInputV3, AdapterOperationV3, AdapterPinnedInputV3,
+            AdapterPipelineV3, AdapterProcessCapabilityV3, AdapterProtocolLimitsV3,
+            AdapterQuarantinePolicyV3, AdapterSourceExportAuthorizationV3,
+            AdapterSourceExportCollisionV3, AdapterSourceExportV3, AdapterValidationKindV3,
+            AdapterValidationV3,
+        };
+
+        let mut plugin = plugin_with_protocols(&[PROTOCOL_V3, PROTOCOL_V2]);
+        plugin.manifest.adapter.capabilities.source_exports = true;
+        plugin.manifest.adapter.capabilities.certification_ceiling =
+            AdapterCertificationCeiling::LocalArtifact;
+        let proposal = AdapterComponentProposalV3 {
+            component_id: "example.generated".into(),
+            component_root: ".".into(),
+            kind: "generated".into(),
+            status: AdapterProposalStatusV3::Ready,
+            proposal_key: "sha256:proposal".into(),
+            missing_requirements: Vec::new(),
+            recovery_actions: Vec::new(),
+        };
+        let inputs = [
+            AdapterPinnedInputV3 {
+                input: AdapterInputV3 {
+                    path: "z.json".into(),
+                    content_hash: "sha256:z".into(),
+                    size_bytes: 2,
+                    executable: false,
+                    role: AdapterInputRoleV3::Identity,
+                    format: "application/json".into(),
+                    required: true,
+                },
+                content: b"{}".to_vec(),
+            },
+            AdapterPinnedInputV3 {
+                input: AdapterInputV3 {
+                    path: "a.json".into(),
+                    content_hash: "sha256:a".into(),
+                    size_bytes: 2,
+                    executable: false,
+                    role: AdapterInputRoleV3::Identity,
+                    format: "application/json".into(),
+                    required: true,
+                },
+                content: b"{}".to_vec(),
+            },
+        ];
+        let request = AdapterRequestV3 {
+            protocol: PROTOCOL_V3.into(),
+            request_id: "request-v3".into(),
+            adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+            distribution_digest: plugin.distribution_digest.clone(),
+            host: AdapterHost {
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+            },
+            source_root: "root:v3".into(),
+            limits: AdapterProtocolLimitsV3::default(),
+            operation: AdapterOperationV3::Plan {
+                proposal: Box::new(proposal.clone()),
+                files: inputs.to_vec(),
+                resolution_snapshot: None,
+                host_evidence: None,
+            },
+        };
+        let mut action_capabilities = denied_capabilities_v3();
+        action_capabilities.process = AdapterProcessCapabilityV3::DeclaredExecutable;
+        let pipeline = AdapterPipelineV3::builder(
+            proposal,
+            AdapterIdentityContractV3 {
+                normalizer_version: "trail-path-v1".into(),
+                source_closure_complete: true,
+                semantic_identities: BTreeMap::new(),
+                target: "host".into(),
+                platform: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                abi: "host".into(),
+                portability: AdapterPortability::Host,
+                portability_certified: false,
+                portability_scope: "workspace".into(),
+                trust_scope: "local_plugin".into(),
+            },
+        )
+        .input(inputs[0].input.clone())
+        .input(inputs[1].input.clone())
+        .action(AdapterActionV3 {
+            name: "construct".into(),
+            phase: AdapterActionPhaseV3::Construct,
+            program: "generator".into(),
+            argv: vec!["build".into()],
+            working_directory: ".".into(),
+            environment: BTreeMap::new(),
+            capabilities: action_capabilities.clone(),
+            limits: AdapterActionLimitsV3 {
+                timeout_ms: 30_000,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                output_entries: 100,
+                output_bytes: 1024 * 1024,
+                child_processes: 0,
+            },
+        })
+        .action(AdapterActionV3 {
+            name: "finalize".into(),
+            phase: AdapterActionPhaseV3::Finalize,
+            program: "generator".into(),
+            argv: vec!["finalize".into()],
+            working_directory: ".".into(),
+            environment: BTreeMap::new(),
+            capabilities: action_capabilities,
+            limits: AdapterActionLimitsV3 {
+                timeout_ms: 30_000,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                output_entries: 100,
+                output_bytes: 1024 * 1024,
+                child_processes: 0,
+            },
+        })
+        .validation(AdapterValidationV3 {
+            name: "path-contract".into(),
+            kind: AdapterValidationKindV3::PathContract,
+            path: "generated".into(),
+            required: true,
+            parameters: BTreeMap::new(),
+        })
+        .output(AdapterOutput::immutable_seed_private(
+            "generated",
+            "generated",
+            ".trail-generated/generated",
+        ))
+        .source_export(AdapterSourceExportV3 {
+            name: "client".into(),
+            output_name: "generated".into(),
+            artifact_subpath: "client".into(),
+            destination: "src/generated".into(),
+            collision: AdapterSourceExportCollisionV3::Fail,
+            required_validation: "path-contract".into(),
+            required_gate: None,
+            authorization: AdapterSourceExportAuthorizationV3::ExplicitUser,
+        })
+        .quarantine_policy(AdapterQuarantinePolicyV3::FailClosed)
+        .stale_reason("source or tool changed")
+        .build()
+        .unwrap();
+        let response = AdapterResponseV3 {
+            protocol: PROTOCOL_V3.into(),
+            request_id: request.request_id.clone(),
+            result: AdapterResultV3::Planned {
+                pipeline: Box::new(pipeline),
+            },
+        };
+        (plugin, request, response)
+    }
+
     #[test]
     fn host_negotiation_falls_back_exactly_until_v3_normalization_is_enabled() {
         assert_eq!(
@@ -3115,6 +3512,106 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("shares no supported protocol")
+        );
+    }
+
+    #[test]
+    fn protocol_v3_host_validation_repeats_bounds_canonical_and_package_checks() {
+        let (plugin, request, response) = valid_v3_exchange();
+        assert!(matches!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, response.clone()).unwrap(),
+            AdapterResultV3::Planned { .. }
+        ));
+
+        let mut noncanonical = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut noncanonical.result else {
+            unreachable!();
+        };
+        pipeline.inputs.reverse();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, noncanonical)
+                .unwrap_err()
+                .to_string()
+                .contains("noncanonical")
+        );
+
+        let mut too_small = request.clone();
+        too_small.limits.max_actions = 1;
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &too_small, response.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("pipeline.actions")
+        );
+
+        let mut underdeclared = plugin.clone();
+        underdeclared.manifest.adapter.capabilities.source_exports = false;
+        assert!(validate_environment_plugin_v3_exchange(
+            &underdeclared,
+            &request,
+            response.clone()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("without package capability"));
+
+        let mut duplicate = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut duplicate.result else {
+            unreachable!();
+        };
+        pipeline.actions.push(pipeline.actions[0].clone());
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("repeats")
+        );
+
+        let mut invalid_request = request.clone();
+        let trail_environment_adapter_sdk::AdapterOperationV3::Plan { files, .. } =
+            &mut invalid_request.operation
+        else {
+            unreachable!();
+        };
+        files[0].input.path = "src/../escape".into();
+        let mut invalid_path = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut invalid_path.result else {
+            unreachable!();
+        };
+        pipeline.inputs[1].path = "src/../escape".into();
+        pipeline.inputs.sort();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &invalid_request, invalid_path)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid relative path")
+        );
+
+        let mut invalid_phase = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut invalid_phase.result else {
+            unreachable!();
+        };
+        pipeline.actions[0].phase =
+            trail_environment_adapter_sdk::AdapterActionPhaseV3::MountedInitialization;
+        pipeline.actions.sort_by(|left, right| {
+            left.phase
+                .cmp(&right.phase)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, invalid_phase)
+                .unwrap_err()
+                .to_string()
+                .contains("mounted initialization")
+        );
+
+        let mut mismatched = request;
+        mismatched.distribution_digest = "sha256:wrong".into();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &mismatched, response)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol/package/request mismatch")
         );
     }
 

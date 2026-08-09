@@ -649,6 +649,33 @@ impl AdapterPipelineV3 {
     ) -> AdapterPipelineV3Builder {
         AdapterPipelineV3Builder::new(proposal, identity)
     }
+
+    /// Rebuild this untrusted wire value through the validating builder and
+    /// require byte-semantic canonical equality. Hosts call this even when an
+    /// adapter used the SDK because a plugin may serialize arbitrary values.
+    pub fn validate_canonical(&self) -> Result<(), AdapterPipelineV3BuildError> {
+        let rebuilt = AdapterPipelineV3Builder {
+            proposal: self.proposal.clone(),
+            dependencies: self.dependencies.clone(),
+            inputs: self.inputs.clone(),
+            resolution: self.resolution.clone(),
+            actions: self.actions.clone(),
+            validations: self.validations.clone(),
+            capabilities: self.capabilities.clone(),
+            identity: self.identity.clone(),
+            outputs: self.outputs.clone(),
+            source_exports: self.source_exports.clone(),
+            attestation: self.attestation.clone(),
+            secret_taint: self.secret_taint,
+            quarantine_policy: self.quarantine_policy,
+            stale_reason: Some(self.stale_reason.clone()),
+        }
+        .build()?;
+        if rebuilt != *self {
+            return Err(AdapterPipelineV3BuildError::NonCanonical);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -755,6 +782,29 @@ impl AdapterPipelineV3Builder {
     }
 
     pub fn build(mut self) -> Result<AdapterPipelineV3, AdapterPipelineV3BuildError> {
+        self.proposal
+            .missing_requirements
+            .sort_by(|left, right| left.code.cmp(&right.code));
+        reject_duplicate_by(
+            &self.proposal.missing_requirements,
+            "proposal.missing_requirements",
+            |requirement| requirement.code.as_str(),
+        )?;
+        self.proposal
+            .recovery_actions
+            .sort_by(|left, right| left.code.cmp(&right.code));
+        reject_duplicate_by(
+            &self.proposal.recovery_actions,
+            "proposal.recovery_actions",
+            |action| action.code.as_str(),
+        )?;
+        if self.proposal.status == AdapterProposalStatusV3::Ready
+            && !self.proposal.missing_requirements.is_empty()
+        {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "a ready proposal cannot retain missing requirements",
+            ));
+        }
         if matches!(
             self.proposal.status,
             AdapterProposalStatusV3::Blocked
@@ -999,6 +1049,8 @@ pub enum AdapterPipelineV3BuildError {
     UnsafeCommand { field: &'static str },
     #[error("protocol-v3 pipeline has an invalid combination: {0}")]
     InvalidCombination(&'static str),
+    #[error("protocol-v3 pipeline collections are not in canonical order")]
+    NonCanonical,
     #[error(transparent)]
     Bounds(#[from] AdapterProtocolV3BoundsError),
 }
@@ -1996,6 +2048,13 @@ mod tests {
             .unwrap();
         assert_eq!(pipeline.dependencies[0].component_id, "a-compiler");
         assert_eq!(pipeline.inputs[0].path, "schema.json");
+        pipeline.validate_canonical().unwrap();
+        let mut noncanonical = pipeline.clone();
+        noncanonical.inputs.reverse();
+        assert_eq!(
+            noncanonical.validate_canonical(),
+            Err(AdapterPipelineV3BuildError::NonCanonical)
+        );
 
         let secret_export = AdapterPipelineV3::builder(proposal(), identity())
             .input(input())
@@ -2088,5 +2147,36 @@ mod tests {
             serde_cbor::from_slice(&serde_cbor::to_vec(&projection).unwrap()).unwrap();
         assert_eq!(decoded, projection);
         assert!(decoded.v3_only.is_absent());
+    }
+
+    #[test]
+    fn v3_wire_rejects_unknown_required_fields_and_enum_values() {
+        #[derive(Serialize)]
+        struct InputWithUnknownField {
+            path: String,
+            content_hash: String,
+            size_bytes: u64,
+            executable: bool,
+            role: AdapterInputRoleV3,
+            format: String,
+            required: bool,
+            future_required_authority: bool,
+        }
+        let encoded = serde_cbor::to_vec(&InputWithUnknownField {
+            path: "input.txt".into(),
+            content_hash: "sha256:input".into(),
+            size_bytes: 1,
+            executable: false,
+            role: AdapterInputRoleV3::Identity,
+            format: "bytes".into(),
+            required: true,
+            future_required_authority: true,
+        })
+        .unwrap();
+        assert!(serde_cbor::from_slice::<AdapterInputV3>(&encoded).is_err());
+        assert!(serde_cbor::from_slice::<AdapterActionPhaseV3>(
+            &serde_cbor::to_vec(&"future_phase").unwrap()
+        )
+        .is_err());
     }
 }

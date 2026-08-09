@@ -1037,6 +1037,15 @@ plus a certification ceiling; omission is deny-all legacy behavior. These declar
 are maximum requests, not grants: package trust, host policy, protocol selection, and
 native enforcement may only narrow them.
 
+Trail's v3 exchange validator does not trust builder use. It rechecks request and
+response ceilings, exact protocol/request/package/source/host pins, canonical proposal
+evidence, complete typed-input equality, normalized paths, duplicate component/action/
+validation/output/export identities, graph and phase/output compatibility, conservative
+secret taint, package resolution/export/evidence declarations, and certification
+ceiling. Unknown required fields and enum values fail CBOR decoding. Multi-version
+packages continue negotiating v2 until the v3 invocation/normalization path is enabled,
+so merely installing a v3 declaration cannot bypass this validator.
+
 The planner capability set is deliberately fixed rather than open-ended: bounded pinned
 bytes in, discovery or plan data out, no direct repository reads or writes, no child
 process, no network, no shell, no secrets, no database, and no mount/publication
