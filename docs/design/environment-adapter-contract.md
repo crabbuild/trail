@@ -1129,6 +1129,13 @@ The following mappings show how one policy vocabulary fits very different toolch
 Next.js and Vite are profiles composed over the Node adapter. They do not duplicate
 package installation logic.
 
+The executable conformance fixture represents Next.js state as a writable-private
+component depending on `node`. Vite is split into an immutable validated `dist`
+component and an independently keyed writable-private optimizer-cache component, both
+depending on `node`. Splitting outputs with different lifecycles avoids relabeling a
+path-bound cache as reusable merely because a sibling build output is portable. These
+are repository-v2 compositions, not framework names or new COW modes in Trail core.
+
 ### Rust and Cargo
 
 | Concern | Inputs | Policy/binding |

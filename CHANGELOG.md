@@ -7,6 +7,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- `trail.environment/v2` framework fixtures now compose Next.js and Vite build/state
+  components over the Node dependency component: `.next` and `.vite` remain lane-private,
+  while validated Vite `dist` content can use an independently keyed immutable layer.
 - Manifest-only Node components can now resolve manager-specific npm, pnpm, Yarn, or
   Bun lock snapshots into Trail metadata, then reuse the existing frozen-install
   dependency seed and performance-only content cache with lane-private COW writes.

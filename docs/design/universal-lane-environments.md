@@ -593,6 +593,12 @@ replacement. All managers converge on a frozen dependency seed plus a performanc
 download cache and lane-private COW upper; Trail core does not gain manager-specific
 workspace or storage modes.
 
+Framework composition follows the same rule. The repository-v2 Next fixture binds
+`.next` as writable-private state over a typed Node dependency. Vite uses separate
+components for lane-private `.vite` optimizer state and a validated immutable `dist`
+artifact. Separating those lifecycles prevents a portable build output from granting
+reuse to a path-bound cache, without adding Next.js or Vite branches to Trail core.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own

@@ -688,6 +688,12 @@ snapshot projection. The snapshot stays outside source and Git; the resulting
 same as for a tracked lockfile. Until a narrower package input closure is certified, the
 managed snapshot is pinned to the complete source root.
 
+The repository-v2 framework fixture composes Next.js and Vite over that Node component.
+Next owns lane-private `.next`; Vite splits lane-private `.vite` optimizer state from a
+separately validated immutable `dist` component. Every framework component has a typed
+`build_requires` edge to Node, so dependency resolution and `node_modules` COW remain
+centralized while each generated path follows its own reuse and disposal policy.
+
 ### Cargo adapter
 
 Cargo needs a different strategy because `target` mixes reusable compiler

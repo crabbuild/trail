@@ -3163,6 +3163,192 @@ validation = "path-contract"
     }
 
     #[test]
+    fn next_and_vite_v2_components_compose_over_node_with_private_framework_state() {
+        if !Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"framework-composition","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("package-lock.json"),
+            r#"{"name":"framework-composition","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"framework-composition","version":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        fs::write(workspace.path().join("next-source.js"), "next fixture\n").unwrap();
+        fs::write(workspace.path().join("vite-source.js"), "vite fixture\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "web.next-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "next-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "next-state", source = "next-output", target = ".next", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "next-source.js", "next-output/server.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "web.vite-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [
+  { name = "dist", source = "dist", target = "dist", policy = "immutable_shared", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }
+]
+[component.build]
+command = ["cp", "vite-source.js", "dist/app.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dist-path-contract"
+kind = "path_contract"
+path = "dist"
+required = true
+parameters = { maximum_entries = "1000" }
+
+[[component]]
+id = "web.vite-cache"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "vite-cache", source = "vite-cache", target = ".vite", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "vite-source.js", "vite-cache/metadata.json"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+"#,
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        for lane in ["framework-one", "framework-two"] {
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                lane,
+                Some("main"),
+                mode.clone(),
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        }
+
+        let graph = db
+            .workspace_environment_graph("framework-one", None)
+            .unwrap();
+        assert_eq!(graph.nodes.len(), 4);
+        assert_eq!(graph.edges.len(), 3);
+        assert!(graph.edges.iter().all(|edge| {
+            edge.source_component_id == "node" && edge.edge_type == "build_requires"
+        }));
+
+        let first = db
+            .sync_all_workspace_environments("framework-one", None)
+            .unwrap();
+        let second = db
+            .sync_all_workspace_environments("framework-two", None)
+            .unwrap();
+        assert_eq!(first.generation.components.len(), 4);
+        assert_eq!(second.generation.components.len(), 4);
+        let next = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.next-build")
+            .unwrap();
+        assert_eq!(
+            next.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert!(next.outputs[0].layer_id.is_none());
+        let vite = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.vite-build")
+            .unwrap();
+        assert_eq!(vite.outputs.len(), 1);
+        assert_eq!(
+            vite.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableShared
+        );
+        assert!(vite.outputs[0].layer_id.is_some());
+        let vite_cache = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.vite-cache")
+            .unwrap();
+        assert_eq!(
+            vite_cache.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert!(vite_cache.outputs[0].layer_id.is_none());
+
+        let first_view = db.lane_workspace_view("framework-one").unwrap().unwrap();
+        let second_view = db.lane_workspace_view("framework-two").unwrap().unwrap();
+        let first_generated = Path::new(&first_view.generated_upper);
+        let second_generated = Path::new(&second_view.generated_upper);
+        fs::write(first_generated.join(".next/lane.txt"), "one\n").unwrap();
+        fs::write(second_generated.join(".next/lane.txt"), "two\n").unwrap();
+        fs::write(first_generated.join(".vite/cache.txt"), "one\n").unwrap();
+        fs::write(second_generated.join(".vite/cache.txt"), "two\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(first_generated.join(".next/lane.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second_generated.join(".next/lane.txt")).unwrap(),
+            "two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(first_generated.join(".vite/cache.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second_generated.join(".vite/cache.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[test]
     fn v2_pipeline_sections_reject_unknown_fields_and_v1_cannot_opt_in_implicitly() {
         for (schema, extra, expected) in [
             (
