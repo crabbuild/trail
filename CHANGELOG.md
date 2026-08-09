@@ -67,6 +67,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Repository environment parsing now recognizes an explicit `trail.environment/v2`
   header without changing v1 command semantics, and rejects mixed schema versions across
   one local include/profile graph.
+- Version-2 repository documents now retain typed resolver, action-phase, validation,
+  capability, heterogeneous-output, and source-export declarations with strict nested
+  unknown-field rejection; v1 documents cannot opt into those fields implicitly.
 
 ### Changed
 

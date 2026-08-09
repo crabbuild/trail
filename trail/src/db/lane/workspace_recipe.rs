@@ -97,6 +97,8 @@ struct RecipeEnvironment {
     name: Option<String>,
     default_network: String,
     default_scripts: String,
+    #[serde(default)]
+    missing_resolution: Option<String>,
 }
 
 impl Default for RecipeEnvironment {
@@ -105,6 +107,7 @@ impl Default for RecipeEnvironment {
             name: None,
             default_network: "deny".to_string(),
             default_scripts: "deny".to_string(),
+            missing_resolution: None,
         }
     }
 }
@@ -131,6 +134,16 @@ struct RecipeComponentDefinition {
     outputs: Vec<RecipeOutput>,
     #[serde(default)]
     build: Option<RecipeBuild>,
+    #[serde(default, rename = "resolve")]
+    resolution: Option<RecipeResolution>,
+    #[serde(default, rename = "action")]
+    actions: Vec<RecipeAction>,
+    #[serde(default, rename = "validation")]
+    validations: Vec<RecipeValidation>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+    #[serde(default, rename = "source_export")]
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -153,6 +166,16 @@ struct RecipeProfile {
     outputs: Vec<RecipeOutput>,
     #[serde(default)]
     build: Option<RecipeBuild>,
+    #[serde(default, rename = "resolve")]
+    resolution: Option<RecipeResolution>,
+    #[serde(default, rename = "action")]
+    actions: Vec<RecipeAction>,
+    #[serde(default, rename = "validation")]
+    validations: Vec<RecipeValidation>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+    #[serde(default, rename = "source_export")]
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +187,11 @@ struct RecipeFragment {
     inputs: Vec<RecipeInput>,
     outputs: Vec<RecipeOutput>,
     build: Option<RecipeBuild>,
+    resolution: Option<RecipeResolution>,
+    actions: Vec<RecipeAction>,
+    validations: Vec<RecipeValidation>,
+    capabilities: Option<RecipeCapabilities>,
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +220,11 @@ struct RecipeComponent {
     inputs: Vec<RecipeInput>,
     outputs: Vec<RecipeOutput>,
     build: RecipeBuild,
+    resolution: Option<RecipeResolution>,
+    actions: Vec<RecipeAction>,
+    validations: Vec<RecipeValidation>,
+    capabilities: Option<RecipeCapabilities>,
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -249,6 +282,115 @@ struct RecipeBuild {
     environment: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeResolution {
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    network: Option<RecipeNetwork>,
+    snapshot: String,
+    format: String,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RecipeNetwork {
+    Policy(String),
+    Authorities(RecipeNetworkAuthorities),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeNetworkAuthorities {
+    authorities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RecipeActionPhase {
+    Construct,
+    Validate,
+    MountedExecution,
+    SourceExport,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeAction {
+    #[serde(default)]
+    name: Option<String>,
+    phase: RecipeActionPhase,
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    network: Option<RecipeNetwork>,
+    #[serde(default)]
+    scripts: Option<String>,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeValidation {
+    #[serde(default)]
+    name: Option<String>,
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeCapabilities {
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    filesystem_read: Option<String>,
+    #[serde(default)]
+    filesystem_write: Option<String>,
+    #[serde(default)]
+    process: Option<String>,
+    #[serde(default)]
+    child_processes: Option<u32>,
+    #[serde(default)]
+    secrets: Option<String>,
+    #[serde(default)]
+    publication: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeSourceExport {
+    from_output: String,
+    source: String,
+    target: String,
+    mode: String,
+    #[serde(default = "default_fail_collision")]
+    collision: String,
+    #[serde(default)]
+    validation: Option<String>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
 fn default_recipe_kind() -> String {
     "generated".to_string()
 }
@@ -263,6 +405,14 @@ fn default_bytes_format() -> String {
 
 fn default_host_portability() -> String {
     "host".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fail_collision() -> String {
+    "fail".to_string()
 }
 
 impl Trail {
@@ -1007,6 +1157,18 @@ fn validate_recipe_specification_header(
     path: &str,
 ) -> Result<RecipeSchemaVersion> {
     let schema = RecipeSchemaVersion::parse(&specification.schema, path)?;
+    if schema == RecipeSchemaVersion::V1
+        && (specification.environment.missing_resolution.is_some()
+            || specification.profile.values().any(recipe_profile_uses_v2)
+            || specification
+                .components
+                .iter()
+                .any(recipe_component_definition_uses_v2))
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment specification `{path}` uses fields that require `{RECIPE_SCHEMA_V2}`"
+        )));
+    }
     if specification.environment.default_network != "deny"
         || specification.environment.default_scripts != "deny"
     {
@@ -1016,6 +1178,22 @@ fn validate_recipe_specification_header(
     }
     let _environment_name = specification.environment.name.as_deref();
     Ok(schema)
+}
+
+fn recipe_profile_uses_v2(profile: &RecipeProfile) -> bool {
+    profile.resolution.is_some()
+        || !profile.actions.is_empty()
+        || !profile.validations.is_empty()
+        || profile.capabilities.is_some()
+        || !profile.source_exports.is_empty()
+}
+
+fn recipe_component_definition_uses_v2(component: &RecipeComponentDefinition) -> bool {
+    component.resolution.is_some()
+        || !component.actions.is_empty()
+        || !component.validations.is_empty()
+        || component.capabilities.is_some()
+        || !component.source_exports.is_empty()
 }
 
 fn resolve_recipe_include_path(including_path: &str, include: &str) -> Result<String> {
@@ -1071,6 +1249,11 @@ fn recipe_profile_fragment(profile: &RecipeProfile) -> RecipeFragment {
         inputs: profile.inputs.clone(),
         outputs: profile.outputs.clone(),
         build: profile.build.clone(),
+        resolution: profile.resolution.clone(),
+        actions: profile.actions.clone(),
+        validations: profile.validations.clone(),
+        capabilities: profile.capabilities.clone(),
+        source_exports: profile.source_exports.clone(),
     }
 }
 
@@ -1090,6 +1273,15 @@ fn apply_recipe_fragment(target: &mut RecipeFragment, source: &RecipeFragment) {
     if source.build.is_some() {
         target.build.clone_from(&source.build);
     }
+    if source.resolution.is_some() {
+        target.resolution.clone_from(&source.resolution);
+    }
+    target.actions.extend(source.actions.clone());
+    target.validations.extend(source.validations.clone());
+    if source.capabilities.is_some() {
+        target.capabilities.clone_from(&source.capabilities);
+    }
+    target.source_exports.extend(source.source_exports.clone());
 }
 
 fn resolve_recipe_profile(
@@ -1167,6 +1359,11 @@ fn resolve_recipe_component(
             inputs: definition.inputs,
             outputs: definition.outputs,
             build: definition.build,
+            resolution: definition.resolution,
+            actions: definition.actions,
+            validations: definition.validations,
+            capabilities: definition.capabilities,
+            source_exports: definition.source_exports,
         },
     );
     let adapter = fragment.adapter.ok_or_else(|| {
@@ -1183,6 +1380,11 @@ fn resolve_recipe_component(
     })?;
     let mut inputs = fragment.inputs;
     let mut outputs = fragment.outputs;
+    let mut resolution = fragment.resolution;
+    let mut actions = fragment.actions;
+    let mut validations = fragment.validations;
+    let capabilities = fragment.capabilities;
+    let mut source_exports = fragment.source_exports;
     let mut dependencies = fragment.dependencies;
     let edges = fragment.edges;
     let mut seen_dependencies = BTreeSet::new();
@@ -1247,6 +1449,41 @@ fn resolve_recipe_component(
     for value in build.environment.values_mut() {
         *value = expand_recipe_root_template(value, &root);
     }
+    if let Some(resolution) = &mut resolution {
+        for argument in &mut resolution.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+        if let Some(cwd) = &mut resolution.cwd {
+            *cwd = expand_recipe_root_template(cwd, &root);
+        }
+        resolution.snapshot = expand_recipe_root_template(&resolution.snapshot, &root);
+        for value in resolution.environment.values_mut() {
+            *value = expand_recipe_root_template(value, &root);
+        }
+    }
+    for action in &mut actions {
+        for argument in &mut action.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+        if let Some(cwd) = &mut action.cwd {
+            *cwd = expand_recipe_root_template(cwd, &root);
+        }
+        for value in action.environment.values_mut() {
+            *value = expand_recipe_root_template(value, &root);
+        }
+    }
+    for validation in &mut validations {
+        if let Some(path) = &mut validation.path {
+            *path = expand_recipe_root_template(path, &root);
+        }
+        for argument in &mut validation.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+    }
+    for export in &mut source_exports {
+        export.source = expand_recipe_root_template(&export.source, &root);
+        export.target = expand_recipe_root_template(&export.target, &root);
+    }
     let mut seen_inputs = BTreeSet::new();
     inputs.retain(|input| {
         seen_inputs.insert((
@@ -1267,6 +1504,11 @@ fn resolve_recipe_component(
             inputs,
             outputs,
             build,
+            resolution,
+            actions,
+            validations,
+            capabilities,
+            source_exports,
         },
         versions,
     ))
@@ -1647,6 +1889,158 @@ portability = "host"
         );
         assert_eq!(plan.outputs[0].mount_path, ".trail-generated/copy");
         assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn v2_schema_parses_typed_pipeline_sections_and_heterogeneous_outputs() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+missing_resolution = "explicit"
+
+[[component]]
+id = "custom.pipeline"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+cwd = "."
+
+[component.resolve]
+command = ["tool", "resolve", "--snapshot", "generated.lock"]
+cwd = "."
+network = { authorities = ["registry.example:443"] }
+snapshot = "generated.lock"
+format = "application/vnd.example.lock+json"
+
+[component.resolve.capabilities]
+network = "exact_authorities"
+filesystem_write = "isolated_candidate"
+process = "declared_executable"
+child_processes = 4
+secrets = "opaque_handles"
+publication = "deny"
+
+[[component.action]]
+name = "construct"
+phase = "construct"
+command = ["tool", "build", "--offline"]
+cwd = "."
+network = "deny"
+
+[[component.action]]
+name = "load-check"
+phase = "validate"
+command = ["tool", "check", "generated/result.txt"]
+
+[[component.validation]]
+name = "path-contract"
+kind = "path_contract"
+path = "generated"
+required = true
+parameters = { maximum_entries = "1000" }
+
+[component.capabilities]
+network = "deny"
+filesystem_read = "declared_inputs"
+filesystem_write = "isolated_candidate"
+process = "declared_executable"
+child_processes = 1
+secrets = "deny"
+publication = "deny"
+
+[[component.output]]
+name = "seed"
+source = "generated"
+target = ".trail-generated/seed"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+
+[[component.output]]
+name = "scratch"
+source = "scratch"
+target = ".trail-generated/scratch"
+policy = "disposable"
+reuse = "none"
+scope = "lane"
+publish = "never"
+
+[[component.source_export]]
+from_output = "seed"
+source = "generated-client"
+target = "src/generated-client"
+mode = "explicit"
+collision = "fail"
+validation = "path-contract"
+"#;
+        let (_workspace, db) = open_recipe_graph(specification);
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        let component = &recipes[0].component;
+
+        assert_eq!(
+            component.resolution.as_ref().unwrap().snapshot,
+            "generated.lock"
+        );
+        assert_eq!(component.actions.len(), 2);
+        assert_eq!(component.actions[0].phase, RecipeActionPhase::Construct);
+        assert_eq!(component.actions[1].phase, RecipeActionPhase::Validate);
+        assert_eq!(component.validations.len(), 1);
+        assert_eq!(component.outputs.len(), 2);
+        assert_eq!(
+            component.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableSeedPrivate
+        );
+        assert_eq!(
+            component.outputs[1].policy,
+            EnvironmentOutputPolicy::Disposable
+        );
+        assert_eq!(
+            component.capabilities.as_ref().unwrap().child_processes,
+            Some(1)
+        );
+        assert_eq!(component.source_exports.len(), 1);
+        assert_eq!(component.source_exports[0].target, "src/generated-client");
+    }
+
+    #[test]
+    fn v2_pipeline_sections_reject_unknown_fields_and_v1_cannot_opt_in_implicitly() {
+        for (schema, extra, expected) in [
+            (
+                RECIPE_SCHEMA_V2,
+                "[[component.action]]\nphase = \"construct\"\ncommand = [\"tool\"]\nshell = true\n",
+                "unknown field",
+            ),
+            (
+                RECIPE_SCHEMA_V1,
+                "[[component.action]]\nphase = \"construct\"\ncommand = [\"tool\"]\n",
+                RECIPE_SCHEMA_V2,
+            ),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("input.txt"), "strict\n").unwrap();
+            fs::write(
+                workspace.path().join("trail.environment.toml"),
+                format!(
+                    "schema = {schema:?}\n[[component]]\nid = \"strict\"\nadapter = \"trail/command@1\"\ninputs = [{{ path = \"input.txt\" }}]\noutputs = [{{ source = \"generated\", target = \"generated\" }}]\n[component.build]\ncommand = [\"tool\"]\n{extra}"
+                ),
+            )
+            .unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+            let error = db.load_command_recipes(&source_root).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected strict-v2 parser error: {error}"
+            );
+        }
     }
 
     #[test]

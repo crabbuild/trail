@@ -71,7 +71,7 @@
 ## 8. trail.environment/v2 and Source Export
 
 - [x] 8.1 Extend the existing repository parser with explicit `trail.environment/v2` while preserving exact v1 paths, includes/profiles, defaults, validation, and errors
-- [ ] 8.2 Add v2 resolution, multiple typed action phases, validations, capability declarations, heterogeneous outputs, and source-export sections with strict unknown-field rejection
+- [x] 8.2 Add v2 resolution, multiple typed action phases, validations, capability declarations, heterogeneous outputs, and source-export sections with strict unknown-field rejection
 - [ ] 8.3 Compile v2 documents to the same proposal, resolution, graph, desired-key, output, and report models used by built-in and plugin adapters
 - [ ] 8.4 Preserve fixed argv and bounded deterministic input expansion; reject shell interpolation, control flow, absolute host paths, forbidden child execution, raw secrets, provider sockets, and over-broad reuse
 - [ ] 8.5 Implement source-export planning with artifact/subtree identity, destination, collision mode, validation/gate, source pin, and explicit authorization

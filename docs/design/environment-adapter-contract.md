@@ -207,8 +207,15 @@ recognize both `trail.environment/v1` and the explicitly opted-in
 `trail.environment/v2` header. Version 1 retains its existing paths, defaults,
 includes/profiles, validation, and normalized identity. Every file in one include graph
 must declare the same version. The v2 header initially accepts the existing restricted
-command shape; v2-only phases and exports are added as typed fields rather than inferred
-from v1 documents.
+command shape and adds strictly typed `component.resolve`, repeated `component.action`,
+repeated `component.validation`, `component.capabilities`, heterogeneous
+`component.output`, and repeated `component.source_export` sections. Resolver and action
+commands remain argv arrays. Network authority lists, candidate snapshot format/path,
+phase names, capability requests, validation requirements, output policies, and export
+collision intent are represented as separate fields. Unknown fields fail deserialization,
+and a v1 document cannot gain any of these authorities by spelling a v2-only section.
+Compilation and execution still pass through the host-owned normalized models and
+capability checks; parsing a declaration never grants authority by itself.
 
 ### Add a repository adapter without Rust
 
