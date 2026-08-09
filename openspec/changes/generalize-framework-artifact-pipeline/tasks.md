@@ -60,7 +60,7 @@
 ## 7. Validation, Nondeterminism, Trust, Secrets, and Attestations
 
 - [x] 7.1 Add typed structural, loadability, framework, policy, gate, and reproducibility validation declarations and deterministic receipts
-- [ ] 7.2 Implement required host sealing checks for producer termination, unchanged pins, path containment, safe content, limits, secret policy, complete tree identity, validations, and producer trust
+- [x] 7.2 Implement required host sealing checks for producer termination, unchanged pins, path containment, safe content, limits, secret policy, complete tree identity, validations, and producer trust
 - [x] 7.3 Detect differing tree roots for one `(trust_scope, desired_key)`, create durable quarantine/holds, block shared attachment, and retain bounded comparison provenance
 - [x] 7.4 Implement explicit quarantine list/show/resolve operations and policy-controlled lane-private fallback without relabeling candidates or clearing evidence implicitly
 - [ ] 7.5 Define and enforce phase-specific capability ceilings for reviewed built-ins, certified signed plugins, locally trusted plugins, and repository declarations

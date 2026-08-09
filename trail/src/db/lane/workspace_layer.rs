@@ -1996,6 +1996,47 @@ impl Trail {
         Ok(())
     }
 
+    fn verify_artifact_construction_seal_fence(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        desired_key: &str,
+        source_root: &ObjectId,
+    ) -> Result<()> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let matched = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM artifact_construction_attempts
+                 WHERE attempt_id=?1 AND desired_key=?2 AND source_root=?3
+                   AND owner_generation=?4 AND owner_pid=?5 AND owner_start_token=?6
+                   AND phase='validating' AND status='running' AND cancel_requested=0",
+                params![
+                    attempt.attempt_id,
+                    desired_key,
+                    source_root.0,
+                    i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                        "artifact construction generation exceeds SQLite range".into()
+                    ))?,
+                    i64::from(attempt.owner_pid),
+                    attempt.owner_start_token,
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !matched {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` changed its source, desired key, owner, phase, or cancellation pin before sealing",
+                attempt.attempt_id
+            )));
+        }
+        let _: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, source_root)?;
+        Ok(())
+    }
+
     /// Terminalize construction attempts whose exact process owner is proven
     /// dead and remove only staging/lock paths derived from that fenced owner.
     /// This is called by workspace-open recovery while the workspace write
@@ -2306,6 +2347,17 @@ impl Trail {
             )?;
             return Err(error);
         }
+        if let Err(error) =
+            self.verify_artifact_construction_seal_fence(&attempt, &cache_key, source_root)
+        {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("seal_pin_changed"),
+                Some("artifact construction pins changed before sealing"),
+            )?;
+            return Err(error);
+        }
         // Different ready DAG nodes may finish their external builds at the
         // same time.  Publication is intentionally serialized by the
         // workspace lock, so a builder waits for that short commit boundary
@@ -2425,18 +2477,25 @@ impl Trail {
             let (artifact_tree_id, artifact_tree) =
                 self.ingest_artifact_tree_under_write_lock(&staging)?;
             test_crash_point("layer_after_cas_tree");
+            let stable_entries = scan_layer_entries(&staging, false)?;
+            if stable_entries != validated_entries {
+                return Err(Error::InvalidInput(
+                    "workspace layer candidate changed while Trail was sealing its content".into(),
+                ));
+            }
             verify_artifact_shadow_matches_layer_entries(
                 &artifact_tree,
                 &self.artifact_tree_flat_entries(&artifact_tree_id)?,
-                &validated_entries,
+                &stable_entries,
             )?;
+            let entries = scan_layer_entries(&staging, true)?;
+            sync_layer_tree(&staging)?;
             let artifact_envelope_id = self.put_legacy_artifact_envelope_under_write_lock(
                 key,
                 &cache_key,
                 artifact_tree_id.clone(),
             )?;
             test_crash_point("layer_after_envelope_ready");
-            let entries = scan_layer_entries(&staging, true)?;
             let logical_bytes = entries.values().map(|entry| entry.size_bytes).sum();
             let entry_count = entries.len() as u64;
             let mut entry_pages = Vec::new();
@@ -7770,6 +7829,83 @@ mod tests {
     }
 
     #[test]
+    fn host_sealing_precedes_ready_workspace_layer_envelopes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(built.path().join("pkg/index.js"), "sealed\n").unwrap();
+
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let (tree_id, envelope_id) = db
+            .conn
+            .query_row(
+                "SELECT tree_root_id,envelope_id
+                 FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer.layer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let tree_id = ArtifactTreeId::parse(tree_id).unwrap();
+        let envelope_id = crate::ids::ArtifactEnvelopeId::parse(envelope_id).unwrap();
+        let envelope = db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
+        assert_eq!(envelope.validation_receipt_ids.len(), 2);
+        let receipts = envelope
+            .validation_receipt_ids
+            .iter()
+            .map(|receipt_id| db.artifact_validation_receipt(receipt_id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(receipts.iter().any(|receipt| {
+            receipt.declaration.name == "trail.host.workspace-layer.structural-seal/v1"
+                && receipt.declaration.kind == ArtifactValidationKindV1::Structural
+                && receipt
+                    .evidence
+                    .get("complete_tree_identity")
+                    .map(String::as_str)
+                    == Some("passed")
+        }));
+        assert!(receipts.iter().any(|receipt| {
+            receipt.declaration.name == "trail.host.workspace-layer.policy-seal/v1"
+                && receipt.declaration.kind == ArtifactValidationKindV1::Policy
+                && receipt
+                    .evidence
+                    .get("producer_termination")
+                    .map(String::as_str)
+                    == Some("terminated_or_disconnected")
+                && receipt.evidence.get("desired_pins").map(String::as_str) == Some("unchanged")
+                && receipt.evidence.get("producer_trust").map(String::as_str)
+                    == Some("local_host_authorized")
+        }));
+
+        let mut missing_required_seals = envelope.clone();
+        missing_required_seals.validation_receipt_ids.clear();
+        assert!(db
+            .put_artifact_envelope_under_write_lock(missing_required_seals)
+            .unwrap_err()
+            .to_string()
+            .contains("missing required host"));
+
+        let mut stale_receipt = receipts
+            .into_iter()
+            .find(|receipt| receipt.declaration.name == "trail.host.workspace-layer.policy-seal/v1")
+            .unwrap();
+        stale_receipt
+            .evidence
+            .insert("producer_trust".into(), "untrusted".into());
+        assert!(db
+            .put_artifact_validation_receipt(stale_receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("stale input digest"));
+    }
+
+    #[test]
     fn two_views_share_one_layer_but_copy_writes_to_private_generated_uppers() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("README.md"), "root\n").unwrap();
@@ -8406,6 +8542,24 @@ mod tests {
             .advance_artifact_construction_attempt(&stale_fence, "building")
             .unwrap_err();
         assert!(error.to_string().contains("lost its exact owner fence"));
+        db.advance_artifact_construction_attempt(&attempt, "building")
+            .unwrap();
+        db.advance_artifact_construction_attempt(&attempt, "validating")
+            .unwrap();
+        db.verify_artifact_construction_seal_fence(&attempt, "exact-fence-test", &source_root)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE artifact_construction_attempts SET desired_key='changed-pin'
+                 WHERE attempt_id=?1",
+                params![attempt.attempt_id],
+            )
+            .unwrap();
+        assert!(db
+            .verify_artifact_construction_seal_fence(&attempt, "exact-fence-test", &source_root,)
+            .unwrap_err()
+            .to_string()
+            .contains("changed its source, desired key"));
         db.finish_artifact_construction_attempt(
             &attempt,
             "abandoned",

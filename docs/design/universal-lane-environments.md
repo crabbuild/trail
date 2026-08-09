@@ -613,6 +613,23 @@ content sealing, and manifest validation, while activation also requires a lane
 transaction. The bounded component-DAG scheduler remains independent of per-key
 singleflight, so unrelated ready components can build concurrently.
 
+The host seal is taken only after the synchronous producer returns and the output has
+been copied into an attempt-owned staging tree that the producer does not control. Trail
+then revalidates the exact construction owner, source root, desired key, phase, and
+cancellation fence; enforces configured byte quotas; validates normalized contained
+paths, regular file metadata, confined links, and secret policy; ingests the complete
+bounded tree into CAS; and rescans the staging tree to reject mutation during sealing.
+Only after the staged tree is immutable and agrees with its CAS manifest does Trail
+publish the ready envelope.
+
+Every compatibility workspace-layer envelope carries two required deterministic host
+receipts. The structural seal records path/content/limit/secret/tree checks; the policy
+seal records producer termination or disconnection, unchanged desired pins, and local
+host authorization. Both receipts are bound to the exact desired identity and tree,
+and attachment rejects missing, duplicate, failed, stale-digest, or mismatched evidence.
+Package-specific trust and revocation remain additional attachment requirements rather
+than being inferred from content safety.
+
 Garbage collection considers active generations, retained predecessors, checkpoints,
 running operations, open backend references, and leases. Logical and physical byte
 accounting are reported separately so shared-space savings remain visible.

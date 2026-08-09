@@ -254,6 +254,11 @@ Garbage collection works from reachability:
   traverse directories/files; file nodes traverse blobs or chunk lists; and
   chunk lists traverse chunks. Shared nodes remain live while any rooted graph
   reaches them.
+- Ready compatibility workspace-layer envelopes require exact structural and policy
+  host-seal receipts. Their deterministic input digests bind the declaration, desired
+  identity, tree root, validator identity, outcome, and bounded evidence; object or
+  reference tampering therefore fails attachment and fsck instead of weakening the
+  publication boundary.
 - A recorded real-directory artifact materialization acts as a conservative
   local cache lease. Cache eviction removes that row independently; a later
   object GC may collect the CAS graph if no durable authority remains.

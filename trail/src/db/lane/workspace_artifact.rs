@@ -20,6 +20,9 @@ const ARTIFACT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_ENTRIES: u64 = 1_000_000;
 const MAX_ARTIFACT_TREE_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_DEPTH: usize = 256;
+const HOST_WORKSPACE_LAYER_SEAL_VALIDATOR: &str = "trail.host/workspace-layer-sealer@1";
+const HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL: &str = "trail.host.workspace-layer.structural-seal/v1";
+const HOST_WORKSPACE_LAYER_POLICY_SEAL: &str = "trail.host.workspace-layer.policy-seal/v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ArtifactResolutionAttemptFence {
@@ -2918,12 +2921,78 @@ impl Trail {
         tree_root_id: ArtifactTreeId,
     ) -> Result<ArtifactEnvelopeId> {
         validate_resolution_text(cache_key, "legacy layer cache key")?;
+        let canonical_cache_key = self.workspace_layer_cache_key(layer_key)?;
+        if canonical_cache_key != cache_key {
+            return Err(Error::InvalidInput(
+                "workspace layer key changed before artifact sealing".into(),
+            ));
+        }
+        let tree = self.verified_artifact_tree_root(&tree_root_id)?;
+        let entries = self.artifact_tree_flat_entries(&tree_root_id)?;
+        if entries.len() as u64 != tree.entry_count
+            || entries
+                .values()
+                .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes))
+                != Some(tree.logical_bytes)
+        {
+            return Err(Error::Corrupt(
+                "workspace layer artifact tree is not a complete content identity".into(),
+            ));
+        }
+        let desired_identity = ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
+            cache_key: cache_key.to_string(),
+            canonical_key: layer_key.clone(),
+        };
+        let validation_receipt_ids = [
+            self.put_host_workspace_layer_seal_receipt_under_write_lock(
+                ArtifactValidationV1 {
+                    name: HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL.into(),
+                    kind: ArtifactValidationKindV1::Structural,
+                    required: true,
+                    parameters: BTreeMap::from([
+                        ("content_identity".into(), "artifact-tree-v1".into()),
+                        ("path_normalizer".into(), tree.path_normalizer.clone()),
+                    ]),
+                },
+                desired_identity.clone(),
+                tree_root_id.clone(),
+                BTreeMap::from([
+                    ("complete_tree_identity".into(), "passed".into()),
+                    ("declared_path_containment".into(), "passed".into()),
+                    ("entry_count".into(), tree.entry_count.to_string()),
+                    ("limits".into(), "passed".into()),
+                    ("logical_bytes".into(), tree.logical_bytes.to_string()),
+                    ("safe_normalized_content".into(), "passed".into()),
+                    ("secret_policy".into(), "passed".into()),
+                ]),
+            )?,
+            self.put_host_workspace_layer_seal_receipt_under_write_lock(
+                ArtifactValidationV1 {
+                    name: HOST_WORKSPACE_LAYER_POLICY_SEAL.into(),
+                    kind: ArtifactValidationKindV1::Policy,
+                    required: true,
+                    parameters: BTreeMap::from([
+                        ("pin_contract".into(), "workspace-layer-key-v1".into()),
+                        ("trust_scope".into(), "workspace-layer-v1".into()),
+                    ]),
+                },
+                desired_identity.clone(),
+                tree_root_id.clone(),
+                BTreeMap::from([
+                    ("desired_pins".into(), "unchanged".into()),
+                    (
+                        "producer_termination".into(),
+                        "terminated_or_disconnected".into(),
+                    ),
+                    ("producer_trust".into(), "local_host_authorized".into()),
+                ]),
+            )?,
+        ]
+        .into_iter()
+        .collect();
         let envelope = ArtifactEnvelopeV1 {
             version: ARTIFACT_ENVELOPE_VERSION,
-            desired_identity: ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
-                cache_key: cache_key.to_string(),
-                canonical_key: layer_key.clone(),
-            },
+            desired_identity,
             tree_root_id,
             component_id: format!("legacy:{}", layer_key.adapter),
             output_name: "legacy-layer".into(),
@@ -2931,7 +3000,7 @@ impl Trail {
             portability_scope: layer_key.portability_scope.clone(),
             trust_scope: "workspace-layer-v1".into(),
             resolution_snapshot_id: None,
-            validation_receipt_ids: Vec::new(),
+            validation_receipt_ids,
         };
         let (envelope_id, quarantined) = self.put_artifact_envelope_under_write_lock(envelope)?;
         if quarantined {
@@ -3141,7 +3210,15 @@ impl Trail {
     }
 
     fn validate_envelope_validation_receipts(&self, envelope: &ArtifactEnvelopeV1) -> Result<()> {
+        let mut seen_receipts = BTreeSet::new();
+        let mut host_structural_seal = false;
+        let mut host_policy_seal = false;
         for receipt_id in &envelope.validation_receipt_ids {
+            if !seen_receipts.insert(receipt_id.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "artifact envelope repeats validation receipt `{receipt_id}`"
+                )));
+            }
             let receipt = self.artifact_validation_receipt(receipt_id)?;
             if receipt.desired_identity != envelope.desired_identity
                 || receipt.tree_root_id != envelope.tree_root_id
@@ -3151,6 +3228,32 @@ impl Trail {
                     "artifact validation receipt `{receipt_id}` does not pass for the envelope desired identity and tree"
                 )));
             }
+            if receipt.validator_identity == HOST_WORKSPACE_LAYER_SEAL_VALIDATOR {
+                match (&receipt.declaration.kind, receipt.declaration.name.as_str()) {
+                    (
+                        ArtifactValidationKindV1::Structural,
+                        HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL,
+                    ) if receipt.declaration.required => {
+                        host_structural_seal = true;
+                    }
+                    (ArtifactValidationKindV1::Policy, HOST_WORKSPACE_LAYER_POLICY_SEAL)
+                        if receipt.declaration.required =>
+                    {
+                        host_policy_seal = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if matches!(
+            envelope.desired_identity,
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { .. }
+        ) && (!host_structural_seal || !host_policy_seal)
+        {
+            return Err(Error::InvalidInput(
+                "workspace layer artifact is missing required host structural or policy seal evidence"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -3697,12 +3800,48 @@ impl Trail {
         receipt: ArtifactValidationReceiptV1,
     ) -> Result<ObjectId> {
         let _lock = self.acquire_write_lock()?;
+        self.put_artifact_validation_receipt_under_write_lock(receipt)
+    }
+
+    fn put_artifact_validation_receipt_under_write_lock(
+        &self,
+        receipt: ArtifactValidationReceiptV1,
+    ) -> Result<ObjectId> {
         validate_artifact_validation_receipt(&receipt)?;
         self.put_object(
             ARTIFACT_VALIDATION_RECEIPT_KIND,
             ARTIFACT_VALIDATION_RECEIPT_VERSION,
             &receipt,
         )
+    }
+
+    fn put_host_workspace_layer_seal_receipt_under_write_lock(
+        &self,
+        declaration: ArtifactValidationV1,
+        desired_identity: ArtifactDesiredIdentityV1,
+        tree_root_id: ArtifactTreeId,
+        evidence: BTreeMap<String, String>,
+    ) -> Result<ObjectId> {
+        let outcome = ArtifactValidationOutcomeV1::Passed;
+        let validated_input_digest = artifact_validation_receipt_input_digest(
+            ARTIFACT_VALIDATION_RECEIPT_VERSION,
+            &declaration,
+            &desired_identity,
+            &tree_root_id,
+            HOST_WORKSPACE_LAYER_SEAL_VALIDATOR,
+            outcome,
+            &evidence,
+        )?;
+        self.put_artifact_validation_receipt_under_write_lock(ArtifactValidationReceiptV1 {
+            version: ARTIFACT_VALIDATION_RECEIPT_VERSION,
+            declaration,
+            desired_identity,
+            tree_root_id,
+            validator_identity: HOST_WORKSPACE_LAYER_SEAL_VALIDATOR.into(),
+            validated_input_digest,
+            outcome,
+            evidence,
+        })
     }
 
     pub(crate) fn artifact_validation_receipt(
@@ -4907,7 +5046,43 @@ pub(crate) fn validate_artifact_validation_receipt(
             )));
         }
     }
+    if receipt.validator_identity == HOST_WORKSPACE_LAYER_SEAL_VALIDATOR {
+        let expected = artifact_validation_receipt_input_digest(
+            receipt.version,
+            &receipt.declaration,
+            &receipt.desired_identity,
+            &receipt.tree_root_id,
+            &receipt.validator_identity,
+            receipt.outcome,
+            &receipt.evidence,
+        )?;
+        if receipt.validated_input_digest != expected {
+            return Err(Error::InvalidInput(
+                "host workspace layer validation receipt has a stale input digest".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn artifact_validation_receipt_input_digest(
+    version: u16,
+    declaration: &ArtifactValidationV1,
+    desired_identity: &ArtifactDesiredIdentityV1,
+    tree_root_id: &ArtifactTreeId,
+    validator_identity: &str,
+    outcome: ArtifactValidationOutcomeV1,
+    evidence: &BTreeMap<String, String>,
+) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&(
+        version,
+        declaration,
+        desired_identity,
+        tree_root_id,
+        validator_identity,
+        outcome,
+        evidence,
+    ))?))
 }
 
 fn validate_resolution_relative_path(value: &str, field: &str, allow_dot: bool) -> Result<()> {

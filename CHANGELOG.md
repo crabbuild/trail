@@ -47,6 +47,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Artifact validations now distinguish structural, loadability, framework,
   policy, gate, and reproducibility declarations and produce deterministic,
   secret-rejected receipts bound to the exact desired identity and tree.
+- Workspace-layer publication now rechecks exact construction pins, freezes and
+  rescans Trail-owned candidate output, and requires structural and policy host-seal
+  receipts before a ready artifact envelope can be published or attached.
 
 ### Changed
 
