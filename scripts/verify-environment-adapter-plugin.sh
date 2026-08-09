@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 ci_tmpdir=""
+ci_tool_bin=""
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   : "${RUNNER_TEMP:?GitHub Actions did not provide RUNNER_TEMP}"
   : "${GITHUB_WORKSPACE:?GitHub Actions did not provide GITHUB_WORKSPACE}"
@@ -35,7 +36,13 @@ example_dir="${CARGO_TARGET_DIR}/debug/examples"
 
 root="$(mktemp -d)"
 packages="$(mktemp -d)"
-tool_bin="$(mktemp -d)"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  ci_tool_bin="/opt/trail-ci-adapter-tools-${GITHUB_RUN_ID:-run}-${GITHUB_JOB:-job}"
+  sudo install -d -o "$(id -u)" -g "$(id -g)" "${ci_tool_bin}"
+  tool_bin="${ci_tool_bin}"
+else
+  tool_bin="$(mktemp -d)"
+fi
 force_test_mount_cleanup() {
   local mountpoint="${root}/.trail/worktrees/plugin-mounted-kill"
   if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -55,7 +62,12 @@ cleanup() {
     done
   fi
   chmod -R u+w "${root}" "${packages}" "${tool_bin}" 2>/dev/null || true
-  rm -rf "${root}" "${packages}" "${tool_bin}"
+  rm -rf "${root}" "${packages}"
+  if [[ -n "${ci_tool_bin}" ]]; then
+    sudo rm -rf -- "${ci_tool_bin}"
+  else
+    rm -rf "${tool_bin}"
+  fi
   if [[ -n "${ci_tmpdir}" ]]; then
     rmdir "${ci_tmpdir}" 2>/dev/null || true
   fi
