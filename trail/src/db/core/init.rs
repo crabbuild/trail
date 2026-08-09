@@ -1535,6 +1535,7 @@ mod schema_handoff_tests {
             drop(writer);
 
             let lock = acquire_workspace_lock(&db_dir).unwrap();
+            let mut retired_sidecar = None;
             if suffix.is_empty() {
                 let replacement = db_path.with_extension("validation-replacement");
                 fs::copy(&db_path, &replacement).unwrap();
@@ -1542,7 +1543,9 @@ mod schema_handoff_tests {
             } else {
                 let mut sidecar = db_path.as_os_str().to_os_string();
                 sidecar.push(suffix);
-                match fs::remove_file(PathBuf::from(sidecar)) {
+                let sidecar = PathBuf::from(sidecar);
+                retired_sidecar = File::open(&sidecar).ok();
+                match fs::remove_file(&sidecar) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => panic!("failed to rotate {suffix}: {error}"),
@@ -1561,6 +1564,7 @@ mod schema_handoff_tests {
                 before_file, after_file,
                 "{suffix} generation did not change"
             );
+            drop(retired_sidecar);
             drop(lock);
 
             let fresh_go = root.path().join(format!("{index}-fresh-go"));
