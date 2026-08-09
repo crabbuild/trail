@@ -3282,14 +3282,17 @@ impl Trail {
     ) -> Result<u32> {
         let file = self.verified_artifact_file(file_id)?;
         self.verify_artifact_file_content(&file)?;
+        // Open outside the cleanup scope so a create-new collision never
+        // removes a destination that this materialization attempt did not
+        // create.
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
         let materialized = (|| -> Result<()> {
             // Stream bounded ranges so copy-up never allocates a complete
             // large artifact file. The complete digest was verified before
             // publication.
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(destination)?;
             let mut offset = 0u64;
             while offset < file.size_bytes {
                 let part = self.artifact_file_read_range(file_id, offset, 4 * 1024 * 1024)?;
@@ -7997,6 +8000,30 @@ mod tests {
             db.artifact_file_read_range(&node_id, 0, count).unwrap(),
             large[..count as usize]
         );
+    }
+
+    #[test]
+    fn artifact_file_materialization_never_removes_a_preexisting_destination() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact.txt"), b"artifact bytes\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+        let Some(ArtifactLazyEntry::File { node_id, .. }) = db
+            .artifact_tree_lazy_entry(&tree_id, "artifact.txt")
+            .unwrap()
+        else {
+            panic!("artifact fixture must resolve to a file");
+        };
+        let destination_root = tempfile::tempdir().unwrap();
+        let destination = destination_root.path().join("existing.txt");
+        fs::write(&destination, b"user-owned bytes\n").unwrap();
+
+        assert!(db
+            .materialize_artifact_file(&node_id, &destination)
+            .is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"user-owned bytes\n");
     }
 
     #[test]
