@@ -27,6 +27,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Real-directory artifact consumers now reuse tree-root/backend-keyed verified
   materialization caches that rebuild from authoritative CAS, restore immutable
   permissions on reuse, and clone/reflink or independently copy into mutable state.
+- Lane forks now inherit only individually verified CAS-backed outputs after desired-key,
+  envelope/tree, current adapter package, scope, portability, and backend checks, while
+  allocating fresh artifact bindings and private workspace identities.
 
 ### Changed
 

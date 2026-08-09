@@ -23,6 +23,24 @@ struct ArtifactConstructionWaiterFence {
     owner_pid: u32,
     owner_start_token: String,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InheritedArtifactBinding {
+    output_name: String,
+    desired_key: String,
+    envelope_id: String,
+    tree_root_id: String,
+}
+
+struct ArtifactInheritanceRequest<'a> {
+    component_id: &'a str,
+    component_key: &'a str,
+    output_name: &'a str,
+    output_policy: EnvironmentOutputPolicy,
+    child_backend: &'a str,
+    child_desired_key_was_planned: bool,
+}
+
 const WORKSPACE_LAYER_VERIFICATION_STAMP_VERSION: u16 = 1;
 const WORKSPACE_LAYER_SIDECAR_MAX_BYTES: u64 = 64 * 1024;
 
@@ -41,6 +59,10 @@ fn inheritable_workspace_layer_scope(scope: &str) -> bool {
             | "recipe-tool-host"
             | "recipe-tool-platform"
     )
+}
+
+fn artifact_inheritance_backend_supported(backend: &str) -> bool {
+    matches!(backend, "fuse" | "nfs" | "dokan")
 }
 
 #[derive(Clone, Debug)]
@@ -1038,6 +1060,190 @@ impl Trail {
         Ok(errors)
     }
 
+    fn inheritance_adapter_compatibility(
+        &self,
+        parent_view_id: &str,
+        component_id: &str,
+        component_key: &str,
+        adapter_identity: &str,
+        layer_adapter: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let (canonical_identity, contract_major, implementation_version, distribution_digest) =
+            if let Some(metadata) =
+                super::workspace_environment::registered_environment_adapter_metadata()
+                    .into_iter()
+                    .find(|metadata| {
+                        metadata.canonical_identity == adapter_identity
+                            || metadata.selectors.contains(&adapter_identity)
+                    })
+            {
+                if metadata.layer_adapter_name != layer_adapter {
+                    return Err("adapter_package_identity_mismatch");
+                }
+                if !metadata
+                    .supported_operating_systems
+                    .contains(&std::env::consts::OS)
+                    || !metadata
+                        .supported_architectures
+                        .contains(&std::env::consts::ARCH)
+                {
+                    return Err("adapter_host_unsupported");
+                }
+                (
+                    metadata.canonical_identity.to_string(),
+                    metadata.contract_major,
+                    metadata.implementation_version.to_string(),
+                    metadata.distribution_digest.to_string(),
+                )
+            } else {
+                let plugin = match self.environment_plugin_for_selector(adapter_identity) {
+                    Ok(Some(plugin)) => plugin,
+                    Ok(None) => return Err("adapter_package_unavailable"),
+                    Err(_) => return Err("adapter_package_trust_failed"),
+                };
+                if plugin.manifest.adapter.layer_adapter_name != layer_adapter {
+                    return Err("adapter_package_identity_mismatch");
+                }
+                if !super::workspace_plugin::environment_plugin_supports_current_host(&plugin) {
+                    return Err("adapter_host_unsupported");
+                }
+                let (_, _, contract_major) = super::workspace_plugin::validate_plugin_identity(
+                    &plugin.manifest.adapter.canonical_identity,
+                )
+                .map_err(|_| "adapter_package_identity_mismatch")?;
+                (
+                    plugin.manifest.adapter.canonical_identity,
+                    contract_major,
+                    plugin.manifest.adapter.implementation_version,
+                    plugin.distribution_digest,
+                )
+            };
+        let recorded = self
+            .conn
+            .query_row(
+                "SELECT adapter_identity,adapter_version,implementation_version,
+                        COALESCE(distribution_digest,''),attached_key,status
+                 FROM environment_component_states
+                 WHERE view_id=?1 AND component_id=?2",
+                params![parent_view_id, component_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| "adapter_package_evidence_invalid")?
+            .ok_or("adapter_package_identity_unproven")?;
+        if recorded.0 != canonical_identity
+            || recorded.1 != contract_major
+            || recorded.2 != implementation_version
+            || recorded.3 != distribution_digest
+            || recorded.4.as_deref() != Some(component_key)
+            || recorded.5 != "ready"
+        {
+            return Err("adapter_package_identity_mismatch");
+        }
+        Ok(())
+    }
+
+    fn verify_artifact_inheritance_binding(
+        &self,
+        layer: &WorkspaceLayerReport,
+        request: ArtifactInheritanceRequest<'_>,
+    ) -> std::result::Result<InheritedArtifactBinding, &'static str> {
+        if !artifact_inheritance_backend_supported(request.child_backend) {
+            return Err("artifact_backend_unsupported");
+        }
+        let shadow = self
+            .conn
+            .query_row(
+                "SELECT tree_root_id,envelope_id,state
+                 FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![&layer.layer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| "artifact_binding_query_failed")?
+            .ok_or("artifact_binding_missing")?;
+        if shadow.2 != "verified" {
+            return Err("artifact_binding_unverified");
+        }
+        let tree_id = ArtifactTreeId::parse(shadow.0.clone())
+            .map_err(|_| "artifact_tree_identity_invalid")?;
+        let envelope_id = crate::ids::ArtifactEnvelopeId::parse(shadow.1.clone())
+            .map_err(|_| "artifact_envelope_identity_invalid")?;
+        let envelope = self
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .map_err(|_| "artifact_envelope_verification_failed")?;
+        self.artifact_tree_flat_entries(&tree_id)
+            .map_err(|_| "artifact_tree_verification_failed")?;
+        if envelope.portability_scope != layer.portability_scope
+            || !inheritable_workspace_layer_scope(&envelope.portability_scope)
+        {
+            return Err("artifact_portability_mismatch");
+        }
+        let desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
+                cache_key,
+                canonical_key,
+            } => {
+                if envelope.component_id != format!("legacy:{}", layer.adapter)
+                    || envelope.output_name != "legacy-layer"
+                    || !envelope.output_policy.has_immutable_layer()
+                    || !request.output_policy.has_immutable_layer()
+                    || envelope.trust_scope != "workspace-layer-v1"
+                    || cache_key != request.component_key
+                    || canonical_key.adapter != layer.adapter
+                    || canonical_key.portability_scope != layer.portability_scope
+                    || canonical_key.portability_scope != "portable"
+                        && (canonical_key.platform != std::env::consts::OS
+                            || canonical_key.architecture != std::env::consts::ARCH)
+                    || self
+                        .workspace_layer_cache_key(canonical_key)
+                        .ok()
+                        .as_deref()
+                        != Some(request.component_key)
+                {
+                    return Err("artifact_desired_identity_mismatch");
+                }
+                cache_key.clone()
+            }
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => {
+                if !request.child_desired_key_was_planned {
+                    return Err("artifact_desired_identity_unproven");
+                }
+                if envelope.component_id != request.component_id
+                    || envelope.output_name != request.output_name
+                    || envelope.output_policy != request.output_policy
+                {
+                    return Err("artifact_output_contract_mismatch");
+                }
+                if desired_key.0 != request.component_key {
+                    return Err("artifact_desired_identity_mismatch");
+                }
+                desired_key.0.clone()
+            }
+        };
+        Ok(InheritedArtifactBinding {
+            output_name: request.output_name.to_string(),
+            desired_key,
+            envelope_id: envelope_id.0,
+            tree_root_id: tree_id.0,
+        })
+    }
+
     pub(crate) fn inherit_workspace_environment_generation(
         &self,
         parent_lane_id: &str,
@@ -1113,6 +1319,7 @@ impl Trail {
             mount_path: Option<String>,
             source_path: String,
             priority: i64,
+            artifact_bindings: Vec<InheritedArtifactBinding>,
         }
 
         let candidates = {
@@ -1141,6 +1348,7 @@ impl Trail {
                             mount_path: row.get(5)?,
                             source_path: row.get(6)?,
                             priority: row.get(7)?,
+                            artifact_bindings: Vec::new(),
                         })
                     },
                 )?
@@ -1148,7 +1356,7 @@ impl Trail {
         };
         let mut inherited = Vec::new();
         let mut decisions = Vec::<EnvironmentOutputInheritanceDecisionReport>::new();
-        for component in candidates {
+        for mut component in candidates {
             let mut component_rejection = None;
             if let Some(planned) = desired.get(&component.component_id) {
                 if planned.adapter_identity != component.adapter_identity {
@@ -1164,7 +1372,7 @@ impl Trail {
 
             let outputs = {
                 let mut statement = self.conn.prepare(
-                    "SELECT output_name,policy,storage_identity,layer_id
+                    "SELECT output_name,policy,reuse_mode,sharing_scope,storage_identity,layer_id
                      FROM environment_generation_outputs
                      WHERE generation_id=?1 AND component_id=?2 ORDER BY output_name",
                 )?;
@@ -1175,19 +1383,26 @@ impl Trail {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, EnvironmentOutputPolicy>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, EnvironmentReuseMode>(2)?,
+                                row.get::<_, EnvironmentSharingScope>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<String>>(5)?,
                             ))
                         },
                     )?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
             let mut reusable_output = false;
-            for (output_name, policy, storage_identity, layer_id) in outputs {
+            for (output_name, policy, reuse, scope, storage_identity, layer_id) in outputs {
                 let mut rejection = component_rejection;
                 let decision = if !policy.has_immutable_layer() {
                     rejection = Some("fresh_lane_private_upper");
                     EnvironmentComponentDecision::Private
+                } else if reuse == EnvironmentReuseMode::None
+                    || scope == EnvironmentSharingScope::Lane
+                {
+                    rejection = Some("artifact_sharing_policy_rejected");
+                    EnvironmentComponentDecision::Rejected
                 } else if rejection.is_some() {
                     EnvironmentComponentDecision::Rejected
                 } else if let Some(layer_id) = layer_id.as_deref() {
@@ -1195,8 +1410,39 @@ impl Trail {
                         Ok(layer)
                             if inheritable_workspace_layer_scope(&layer.portability_scope) =>
                         {
-                            reusable_output = true;
-                            EnvironmentComponentDecision::Reused
+                            if let Err(reason) = self.inheritance_adapter_compatibility(
+                                &parent_view.view_id,
+                                &component.component_id,
+                                &component.component_key,
+                                &component.adapter_identity,
+                                &layer.adapter,
+                            ) {
+                                rejection = Some(reason);
+                                EnvironmentComponentDecision::Rejected
+                            } else {
+                                match self.verify_artifact_inheritance_binding(
+                                    &layer,
+                                    ArtifactInheritanceRequest {
+                                        component_id: &component.component_id,
+                                        component_key: &component.component_key,
+                                        output_name: &output_name,
+                                        output_policy: policy,
+                                        child_backend: &child_view.backend,
+                                        child_desired_key_was_planned: desired
+                                            .contains_key(&component.component_id),
+                                    },
+                                ) {
+                                    Ok(binding) => {
+                                        component.artifact_bindings.push(binding);
+                                        reusable_output = true;
+                                        EnvironmentComponentDecision::Reused
+                                    }
+                                    Err(reason) => {
+                                        rejection = Some(reason);
+                                        EnvironmentComponentDecision::Rejected
+                                    }
+                                }
+                            }
                         }
                         Ok(_) => {
                             rejection = Some("unsupported_portability_scope");
@@ -1322,23 +1568,67 @@ impl Trail {
                         &component.component_id
                     ],
                 )?;
-                self.conn.execute(
-                    "INSERT INTO environment_generation_outputs(
-                         generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
-                         publication_trigger,publication_gate,storage_identity,layer_id,
-                         manifest_object_id,publication_id,mount_path,layer_subpath)
-                     SELECT ?1,component_id,output_name,policy,reuse_mode,sharing_scope,
-                            publication_trigger,publication_gate,storage_identity,layer_id,
-                            manifest_object_id,publication_id,mount_path,layer_subpath
-                     FROM environment_generation_outputs
-                     WHERE generation_id=?2 AND component_id=?3
-                       AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
-                    params![
-                        &generation_id,
-                        &parent_generation_id,
-                        &component.component_id
-                    ],
-                )?;
+                for binding in &component.artifact_bindings {
+                    let inserted = self.conn.execute(
+                        "INSERT INTO environment_generation_outputs(
+                             generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+                             publication_trigger,publication_gate,storage_identity,layer_id,
+                             manifest_object_id,publication_id,mount_path,layer_subpath)
+                         SELECT ?1,component_id,output_name,policy,reuse_mode,sharing_scope,
+                                publication_trigger,publication_gate,storage_identity,layer_id,
+                                manifest_object_id,publication_id,mount_path,layer_subpath
+                         FROM environment_generation_outputs
+                         WHERE generation_id=?2 AND component_id=?3 AND output_name=?4
+                           AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
+                        params![
+                            &generation_id,
+                            &parent_generation_id,
+                            &component.component_id,
+                            &binding.output_name
+                        ],
+                    )?;
+                    if inserted != 1 {
+                        return Err(Error::Corrupt(format!(
+                            "inherited artifact output `{}/{}` changed after compatibility verification",
+                            component.component_id, binding.output_name
+                        )));
+                    }
+                    let binding_identity = format!(
+                        "artifact_binding_{}",
+                        crate::ids::short_hash(
+                            format!(
+                                "{}\0{}\0{}\0{}",
+                                generation_id,
+                                component.component_id,
+                                binding.output_name,
+                                binding.envelope_id
+                            )
+                            .as_bytes(),
+                            32,
+                        )
+                    );
+                    let binding_id = format!(
+                        "binding_{}",
+                        crate::ids::short_hash(binding_identity.as_bytes(), 32)
+                    );
+                    self.conn.execute(
+                        "INSERT INTO artifact_generation_bindings(
+                             binding_id,generation_id,component_id,output_name,desired_key,
+                             envelope_id,tree_root_id,binding_identity,created_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            binding_id,
+                            &generation_id,
+                            &component.component_id,
+                            &binding.output_name,
+                            &binding.desired_key,
+                            &binding.envelope_id,
+                            &binding.tree_root_id,
+                            binding_identity,
+                            now
+                        ],
+                    )?;
+                }
             }
             self.conn.execute(
                 "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
@@ -6023,6 +6313,20 @@ mod tests {
         }
     }
 
+    fn artifact_inheritance_request<'a>(
+        component_key: &'a str,
+        child_backend: &'a str,
+    ) -> ArtifactInheritanceRequest<'a> {
+        ArtifactInheritanceRequest {
+            component_id: "node",
+            component_key,
+            output_name: "dependencies",
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            child_backend,
+            child_desired_key_was_planned: false,
+        }
+    }
+
     #[test]
     fn workspace_layer_storage_identity_requires_lowercase_canonical_absolute_paths() {
         let layer_id = "layer_0123456789abcdef0123456789abcdef";
@@ -6162,6 +6466,139 @@ mod tests {
         ] {
             assert!(!inheritable_workspace_layer_scope(scope), "{scope}");
         }
+    }
+
+    #[test]
+    fn artifact_inheritance_checks_backend_adapter_identity_envelope_tree_and_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), b"shared\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO environment_component_states(
+                     view_id,component_id,adapter_identity,adapter_version,implementation_version,
+                     distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
+                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v1',
+                        'dependency',?2,?2,'ready',NULL,1)",
+                params![env!("CARGO_PKG_VERSION"), &layer.cache_key],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "node"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "cargo"
+            ),
+            Err("adapter_package_identity_mismatch")
+        );
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "missing/adapter@1",
+                "node"
+            ),
+            Err("adapter_package_unavailable")
+        );
+        db.conn
+            .execute(
+                "UPDATE environment_component_states SET distribution_digest='changed-package'
+                 WHERE view_id='parent-view' AND component_id='node'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "node"
+            ),
+            Err("adapter_package_identity_mismatch")
+        );
+        db.conn
+            .execute(
+                "UPDATE environment_component_states
+                 SET distribution_digest='builtin:node-plan-v1'
+                 WHERE view_id='parent-view' AND component_id='node'",
+                [],
+            )
+            .unwrap();
+
+        let native_backend = if cfg!(target_os = "macos") {
+            "nfs"
+        } else if cfg!(target_os = "windows") {
+            "dokan"
+        } else {
+            "fuse"
+        };
+        let binding = db
+            .verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            )
+            .unwrap();
+        assert_eq!(binding.desired_key, layer.cache_key);
+        assert!(binding.envelope_id.starts_with("artifact_envelope_"));
+        assert!(binding.tree_root_id.starts_with("artifact_tree_"));
+
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request("wrong-key", "virtual"),
+            ),
+            Err("artifact_backend_unsupported")
+        );
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request("wrong-key", native_backend),
+            ),
+            Err("artifact_desired_identity_mismatch")
+        );
+        let mut wrong_scope = layer.clone();
+        wrong_scope.portability_scope = "host".to_string();
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &wrong_scope,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            ),
+            Err("artifact_portability_mismatch")
+        );
+
+        db.conn
+            .execute(
+                "UPDATE artifact_envelopes SET state='quarantined' WHERE envelope_id=?1",
+                params![&binding.envelope_id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            ),
+            Err("artifact_envelope_verification_failed")
+        );
     }
 
     #[test]

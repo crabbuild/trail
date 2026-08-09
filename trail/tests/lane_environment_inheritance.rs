@@ -67,6 +67,19 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO environment_component_states(
+             view_id,component_id,adapter_identity,adapter_version,implementation_version,
+             distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
+         VALUES(?1,'node','trail/node@1',1,?2,'builtin:node-plan-v1','dependency',
+                ?3,?3,'ready',NULL,1)",
+        params![
+            &parent_view.view_id,
+            env!("CARGO_PKG_VERSION"),
+            &layer.cache_key
+        ],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO environment_generation_outputs(
              generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
              publication_trigger,publication_gate,storage_identity,layer_id,
@@ -75,6 +88,17 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
                 'on_sync',NULL,?1,?2,manifest_object_id,NULL,'node_modules',''
          FROM workspace_layers WHERE layer_id=?2",
         params![&layer.cache_key, &layer.layer_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO environment_generation_outputs(
+             generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+             publication_trigger,publication_gate,storage_identity,layer_id,
+             manifest_object_id,publication_id,mount_path,layer_subpath)
+         VALUES('env_parent','node','rejected-sibling','immutable_seed_private','exact',
+                'workspace','on_sync',NULL,'rejected-key','layer_missing','object_missing',NULL,
+                'vendor/rejected','')",
+        [],
     )
     .unwrap();
     conn.execute(
@@ -151,7 +175,7 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         Some(layer.layer_id.as_str())
     );
 
-    let conn = Connection::open(sqlite).unwrap();
+    let conn = Connection::open(&sqlite).unwrap();
     let child_binding: String = conn
         .query_row(
             "SELECT layer_id FROM workspace_view_layers
@@ -170,6 +194,27 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         )
         .unwrap();
     assert_eq!(inherited_runtime_count, 0);
+    let child_output_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM environment_generation_outputs WHERE generation_id=?1",
+            [&generation.generation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(child_output_count, 1);
+    let child_artifact_binding: (String, String, String, String) = conn
+        .query_row(
+            "SELECT desired_key,envelope_id,tree_root_id,binding_identity
+             FROM artifact_generation_bindings
+             WHERE generation_id=?1 AND component_id='node' AND output_name='dependencies'",
+            [&generation.generation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(child_artifact_binding.0, layer.cache_key);
+    assert!(child_artifact_binding.1.starts_with("artifact_envelope_"));
+    assert!(child_artifact_binding.2.starts_with("artifact_tree_"));
+    assert!(child_artifact_binding.3.starts_with("artifact_binding_"));
     drop(conn);
     let inheritance_event = db
         .list_lane_events(
@@ -192,6 +237,12 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         .any(|output| { output["component_id"] == "node" && output["decision"] == "reused" }));
     assert!(outputs.iter().any(|output| {
         output["component_id"] == "corrupt-cache"
+            && output["decision"] == "rejected"
+            && output["reason"] == "layer_verification_failed"
+    }));
+    assert!(outputs.iter().any(|output| {
+        output["component_id"] == "node"
+            && output["output_name"] == "rejected-sibling"
             && output["decision"] == "rejected"
             && output["reason"] == "layer_verification_failed"
     }));
@@ -238,6 +289,24 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         assert_ne!(fork_view.generated_upper, child_view.generated_upper);
         assert_ne!(fork_view.scratch_upper, child_view.scratch_upper);
     }
+
+    let conn = Connection::open(&sqlite).unwrap();
+    let mut artifact_binding_identities = conn
+        .prepare(
+            "SELECT b.binding_identity
+             FROM artifact_generation_bindings b
+             JOIN environment_generations g ON g.generation_id=b.generation_id
+             WHERE b.component_id='node' AND b.output_name='dependencies'
+             ORDER BY b.binding_identity",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    artifact_binding_identities.dedup();
+    assert_eq!(artifact_binding_identities.len(), fork_names.len() + 1);
+    drop(conn);
 
     let conn = Connection::open(root.path().join(".trail/index/trail.sqlite")).unwrap();
     conn.execute(

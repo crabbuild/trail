@@ -225,6 +225,15 @@ Terminal alternatives are `failed`, `cancelled`, `quarantined`, and `repair_requ
 
 Promotion never mutates or deletes the live private upper. Source, desired key, generation, private-output journal, gate, or validation changes after the fence make the attempt stale and prevent activation.
 
+Fork inheritance now makes an output-level decision rather than trusting a
+component-level layer hit. Before reuse, Trail verifies the child desired key,
+the ready artifact envelope and complete content tree, the currently installed
+adapter implementation/package identity and trust, output sharing policy,
+portability, and native backend support. Only individually accepted immutable
+outputs are copied into the successor generation, each with a fresh generation
+binding identity. Lane-private source, generated, scratch, seeded, writable,
+and disposable state is never inherited by identity.
+
 ### 9. Upgrade singleflight and quarantine nondeterminism
 
 The existing key lock remains the fast mutual-exclusion boundary, but durable attempt rows record owner token/generation, PID/start identity, heartbeat, pins, current phase, candidate root, waiters, error, and recovery command. At most one live reusable constructor owns `(trust_scope, desired_key)`.

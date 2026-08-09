@@ -236,6 +236,14 @@ from authoritative CAS objects. Copies into mutable layer or lane state prefer
 native clone/reflink support and fall back to independent file copies; Trail
 does not use hard links that could alias mutable bytes back into this cache.
 
+When one lane forks another, immutable environment outputs are inherited only
+after output-level CAS compatibility checks. Trail revalidates the exact desired
+key, ready envelope, complete tree, current adapter implementation/distribution
+and package trust, sharing and portability scopes, and the child view backend.
+Rejected sibling outputs are not copied merely because another output from the
+same component is reusable. Every accepted child artifact binding is new, as
+are the child source, generated, scratch, and seeded/writable private uppers.
+
 The remaining principal gaps are:
 
 1. Verified real-directory materialization caches do not yet have independent
