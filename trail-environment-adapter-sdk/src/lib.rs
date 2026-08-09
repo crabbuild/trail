@@ -22,10 +22,29 @@ pub const PROTOCOL_V2: &str = "trail.environment-adapter/v2";
 /// validation/capability contracts, generated-source exports, and host-owned
 /// attestation/quarantine evidence without changing v1/v2 wire meanings.
 pub const PROTOCOL_V3: &str = "trail.environment-adapter/v3";
+/// Exact protocol identities in descending semantic version order.
+pub const ADAPTER_PROTOCOLS_HIGHEST_FIRST: [&str; 3] = [PROTOCOL_V3, PROTOCOL_V2, PROTOCOL_V1];
 pub const PACKAGE_SCHEMA_V1: &str = "trail.environment-adapter-package/v1";
 pub const PACKAGE_SIGNATURE_SCHEMA_V1: &str = "trail.environment-adapter-signature/v1";
 pub const TRUSTED_PUBLISHER_KEY_SCHEMA_V1: &str = "trail.environment-adapter-publisher-key/v1";
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Select the highest exact protocol identity supported by both peers.
+/// Prefixes, aliases, unknown future versions, and list order never influence
+/// the result.
+pub fn negotiate_highest_mutual_protocol(
+    host_protocols: &[&str],
+    package_protocols: &[String],
+) -> Option<&'static str> {
+    ADAPTER_PROTOCOLS_HIGHEST_FIRST
+        .into_iter()
+        .find(|candidate| {
+            host_protocols.contains(candidate)
+                && package_protocols
+                    .iter()
+                    .any(|protocol| protocol == candidate)
+        })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +72,10 @@ pub struct AdapterMetadata {
         skip_serializing_if = "is_default_v1_protocols"
     )]
     pub protocols: Vec<String>,
+    /// V3-only declarations. Missing metadata grants no v3 semantics and is
+    /// omitted from legacy package serialization.
+    #[serde(default, skip_serializing_if = "AdapterPackageCapabilities::is_denied")]
+    pub capabilities: AdapterPackageCapabilities,
     #[serde(default = "default_supported_operating_systems")]
     pub supported_operating_systems: Vec<String>,
     #[serde(default = "default_supported_architectures")]
@@ -63,6 +86,31 @@ pub struct AdapterMetadata {
 
 fn default_adapter_protocols() -> Vec<String> {
     vec![PROTOCOL_V1.to_string()]
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdapterPackageCapabilities {
+    pub resolution: bool,
+    pub source_exports: bool,
+    pub host_attestation_evidence: bool,
+    pub host_quarantine_evidence: bool,
+    pub certification_ceiling: AdapterCertificationCeiling,
+}
+
+impl AdapterPackageCapabilities {
+    pub fn is_denied(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterCertificationCeiling {
+    #[default]
+    LegacyExact,
+    LocalArtifact,
+    PortableArtifact,
 }
 
 fn is_default_v1_protocols(protocols: &[String]) -> bool {
@@ -1666,9 +1714,46 @@ pub fn serve_once(
     write_frame(&mut io::stdout().lock(), &response, MAX_FRAME_BYTES)
 }
 
+pub fn serve_once_v3(
+    handler: impl FnOnce(AdapterRequestV3) -> AdapterResponseV3,
+) -> Result<(), ProtocolError> {
+    let request = read_frame(&mut io::stdin().lock(), MAX_FRAME_BYTES)?;
+    let response = handler(request);
+    write_frame(&mut io::stdout().lock(), &response, MAX_FRAME_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_negotiation_selects_highest_exact_mutual_identity() {
+        let package = vec![
+            PROTOCOL_V1.to_string(),
+            "trail.environment-adapter/v30".to_string(),
+            PROTOCOL_V3.to_string(),
+            PROTOCOL_V2.to_string(),
+        ];
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3], &package),
+            Some(PROTOCOL_V3)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1, PROTOCOL_V2], &package),
+            Some(PROTOCOL_V2)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1], &package),
+            Some(PROTOCOL_V1)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(
+                &[PROTOCOL_V3],
+                &["trail.environment-adapter/v3-preview".to_string()]
+            ),
+            None
+        );
+    }
 
     #[test]
     fn framed_protocol_round_trips_binary_pinned_files() {
@@ -2000,6 +2085,7 @@ sha256 = "sha256:00"
         )
         .unwrap();
         assert_eq!(manifest.adapter.protocols, [PROTOCOL_V1]);
+        assert!(manifest.adapter.capabilities.is_denied());
         let encoded = serde_cbor::to_vec(&manifest).unwrap();
         let value: serde_cbor::Value = serde_cbor::from_slice(&encoded).unwrap();
         let serde_cbor::Value::Map(package) = value else {
@@ -2012,6 +2098,46 @@ sha256 = "sha256:00"
             panic!("adapter metadata did not encode as a CBOR map");
         };
         assert!(!adapter.contains_key(&serde_cbor::Value::Text("protocols".to_string())));
+        assert!(!adapter.contains_key(&serde_cbor::Value::Text("capabilities".to_string())));
+    }
+
+    #[test]
+    fn protocol_v3_package_capabilities_are_explicit_and_round_trip() {
+        let manifest: AdapterPackageManifest = toml::from_str(
+            r#"schema = "trail.environment-adapter-package/v1"
+[adapter]
+canonical_identity = "example/test@1"
+implementation_version = "1"
+selectors = ["example/test@1"]
+kind = "generated"
+layer_adapter_name = "test"
+discovery_markers = ["test.adapter"]
+protocols = ["trail.environment-adapter/v3"]
+stability = "experimental"
+description = "test"
+
+[adapter.capabilities]
+resolution = true
+source_exports = true
+host_attestation_evidence = true
+host_quarantine_evidence = true
+certification_ceiling = "local_artifact"
+
+[executable]
+path = "adapter"
+sha256 = "sha256:00"
+"#,
+        )
+        .unwrap();
+        assert!(manifest.adapter.capabilities.resolution);
+        assert!(manifest.adapter.capabilities.source_exports);
+        assert_eq!(
+            manifest.adapter.capabilities.certification_ceiling,
+            AdapterCertificationCeiling::LocalArtifact
+        );
+        let decoded: AdapterPackageManifest =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(decoded, manifest);
     }
 
     #[test]

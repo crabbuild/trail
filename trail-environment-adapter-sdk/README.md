@@ -151,6 +151,37 @@ Protocol-v3 negotiation and host normalization are explicit. Merely adding v3 ty
 an adapter does not cause a v1/v2 package to receive resolution, export, attestation, or
 compatibility authority.
 
+Start v3 authoring from
+[`examples/artifact-pipeline-adapter.rs`](examples/artifact-pipeline-adapter.rs). Use
+`AdapterPipelineV3::builder(...)` rather than constructing an unvalidated response. The
+builder canonicalizes set-like dependencies, inputs, authorities, validations, outputs,
+and exports; rejects duplicates, unsafe paths and shell-style commands; verifies export
+references; and prevents secret-tainted output from becoming reusable or exportable.
+It returns `AdapterPipelineV3BuildError` for local authoring errors. The host still
+repeats complete validation because serialized plugin output is untrusted.
+
+A v3 package declares its maximum semantics explicitly; omitted capability metadata is
+the deny-all legacy value and is not serialized into v1/v2 packages:
+
+```toml
+[adapter]
+protocols = ["trail.environment-adapter/v3", "trail.environment-adapter/v2"]
+
+[adapter.capabilities]
+resolution = true
+source_exports = true
+host_attestation_evidence = false
+host_quarantine_evidence = false
+certification_ceiling = "local_artifact"
+```
+
+`negotiate_highest_mutual_protocol` compares exact protocol identities and selects v3,
+then v2, then v1 only when both peers list that exact value. Unknown future strings,
+aliases, prefixes, and package list order cannot change the result. The canonical legacy
+projection retains v1/v2 data while `v3_only` remains entirely absent, so conversion
+cannot infer resolution, validation, certification, export, attestation, or quarantine
+authority from missing fields.
+
 A mounted-only plan is authored as:
 
 ```rust

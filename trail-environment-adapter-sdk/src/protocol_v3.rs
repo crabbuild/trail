@@ -4,12 +4,14 @@
 //! authority. An adapter cannot mount a lane, publish an artifact, mint a
 //! Trail attestation, resolve a quarantine, or write generated source.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdapterDependency, AdapterHost, AdapterOutput, AdapterPortability, PinnedFile, PROTOCOL_V3,
+    AdapterAction, AdapterCache, AdapterDependency, AdapterDependencyType, AdapterExternalArtifact,
+    AdapterHost, AdapterOutput, AdapterOutputPolicy, AdapterPlan, AdapterPlanV2,
+    AdapterPortability, AdapterRuntimeResource, PinnedFile, PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3,
 };
 
 pub const MAX_V3_PROPOSALS: usize = 1_024;
@@ -108,7 +110,7 @@ pub enum AdapterOperationV3 {
     },
     Plan {
         proposal: Box<AdapterComponentProposalV3>,
-        files: Vec<AdapterInputV3>,
+        files: Vec<AdapterPinnedInputV3>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolution_snapshot: Option<Box<AdapterResolutionSnapshotV3>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +234,12 @@ pub struct AdapterInputV3 {
     pub role: AdapterInputRoleV3,
     pub format: String,
     pub required: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterPinnedInputV3 {
+    pub input: AdapterInputV3,
     #[serde(with = "serde_bytes")]
     pub content: Vec<u8>,
 }
@@ -521,6 +529,563 @@ pub enum AdapterQuarantinePolicyV3 {
     RetainPrivate,
 }
 
+/// Canonical compatibility projection for v1/v2 plans. The nested v3-only
+/// fields are always absent; no default can grant resolution, validation,
+/// certification, export, attestation, or quarantine semantics.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterLegacyPlanProjectionV3 {
+    pub source_protocol: String,
+    pub component_id: String,
+    pub kind: String,
+    pub dependencies: Vec<AdapterDependency>,
+    pub identity_inputs: Vec<String>,
+    pub semantic_inputs: BTreeMap<String, String>,
+    pub caches: Vec<AdapterCache>,
+    pub external_artifacts: Vec<AdapterExternalArtifact>,
+    pub runtime_resources: Vec<AdapterRuntimeResource>,
+    pub actions: Vec<AdapterAction>,
+    pub outputs: Vec<AdapterOutput>,
+    pub portability: AdapterPortability,
+    pub stale_reason: String,
+    pub v3_only: AdapterV3OnlySemantics,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterV3OnlySemantics {
+    pub proposal_status: Option<AdapterProposalStatusV3>,
+    pub resolution: Option<AdapterResolutionPlanV3>,
+    pub typed_inputs: Vec<AdapterInputV3>,
+    pub validations: Vec<AdapterValidationV3>,
+    pub capabilities: Option<AdapterCapabilityProfileV3>,
+    pub identity: Option<AdapterIdentityContractV3>,
+    pub source_exports: Vec<AdapterSourceExportV3>,
+    pub attestation: Option<AdapterAttestationRequirementsV3>,
+    pub quarantine_policy: Option<AdapterQuarantinePolicyV3>,
+}
+
+impl AdapterV3OnlySemantics {
+    pub fn is_absent(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl AdapterLegacyPlanProjectionV3 {
+    pub fn from_v1(plan: AdapterPlan) -> Self {
+        let mut dependencies = plan
+            .dependencies
+            .into_iter()
+            .map(|component_id| {
+                AdapterDependency::new(component_id, AdapterDependencyType::BuildRequires)
+            })
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        let mut identity_inputs = plan.identity_inputs;
+        identity_inputs.sort();
+        let mut outputs = plan.outputs;
+        outputs.sort_by(|left, right| left.name.cmp(&right.name));
+        Self {
+            source_protocol: PROTOCOL_V1.into(),
+            component_id: plan.component_id,
+            kind: plan.kind,
+            dependencies,
+            identity_inputs,
+            semantic_inputs: plan.semantic_inputs,
+            caches: Vec::new(),
+            external_artifacts: Vec::new(),
+            runtime_resources: Vec::new(),
+            actions: vec![AdapterAction::Staging(plan.command)],
+            outputs,
+            portability: plan.portability,
+            stale_reason: plan.stale_reason,
+            v3_only: AdapterV3OnlySemantics::default(),
+        }
+    }
+
+    pub fn from_v2(plan: AdapterPlanV2) -> Self {
+        let mut dependencies = plan
+            .dependencies
+            .into_iter()
+            .map(|component_id| {
+                AdapterDependency::new(component_id, AdapterDependencyType::BuildRequires)
+            })
+            .chain(plan.dependency_edges)
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        let mut identity_inputs = plan.identity_inputs;
+        identity_inputs.sort();
+        let mut caches = plan.caches;
+        caches.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut external_artifacts = plan.external_artifacts;
+        external_artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut runtime_resources = plan.runtime_resources;
+        runtime_resources.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut outputs = plan.outputs;
+        outputs.sort_by(|left, right| left.name.cmp(&right.name));
+        Self {
+            source_protocol: PROTOCOL_V2.into(),
+            component_id: plan.component_id,
+            kind: plan.kind,
+            dependencies,
+            identity_inputs,
+            semantic_inputs: plan.semantic_inputs,
+            caches,
+            external_artifacts,
+            runtime_resources,
+            actions: plan.actions,
+            outputs,
+            portability: plan.portability,
+            stale_reason: plan.stale_reason,
+            v3_only: AdapterV3OnlySemantics::default(),
+        }
+    }
+}
+
+impl AdapterPipelineV3 {
+    pub fn builder(
+        proposal: AdapterComponentProposalV3,
+        identity: AdapterIdentityContractV3,
+    ) -> AdapterPipelineV3Builder {
+        AdapterPipelineV3Builder::new(proposal, identity)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AdapterPipelineV3Builder {
+    proposal: AdapterComponentProposalV3,
+    dependencies: Vec<AdapterDependency>,
+    inputs: Vec<AdapterInputV3>,
+    resolution: Option<AdapterResolutionPlanV3>,
+    actions: Vec<AdapterActionV3>,
+    validations: Vec<AdapterValidationV3>,
+    capabilities: AdapterCapabilityProfileV3,
+    identity: AdapterIdentityContractV3,
+    outputs: Vec<AdapterOutput>,
+    source_exports: Vec<AdapterSourceExportV3>,
+    attestation: AdapterAttestationRequirementsV3,
+    secret_taint: AdapterSecretTaintV3,
+    quarantine_policy: AdapterQuarantinePolicyV3,
+    stale_reason: Option<String>,
+}
+
+impl AdapterPipelineV3Builder {
+    pub fn new(proposal: AdapterComponentProposalV3, identity: AdapterIdentityContractV3) -> Self {
+        Self {
+            proposal,
+            dependencies: Vec::new(),
+            inputs: Vec::new(),
+            resolution: None,
+            actions: Vec::new(),
+            validations: Vec::new(),
+            capabilities: denied_capabilities_v3(),
+            identity,
+            outputs: Vec::new(),
+            source_exports: Vec::new(),
+            attestation: AdapterAttestationRequirementsV3 {
+                required_validations: Vec::new(),
+                require_sandbox_evidence: true,
+                require_executable_identities: true,
+                signature_policy: AdapterAttestationSignaturePolicyV3::OptionalLocal,
+            },
+            secret_taint: AdapterSecretTaintV3::Clear,
+            quarantine_policy: AdapterQuarantinePolicyV3::FailClosed,
+            stale_reason: None,
+        }
+    }
+
+    pub fn dependency(mut self, dependency: AdapterDependency) -> Self {
+        self.dependencies.push(dependency);
+        self
+    }
+
+    pub fn input(mut self, input: AdapterInputV3) -> Self {
+        self.inputs.push(input);
+        self
+    }
+
+    pub fn resolution(mut self, resolution: AdapterResolutionPlanV3) -> Self {
+        self.resolution = Some(resolution);
+        self
+    }
+
+    pub fn action(mut self, action: AdapterActionV3) -> Self {
+        self.actions.push(action);
+        self
+    }
+
+    pub fn validation(mut self, validation: AdapterValidationV3) -> Self {
+        self.validations.push(validation);
+        self
+    }
+
+    pub fn capabilities(mut self, capabilities: AdapterCapabilityProfileV3) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn output(mut self, output: AdapterOutput) -> Self {
+        self.outputs.push(output);
+        self
+    }
+
+    pub fn source_export(mut self, source_export: AdapterSourceExportV3) -> Self {
+        self.source_exports.push(source_export);
+        self
+    }
+
+    pub fn attestation(mut self, attestation: AdapterAttestationRequirementsV3) -> Self {
+        self.attestation = attestation;
+        self
+    }
+
+    pub fn secret_taint(mut self, secret_taint: AdapterSecretTaintV3) -> Self {
+        self.secret_taint = secret_taint;
+        self
+    }
+
+    pub fn quarantine_policy(mut self, policy: AdapterQuarantinePolicyV3) -> Self {
+        self.quarantine_policy = policy;
+        self
+    }
+
+    pub fn stale_reason(mut self, stale_reason: impl Into<String>) -> Self {
+        self.stale_reason = Some(stale_reason.into());
+        self
+    }
+
+    pub fn build(mut self) -> Result<AdapterPipelineV3, AdapterPipelineV3BuildError> {
+        if matches!(
+            self.proposal.status,
+            AdapterProposalStatusV3::Blocked
+                | AdapterProposalStatusV3::Unsupported
+                | AdapterProposalStatusV3::Ambiguous
+        ) {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "blocked, unsupported, or ambiguous proposals cannot produce a pipeline",
+            ));
+        }
+        if self.proposal.status == AdapterProposalStatusV3::Resolvable && self.resolution.is_none()
+        {
+            return Err(AdapterPipelineV3BuildError::MissingField {
+                field: "resolution",
+            });
+        }
+        if self.inputs.is_empty() {
+            return Err(AdapterPipelineV3BuildError::MissingField { field: "inputs" });
+        }
+        if self.outputs.is_empty() {
+            return Err(AdapterPipelineV3BuildError::MissingField { field: "outputs" });
+        }
+        let stale_reason =
+            self.stale_reason
+                .take()
+                .ok_or(AdapterPipelineV3BuildError::MissingField {
+                    field: "stale_reason",
+                })?;
+
+        self.dependencies.sort();
+        reject_duplicate_by(&self.dependencies, "dependencies", |dependency| {
+            dependency.component_id.as_str()
+        })?;
+        if self
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.component_id == self.proposal.component_id)
+        {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "a component cannot depend on itself",
+            ));
+        }
+        self.inputs.sort();
+        reject_duplicate_by(&self.inputs, "inputs", |input| input.path.as_str())?;
+        for input in &self.inputs {
+            validate_relative_path_v3(&input.path, "inputs.path")?;
+            if input.size_bytes > MAX_V3_INPUT_BYTES {
+                return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                    "an input exceeds the v3 byte ceiling",
+                ));
+            }
+        }
+
+        if let Some(resolution) = &mut self.resolution {
+            canonical_strings_v3(
+                &mut resolution.readable_inputs,
+                "resolution.readable_inputs",
+            )?;
+            canonical_strings_v3(
+                &mut resolution.allowed_authorities,
+                "resolution.allowed_authorities",
+            )?;
+            canonical_strings_v3(
+                &mut resolution.credential_handles,
+                "resolution.credential_handles",
+            )?;
+            canonical_strings_v3(
+                &mut resolution.capabilities.network_authorities,
+                "resolution.capabilities.network_authorities",
+            )?;
+            validate_command_v3(
+                &resolution.program,
+                &resolution.argv,
+                &resolution.working_directory,
+                "resolution",
+            )?;
+            validate_relative_path_v3(&resolution.candidate_output, "resolution.candidate_output")?;
+        }
+
+        self.actions.sort_by(|left, right| {
+            left.phase
+                .cmp(&right.phase)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        reject_duplicate_by(&self.actions, "actions", |action| action.name.as_str())?;
+        for action in &mut self.actions {
+            canonical_strings_v3(
+                &mut action.capabilities.network_authorities,
+                "actions.capabilities.network_authorities",
+            )?;
+            validate_command_v3(
+                &action.program,
+                &action.argv,
+                &action.working_directory,
+                "actions",
+            )?;
+        }
+
+        self.validations.sort();
+        reject_duplicate_by(&self.validations, "validations", |validation| {
+            validation.name.as_str()
+        })?;
+        for validation in &self.validations {
+            if !validation.path.is_empty() {
+                validate_relative_path_v3(&validation.path, "validations.path")?;
+            }
+        }
+
+        self.outputs
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        reject_duplicate_by(&self.outputs, "outputs.name", |output| output.name.as_str())?;
+        let mut output_targets = BTreeSet::new();
+        for output in &self.outputs {
+            validate_relative_path_v3(&output.source, "outputs.source")?;
+            validate_relative_path_v3(&output.target, "outputs.target")?;
+            if !output_targets.insert(output.target.as_str()) {
+                return Err(AdapterPipelineV3BuildError::Duplicate {
+                    field: "outputs.target",
+                    value: output.target.clone(),
+                });
+            }
+        }
+
+        self.source_exports.sort();
+        reject_duplicate_by(&self.source_exports, "source_exports", |export| {
+            export.name.as_str()
+        })?;
+        let output_names = self
+            .outputs
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let validation_names = self
+            .validations
+            .iter()
+            .map(|validation| validation.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for export in &self.source_exports {
+            validate_relative_path_v3(&export.artifact_subpath, "source_exports.artifact_subpath")?;
+            validate_relative_path_v3(&export.destination, "source_exports.destination")?;
+            if !output_names.contains(export.output_name.as_str())
+                || !validation_names.contains(export.required_validation.as_str())
+            {
+                return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                    "a source export must reference one declared output and validation",
+                ));
+            }
+        }
+        canonical_strings_v3(
+            &mut self.attestation.required_validations,
+            "attestation.required_validations",
+        )?;
+        if self
+            .attestation
+            .required_validations
+            .iter()
+            .any(|name| !validation_names.contains(name.as_str()))
+        {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "attestation requirements must reference declared validations",
+            ));
+        }
+
+        let has_mounted_action = self
+            .actions
+            .iter()
+            .any(|action| action.phase == AdapterActionPhaseV3::MountedInitialization);
+        if has_mounted_action
+            && self.outputs.iter().any(|output| {
+                !matches!(
+                    output.policy,
+                    AdapterOutputPolicy::WritablePrivate | AdapterOutputPolicy::Disposable
+                )
+            })
+        {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "mounted initialization requires lane-private or disposable outputs",
+            ));
+        }
+        if self.secret_taint != AdapterSecretTaintV3::Clear
+            && (!self.source_exports.is_empty()
+                || self.outputs.iter().any(|output| {
+                    matches!(
+                        output.policy,
+                        AdapterOutputPolicy::ImmutableShared
+                            | AdapterOutputPolicy::ImmutableSeedPrivate
+                    )
+                }))
+        {
+            return Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "secret-tainted pipelines cannot publish reusable artifacts or source exports",
+            ));
+        }
+        canonical_strings_v3(
+            &mut self.capabilities.network_authorities,
+            "capabilities.network_authorities",
+        )?;
+
+        let pipeline = AdapterPipelineV3 {
+            proposal: self.proposal,
+            dependencies: self.dependencies,
+            inputs: self.inputs,
+            resolution: self.resolution,
+            actions: self.actions,
+            validations: self.validations,
+            capabilities: self.capabilities,
+            identity: self.identity,
+            outputs: self.outputs,
+            source_exports: self.source_exports,
+            attestation: self.attestation,
+            secret_taint: self.secret_taint,
+            quarantine_policy: self.quarantine_policy,
+            stale_reason,
+        };
+        pipeline.validate_bounds(&AdapterProtocolLimitsV3::default())?;
+        Ok(pipeline)
+    }
+}
+
+pub fn denied_capabilities_v3() -> AdapterCapabilityProfileV3 {
+    AdapterCapabilityProfileV3 {
+        network: AdapterNetworkCapabilityV3::Deny,
+        network_authorities: Vec::new(),
+        filesystem_read: AdapterFilesystemCapabilityV3::Deny,
+        filesystem_write: AdapterFilesystemCapabilityV3::Deny,
+        process: AdapterProcessCapabilityV3::Deny,
+        child_processes: 0,
+        secrets: AdapterSecretCapabilityV3::Deny,
+        publication: AdapterPublicationCapabilityV3::Deny,
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdapterPipelineV3BuildError {
+    #[error("protocol-v3 pipeline field `{field}` is required")]
+    MissingField { field: &'static str },
+    #[error("protocol-v3 pipeline field `{field}` repeats `{value}`")]
+    Duplicate { field: &'static str, value: String },
+    #[error("protocol-v3 pipeline field `{field}` has invalid relative path `{path}`")]
+    InvalidPath { field: &'static str, path: String },
+    #[error("protocol-v3 pipeline {field} must use fixed, non-shell argv")]
+    UnsafeCommand { field: &'static str },
+    #[error("protocol-v3 pipeline has an invalid combination: {0}")]
+    InvalidCombination(&'static str),
+    #[error(transparent)]
+    Bounds(#[from] AdapterProtocolV3BoundsError),
+}
+
+fn canonical_strings_v3(
+    values: &mut [String],
+    field: &'static str,
+) -> Result<(), AdapterPipelineV3BuildError> {
+    values.sort();
+    if let Some(pair) = values.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(AdapterPipelineV3BuildError::Duplicate {
+            field,
+            value: pair[0].clone(),
+        });
+    }
+    Ok(())
+}
+
+fn reject_duplicate_by<'a, T>(
+    values: &'a [T],
+    field: &'static str,
+    key: impl Fn(&'a T) -> &'a str,
+) -> Result<(), AdapterPipelineV3BuildError> {
+    if let Some(pair) = values
+        .windows(2)
+        .find(|pair| key(&pair[0]) == key(&pair[1]))
+    {
+        return Err(AdapterPipelineV3BuildError::Duplicate {
+            field,
+            value: key(&pair[0]).to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_command_v3(
+    program: &str,
+    argv: &[String],
+    working_directory: &str,
+    field: &'static str,
+) -> Result<(), AdapterPipelineV3BuildError> {
+    let program_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let shell = matches!(
+        program_name.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "dash" | "zsh" | "fish" | "cmd" | "cmd.exe" | "powershell" | "pwsh"
+    );
+    if program.is_empty()
+        || program.contains(['/', '\\'])
+        || shell
+        || argv.len() > MAX_V3_ARGV
+        || argv.iter().any(|argument| {
+            argument.is_empty()
+                || argument.contains('\0')
+                || argument.contains("$(")
+                || argument.contains('`')
+                || argument.chars().any(char::is_control)
+        })
+    {
+        return Err(AdapterPipelineV3BuildError::UnsafeCommand { field });
+    }
+    validate_relative_path_v3(working_directory, field)
+}
+
+fn validate_relative_path_v3(
+    path: &str,
+    field: &'static str,
+) -> Result<(), AdapterPipelineV3BuildError> {
+    if path == "." {
+        return Ok(());
+    }
+    let invalid = path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    if invalid {
+        Err(AdapterPipelineV3BuildError::InvalidPath {
+            field,
+            path: path.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AdapterProtocolV3BoundsError {
     #[error("protocol-v3 field `{field}` is required")]
@@ -590,13 +1155,13 @@ impl AdapterRequestV3 {
                     (self.limits.max_input_files as usize).min(MAX_V3_INPUTS),
                 )?;
                 let mut total = 0u64;
-                for input in files {
-                    input.validate_bounds()?;
-                    let actual = input.content.len() as u64;
-                    if actual != input.size_bytes {
+                for pinned in files {
+                    pinned.input.validate_bounds()?;
+                    let actual = pinned.content.len() as u64;
+                    if actual != pinned.input.size_bytes {
                         return Err(AdapterProtocolV3BoundsError::InputSizeMismatch {
-                            path: input.path.clone(),
-                            declared: input.size_bytes,
+                            path: pinned.input.path.clone(),
+                            declared: pinned.input.size_bytes,
                             actual,
                         });
                     }
@@ -1166,6 +1731,22 @@ mod tests {
         }
     }
 
+    fn identity() -> AdapterIdentityContractV3 {
+        AdapterIdentityContractV3 {
+            normalizer_version: "trail-path-v1".into(),
+            source_closure_complete: true,
+            semantic_identities: BTreeMap::from([("mode".into(), "production".into())]),
+            target: "host".into(),
+            platform: "linux".into(),
+            architecture: "x86_64".into(),
+            abi: "gnu".into(),
+            portability: AdapterPortability::Platform,
+            portability_certified: false,
+            portability_scope: "workspace".into(),
+            trust_scope: "local_plugin".into(),
+        }
+    }
+
     fn input() -> AdapterInputV3 {
         AdapterInputV3 {
             path: "schema.json".into(),
@@ -1175,6 +1756,12 @@ mod tests {
             role: AdapterInputRoleV3::Identity,
             format: "application/json".into(),
             required: true,
+        }
+    }
+
+    fn pinned_input() -> AdapterPinnedInputV3 {
+        AdapterPinnedInputV3 {
+            input: input(),
             content: b"{}\n".to_vec(),
         }
     }
@@ -1192,7 +1779,7 @@ mod tests {
             "root:v3",
             AdapterOperationV3::Plan {
                 proposal: Box::new(proposal()),
-                files: vec![input()],
+                files: vec![pinned_input()],
                 resolution_snapshot: Some(Box::new(AdapterResolutionSnapshotV3 {
                     snapshot_id: "object:snapshot".into(),
                     proposal_key: "sha256:proposal".into(),
@@ -1275,19 +1862,7 @@ mod tests {
                 parameters: BTreeMap::new(),
             }],
             capabilities: capabilities(),
-            identity: AdapterIdentityContractV3 {
-                normalizer_version: "trail-path-v1".into(),
-                source_closure_complete: true,
-                semantic_identities: BTreeMap::from([("mode".into(), "production".into())]),
-                target: "host".into(),
-                platform: "linux".into(),
-                architecture: "x86_64".into(),
-                abi: "gnu".into(),
-                portability: AdapterPortability::Platform,
-                portability_certified: false,
-                portability_scope: "workspace".into(),
-                trust_scope: "local_plugin".into(),
-            },
+            identity: identity(),
             outputs: vec![AdapterOutput::immutable_seed_private(
                 "generated",
                 "generated",
@@ -1342,7 +1917,7 @@ mod tests {
             "root:v3",
             AdapterOperationV3::Plan {
                 proposal: Box::new(proposal()),
-                files: vec![input()],
+                files: vec![pinned_input()],
                 resolution_snapshot: None,
                 host_evidence: None,
             },
@@ -1360,10 +1935,158 @@ mod tests {
         let AdapterOperationV3::Plan { files, .. } = &mut request.operation else {
             unreachable!();
         };
-        files[0].size_bytes += 1;
+        files[0].input.size_bytes += 1;
         assert!(matches!(
             request.validate_bounds(),
             Err(AdapterProtocolV3BoundsError::InputSizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn v3_builder_canonicalizes_collections_and_rejects_v3_authority_conflicts() {
+        let validation = AdapterValidationV3 {
+            name: "path-contract".into(),
+            kind: AdapterValidationKindV3::PathContract,
+            path: "generated".into(),
+            required: true,
+            parameters: BTreeMap::new(),
+        };
+        let pipeline = AdapterPipelineV3::builder(proposal(), identity())
+            .dependency(AdapterDependency::new(
+                "z-runtime",
+                AdapterDependencyType::RuntimeRequires,
+            ))
+            .dependency(AdapterDependency::new(
+                "a-compiler",
+                AdapterDependencyType::BuildRequires,
+            ))
+            .input(AdapterInputV3 {
+                path: "z.json".into(),
+                ..input()
+            })
+            .input(input())
+            .action(AdapterActionV3 {
+                name: "construct".into(),
+                phase: AdapterActionPhaseV3::Construct,
+                program: "generator".into(),
+                argv: vec!["build".into()],
+                working_directory: ".".into(),
+                environment: BTreeMap::new(),
+                capabilities: capabilities(),
+                limits: limits(),
+            })
+            .validation(validation.clone())
+            .output(AdapterOutput::immutable_seed_private(
+                "generated",
+                "generated",
+                ".trail-generated/generated",
+            ))
+            .source_export(AdapterSourceExportV3 {
+                name: "client".into(),
+                output_name: "generated".into(),
+                artifact_subpath: "client".into(),
+                destination: "src/generated".into(),
+                collision: AdapterSourceExportCollisionV3::Fail,
+                required_validation: validation.name.clone(),
+                required_gate: None,
+                authorization: AdapterSourceExportAuthorizationV3::ExplicitUser,
+            })
+            .stale_reason("source, tool, or platform changed")
+            .build()
+            .unwrap();
+        assert_eq!(pipeline.dependencies[0].component_id, "a-compiler");
+        assert_eq!(pipeline.inputs[0].path, "schema.json");
+
+        let secret_export = AdapterPipelineV3::builder(proposal(), identity())
+            .input(input())
+            .action(AdapterActionV3 {
+                name: "construct".into(),
+                phase: AdapterActionPhaseV3::Construct,
+                program: "generator".into(),
+                argv: vec!["build".into()],
+                working_directory: ".".into(),
+                environment: BTreeMap::new(),
+                capabilities: capabilities(),
+                limits: limits(),
+            })
+            .validation(validation)
+            .output(AdapterOutput::immutable_shared(
+                "generated",
+                "generated",
+                ".trail-generated/generated",
+            ))
+            .secret_taint(AdapterSecretTaintV3::Credential)
+            .stale_reason("source changed")
+            .build();
+        assert!(matches!(
+            secret_export,
+            Err(AdapterPipelineV3BuildError::InvalidCombination(
+                "secret-tainted pipelines cannot publish reusable artifacts or source exports"
+            ))
+        ));
+
+        let shell = AdapterPipelineV3::builder(proposal(), identity())
+            .input(input())
+            .action(AdapterActionV3 {
+                name: "construct".into(),
+                phase: AdapterActionPhaseV3::Construct,
+                program: "sh".into(),
+                argv: vec!["-c".into(), "build".into()],
+                working_directory: ".".into(),
+                environment: BTreeMap::new(),
+                capabilities: capabilities(),
+                limits: limits(),
+            })
+            .output(AdapterOutput::writable_private(
+                "generated",
+                "generated",
+                ".trail-generated/generated",
+            ))
+            .stale_reason("source changed")
+            .build();
+        assert!(matches!(
+            shell,
+            Err(AdapterPipelineV3BuildError::UnsafeCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_plan_projections_are_canonical_and_never_infer_v3_semantics() {
+        let v1 = AdapterPlan::builder("legacy", "generated")
+            .dependencies(["z-tool", "a-source"])
+            .identity_inputs(["z.lock", "a.toml"])
+            .command(crate::AdapterCommand::new("generator", ["build"]))
+            .outputs([
+                AdapterOutput::writable_private("z-state", "z", "z"),
+                AdapterOutput::immutable_seed_private("a-seed", "a", "a"),
+            ])
+            .stale_reason("legacy inputs changed")
+            .build()
+            .unwrap();
+        let projection = AdapterLegacyPlanProjectionV3::from_v1(v1);
+        assert_eq!(projection.source_protocol, PROTOCOL_V1);
+        assert_eq!(projection.dependencies[0].component_id, "a-source");
+        assert_eq!(projection.identity_inputs, ["a.toml", "z.lock"]);
+        assert_eq!(projection.outputs[0].name, "a-seed");
+        assert!(projection.v3_only.is_absent());
+
+        let v2 = AdapterPlanV2::builder("legacy-v2", "generated")
+            .runtime_requires("z-runtime")
+            .build_requires("a-compiler")
+            .identity_inputs(["z.lock", "a.toml"])
+            .mounted_command(crate::AdapterCommand::new("initializer", ["prepare"]))
+            .output(AdapterOutput::writable_private("state", "state", "state"))
+            .stale_reason("legacy v2 inputs changed")
+            .build()
+            .unwrap();
+        let projection = AdapterLegacyPlanProjectionV3::from_v2(v2);
+        assert_eq!(projection.source_protocol, PROTOCOL_V2);
+        assert_eq!(projection.dependencies[0].component_id, "a-compiler");
+        assert!(projection.v3_only.is_absent());
+
+        let decoded: AdapterLegacyPlanProjectionV3 =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&projection).unwrap()).unwrap();
+        assert_eq!(decoded, projection);
+        assert!(decoded.v3_only.is_absent());
     }
 }

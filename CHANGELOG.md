@@ -93,6 +93,10 @@ All notable changes to Trail are documented in this file. Trail follows
   response, proposal, resolution, typed-phase, validation, capability, identity,
   source-export, attestation-requirement, secret-taint, and quarantine-evidence types
   without changing v1/v2 wire layouts or granting adapters host mutation authority.
+- Adapter protocol negotiation now selects the highest exact mutual identity, and
+  canonical v1/v2 projections keep every v3-only authority absent. The SDK adds a v3
+  pipeline builder, explicit deny-by-default package capability declarations, detailed
+  validation errors, and an artifact-pipeline example adapter.
 
 ### Changed
 

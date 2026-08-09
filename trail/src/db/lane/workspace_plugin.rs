@@ -7,13 +7,14 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use trail_environment_adapter_sdk::{
-    read_frame, write_frame, AdapterAction, AdapterCache, AdapterCacheAccess, AdapterCacheProtocol,
-    AdapterCommand, AdapterDependencyType, AdapterExternalArtifact, AdapterHost, AdapterOperation,
-    AdapterOutput, AdapterOutputPolicy, AdapterPackageManifest, AdapterPackageSignature,
-    AdapterPermissions, AdapterPlan, AdapterPlanV2, AdapterPortability, AdapterPublicationTrigger,
-    AdapterPublisherKey, AdapterRequest, AdapterResponse, AdapterResult, AdapterReuseMode,
-    AdapterRuntimeResource, AdapterSharingScope, DiscoveredComponent, PinnedFile, MAX_FRAME_BYTES,
-    PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1, PROTOCOL_V2,
+    negotiate_highest_mutual_protocol, read_frame, write_frame, AdapterAction, AdapterCache,
+    AdapterCacheAccess, AdapterCacheProtocol, AdapterCommand, AdapterDependencyType,
+    AdapterExternalArtifact, AdapterHost, AdapterOperation, AdapterOutput, AdapterOutputPolicy,
+    AdapterPackageManifest, AdapterPackageSignature, AdapterPermissions, AdapterPlan,
+    AdapterPlanV2, AdapterPortability, AdapterPublicationTrigger, AdapterPublisherKey,
+    AdapterRequest, AdapterResponse, AdapterResult, AdapterReuseMode, AdapterRuntimeResource,
+    AdapterSharingScope, DiscoveredComponent, PinnedFile, MAX_FRAME_BYTES, PACKAGE_SCHEMA_V1,
+    PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3,
     TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
 };
 
@@ -2363,28 +2364,16 @@ pub(super) fn unsupported_environment_plugin_proposal(
 pub(super) fn selected_environment_plugin_protocol(
     plugin: &InstalledEnvironmentPlugin,
 ) -> Result<&'static str> {
-    if plugin
-        .manifest
-        .adapter
-        .protocols
-        .iter()
-        .any(|protocol| protocol == PROTOCOL_V2)
-    {
-        Ok(PROTOCOL_V2)
-    } else if plugin
-        .manifest
-        .adapter
-        .protocols
-        .iter()
-        .any(|protocol| protocol == PROTOCOL_V1)
-    {
-        Ok(PROTOCOL_V1)
-    } else {
-        Err(Error::InvalidInput(format!(
+    negotiate_highest_mutual_protocol(
+        &[PROTOCOL_V2, PROTOCOL_V1],
+        &plugin.manifest.adapter.protocols,
+    )
+    .ok_or_else(|| {
+        Error::InvalidInput(format!(
             "adapter `{}` shares no supported protocol with this Trail host",
             plugin.manifest.adapter.canonical_identity
-        )))
-    }
+        ))
+    })
 }
 
 fn ensure_environment_plugin_supports_current_host(
@@ -2788,10 +2777,22 @@ fn canonicalize_and_validate_package(package: &mut AdapterPackageManifest) -> Re
             .adapter
             .protocols
             .iter()
-            .any(|protocol| !matches!(protocol.as_str(), PROTOCOL_V1 | PROTOCOL_V2))
+            .any(|protocol| !matches!(protocol.as_str(), PROTOCOL_V1 | PROTOCOL_V2 | PROTOCOL_V3))
     {
         return Err(Error::InvalidInput(format!(
             "adapter `{}` must declare one or more host-supported protocols",
+            package.adapter.canonical_identity
+        )));
+    }
+    if !package
+        .adapter
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3)
+        && !package.adapter.capabilities.is_denied()
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` declares protocol-v3 capabilities without protocol v3",
             package.adapter.canonical_identity
         )));
     }
@@ -3051,6 +3052,71 @@ mod tests {
     use super::*;
     use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
     use ed25519_dalek::{Signer, SigningKey};
+
+    fn plugin_with_protocols(protocols: &[&str]) -> InstalledEnvironmentPlugin {
+        InstalledEnvironmentPlugin {
+            manifest: AdapterPackageManifest {
+                schema: PACKAGE_SCHEMA_V1.into(),
+                adapter: trail_environment_adapter_sdk::AdapterMetadata {
+                    canonical_identity: "example/test@1".into(),
+                    implementation_version: "1".into(),
+                    selectors: vec!["example/test@1".into()],
+                    kind: "generated".into(),
+                    layer_adapter_name: "test".into(),
+                    discovery_markers: vec!["test.adapter".into()],
+                    protocols: protocols
+                        .iter()
+                        .map(|protocol| (*protocol).into())
+                        .collect(),
+                    capabilities:
+                        trail_environment_adapter_sdk::AdapterPackageCapabilities::default(),
+                    supported_operating_systems: vec![std::env::consts::OS.into()],
+                    supported_architectures: vec![std::env::consts::ARCH.into()],
+                    stability: "experimental".into(),
+                    description: "test".into(),
+                },
+                executable: trail_environment_adapter_sdk::AdapterExecutable {
+                    path: "adapter".into(),
+                    sha256: format!("sha256:{}", "0".repeat(64)),
+                },
+                permissions: AdapterPermissions::default(),
+            },
+            distribution_digest: format!("sha256:{}", "1".repeat(64)),
+            executable_digest: format!("sha256:{}", "2".repeat(64)),
+            executable_path: PathBuf::from("adapter"),
+            publisher: None,
+            publisher_key_id: None,
+            trust: "local".into(),
+            certification_tier: "uncertified".into(),
+        }
+    }
+
+    #[test]
+    fn host_negotiation_falls_back_exactly_until_v3_normalization_is_enabled() {
+        assert_eq!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[
+                PROTOCOL_V1,
+                PROTOCOL_V3,
+                PROTOCOL_V2,
+            ]))
+            .unwrap(),
+            PROTOCOL_V2
+        );
+        assert_eq!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[
+                PROTOCOL_V3,
+                PROTOCOL_V1,
+            ]))
+            .unwrap(),
+            PROTOCOL_V1
+        );
+        assert!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[PROTOCOL_V3]))
+                .unwrap_err()
+                .to_string()
+                .contains("shares no supported protocol")
+        );
+    }
 
     #[test]
     fn protocol_v2_typed_dependencies_normalize_to_host_edge_semantics() {

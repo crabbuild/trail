@@ -1022,6 +1022,21 @@ objects or acquire mutation authority. Both request and response expose bounded
 validation before semantic host normalization; exact protocol negotiation and complete
 host-side validation remain mandatory trust boundaries.
 
+Negotiation compares exact identities and chooses the highest mutual value from v3,
+v2, then v1; caller ordering and unknown version-like prefixes have no effect. Until the
+host completes v3 normalization, its advertised host set remains v1/v2, so a multi-version
+package deterministically falls back while a v3-only package is not invoked. Canonical
+v1/v2 compatibility projections preserve their existing commands, outputs, caches, and
+external/runtime declarations but carry a structurally empty v3-only section. Missing
+legacy fields can therefore never imply proposal, resolver, validation, capability,
+identity-certification, export, attestation, or quarantine semantics.
+
+The SDK v3 builder provides early authoring validation and deterministic set ordering.
+Package metadata separately declares resolution/export and host-evidence capabilities
+plus a certification ceiling; omission is deny-all legacy behavior. These declarations
+are maximum requests, not grants: package trust, host policy, protocol selection, and
+native enforcement may only narrow them.
+
 The planner capability set is deliberately fixed rather than open-ended: bounded pinned
 bytes in, discovery or plan data out, no direct repository reads or writes, no child
 process, no network, no shell, no secrets, no database, and no mount/publication
