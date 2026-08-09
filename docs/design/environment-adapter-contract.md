@@ -1012,6 +1012,16 @@ the same models. Local plugins are installed by digest and declare:
 - timeout and response-size limits;
 - one executable digest and experimental stability.
 
+The SDK's protocol-v3 wire layer is separate from v1/v2 and carries explicit host
+ceilings. It models incomplete proposals, resolution plans and verified snapshot input,
+typed artifact phases, input roles, validation and capability contracts, identity
+declarations, explicit source exports, attestation requirements, secret taint, and
+quarantine policy. Only Trail-authored object references can appear as attestation or
+quarantine evidence in an adapter request. Adapter responses cannot publish those
+objects or acquire mutation authority. Both request and response expose bounded
+validation before semantic host normalization; exact protocol negotiation and complete
+host-side validation remain mandatory trust boundaries.
+
 The planner capability set is deliberately fixed rather than open-ended: bounded pinned
 bytes in, discovery or plan data out, no direct repository reads or writes, no child
 process, no network, no shell, no secrets, no database, and no mount/publication

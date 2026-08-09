@@ -89,6 +89,10 @@ All notable changes to Trail are documented in this file. Trail follows
   contract while exercising v1 planning, include/profile cycles, unsafe and
   secret-capable declarations, stale and conflicting destinations, ignored paths, a
   custom command framework, and visibility of exported source in the normal lane diff.
+- The environment-adapter SDK now defines separate bounded protocol-v3 request,
+  response, proposal, resolution, typed-phase, validation, capability, identity,
+  source-export, attestation-requirement, secret-taint, and quarantine-evidence types
+  without changing v1/v2 wire layouts or granting adapters host mutation authority.
 
 ### Changed
 

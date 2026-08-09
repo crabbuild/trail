@@ -80,7 +80,7 @@
 
 ## 9. Adapter Protocol v3 and SDK
 
-- [ ] 9.1 Define bounded `trail.environment-adapter/v3` request/response types for proposals, resolution, inputs, typed phases, validations, capabilities, identities, exports, attestations, and quarantine evidence
+- [x] 9.1 Define bounded `trail.environment-adapter/v3` request/response types for proposals, resolution, inputs, typed phases, validations, capabilities, identities, exports, attestations, and quarantine evidence
 - [ ] 9.2 Implement exact highest-mutual-version negotiation and deterministic v1/v2 conversions that cannot obtain v3 semantics from absent fields
 - [ ] 9.3 Add SDK v3 builders with canonical collections, validation errors, finite limits, example adapters, package capability declarations, and documentation
 - [ ] 9.4 Repeat complete host validation for every v3 response and reject duplicate IDs, bad normalization, invalid graph/phase combinations, oversized data, unsupported required fields, and package/protocol mismatch

@@ -132,6 +132,25 @@ wire types. Select it in `trail-adapter.toml`:
 protocols = ["trail.environment-adapter/v2"]
 ```
 
+Protocol v3 is a separate, strictly bounded wire surface so existing v1/v2 request,
+response, and plan layouts remain unchanged. `AdapterRequestV3` carries exact host
+ceilings and either pinned proposal inputs or typed planning inputs plus an optional
+verified resolution snapshot. `AdapterResponseV3` returns an incomplete/ready proposal
+or an `AdapterPipelineV3` containing resolution, typed phases, validations, capability
+profiles, identity declarations, outputs, explicit source exports, attestation
+requirements, secret taint, and quarantine policy.
+
+Call `validate_bounds()` before writing a v3 frame. It enforces hard limits for input
+bytes/files, actions, validations, outputs, authorities, exports, maps, strings, resolver
+captures, output trees, and child processes. Trail repeats this validation and the full
+semantic/trust validation at the host boundary. Host evidence in a v3 request is tagged
+and object-referenced; an adapter cannot mint an attestation, resolve a quarantine,
+publish an artifact, mount a lane, or write exported source.
+
+Protocol-v3 negotiation and host normalization are explicit. Merely adding v3 types to
+an adapter does not cause a v1/v2 package to receive resolution, export, attestation, or
+compatibility authority.
+
 A mounted-only plan is authored as:
 
 ```rust

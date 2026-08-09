@@ -10,11 +10,18 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+mod protocol_v3;
+pub use protocol_v3::*;
+
 pub const PROTOCOL_V1: &str = "trail.environment-adapter/v1";
 /// Adds host-sandboxed actions that execute against Trail's ephemeral mounted
 /// candidate view. V1 remains the default for packages that do not declare a
 /// protocol list, so existing adapters keep their exact behavior.
 pub const PROTOCOL_V2: &str = "trail.environment-adapter/v2";
+/// Adds incomplete proposals, explicit resolution, typed artifact phases,
+/// validation/capability contracts, generated-source exports, and host-owned
+/// attestation/quarantine evidence without changing v1/v2 wire meanings.
+pub const PROTOCOL_V3: &str = "trail.environment-adapter/v3";
 pub const PACKAGE_SCHEMA_V1: &str = "trail.environment-adapter-package/v1";
 pub const PACKAGE_SIGNATURE_SCHEMA_V1: &str = "trail.environment-adapter-signature/v1";
 pub const TRUSTED_PUBLISHER_KEY_SCHEMA_V1: &str = "trail.environment-adapter-publisher-key/v1";
