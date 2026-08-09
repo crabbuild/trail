@@ -666,6 +666,19 @@ the local-plugin ceiling until a future durable certification record says otherw
 Reviewed built-ins retain an explicitly identified managed-network compatibility ceiling
 while their ecosystem actions migrate to separate resolver and offline-constructor phases.
 
+Secret consumption is a one-way trust transition. The host represents it with a typed
+`clear` or `tainted` result containing canonical, non-secret channel classes only. A
+resolver candidate with exact-value redactions is terminated as
+`secret_tainted_output_private_only`: Trail may retain bounded redacted failure evidence,
+but it does not store the snapshot candidate or publish a shared envelope. Because the
+current resolver request cannot prove that a declared credential handle was unused,
+credential-capable resolver publication fails closed before shared snapshot reuse or
+creation. Runtime secret access similarly taints the active environment generation;
+writable-private outputs from that generation cannot be promoted. Producer receipts are
+checked for both typed taint and accidental sensitive fields before they become durable.
+Source export remains a planned v2 operation and must apply the same taint check before
+reading candidate bytes or writing repository source.
+
 Adapters never receive raw database access, shared artifact mutation, arbitrary host
 paths, or undeclared secrets. They return plans and observations. The host validates
 paths, executes approved actions, publishes artifacts, and commits generations.

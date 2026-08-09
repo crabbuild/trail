@@ -135,6 +135,8 @@ pub struct ArtifactEnvelopeV1 {
     pub output_policy: EnvironmentOutputPolicy,
     pub portability_scope: String,
     pub trust_scope: String,
+    #[serde(default, skip_serializing_if = "ArtifactSecretTaintV1::is_clear")]
+    pub secret_taint: ArtifactSecretTaintV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_snapshot_id: Option<ObjectId>,
     #[serde(default)]
@@ -239,6 +241,27 @@ pub enum ArtifactSecretCapabilityV1 {
     Deny,
     OpaqueHandles,
     RuntimeInjection,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ArtifactSecretTaintV1 {
+    #[default]
+    Clear,
+    Tainted { channels: Vec<String> },
+}
+
+impl ArtifactSecretTaintV1 {
+    pub fn is_clear(&self) -> bool {
+        matches!(self, Self::Clear)
+    }
+
+    pub fn channels(&self) -> &[String] {
+        match self {
+            Self::Clear => &[],
+            Self::Tainted { channels } => channels,
+        }
+    }
 }
 
 /// Maximum authority available to one producer tier in one execution phase.
@@ -499,6 +522,8 @@ pub struct ArtifactResolutionSnapshotV1 {
     pub contacted_authorities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_snapshot_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "ArtifactSecretTaintV1::is_clear")]
+    pub secret_taint: ArtifactSecretTaintV1,
     pub verification_state: ArtifactResolutionVerificationStateV1,
 }
 
@@ -543,6 +568,8 @@ pub struct ArtifactResolutionFailureReceiptV1 {
     pub code: String,
     pub message: String,
     pub authority_evidence: ArtifactResolutionAuthorityEvidenceV1,
+    #[serde(default, skip_serializing_if = "ArtifactSecretTaintV1::is_clear")]
+    pub secret_taint: ArtifactSecretTaintV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdout_object_id: Option<ObjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

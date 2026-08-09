@@ -53,6 +53,10 @@ All notable changes to Trail are documented in this file. Trail follows
 - Artifact producers now use a host-selected phase/trust-tier capability ceiling for
   reviewed built-ins, certified signed plugins, locally trusted plugins, and repository
   declarations; signatures authenticate origin without implicitly elevating authority.
+- Secret-consuming artifact producers now carry typed non-secret taint evidence;
+  resolver candidates stay out of shared CAS, runtime-secret generations cannot promote
+  private output, and producer receipts are rejected if tainted or sensitive while
+  bounded failure evidence remains exact-value redacted.
 
 ### Changed
 

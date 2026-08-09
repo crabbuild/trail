@@ -286,6 +286,16 @@ impl Trail {
             .ok_or_else(|| {
                 Error::InvalidInput("lane has no active environment generation".to_string())
             })?;
+        let generation_secret_tainted = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM environment_secret_access_audit
+                 WHERE generation_id=?1 AND status='available'
+             )",
+            params![&predecessor],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let producer_receipt_json =
+            validate_private_output_promotion_taint(generation_secret_tainted, producer_receipt)?;
         let (policy, reuse, scope, trigger, gate, binding_identity, mount_path, component_key) =
             self.conn
                 .query_row(
@@ -387,7 +397,7 @@ impl Trail {
                 &output_identity,
                 trigger.as_str(),
                 &gate,
-                producer_receipt.map(serde_json::to_vec).transpose()?,
+                producer_receipt_json,
                 std::process::id(),
                 current_process_start_token(),
                 staging_relative,
@@ -5536,6 +5546,48 @@ impl Trail {
     }
 }
 
+fn validate_private_output_promotion_taint(
+    generation_secret_tainted: bool,
+    producer_receipt: Option<&serde_json::Value>,
+) -> Result<Option<Vec<u8>>> {
+    if generation_secret_tainted {
+        return Err(Error::InvalidInput(
+            "secret-tainted private output is non-promotable and must remain lane-private"
+                .to_string(),
+        ));
+    }
+    let Some(producer_receipt) = producer_receipt else {
+        return Ok(None);
+    };
+    let secret_taint = match producer_receipt.get("secret_taint") {
+        Some(value) => {
+            serde_json::from_value::<ArtifactSecretTaintV1>(value.clone()).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "producer receipt has malformed secret-taint evidence: {error}"
+                ))
+            })?
+        }
+        None => ArtifactSecretTaintV1::Clear,
+    };
+    super::workspace_artifact::validate_artifact_secret_taint(&secret_taint)?;
+    if !secret_taint.is_clear() {
+        return Err(Error::InvalidInput(
+            "secret-tainted private output is non-promotable and must remain lane-private"
+                .to_string(),
+        ));
+    }
+    let mut non_taint_evidence = producer_receipt.clone();
+    if let Some(object) = non_taint_evidence.as_object_mut() {
+        object.remove("secret_taint");
+    }
+    if contains_sensitive_json(&non_taint_evidence) {
+        return Err(Error::InvalidInput(
+            "producer receipt may contain secret material and cannot be stored".to_string(),
+        ));
+    }
+    Ok(Some(serde_json::to_vec(producer_receipt)?))
+}
+
 struct EnvironmentRuntimeAllocationNames {
     allocation_id: String,
     container_name: String,
@@ -6541,6 +6593,46 @@ mod tests {
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
         }
+    }
+
+    #[test]
+    fn private_output_promotion_rejects_secret_taint_and_sensitive_receipts() {
+        let clear = serde_json::json!({
+            "gate": "integration",
+            "secret_taint": { "state": "clear" }
+        });
+        assert!(validate_private_output_promotion_taint(false, Some(&clear))
+            .unwrap()
+            .is_some());
+
+        let tainted = serde_json::json!({
+            "gate": "integration",
+            "secret_taint": {
+                "state": "tainted",
+                "channels": ["runtime_credential"]
+            }
+        });
+        assert!(
+            validate_private_output_promotion_taint(false, Some(&tainted))
+                .unwrap_err()
+                .to_string()
+                .contains("non-promotable")
+        );
+        assert!(validate_private_output_promotion_taint(true, None)
+            .unwrap_err()
+            .to_string()
+            .contains("non-promotable"));
+
+        let sensitive = serde_json::json!({
+            "gate": "integration",
+            "authorization": "Bearer credential-value-never-store"
+        });
+        assert!(
+            validate_private_output_promotion_taint(false, Some(&sensitive))
+                .unwrap_err()
+                .to_string()
+                .contains("secret material")
+        );
     }
 
     fn artifact_inheritance_request<'a>(

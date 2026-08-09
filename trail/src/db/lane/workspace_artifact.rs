@@ -100,6 +100,12 @@ impl Trail {
         } = request;
         normalize_artifact_resolution_plan(&mut plan)?;
         self.validate_artifact_resolution_plan_pins(&plan)?;
+        if !plan.credential_handles.is_empty() {
+            return Err(Error::InvalidInput(
+                "artifact resolution declares credential access; secret-influenced resolver output must remain lane-private and cannot enter shared CAS"
+                    .into(),
+            ));
+        }
 
         if let Some((snapshot_id, snapshot)) =
             self.artifact_resolution_snapshot_for_proposal(&plan.proposal_key)?
@@ -139,6 +145,25 @@ impl Trail {
             stderr,
             redactions,
         } = candidate;
+        if redactions.iter().any(|secret| !secret.is_empty()) {
+            let message = "resolver consumed secret material; its output is private, non-promotable, and cannot enter shared CAS";
+            let attempt = self.finish_artifact_resolution_attempt_failure(
+                &fence,
+                ArtifactResolutionAttemptFailure {
+                    code: "secret_tainted_output_private_only",
+                    message,
+                    contacted_authorities,
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    redactions: &redactions,
+                    cancelled: false,
+                },
+            )?;
+            return Err(Error::InvalidInput(format!(
+                "artifact resolution attempt `{}` failed: {message}",
+                attempt.attempt_id
+            )));
+        }
         if snapshot_bytes.is_empty() {
             let message = "resolver produced an empty or malformed snapshot candidate";
             let attempt = self.finish_artifact_resolution_attempt_failure(
@@ -454,6 +479,7 @@ impl Trail {
         let (stderr_object_id, stderr_truncated) =
             self.put_artifact_resolution_capture(stderr, plan.limits.stderr_bytes, redactions)?;
         if stdout_truncated || stderr_truncated {
+            let secret_tainted = resolution_is_secret_tainted(&plan, redactions);
             return self.finish_artifact_resolution_attempt_failure_under_write_lock(
                 fence,
                 "captured_output_limit_exceeded",
@@ -461,6 +487,7 @@ impl Trail {
                 authority_evidence,
                 stdout_object_id,
                 stderr_object_id,
+                secret_tainted,
                 ArtifactResolutionAttemptStatusV1::Failed,
             );
         }
@@ -520,6 +547,7 @@ impl Trail {
             failure.redactions,
         ))
         .into_owned();
+        let secret_tainted = resolution_is_secret_tainted(&plan, failure.redactions);
         self.finish_artifact_resolution_attempt_failure_under_write_lock(
             fence,
             failure.code,
@@ -527,6 +555,7 @@ impl Trail {
             authority_evidence,
             stdout_object_id,
             stderr_object_id,
+            secret_tainted,
             if failure.cancelled {
                 ArtifactResolutionAttemptStatusV1::Cancelled
             } else {
@@ -666,6 +695,7 @@ impl Trail {
             };
             let plan = self.artifact_resolution_plan_for_fence(&fence)?;
             let evidence = normalized_resolution_authority_evidence(&plan, Vec::new())?;
+            let secret_tainted = !plan.credential_handles.is_empty();
             self.finish_artifact_resolution_attempt_failure_under_write_lock(
                 &fence,
                 if cancel_requested {
@@ -681,6 +711,7 @@ impl Trail {
                 evidence,
                 None,
                 None,
+                secret_tainted,
                 if cancel_requested {
                     ArtifactResolutionAttemptStatusV1::Cancelled
                 } else {
@@ -1258,6 +1289,7 @@ impl Trail {
         authority_evidence: ArtifactResolutionAuthorityEvidenceV1,
         stdout_object_id: Option<ObjectId>,
         stderr_object_id: Option<ObjectId>,
+        secret_tainted: bool,
         status: ArtifactResolutionAttemptStatusV1,
     ) -> Result<ArtifactResolutionAttemptReportV1> {
         if !matches!(
@@ -1279,6 +1311,7 @@ impl Trail {
             code: code.to_string(),
             message: message.to_string(),
             authority_evidence: authority_evidence.clone(),
+            secret_taint: artifact_secret_taint(secret_tainted, "resolver_credential"),
             stdout_object_id: stdout_object_id.clone(),
             stderr_object_id: stderr_object_id.clone(),
         };
@@ -2999,6 +3032,7 @@ impl Trail {
             output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
             portability_scope: layer_key.portability_scope.clone(),
             trust_scope: "workspace-layer-v1".into(),
+            secret_taint: ArtifactSecretTaintV1::Clear,
             resolution_snapshot_id: None,
             validation_receipt_ids,
         };
@@ -3021,6 +3055,13 @@ impl Trail {
         };
         validate_resolution_text(&desired_key, "artifact desired key")?;
         validate_resolution_text(&envelope.trust_scope, "artifact trust scope")?;
+        validate_artifact_secret_taint(&envelope.secret_taint)?;
+        if !envelope.secret_taint.is_clear() {
+            return Err(Error::InvalidInput(
+                "secret-tainted artifact output must remain lane-private and cannot enter shared CAS"
+                    .into(),
+            ));
+        }
         self.validate_envelope_validation_receipts(&envelope)?;
         let (envelope_id, _) = encode_artifact_envelope(envelope.clone())?;
         let object_id = self.put_artifact_cas_object(
@@ -3677,6 +3718,12 @@ impl Trail {
     ) -> Result<(ObjectId, ArtifactResolutionSnapshotV1)> {
         let _lock = self.acquire_write_lock()?;
         normalize_artifact_resolution_plan(&mut plan)?;
+        if !plan.credential_handles.is_empty() {
+            return Err(Error::InvalidInput(
+                "artifact resolution declares credential access; secret-influenced snapshots cannot enter shared CAS"
+                    .into(),
+            ));
+        }
         if snapshot_bytes.len() as u64 > plan.limits.candidate_bytes {
             return Err(Error::InvalidInput(format!(
                 "artifact resolution candidate contains {} bytes; maximum is {}",
@@ -3738,6 +3785,7 @@ impl Trail {
             policy_identity: plan.policy_identity,
             contacted_authorities,
             predecessor_snapshot_id,
+            secret_taint: ArtifactSecretTaintV1::Clear,
             verification_state: ArtifactResolutionVerificationStateV1::Verified,
         };
         validate_artifact_resolution_snapshot(&snapshot)?;
@@ -4768,6 +4816,7 @@ fn encode_artifact_envelope(
     validate_resolution_text(&envelope.output_name, "envelope output name")?;
     validate_resolution_text(&envelope.portability_scope, "envelope portability scope")?;
     validate_resolution_text(&envelope.trust_scope, "envelope trust scope")?;
+    validate_artifact_secret_taint(&envelope.secret_taint)?;
     envelope.validation_receipt_ids.sort();
     envelope.validation_receipt_ids.dedup();
     let bytes = cbor(&envelope)?;
@@ -5004,6 +5053,12 @@ fn validate_artifact_resolution_snapshot(snapshot: &ArtifactResolutionSnapshotV1
     validate_sha256(&snapshot.content_sha256, "snapshot content hash")?;
     validate_identity_map(&snapshot.resolved_identities, "resolved identity")?;
     validate_identity_map(&snapshot.checksums, "snapshot checksum")?;
+    validate_artifact_secret_taint(&snapshot.secret_taint)?;
+    if !snapshot.secret_taint.is_clear() {
+        return Err(Error::Corrupt(
+            "secret-tainted artifact resolution snapshot entered shared storage".into(),
+        ));
+    }
     if snapshot.contacted_authorities.len() > MAX_RESOLUTION_AUTHORITIES
         || !snapshot
             .contacted_authorities
@@ -5013,6 +5068,45 @@ fn validate_artifact_resolution_snapshot(snapshot: &ArtifactResolutionSnapshotV1
         return Err(Error::Corrupt(
             "artifact snapshot authorities are excessive, duplicated, or not canonical".into(),
         ));
+    }
+    Ok(())
+}
+
+fn resolution_is_secret_tainted(plan: &ArtifactResolutionPlanV1, redactions: &[Vec<u8>]) -> bool {
+    !plan.credential_handles.is_empty() || redactions.iter().any(|secret| !secret.is_empty())
+}
+
+fn artifact_secret_taint(secret_tainted: bool, channel: &str) -> ArtifactSecretTaintV1 {
+    if secret_tainted {
+        ArtifactSecretTaintV1::Tainted {
+            channels: vec![channel.to_string()],
+        }
+    } else {
+        ArtifactSecretTaintV1::Clear
+    }
+}
+
+pub(super) fn validate_artifact_secret_taint(taint: &ArtifactSecretTaintV1) -> Result<()> {
+    let ArtifactSecretTaintV1::Tainted { channels } = taint else {
+        return Ok(());
+    };
+    if channels.is_empty()
+        || channels.len() > MAX_RESOLUTION_ENVIRONMENT_NAMES
+        || !channels.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return Err(Error::InvalidInput(
+            "artifact secret-taint channels are empty, excessive, duplicated, or not canonical"
+                .into(),
+        ));
+    }
+    for channel in channels {
+        validate_resolution_text(channel, "secret-taint channel")?;
+        if contains_sensitive_text(channel) {
+            return Err(Error::InvalidInput(
+                "artifact secret-taint metadata may identify a channel but cannot contain secret material"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -5733,6 +5827,7 @@ mod tests {
             output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
             portability_scope: "workspace".into(),
             trust_scope: "builtin".into(),
+            secret_taint: ArtifactSecretTaintV1::Clear,
             resolution_snapshot_id: None,
             validation_receipt_ids: Vec::new(),
         };
@@ -5979,6 +6074,7 @@ mod tests {
             output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
             portability_scope: "workspace".into(),
             trust_scope: "builtin".into(),
+            secret_taint: ArtifactSecretTaintV1::Clear,
             resolution_snapshot_id: None,
             validation_receipt_ids: vec![receipt_id.clone()],
         };
@@ -5993,6 +6089,15 @@ mod tests {
             vec![receipt_id.clone()]
         );
         assert!(db.validate_artifact_cas_integrity().unwrap().is_empty());
+
+        let mut tainted_envelope = envelope.clone();
+        tainted_envelope.secret_taint = ArtifactSecretTaintV1::Tainted {
+            channels: vec!["runtime_credential".into()],
+        };
+        let error = db
+            .put_artifact_envelope_under_write_lock(tainted_envelope)
+            .unwrap_err();
+        assert!(error.to_string().contains("must remain lane-private"));
         db.conn
             .execute(
                 "INSERT INTO artifact_holds(
@@ -6732,6 +6837,7 @@ mod tests {
                 output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
                 portability_scope: "workspace".into(),
                 trust_scope: "builtin".into(),
+                secret_taint: ArtifactSecretTaintV1::Clear,
                 resolution_snapshot_id: Some(snapshot_id.clone()),
                 validation_receipt_ids: Vec::new(),
             })
@@ -7343,6 +7449,83 @@ mod tests {
     }
 
     #[test]
+    fn resolve_component_keeps_secret_tainted_candidate_out_of_shared_cas() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let plan = executable_fixture_plan(&db, source_root);
+        let secret = b"credential-value-never-store".to_vec();
+        let mut candidate = fixture_candidate(b"snapshot credential-value-never-store");
+        candidate.stdout = b"stdout credential-value-never-store".to_vec();
+        candidate.stderr = b"stderr credential-value-never-store".to_vec();
+        candidate.redactions = vec![secret.clone()];
+
+        let error = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: plan.clone(),
+                    candidate,
+                },
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("private, non-promotable"));
+        assert!(db
+            .artifact_resolution_snapshot_for_proposal(&plan.proposal_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM objects WHERE kind=?1",
+                    params![ARTIFACT_RESOLUTION_CONTENT_KIND],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let attempt = db.artifact_resolution_attempts().unwrap().pop().unwrap();
+        assert_eq!(
+            attempt.failure_code.as_deref(),
+            Some("secret_tainted_output_private_only")
+        );
+        let receipt: ArtifactResolutionFailureReceiptV1 = db
+            .get_object(
+                ARTIFACT_RESOLUTION_FAILURE_KIND,
+                attempt.failure_receipt_object_id.as_ref().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.secret_taint,
+            ArtifactSecretTaintV1::Tainted {
+                channels: vec!["resolver_credential".into()]
+            }
+        );
+        for capture_id in [attempt.stdout_object_id, attempt.stderr_object_id]
+            .into_iter()
+            .flatten()
+        {
+            let capture: ArtifactResolutionCaptureV1 = db
+                .get_object(ARTIFACT_RESOLUTION_CAPTURE_KIND, &capture_id)
+                .unwrap();
+            assert!(!capture
+                .bytes
+                .windows(secret.len())
+                .any(|bytes| bytes == secret));
+        }
+        let durable_objects = db
+            .conn
+            .prepare("SELECT bytes FROM objects ORDER BY object_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(durable_objects
+            .iter()
+            .all(|bytes| !bytes.windows(secret.len()).any(|window| window == secret)));
+    }
+
+    #[test]
     fn resolve_component_rejects_stale_source_and_tool_identity() {
         let (_temp, db, source_root) = initialized_resolution_fixture();
         let plan = executable_fixture_plan(&db, source_root);
@@ -7435,6 +7618,12 @@ mod tests {
             vec!["registry_credentials"]
         );
         assert!(receipt.authority_evidence.credential_values_redacted);
+        assert_eq!(
+            receipt.secret_taint,
+            ArtifactSecretTaintV1::Tainted {
+                channels: vec!["resolver_credential".into()]
+            }
+        );
         assert!(!serde_json::to_vec(&finished)
             .unwrap()
             .windows(secret.len())
@@ -7594,6 +7783,7 @@ mod tests {
                 output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
                 portability_scope: "workspace".into(),
                 trust_scope: "builtin".into(),
+                secret_taint: ArtifactSecretTaintV1::Clear,
                 resolution_snapshot_id: None,
                 validation_receipt_ids: Vec::new(),
             })
@@ -7690,6 +7880,7 @@ mod tests {
             output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
             portability_scope: "workspace".into(),
             trust_scope: "builtin".into(),
+            secret_taint: ArtifactSecretTaintV1::Clear,
             resolution_snapshot_id: None,
             validation_receipt_ids: Vec::new(),
         };
@@ -7863,6 +8054,7 @@ mod tests {
                     output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
                     portability_scope: "workspace".into(),
                     trust_scope: "builtin".into(),
+                    secret_taint: ArtifactSecretTaintV1::Clear,
                     resolution_snapshot_id: None,
                     validation_receipt_ids: Vec::new(),
                 })

@@ -918,6 +918,15 @@ Adapters declare which command argument or output fields may echo credentials so
 host can add structured redaction. This declaration supplements, but never replaces,
 host-wide exact-value redaction and secret scanning.
 
+Receiving a secret value taints the producer output; a non-secret provider/version
+reference alone does not. Taint metadata contains only canonical channel classes, never
+provider names, handles, paths, or values. Tainted candidates may remain in lane-private
+storage, but the host rejects resolution-snapshot publication, shared artifact sealing,
+private-output promotion, and source export. Bounded attempt evidence is exact-value
+redacted before storage. In the current resolver API a declared credential handle cannot
+be distinguished from one actually consumed, so shared resolution fails closed. A future
+private resolver-output store may preserve such output without weakening this rule.
+
 ## Plugin protocol and capabilities
 
 The implemented v1/v2 transport is a natively sandboxed subprocess using one
