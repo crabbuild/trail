@@ -3052,6 +3052,65 @@ impl Trail {
         Ok(envelope_id)
     }
 
+    /// Replace a workspace layer's legacy CAS shadow with a verified desired-key-v2
+    /// envelope over the exact same immutable tree. The physical layer remains a
+    /// compatibility materialization; the envelope becomes artifact authority for
+    /// activation, inheritance, export, reachability, and collection.
+    pub(crate) fn bind_workspace_layer_artifact_v2(
+        &self,
+        layer_id: &str,
+        envelope: ArtifactEnvelopeV1,
+    ) -> Result<ArtifactEnvelopeId> {
+        let ArtifactDesiredIdentityV1::ArtifactDesiredV2 { .. } = &envelope.desired_identity else {
+            return Err(Error::InvalidInput(
+                "workspace artifact-v2 binding requires a desired-key-v2 envelope".into(),
+            ));
+        };
+        if !envelope.output_policy.has_immutable_layer() {
+            return Err(Error::InvalidInput(
+                "workspace artifact-v2 binding requires an immutable output policy".into(),
+            ));
+        }
+        let _lock = self.acquire_write_lock()?;
+        let layer = self.verify_workspace_layer_for_attach(layer_id)?;
+        let (tree_root_id, state) = self.conn.query_row(
+            "SELECT tree_root_id,state FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+            params![layer_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        if state != "verified" || tree_root_id != envelope.tree_root_id.0 {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer `{layer_id}` does not contain the exact artifact-v2 tree"
+            )));
+        }
+        if layer.portability_scope != envelope.portability_scope {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer `{layer_id}` and artifact-v2 envelope have different portability scopes"
+            )));
+        }
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        self.artifact_tree_flat_entries(&tree_root_id)?;
+        let (envelope_id, quarantined) = self.put_artifact_envelope_under_write_lock(envelope)?;
+        if quarantined {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer `{layer_id}` produced divergent artifact-v2 content and was quarantined"
+            )));
+        }
+        let updated = self.conn.execute(
+            "UPDATE workspace_layer_artifact_shadows
+             SET envelope_id=?1,state='verified',verified_at=?2
+             WHERE layer_id=?3 AND tree_root_id=?4 AND state='verified'",
+            params![envelope_id.0, now_ts(), layer_id, tree_root_id.0],
+        )?;
+        if updated != 1 {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{layer_id}` artifact binding changed while publishing v2 authority"
+            )));
+        }
+        Ok(envelope_id)
+    }
+
     pub(crate) fn put_artifact_envelope_under_write_lock(
         &self,
         mut envelope: ArtifactEnvelopeV1,

@@ -90,7 +90,7 @@
 
 ## 10. Built-In Migration and Framework Composition
 
-- [ ] 10.1 Migrate a fixture-only adapter through proposal, resolution, desired key v2, CAS sealing, generation activation, COW execution, export, retirement, and collection before changing real ecosystems
+- [x] 10.1 Migrate a fixture-only adapter through proposal, resolution, desired key v2, CAS sealing, generation activation, COW execution, export, retirement, and collection before changing real ecosystems
 - [ ] 10.2 Change Cargo discovery to report `Cargo.toml` without `Cargo.lock`, add a Trail-managed lock snapshot, and qualify real `--locked --offline` construction with conservative source-root identity
 - [ ] 10.3 Change Node discovery to report `package.json` without a supported lock, add package-manager-specific frozen snapshots, and preserve dependency-seed plus content-cache isolation
 - [ ] 10.4 Express Vite and Next.js fixtures as build components over Node resolution/dependencies, keeping framework caches/path-bound output private unless validation certifies reuse

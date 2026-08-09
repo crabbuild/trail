@@ -1,6 +1,6 @@
 use super::workdir::{classify_view_path, PreparedLayerMountReset, ViewCore, ViewPathClass};
 use super::*;
-use crate::ids::ArtifactTreeId;
+use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
@@ -3837,6 +3837,61 @@ impl Trail {
         )
     }
 
+    fn validate_artifact_v2_activation(
+        &self,
+        layer: &WorkspaceLayerReport,
+        activation: &EnvironmentLayerActivation,
+    ) -> Result<bool> {
+        let (tree_root_id, envelope_id, state) = self.conn.query_row(
+            "SELECT tree_root_id,envelope_id,state
+             FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+            params![&layer.layer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if state != "verified" {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{}` has an unverified artifact binding",
+                layer.layer_id
+            )));
+        }
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?;
+        let envelope =
+            self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_root_id)?;
+        let ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } =
+            &envelope.desired_identity
+        else {
+            return Ok(false);
+        };
+        let matching_outputs = activation
+            .outputs
+            .iter()
+            .filter(|output| {
+                output.name == envelope.output_name && output.policy == envelope.output_policy
+            })
+            .count();
+        if desired_key.0 != activation.expected_key
+            || envelope.component_id != activation.component_id
+            || envelope.portability_scope != layer.portability_scope
+            || activation.outputs.len() != 1
+            || matching_outputs != 1
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{}` does not match its artifact-v2 desired/output contract",
+                activation.component_id
+            )));
+        }
+        Ok(true)
+    }
+
     fn replace_declared_workspace_layers_with_removals_internal(
         &self,
         lane: &str,
@@ -3930,13 +3985,6 @@ impl Trail {
         let mut resolved = Vec::with_capacity(requested.len());
         let mut mount_paths = Vec::<(String, String)>::new();
         for activation in requested {
-            if self.workspace_layer_cache_key(&activation.canonical_key)? != activation.expected_key
-            {
-                return Err(Error::Corrupt(format!(
-                    "environment component `{}` canonical key does not match its expected key",
-                    activation.component_id
-                )));
-            }
             let mut dependency_ids = BTreeSet::new();
             for (dependency, component_key, edge_type) in &activation.dependencies {
                 super::workspace_environment::validate_environment_component_identity(dependency)?;
@@ -4051,6 +4099,28 @@ impl Trail {
                 .as_deref()
                 .map(|layer_id| self.verify_workspace_layer_for_attach(layer_id))
                 .transpose()?;
+            let canonical_storage_key =
+                self.workspace_layer_cache_key(&activation.canonical_key)?;
+            if layer
+                .as_ref()
+                .is_some_and(|layer| layer.cache_key != canonical_storage_key)
+            {
+                return Err(Error::Corrupt(format!(
+                    "environment component `{}` canonical storage key does not match its layer",
+                    activation.component_id
+                )));
+            }
+            let artifact_v2 = layer
+                .as_ref()
+                .map(|layer| self.validate_artifact_v2_activation(layer, activation))
+                .transpose()?
+                .unwrap_or(false);
+            if !artifact_v2 && canonical_storage_key != activation.expected_key {
+                return Err(Error::Corrupt(format!(
+                    "environment component `{}` canonical key does not match its expected key",
+                    activation.component_id
+                )));
+            }
             if let Some(layer) = &layer
                 && layer.kind != activation.kind
             {
@@ -4186,7 +4256,13 @@ impl Trail {
                     private_seed: output.private_seed.clone(),
                 });
             }
-            resolved.push((activation.clone(), layer, outputs, previous_bindings));
+            resolved.push((
+                activation.clone(),
+                layer,
+                outputs,
+                previous_bindings,
+                artifact_v2,
+            ));
         }
         self.validate_environment_batch_mount_ownership(
             &view.view_id,
@@ -4218,7 +4294,7 @@ impl Trail {
                 }
             }
         }
-        for (component, layer, outputs, previous_bindings) in &resolved {
+        for (component, layer, outputs, previous_bindings, _) in &resolved {
             for output in outputs {
                 if matches!(
                     output.policy,
@@ -4362,34 +4438,36 @@ impl Trail {
                     params![&view.view_id, component_id],
                 )?;
             }
-            for (component, layer, outputs, previous_bindings) in &resolved {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO environment_component_key_provenance
-                     (component_key, canonical_key_json, created_at) VALUES (?1, ?2, ?3)",
-                    params![
-                        &component.expected_key,
-                        serde_json::to_vec(&component.canonical_key)?,
-                        now_ts()
-                    ],
-                )?;
-                let stored_key = self.conn.query_row(
-                    "SELECT canonical_key_json FROM environment_component_key_provenance
-                     WHERE component_key = ?1",
-                    params![&component.expected_key],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )?;
-                let stored_key: WorkspaceLayerKeyV1 =
-                    serde_json::from_slice(&stored_key).map_err(|error| {
-                        Error::Corrupt(format!(
-                            "environment key provenance `{}` is malformed: {error}",
+            for (component, layer, outputs, previous_bindings, artifact_v2) in &resolved {
+                if !artifact_v2 {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO environment_component_key_provenance
+                         (component_key, canonical_key_json, created_at) VALUES (?1, ?2, ?3)",
+                        params![
+                            &component.expected_key,
+                            serde_json::to_vec(&component.canonical_key)?,
+                            now_ts()
+                        ],
+                    )?;
+                    let stored_key = self.conn.query_row(
+                        "SELECT canonical_key_json FROM environment_component_key_provenance
+                         WHERE component_key = ?1",
+                        params![&component.expected_key],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?;
+                    let stored_key: WorkspaceLayerKeyV1 = serde_json::from_slice(&stored_key)
+                        .map_err(|error| {
+                            Error::Corrupt(format!(
+                                "environment key provenance `{}` is malformed: {error}",
+                                component.expected_key
+                            ))
+                        })?;
+                    if stored_key != component.canonical_key {
+                        return Err(Error::Corrupt(format!(
+                            "environment key provenance `{}` does not match its content identity",
                             component.expected_key
-                        ))
-                    })?;
-                if stored_key != component.canonical_key {
-                    return Err(Error::Corrupt(format!(
-                        "environment key provenance `{}` does not match its content identity",
-                        component.expected_key
-                    )));
+                        )));
+                    }
                 }
                 for (previous_mount, _, _, _) in previous_bindings {
                     self.conn.execute(
@@ -5020,6 +5098,102 @@ impl Trail {
         Ok(())
     }
 
+    fn record_artifact_generation_binding(
+        &self,
+        generation_id: &str,
+        component: &EnvironmentGenerationComponentReport,
+        output: &EnvironmentGenerationOutputReport,
+        created_at: i64,
+    ) -> Result<()> {
+        if !output.policy.has_immutable_layer() {
+            return Ok(());
+        }
+        let layer_id = output.layer_id.as_deref().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "immutable generation output `{}/{}` has no workspace layer",
+                component.component_id, output.name
+            ))
+        })?;
+        let (tree_root_id, envelope_id, state) = self.conn.query_row(
+            "SELECT tree_root_id,envelope_id,state
+             FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+            params![layer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if state != "verified" {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{layer_id}` has an unverified artifact binding"
+            )));
+        }
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?;
+        let envelope =
+            self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_root_id)?;
+        let desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key.clone(),
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => {
+                if desired_key.0 != component.component_key
+                    || envelope.component_id != component.component_id
+                    || envelope.output_name != output.name
+                    || envelope.output_policy != output.policy
+                {
+                    return Err(Error::Corrupt(format!(
+                        "artifact-v2 envelope does not match generation output `{}/{}`",
+                        component.component_id, output.name
+                    )));
+                }
+                desired_key.0.clone()
+            }
+        };
+        if desired_key != component.component_key {
+            return Err(Error::Corrupt(format!(
+                "artifact desired key does not match generation component `{}`",
+                component.component_id
+            )));
+        }
+        let binding_identity = format!(
+            "artifact_binding_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    generation_id, component.component_id, output.name, envelope_id.0
+                )
+                .as_bytes(),
+                32,
+            )
+        );
+        let binding_id = format!(
+            "binding_{}",
+            crate::ids::short_hash(binding_identity.as_bytes(), 32)
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_generation_bindings(
+                 binding_id,generation_id,component_id,output_name,desired_key,
+                 envelope_id,tree_root_id,binding_identity,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                binding_id,
+                generation_id,
+                &component.component_id,
+                &output.name,
+                desired_key,
+                envelope_id.0,
+                tree_root_id.0,
+                binding_identity,
+                created_at
+            ],
+        )?;
+        Ok(())
+    }
+
     fn record_environment_generation(&self, lane: &str, view_id: &str) -> Result<String> {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
@@ -5227,6 +5401,7 @@ impl Trail {
                         &output.layer_subpath
                     ],
                 )?;
+                self.record_artifact_generation_binding(&generation_id, component, output, now)?;
             }
             for dependency in &component.dependencies {
                 self.conn.execute(
@@ -6577,6 +6752,7 @@ fn layer_file_physical_bytes(metadata: &fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::workdir::{ViewCore, VIEW_ROOT_INO};
+    use super::super::workspace_environment::WorkspaceEnvironmentAdapterProposal;
     use super::*;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6593,6 +6769,426 @@ mod tests {
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
         }
+    }
+
+    #[test]
+    fn fixture_artifact_pipeline_runs_resolution_v2_cas_cow_export_retirement_and_collection() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("fixture.input"), "fixture input\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "fixture.pipeline"
+adapter = "trail/command@1"
+inputs = [{ path = "fixture.input" }]
+
+[component.build]
+command = ["fixture-builder", "build"]
+
+[[component.validation]]
+name = "path-contract"
+kind = "structural"
+required = true
+
+[[component.output]]
+name = "generated"
+source = "artifact"
+target = ".trail-generated/fixture"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+
+[[component.source_export]]
+name = "client"
+from_output = "generated"
+source = "generated-client"
+target = "src/generated-client"
+mode = "explicit"
+collision = "fail"
+validation = "path-contract"
+"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "fixture",
+            Some("main"),
+            if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            },
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let source_root = db.lane_branch("fixture").unwrap().head_root;
+        let input = db
+            .root_file_entry(&source_root, "fixture.input")
+            .unwrap()
+            .unwrap();
+        let proposal = WorkspaceEnvironmentAdapterProposal {
+            status: EnvironmentComponentProposalStatus::Resolvable,
+            reasons: vec![EnvironmentProposalReasonReport {
+                code: "resolution_snapshot_missing".into(),
+                message: "fixture adapter requires an immutable resolution snapshot".into(),
+            }],
+            recovery_actions: vec![EnvironmentRecoveryActionReport {
+                code: "resolve_fixture".into(),
+                description: "resolve the fixture component".into(),
+                command: None,
+            }],
+        };
+        assert_eq!(
+            proposal.status,
+            EnvironmentComponentProposalStatus::Resolvable
+        );
+
+        let resolver = std::env::current_exe().unwrap();
+        let resolver_identity =
+            super::super::workspace_environment::workspace_tool_identity_for_path(&resolver)
+                .unwrap();
+        let resolution = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: ArtifactResolutionPlanV1 {
+                        version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+                        proposal_key: "fixture.pipeline:proposal-v1".into(),
+                        source_root: source_root.clone(),
+                        component_id: "fixture.pipeline".into(),
+                        adapter_identity: "trail.fixture/common-artifact@1".into(),
+                        policy_identity: "fixture-policy-v1".into(),
+                        program: "fixture-resolver".into(),
+                        resolved_program: resolver.to_string_lossy().into_owned(),
+                        executable_identity: resolver_identity.clone(),
+                        argv: vec!["fixture-resolver".into(), "resolve".into()],
+                        working_directory: ".".into(),
+                        readable_inputs: vec![ArtifactResolutionInputV1 {
+                            source_path: "fixture.input".into(),
+                            content_hash: input.content_hash.clone(),
+                            size_bytes: input.size_bytes,
+                        }],
+                        candidate_output: "fixture.lock".into(),
+                        allowed_authorities: Vec::new(),
+                        credential_handles: Vec::new(),
+                        script_policy: ArtifactScriptPolicyV1::Deny,
+                        environment_roles: BTreeMap::new(),
+                        limits: ArtifactActionLimitsV1 {
+                            timeout_ms: 30_000,
+                            stdout_bytes: 1024,
+                            stderr_bytes: 1024,
+                            candidate_bytes: 1024,
+                            candidate_entries: 1,
+                            child_processes: 1,
+                        },
+                        snapshot_format: "fixture-lock/v1".into(),
+                        validations: vec![ArtifactValidationV1 {
+                            name: "fixture-lock-structure".into(),
+                            kind: ArtifactValidationKindV1::Structural,
+                            required: true,
+                            parameters: BTreeMap::new(),
+                        }],
+                    },
+                    candidate: ArtifactResolutionCandidateV1 {
+                        snapshot_bytes: b"fixture = 1\n".to_vec(),
+                        resolved_identities: BTreeMap::from([("fixture".into(), "1".into())]),
+                        checksums: BTreeMap::from([(
+                            "fixture".into(),
+                            sha256_hex(b"fixture = 1\n"),
+                        )]),
+                        contacted_authorities: Vec::new(),
+                        stdout: b"resolved\n".to_vec(),
+                        stderr: Vec::new(),
+                        redactions: Vec::new(),
+                    },
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(resolution.decision, ArtifactResolutionDecisionV1::Resolved);
+
+        let desired_material = ArtifactDesiredKeyMaterialV2 {
+            version: 2,
+            component_id: "fixture.pipeline".into(),
+            adapter_identity: "trail.fixture/common-artifact@1".into(),
+            adapter_implementation_version: "1".into(),
+            adapter_distribution_digest: "builtin:fixture-common-artifact-v1".into(),
+            adapter_protocol: "trail.environment-adapter/fixture-v3".into(),
+            resolution_snapshot_id: Some(resolution.snapshot_id.clone()),
+            source_closure: ArtifactSourceClosureV2 {
+                normalizer_version: "source-paths/v1".into(),
+                certified_complete: false,
+                complete_source_root: Some(source_root.clone()),
+                declared_inputs: vec![ArtifactResolutionInputV1 {
+                    source_path: "fixture.input".into(),
+                    content_hash: input.content_hash,
+                    size_bytes: input.size_bytes,
+                }],
+            },
+            upstream_identities: BTreeMap::new(),
+            actions: vec![ArtifactActionIdentityV2 {
+                name: "construct".into(),
+                phase: ArtifactActionPhaseV2::Construct,
+                executable_identity: resolver_identity,
+                argv: vec!["fixture-builder".into(), "build".into()],
+                working_directory: ".".into(),
+                environment_names: Vec::new(),
+            }],
+            outputs: vec![ArtifactOutputContractV2 {
+                name: "generated".into(),
+                output_path: "artifact".into(),
+                mount_path: ".trail-generated/fixture".into(),
+                policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
+            }],
+            validations: vec![ArtifactValidationV1 {
+                name: "path-contract".into(),
+                kind: ArtifactValidationKindV1::Structural,
+                required: true,
+                parameters: BTreeMap::new(),
+            }],
+            source_exports: vec![ArtifactSourceExportContractV2 {
+                name: "client".into(),
+                output_name: "generated".into(),
+                artifact_subpath: "generated-client".into(),
+                destination: "src/generated-client".into(),
+                collision_policy: "fail".into(),
+                required_validation: "path-contract".into(),
+                required_gate: None,
+                authorization_mode: "explicit".into(),
+            }],
+            build_environment: BTreeMap::new(),
+            target: "fixture".into(),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            abi: "host".into(),
+            portability_certified: true,
+            portability_scope: "workspace".into(),
+            trust_scope: "builtin".into(),
+            network_policy: "deny".into(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            sandbox_policy: "native-deny-by-default".into(),
+        };
+        let desired_key =
+            super::super::workspace_artifact::artifact_desired_key_v2(desired_material).unwrap();
+
+        let candidate = tempfile::tempdir().unwrap();
+        fs::create_dir_all(candidate.path().join("artifact/generated-client")).unwrap();
+        fs::write(
+            candidate.path().join("artifact/generated-client/new.rs"),
+            "generated\n",
+        )
+        .unwrap();
+        let storage_key = WorkspaceLayerKeyV1 {
+            kind: "generated".into(),
+            adapter: "fixture-common-artifact".into(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([
+                ("source_root".into(), source_root.0.clone()),
+                (
+                    "resolution_snapshot".into(),
+                    resolution.snapshot_id.0.clone(),
+                ),
+            ]),
+            tool_versions: BTreeMap::from([("fixture-builder".into(), "1".into())]),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            portability_scope: "workspace".into(),
+            strategy: "fixture-common-artifact-v2".into(),
+        };
+        let layer = db
+            .publish_workspace_layer_from_directory(&storage_key, candidate.path())
+            .unwrap();
+        let tree_root_id = ArtifactTreeId::parse(
+            db.conn
+                .query_row(
+                    "SELECT tree_root_id FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                    params![&layer.layer_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let desired_identity = ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+            desired_key: desired_key.clone(),
+        };
+        let validation_receipt_id = db
+            .put_artifact_validation_receipt(ArtifactValidationReceiptV1 {
+                version: ARTIFACT_VALIDATION_RECEIPT_VERSION,
+                declaration: ArtifactValidationV1 {
+                    name: "path-contract".into(),
+                    kind: ArtifactValidationKindV1::Structural,
+                    required: true,
+                    parameters: BTreeMap::new(),
+                },
+                desired_identity: desired_identity.clone(),
+                tree_root_id: tree_root_id.clone(),
+                validator_identity: "trail.fixture/structural-validator@1".into(),
+                validated_input_digest: sha256_hex(b"fixture desired+tree+validator"),
+                outcome: ArtifactValidationOutcomeV1::Passed,
+                evidence: BTreeMap::from([("structure".into(), "passed".into())]),
+            })
+            .unwrap();
+        let envelope_id = db
+            .bind_workspace_layer_artifact_v2(
+                &layer.layer_id,
+                ArtifactEnvelopeV1 {
+                    version: ARTIFACT_ENVELOPE_VERSION,
+                    desired_identity,
+                    tree_root_id: tree_root_id.clone(),
+                    component_id: "fixture.pipeline".into(),
+                    output_name: "generated".into(),
+                    output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    portability_scope: "workspace".into(),
+                    trust_scope: "builtin".into(),
+                    secret_taint: ArtifactSecretTaintV1::Clear,
+                    resolution_snapshot_id: Some(resolution.snapshot_id),
+                    validation_receipt_ids: vec![validation_receipt_id],
+                },
+            )
+            .unwrap();
+        db.replace_declared_workspace_layers_at_source(
+            "fixture",
+            &[EnvironmentLayerActivation {
+                layer_id: Some(layer.layer_id.clone()),
+                outputs: vec![EnvironmentLayerOutputActivation {
+                    name: "generated".into(),
+                    mount_path: ".trail-generated/fixture".into(),
+                    policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    reuse: EnvironmentReuseMode::Exact,
+                    scope: EnvironmentSharingScope::Workspace,
+                    publish: EnvironmentPublicationTrigger::OnSync,
+                    gate: None,
+                    binding_identity: layer.layer_id.clone(),
+                    manifest_object_id: None,
+                    publication_id: None,
+                    private_seed: None,
+                    layer_subpath: "artifact".into(),
+                }],
+                component_id: "fixture.pipeline".into(),
+                adapter_identity: "trail.fixture/common-artifact@1".into(),
+                adapter_version: 1,
+                implementation_version: "1".into(),
+                distribution_digest: "builtin:fixture-common-artifact-v1".into(),
+                kind: "generated".into(),
+                dependencies: Vec::new(),
+                caches: Vec::new(),
+                external_artifacts: Vec::new(),
+                runtime_resources: Vec::new(),
+                expected_key: desired_key.0.clone(),
+                canonical_key: storage_key,
+            }],
+            &source_root,
+        )
+        .unwrap();
+        let generation = db
+            .active_environment_generation("fixture")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT desired_key FROM artifact_generation_bindings
+                     WHERE generation_id=?1 AND component_id='fixture.pipeline'",
+                    params![&generation.generation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            desired_key.0
+        );
+
+        let branch = db.lane_branch("fixture").unwrap();
+        let paths = db.workspace_view_paths_for_lane("fixture").unwrap();
+        let mut view = ViewCore::new_lazy(
+            Trail::open(workspace.path()).unwrap(),
+            paths.source_upper.clone(),
+            branch.head_root,
+        )
+        .unwrap();
+        let generated = view.lookup(VIEW_ROOT_INO, ".trail-generated").unwrap();
+        let fixture = view.lookup(generated, "fixture").unwrap();
+        let client = view.lookup(fixture, "generated-client").unwrap();
+        let file = view.lookup(client, "new.rs").unwrap();
+        assert_eq!(view.read(file, 0, 64).unwrap().0, b"generated\n");
+        view.write(file, 0, b"private!!\n").unwrap();
+        assert_eq!(view.read(file, 0, 64).unwrap().0, b"private!!\n");
+        assert_eq!(
+            fs::read(Path::new(&layer.storage_path).join("artifact/generated-client/new.rs"))
+                .unwrap(),
+            b"generated\n"
+        );
+        drop(view);
+
+        let export = db
+            .plan_artifact_source_export(
+                "fixture",
+                "fixture.pipeline",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        assert_eq!(export.envelope_id, envelope_id);
+        let exported = db.execute_artifact_source_export(export).unwrap();
+        assert!(exported.checkpointed);
+        let branch = db.lane_branch("fixture").unwrap();
+        let exported_entry = db
+            .root_file_entry(&branch.head_root, "src/generated-client/new.rs")
+            .unwrap()
+            .unwrap();
+        let exported_bytes = db
+            .materialize_entries_bytes(&BTreeMap::from([(
+                "src/generated-client/new.rs".into(),
+                exported_entry,
+            )]))
+            .unwrap();
+        assert_eq!(
+            exported_bytes["src/generated-client/new.rs"],
+            b"generated\n"
+        );
+
+        db.remove_lane("fixture", true).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_generation_bindings",
+                    [],
+                    |row| { row.get::<_, u64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        let cache_gc = db.workspace_cache_gc(false, Some(0)).unwrap();
+        assert!(cache_gc
+            .deleted
+            .iter()
+            .any(|candidate| candidate.id == layer.layer_id));
+        db.gc(false).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![envelope_id.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

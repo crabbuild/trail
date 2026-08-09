@@ -622,6 +622,16 @@ bounded tree into CAS; and rescans the staging tree to reject mutation during se
 Only after the staged tree is immutable and agrees with its CAS manifest does Trail
 publish the ready envelope.
 
+The built-in migration bridge keeps a workspace layer only as a compatibility
+materialization. After Trail verifies that an artifact-v2 envelope names the same tree,
+output contract, and portability, that desired-key envelope replaces the legacy CAS
+shadow as the durable authority. Ordinary activation records an exact generation
+binding to that envelope. Native lane views continue to read the immutable lower while
+copy-up writes remain private to the lane; source export reads the authoritative CAS
+tree rather than the private upper. Retirement removes the generation binding before
+workspace-layer and object garbage collection independently reclaim the disposable
+materialization and unreachable authoritative objects.
+
 Every compatibility workspace-layer envelope carries two required deterministic host
 receipts. The structural seal records path/content/limit/secret/tree checks; the policy
 seal records producer termination or disconnection, unchanged desired pins, and local
