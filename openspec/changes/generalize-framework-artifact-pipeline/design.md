@@ -198,7 +198,15 @@ file for copy-up. It treats the CAS manifest as authoritative over any legacy
 layer directory and preserves existing upper/whiteout behavior. Native FUSE,
 NFS, and Dokan acceptance tests exercise the same nonexistent-materialization
 fixture; owning-host gates remain the authority for platform qualification.
-Tree-root/backend-keyed reusable real-directory caches remain task 6.2.
+Backends that require real paths now reuse a verified real-directory cache keyed
+by the authoritative tree root and an operating-system/architecture/backend
+compatibility identity. Publication projects and verifies CAS content in an
+attempt-owned stage, records durable `building`/`verified`/`failed` state, and
+atomically publishes an immutable root. Reuse revalidates content and restores
+read-only permissions; missing or corrupt cache bytes rebuild from CAS. Private
+projections prefer native clone/reflink and fall back to file copies without
+hard-linking mutable consumers to the authoritative cache. Cache eviction,
+reachability accounting, and quotas remain tasks 6.6-6.8.
 
 Materialization can use safe platform clone/reflink facilities or immutable content copying. Hard links are allowed only where mode and ownership invariants cannot mutate the content object. Materialization amplification is reported separately and is reclaimable without invalidating an artifact.
 

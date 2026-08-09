@@ -65,6 +65,18 @@ pub(crate) enum ArtifactLazyEntry {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactMaterializationReport {
+    pub(crate) materialization_id: String,
+    pub(crate) tree_root_id: ArtifactTreeId,
+    pub(crate) backend_compatibility: String,
+    pub(crate) storage_path: PathBuf,
+    pub(crate) logical_bytes: u64,
+    pub(crate) physical_bytes: u64,
+    pub(crate) entry_count: u64,
+    pub(crate) reused: bool,
+}
+
 impl Trail {
     /// Publish or deliberately refresh one resolver-produced snapshot.
     ///
@@ -2019,6 +2031,335 @@ impl Trail {
             return Err(error);
         }
         Ok(file.mode)
+    }
+
+    pub(crate) fn ensure_artifact_tree_materialization(
+        &self,
+        tree_id: &ArtifactTreeId,
+    ) -> Result<ArtifactMaterializationReport> {
+        let _lock = self.acquire_write_lock()?;
+        self.ensure_artifact_tree_materialization_under_write_lock(tree_id)
+    }
+
+    pub(crate) fn ensure_artifact_tree_materialization_under_write_lock(
+        &self,
+        tree_id: &ArtifactTreeId,
+    ) -> Result<ArtifactMaterializationReport> {
+        let tree = self.verified_artifact_tree_root(tree_id)?;
+        let backend_compatibility = artifact_materialization_backend_compatibility();
+        let identity_seed = format!("{}\0{backend_compatibility}", tree_id.0);
+        let materialization_id = format!(
+            "materialization_{}",
+            crate::ids::short_hash(identity_seed.as_bytes(), 32)
+        );
+        let (materialization_parent, staging_parent) =
+            self.artifact_materialization_cache_parents()?;
+        let final_path = materialization_parent.join(&materialization_id);
+        let final_exists = real_artifact_materialization_directory_exists(
+            &final_path,
+            "artifact materialization",
+        )?;
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT materialization_id,storage_path,state,logical_bytes,
+                        COALESCE(physical_bytes,0),entry_count
+                 FROM artifact_materializations
+                 WHERE tree_root_id=?1 AND backend_compatibility=?2",
+                params![tree_id.0, &backend_compatibility],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_id, stored_path, state, logical, physical, entries)) = existing {
+            if stored_id != materialization_id || Path::new(&stored_path) != final_path {
+                return Err(Error::Corrupt(format!(
+                    "artifact materialization `{stored_id}` has a non-canonical identity or storage path"
+                )));
+            }
+            if state == "verified" && final_exists {
+                match self.verify_artifact_materialization(tree_id, &tree, &final_path) {
+                    Ok(()) => {
+                        self.conn.execute(
+                            "UPDATE artifact_materializations SET last_used_at=?1
+                             WHERE materialization_id=?2 AND state='verified'",
+                            params![now_ts(), &materialization_id],
+                        )?;
+                        return Ok(ArtifactMaterializationReport {
+                            materialization_id,
+                            tree_root_id: tree_id.clone(),
+                            backend_compatibility,
+                            storage_path: final_path,
+                            logical_bytes: u64::try_from(logical).map_err(|_| {
+                                Error::Corrupt(
+                                    "artifact materialization has negative logical bytes".into(),
+                                )
+                            })?,
+                            physical_bytes: u64::try_from(physical).map_err(|_| {
+                                Error::Corrupt(
+                                    "artifact materialization has negative physical bytes".into(),
+                                )
+                            })?,
+                            entry_count: u64::try_from(entries).map_err(|_| {
+                                Error::Corrupt(
+                                    "artifact materialization has negative entry count".into(),
+                                )
+                            })?,
+                            reused: true,
+                        });
+                    }
+                    Err(_) => {
+                        super::workspace_layer::make_tree_writable(&final_path);
+                        fs::remove_dir_all(&final_path)?;
+                    }
+                }
+            } else if final_exists {
+                super::workspace_layer::make_tree_writable(&final_path);
+                fs::remove_dir_all(&final_path)?;
+            }
+            self.conn.execute(
+                "UPDATE artifact_materializations SET state='failed',last_used_at=?1
+                 WHERE materialization_id=?2",
+                params![now_ts(), &materialization_id],
+            )?;
+        } else if final_exists {
+            match self.verify_artifact_materialization(tree_id, &tree, &final_path) {
+                Ok(()) => {
+                    let physical = super::workspace_layer::layer_physical_bytes(&final_path)?;
+                    self.upsert_verified_artifact_materialization(
+                        &materialization_id,
+                        tree_id,
+                        &backend_compatibility,
+                        &final_path,
+                        &tree,
+                        physical,
+                    )?;
+                    return Ok(ArtifactMaterializationReport {
+                        materialization_id,
+                        tree_root_id: tree_id.clone(),
+                        backend_compatibility,
+                        storage_path: final_path,
+                        logical_bytes: tree.logical_bytes,
+                        physical_bytes: physical,
+                        entry_count: tree.entry_count,
+                        reused: true,
+                    });
+                }
+                Err(_) => {
+                    super::workspace_layer::make_tree_writable(&final_path);
+                    fs::remove_dir_all(&final_path)?;
+                }
+            }
+        }
+
+        let staging = staging_parent.join(format!("artifact_{materialization_id}"));
+        if real_artifact_materialization_directory_exists(
+            &staging,
+            "artifact materialization staging",
+        )? {
+            super::workspace_layer::make_tree_writable(&staging);
+            fs::remove_dir_all(&staging)?;
+        }
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO artifact_materializations(
+                materialization_id,tree_root_id,backend_compatibility,storage_path,state,
+                logical_bytes,physical_bytes,entry_count,last_used_at,created_at
+             ) VALUES(?1,?2,?3,?4,'building',?5,NULL,?6,?7,?7)
+             ON CONFLICT(tree_root_id,backend_compatibility) DO UPDATE SET
+                materialization_id=excluded.materialization_id,
+                storage_path=excluded.storage_path,state='building',
+                logical_bytes=excluded.logical_bytes,physical_bytes=NULL,
+                entry_count=excluded.entry_count,last_used_at=excluded.last_used_at",
+            params![
+                &materialization_id,
+                tree_id.0,
+                &backend_compatibility,
+                final_path.to_string_lossy(),
+                i64::try_from(tree.logical_bytes).map_err(|_| Error::InvalidInput(
+                    "artifact materialization logical bytes exceed SQLite range".into()
+                ))?,
+                i64::try_from(tree.entry_count).map_err(|_| Error::InvalidInput(
+                    "artifact materialization entry count exceeds SQLite range".into()
+                ))?,
+                now,
+            ],
+        )?;
+        let publication = (|| -> Result<u64> {
+            self.materialize_artifact_tree_under_write_lock(tree_id, &staging)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "artifact materialization content projection failed: {error}"
+                    ))
+                })?;
+            let entries =
+                super::workspace_layer::scan_layer_entries(&staging, true).map_err(|error| {
+                    Error::Corrupt(format!(
+                        "artifact materialization immutable scan failed: {error}"
+                    ))
+                })?;
+            super::workspace_layer::verify_artifact_shadow_matches_layer_entries(
+                &tree,
+                &self.artifact_tree_flat_entries(tree_id)?,
+                &entries,
+            )?;
+            let physical =
+                super::workspace_layer::layer_physical_bytes(&staging).map_err(|error| {
+                    Error::Corrupt(format!(
+                        "artifact materialization physical accounting failed: {error}"
+                    ))
+                })?;
+            fs::rename(&staging, &final_path).map_err(|error| {
+                Error::Corrupt(format!(
+                    "artifact materialization atomic publication failed: {error}"
+                ))
+            })?;
+            // macOS rejects renaming a read-only directory even when both
+            // parents are writable. Child entries are already immutable, so
+            // publish the root while the workspace write lock is held and
+            // seal that root before marking the database row verified.
+            super::workspace_layer::set_layer_read_only(&final_path, true, 0o755).map_err(
+                |error| {
+                    Error::Corrupt(format!(
+                        "artifact materialization root sealing failed: {error}"
+                    ))
+                },
+            )?;
+            sync_directory(final_path.parent().unwrap());
+            Ok(physical)
+        })();
+        let physical = match publication {
+            Ok(physical) => physical,
+            Err(error) => {
+                super::workspace_layer::make_tree_writable(&staging);
+                let _ = fs::remove_dir_all(&staging);
+                super::workspace_layer::make_tree_writable(&final_path);
+                let _ = fs::remove_dir_all(&final_path);
+                self.conn.execute(
+                    "UPDATE artifact_materializations SET state='failed',last_used_at=?1
+                     WHERE materialization_id=?2",
+                    params![now_ts(), &materialization_id],
+                )?;
+                return Err(error);
+            }
+        };
+        self.upsert_verified_artifact_materialization(
+            &materialization_id,
+            tree_id,
+            &backend_compatibility,
+            &final_path,
+            &tree,
+            physical,
+        )?;
+        Ok(ArtifactMaterializationReport {
+            materialization_id,
+            tree_root_id: tree_id.clone(),
+            backend_compatibility,
+            storage_path: final_path,
+            logical_bytes: tree.logical_bytes,
+            physical_bytes: physical,
+            entry_count: tree.entry_count,
+            reused: false,
+        })
+    }
+
+    fn artifact_materialization_cache_parents(&self) -> Result<(PathBuf, PathBuf)> {
+        // Reuse the environment executor's descriptor-validated staging
+        // hierarchy rather than independently trusting `.trail/cache` path
+        // components.
+        let staging = self.workspace_environment_staging_parent()?;
+        let cache = staging.parent().ok_or_else(|| {
+            Error::Corrupt("artifact materialization staging has no cache parent".into())
+        })?;
+        let materializations = cache.join("artifact-materializations");
+        match fs::symlink_metadata(&materializations) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Error::InvalidPath {
+                    path: materializations.to_string_lossy().into_owned(),
+                    reason: "artifact materialization cache must remain a real directory inside Trail storage"
+                        .into(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&materializations)?;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        let canonical = fs::canonicalize(&materializations)?;
+        if canonical != materializations {
+            return Err(Error::InvalidPath {
+                path: materializations.to_string_lossy().into_owned(),
+                reason: "artifact materialization cache escaped Trail storage".into(),
+            });
+        }
+        Ok((canonical, staging))
+    }
+
+    fn verify_artifact_materialization(
+        &self,
+        tree_id: &ArtifactTreeId,
+        tree: &ArtifactTreeRootV1,
+        path: &Path,
+    ) -> Result<()> {
+        // Verification also restores immutable permissions. Content identity
+        // alone is insufficient because a writable cache could become a
+        // mutable alias of authoritative CAS content after this check.
+        let entries = super::workspace_layer::scan_layer_entries(path, true)?;
+        super::workspace_layer::verify_artifact_shadow_matches_layer_entries(
+            tree,
+            &self.artifact_tree_flat_entries(tree_id)?,
+            &entries,
+        )?;
+        super::workspace_layer::set_layer_read_only(path, true, 0o755)
+    }
+
+    fn upsert_verified_artifact_materialization(
+        &self,
+        materialization_id: &str,
+        tree_id: &ArtifactTreeId,
+        backend_compatibility: &str,
+        path: &Path,
+        tree: &ArtifactTreeRootV1,
+        physical_bytes: u64,
+    ) -> Result<()> {
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO artifact_materializations(
+                materialization_id,tree_root_id,backend_compatibility,storage_path,state,
+                logical_bytes,physical_bytes,entry_count,last_used_at,created_at
+             ) VALUES(?1,?2,?3,?4,'verified',?5,?6,?7,?8,?8)
+             ON CONFLICT(tree_root_id,backend_compatibility) DO UPDATE SET
+                materialization_id=excluded.materialization_id,
+                storage_path=excluded.storage_path,state='verified',
+                logical_bytes=excluded.logical_bytes,physical_bytes=excluded.physical_bytes,
+                entry_count=excluded.entry_count,last_used_at=excluded.last_used_at",
+            params![
+                materialization_id,
+                tree_id.0,
+                backend_compatibility,
+                path.to_string_lossy(),
+                i64::try_from(tree.logical_bytes).map_err(|_| Error::InvalidInput(
+                    "artifact materialization logical bytes exceed SQLite range".into()
+                ))?,
+                i64::try_from(physical_bytes).map_err(|_| Error::InvalidInput(
+                    "artifact materialization physical bytes exceed SQLite range".into()
+                ))?,
+                i64::try_from(tree.entry_count).map_err(|_| Error::InvalidInput(
+                    "artifact materialization entry count exceeds SQLite range".into()
+                ))?,
+                now,
+            ],
+        )?;
+        Ok(())
     }
 
     fn verified_artifact_tree_root(&self, tree_id: &ArtifactTreeId) -> Result<ArtifactTreeRootV1> {
@@ -4043,6 +4384,28 @@ fn validate_resolution_text(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn artifact_materialization_backend_compatibility() -> String {
+    format!(
+        "trail-real-directory/v1/{}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+fn real_artifact_materialization_directory_exists(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: format!("{label} must be a real directory inside Trail storage"),
+            })
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn validate_sha256(value: &str, field: &str) -> Result<()> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::InvalidInput(format!(
@@ -5278,6 +5641,175 @@ mod tests {
                 .0,
             tree_id
         );
+    }
+
+    #[test]
+    fn artifact_materialization_cache_is_tree_keyed_verified_and_copy_safe() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("pkg")).unwrap();
+        fs::write(source.path().join("pkg/index.js"), b"shared-cache\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+
+        let first = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(!first.reused);
+        assert_eq!(first.tree_root_id, tree_id);
+        assert_eq!(
+            fs::read(first.storage_path.join("pkg/index.js")).unwrap(),
+            b"shared-cache\n"
+        );
+        let second = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(second.reused);
+        assert_eq!(first.storage_path, second.storage_path);
+        assert_eq!(first.materialization_id, second.materialization_id);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_materializations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+
+        let private = workspace.path().join("private-copy");
+        super::super::workspace_layer::copy_layer_tree(&first.storage_path, &private).unwrap();
+        super::super::workspace_layer::make_tree_writable(&private);
+        fs::write(private.join("pkg/index.js"), b"private\n").unwrap();
+        assert_eq!(
+            fs::read(first.storage_path.join("pkg/index.js")).unwrap(),
+            b"shared-cache\n"
+        );
+
+        super::super::workspace_layer::make_tree_writable(&first.storage_path);
+        fs::write(first.storage_path.join("pkg/index.js"), b"corrupt\n").unwrap();
+        let repaired = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(!repaired.reused);
+        assert_eq!(repaired.storage_path, first.storage_path);
+        assert_eq!(
+            fs::read(repaired.storage_path.join("pkg/index.js")).unwrap(),
+            b"shared-cache\n"
+        );
+
+        super::super::workspace_layer::make_tree_writable(&repaired.storage_path);
+        fs::remove_dir_all(&repaired.storage_path).unwrap();
+        let rebuilt = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(!rebuilt.reused);
+        assert_eq!(rebuilt.storage_path, repaired.storage_path);
+        assert_eq!(rebuilt.logical_bytes, b"shared-cache\n".len() as u64);
+        assert_eq!(rebuilt.entry_count, 2);
+        assert!(rebuilt.physical_bytes > 0);
+        assert!(rebuilt
+            .backend_compatibility
+            .starts_with("trail-real-directory/v1/"));
+
+        db.conn
+            .execute(
+                "DELETE FROM artifact_materializations WHERE materialization_id=?1",
+                params![&rebuilt.materialization_id],
+            )
+            .unwrap();
+        super::super::workspace_layer::make_tree_writable(&rebuilt.storage_path);
+        let adopted = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(adopted.reused);
+        assert_eq!(adopted.storage_path, rebuilt.storage_path);
+        assert!(fs::metadata(&adopted.storage_path)
+            .unwrap()
+            .permissions()
+            .readonly());
+
+        db.conn
+            .execute(
+                "UPDATE artifact_materializations SET state='building'
+                 WHERE materialization_id=?1",
+                params![&adopted.materialization_id],
+            )
+            .unwrap();
+        let recovered = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        assert!(!recovered.reused);
+        assert_eq!(
+            fs::read(recovered.storage_path.join("pkg/index.js")).unwrap(),
+            b"shared-cache\n"
+        );
+    }
+
+    #[test]
+    fn artifact_materialization_rejects_noncanonical_database_path_without_touching_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), b"safe\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+        let materialization = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let sentinel = external.path().join("sentinel");
+        fs::write(&sentinel, b"keep me\n").unwrap();
+        db.conn
+            .execute(
+                "UPDATE artifact_materializations SET storage_path=?1
+                 WHERE materialization_id=?2",
+                params![
+                    external.path().to_string_lossy(),
+                    &materialization.materialization_id
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .ensure_artifact_tree_materialization(&tree_id)
+            .unwrap_err();
+        assert!(matches!(error, Error::Corrupt(_)));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep me\n");
+        assert!(external.path().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_materialization_rejects_external_cache_and_root_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), b"safe\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(source.path()).unwrap();
+        let external_parent = tempfile::tempdir().unwrap();
+        let parent_sentinel = external_parent.path().join("sentinel");
+        fs::write(&parent_sentinel, b"parent safe\n").unwrap();
+        let staging = db.workspace_environment_staging_parent().unwrap();
+        let materializations = staging.parent().unwrap().join("artifact-materializations");
+        symlink(external_parent.path(), &materializations).unwrap();
+
+        let error = db
+            .ensure_artifact_tree_materialization(&tree_id)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidPath { .. }));
+        assert_eq!(fs::read(&parent_sentinel).unwrap(), b"parent safe\n");
+        assert_eq!(fs::read_dir(external_parent.path()).unwrap().count(), 1);
+
+        fs::remove_file(&materializations).unwrap();
+        let materialization = db.ensure_artifact_tree_materialization(&tree_id).unwrap();
+        super::super::workspace_layer::make_tree_writable(&materialization.storage_path);
+        fs::remove_dir_all(&materialization.storage_path).unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let root_sentinel = external_root.path().join("sentinel");
+        fs::write(&root_sentinel, b"root safe\n").unwrap();
+        symlink(external_root.path(), &materialization.storage_path).unwrap();
+
+        let error = db
+            .ensure_artifact_tree_materialization(&tree_id)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidPath { .. }));
+        assert_eq!(fs::read(&root_sentinel).unwrap(), b"root safe\n");
+        assert!(!fs::metadata(&root_sentinel)
+            .unwrap()
+            .permissions()
+            .readonly());
     }
 
     fn artifact_file_chunk_ids(db: &Trail, file_id: &ArtifactFileId) -> BTreeSet<ArtifactChunkId> {

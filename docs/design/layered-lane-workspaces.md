@@ -227,10 +227,19 @@ The transparent COW modes already establish several correct invariants:
 - Mount failure is explicit rather than silently becoming a full copy.
 - macOS NFS mount state is persisted for stale-mount recovery.
 
+CAS-backed artifacts also have a reconstructible real-directory cache under
+`.trail/cache/artifact-materializations`. Its identity combines the verified
+artifact tree root with the real-directory backend compatibility key. Trail
+stages and verifies complete content before atomic publication, revalidates and
+re-seals entries on reuse, and rebuilds missing or corrupt cache directories
+from authoritative CAS objects. Copies into mutable layer or lane state prefer
+native clone/reflink support and fall back to independent file copies; Trail
+does not use hard links that could alias mutable bytes back into this cache.
+
 The remaining principal gaps are:
 
-1. Verified real-directory materialization caches do not yet have a tree-root
-   and backend-compatibility identity, independent eviction, or accounting.
+1. Verified real-directory materialization caches do not yet have independent
+   eviction, quotas, or complete reachability accounting.
 2. Git-root lower-file reads still use a complete-file projection cache; CAS
    artifact files use direct bounded blob/chunk ranges and materialize only the
    selected file during copy-up.

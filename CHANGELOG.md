@@ -24,6 +24,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Native lane views now resolve verified immutable artifact manifests lazily, read only
   requested blob/chunk ranges, and materialize only touched files during copy-up while
   preserving shared FUSE, NFS, and Dokan upper/whiteout semantics.
+- Real-directory artifact consumers now reuse tree-root/backend-keyed verified
+  materialization caches that rebuild from authoritative CAS, restore immutable
+  permissions on reuse, and clone/reflink or independently copy into mutable state.
 
 ### Changed
 

@@ -143,7 +143,7 @@ fn workspace_layer_manifest_entry_count(manifest: &WorkspaceLayerManifest) -> u6
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkspaceLayerEntry {
+pub(crate) struct WorkspaceLayerEntry {
     kind: String,
     mode: u32,
     size_bytes: u64,
@@ -708,12 +708,14 @@ impl Trail {
                 })?;
             remove_exact_recovery_directory(&staging, "artifact materialization staging")?;
             fs::create_dir_all(staging.parent().unwrap())?;
-            self.materialize_artifact_tree_under_write_lock(&tree_id, &staging)
+            let shared_materialization = self
+                .ensure_artifact_tree_materialization_under_write_lock(&tree_id)
                 .map_err(|error| {
                     Error::Corrupt(format!(
-                        "CAS-backed workspace layer `{layer_id}` could not materialize tree `{tree_id}`: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                        "CAS-backed workspace layer `{layer_id}` could not materialize tree `{tree_id}` through its shared cache: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
                     ))
                 })?;
+            copy_layer_tree(&shared_materialization.storage_path, &staging)?;
             test_crash_point("layer_after_cas_materialization");
             // The legacy manifest records the immutable attachment modes
             // (0555/0444), so seal the reconstructed children before the
@@ -5562,7 +5564,7 @@ fn layer_builder_is_alive(layer_id: &str, conn: &Connection) -> Result<bool> {
     Ok(process_matches_start_token(pid, token))
 }
 
-fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     let mut folded = HashMap::<String, String>::new();
     for entry in walkdir::WalkDir::new(source).follow_links(false) {
@@ -5697,7 +5699,7 @@ fn publication_staging_path(db_dir: &Path, publication_id: &str, stored: &str) -
     safe_join(db_dir, stored)
 }
 
-fn scan_layer_entries(
+pub(crate) fn scan_layer_entries(
     root: &Path,
     make_read_only: bool,
 ) -> Result<BTreeMap<String, WorkspaceLayerEntry>> {
@@ -5782,7 +5784,7 @@ fn scan_layer_entries(
     Ok(entries)
 }
 
-fn verify_artifact_shadow_matches_layer_entries(
+pub(crate) fn verify_artifact_shadow_matches_layer_entries(
     tree: &ArtifactTreeRootV1,
     artifact_entries: &BTreeMap<String, super::workspace_artifact::ArtifactFlatEntry>,
     layer_entries: &BTreeMap<String, WorkspaceLayerEntry>,
@@ -5926,7 +5928,7 @@ fn layer_mode(metadata: &fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-fn set_layer_read_only(path: &Path, directory: bool, original_mode: u32) -> Result<()> {
+pub(crate) fn set_layer_read_only(path: &Path, directory: bool, original_mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let executable = directory || original_mode & 0o111 != 0;
     fs::set_permissions(
@@ -5946,7 +5948,11 @@ fn immutable_layer_mode(directory: bool, original_mode: u32) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn set_layer_read_only(path: &Path, _directory: bool, _original_mode: u32) -> Result<()> {
+pub(crate) fn set_layer_read_only(
+    path: &Path,
+    _directory: bool,
+    _original_mode: u32,
+) -> Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)?;
@@ -5973,7 +5979,7 @@ pub(crate) fn sync_layer_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn layer_physical_bytes(root: &Path) -> Result<u64> {
+pub(crate) fn layer_physical_bytes(root: &Path) -> Result<u64> {
     let mut bytes = 0_u64;
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;

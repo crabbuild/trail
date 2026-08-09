@@ -256,6 +256,21 @@ CREATE TABLE artifact_generation_bindings (
                 created_at INTEGER NOT NULL,
                 UNIQUE(generation_id, component_id, output_name)
             );
+CREATE TABLE artifact_materializations (
+                materialization_id TEXT PRIMARY KEY,
+                tree_root_id TEXT NOT NULL REFERENCES artifact_objects(artifact_id),
+                backend_compatibility TEXT NOT NULL,
+                storage_path TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('building','verified','failed')),
+                logical_bytes INTEGER NOT NULL,
+                physical_bytes INTEGER,
+                entry_count INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(tree_root_id, backend_compatibility)
+            );
+CREATE INDEX artifact_materializations_lru_idx
+                ON artifact_materializations(state, last_used_at, materialization_id);
 CREATE TABLE environment_cache_namespaces (
                 namespace_id TEXT PRIMARY KEY,
                 adapter_identity TEXT NOT NULL,
