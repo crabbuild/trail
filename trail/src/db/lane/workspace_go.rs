@@ -171,6 +171,7 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
                 strategy: "go-mod-vendor-v1".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: Some((source_root.clone(), "project".to_string())),
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {

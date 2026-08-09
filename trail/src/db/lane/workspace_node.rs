@@ -325,6 +325,7 @@ impl Trail {
             resolved_dependencies: Vec::new(),
             layer_key: key,
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {

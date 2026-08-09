@@ -24,6 +24,20 @@ pub(crate) struct WorkspaceEnvironmentInput {
     pub(crate) entry: FileEntry,
 }
 
+/// One verified resolver snapshot projected into adapter-owned staging. The
+/// bytes remain environment metadata in Trail's object store rather than
+/// becoming mergeable source merely because a framework requires a lockfile
+/// at a conventional repository path while it runs.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceEnvironmentResolutionInput {
+    pub(crate) snapshot_id: ObjectId,
+    pub(crate) source_root: ObjectId,
+    pub(crate) source_path: String,
+    pub(crate) staging_path: String,
+    pub(crate) content_hash: String,
+    pub(crate) size_bytes: u64,
+}
+
 /// A command plan is deliberately argv-based. Trail owns the working
 /// directory, environment injection, staging tree, and publication boundary.
 #[derive(Clone, Debug)]
@@ -395,6 +409,9 @@ pub(crate) struct WorkspaceEnvironmentPlan {
     pub(crate) resolved_dependencies: Vec<ResolvedWorkspaceEnvironmentDependency>,
     pub(crate) layer_key: WorkspaceLayerKeyV1,
     pub(crate) inputs: Vec<WorkspaceEnvironmentInput>,
+    /// Verified resolution metadata projected after the immutable source root.
+    /// Host validation forbids these entries from replacing tracked source.
+    pub(crate) resolution_inputs: Vec<WorkspaceEnvironmentResolutionInput>,
     /// Optional complete pinned source projection for adapters such as Cargo
     /// whose build graph can include arbitrary workspace source files. The
     /// host streams this root in bounded chunks during explicit sync.
@@ -486,6 +503,17 @@ impl WorkspaceEnvironmentAdapterProposal {
             recovery_actions: vec![recovery_action],
         }
     }
+
+    pub(crate) fn resolvable(
+        reason: EnvironmentProposalReasonReport,
+        recovery_action: EnvironmentRecoveryActionReport,
+    ) -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Resolvable,
+            reasons: vec![reason],
+            recovery_actions: vec![recovery_action],
+        }
+    }
 }
 
 /// Ecosystem code is restricted to discovery and deterministic planning.
@@ -516,6 +544,15 @@ pub(crate) trait WorkspaceEnvironmentAdapter: Sync {
     fn component_id(&self, component_root: &str) -> Result<String>;
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool>;
+
+    fn resolution_plan(
+        &self,
+        _db: &Trail,
+        _source_root: &ObjectId,
+        _component_root: &str,
+    ) -> Result<Option<ArtifactResolutionPlanV1>> {
+        Ok(None)
+    }
 
     fn propose(
         &self,
@@ -1366,6 +1403,16 @@ impl Trail {
                     content_hash: input.entry.content_hash,
                     size_bytes: input.entry.size_bytes,
                 })
+                .chain(
+                    plan.resolution_inputs
+                        .into_iter()
+                        .map(|input| EnvironmentPlanInputReport {
+                            source_path: input.source_path,
+                            staging_path: input.staging_path,
+                            content_hash: input.content_hash,
+                            size_bytes: input.size_bytes,
+                        }),
+                )
                 .collect(),
             tools,
             commands,
@@ -2913,6 +2960,67 @@ impl Trail {
                 )));
             }
         }
+        for input in &plan.resolution_inputs {
+            normalize_relative_path(&input.source_path)?;
+            let staging = normalize_relative_path(&input.staging_path)?;
+            let Some((projection_root, staging_root)) = &plan.source_projection else {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution metadata requires a pinned source projection",
+                    plan.component_id
+                )));
+            };
+            let expected_staging = format!("{staging_root}/{}", input.source_path);
+            if projection_root != &input.source_root || staging != expected_staging {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input `{}` is not bound to its pinned source projection",
+                    plan.component_id, input.source_path
+                )));
+            }
+            if !plan
+                .layer_key
+                .inputs
+                .values()
+                .any(|value| value == &input.content_hash)
+                || !plan
+                    .layer_key
+                    .inputs
+                    .values()
+                    .any(|value| value == &format!("snapshot:{}", input.snapshot_id.0))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input {} is absent from its artifact identity",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            if !staging_paths.insert(staging.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` maps more than one input to `{staging}`",
+                    plan.component_id
+                )));
+            }
+            let (snapshot, bytes) =
+                self.artifact_resolution_snapshot_content_by_id(&input.snapshot_id)?;
+            if snapshot.source_root != input.source_root
+                || snapshot.component_id != plan.component_id
+                || snapshot.adapter_identity != plan.adapter_identity
+                || snapshot.content_sha256 != input.content_hash
+                || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != input.size_bytes
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input {} does not match its pinned plan",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            if self
+                .root_file_entry(&input.source_root, &input.source_path)?
+                .is_some()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input `{}` would replace tracked source",
+                    plan.component_id, input.source_path
+                )));
+            }
+        }
         if let Some((_, staging_root)) = &plan.source_projection {
             normalize_relative_path(staging_root)?;
         }
@@ -4087,6 +4195,26 @@ impl Trail {
                 &input.entry,
             )?;
         }
+        for input in &plan.resolution_inputs {
+            let (snapshot, bytes) =
+                self.artifact_resolution_snapshot_content_by_id(&input.snapshot_id)?;
+            if snapshot.source_root != input.source_root
+                || snapshot.component_id != plan.component_id
+                || snapshot.adapter_identity != plan.adapter_identity
+                || snapshot.content_sha256 != input.content_hash
+                || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != input.size_bytes
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution snapshot {} changed after planning",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            self.materialize_workspace_environment_resolution_input(
+                build_dir,
+                &input.staging_path,
+                &bytes,
+            )?;
+        }
         let mut outputs = Vec::with_capacity(plan.outputs.len());
         for declaration in &plan.outputs {
             let output = safe_join(build_dir, &declaration.output_path)?;
@@ -4656,6 +4784,37 @@ impl Trail {
             .write(true)
             .open(&destination)?
             .set_modified(SystemTime::UNIX_EPOCH)?;
+        Ok(())
+    }
+
+    fn materialize_workspace_environment_resolution_input(
+        &self,
+        build_dir: &Path,
+        staging_path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let destination = safe_join(build_dir, staging_path)?;
+        if destination.exists() {
+            return Err(Error::InvalidInput(format!(
+                "resolution input `{staging_path}` would replace projected source"
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        let mut permissions = output.metadata()?.permissions();
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        #[cfg(unix)]
+        permissions.set_mode(0o644);
+        fs::set_permissions(&destination, permissions)?;
+        output.set_modified(SystemTime::UNIX_EPOCH)?;
         Ok(())
     }
 
@@ -7057,6 +7216,7 @@ mod tests {
                 strategy: "cache-test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -7398,6 +7558,7 @@ mod tests {
                 strategy: "mounted-failure-candidate".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,
@@ -7733,6 +7894,7 @@ mod tests {
                         strategy: "dependency-scale-test".to_string(),
                     },
                     inputs: Vec::new(),
+                    resolution_inputs: Vec::new(),
                     source_projection: None,
                     pre_commands: Vec::new(),
                     command: None,
@@ -7796,6 +7958,7 @@ mod tests {
                     strategy: "typed-edge-test".to_string(),
                 },
                 inputs: Vec::new(),
+                resolution_inputs: Vec::new(),
                 source_projection: None,
                 pre_commands: Vec::new(),
                 command: None,
@@ -7915,6 +8078,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -8023,14 +8187,22 @@ mod tests {
         assert!(discovery.conflicts.is_empty());
         assert_eq!(discovery.components.len(), 2);
         for component in &discovery.components {
-            assert_eq!(
-                component.status,
-                EnvironmentComponentProposalStatus::Blocked
-            );
+            if component.adapter_identity == "trail/cargo-target-seed@1" {
+                assert_eq!(
+                    component.status,
+                    EnvironmentComponentProposalStatus::Resolvable
+                );
+                assert!(component.recovery_actions[0].command.is_none());
+            } else {
+                assert_eq!(
+                    component.status,
+                    EnvironmentComponentProposalStatus::Blocked
+                );
+                assert!(component.recovery_actions[0].command.is_none());
+            }
             assert_eq!(component.reasons.len(), 1);
             assert_eq!(component.reasons[0].code, "resolution_snapshot_missing");
             assert_eq!(component.recovery_actions.len(), 1);
-            assert!(component.recovery_actions[0].command.is_none());
         }
         assert!(!workspace.path().join("Cargo.lock").exists());
         assert!(!workspace.path().join("package-lock.json").exists());
@@ -8172,6 +8344,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {
@@ -8264,6 +8437,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command),

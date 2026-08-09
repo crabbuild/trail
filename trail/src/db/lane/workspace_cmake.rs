@@ -109,6 +109,7 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
                 strategy: "cmake-build-tree-private-v1".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,

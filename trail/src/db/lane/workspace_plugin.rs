@@ -1998,6 +1998,7 @@ impl Trail {
                 .to_string(),
             },
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command,

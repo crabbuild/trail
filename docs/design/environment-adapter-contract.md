@@ -124,6 +124,15 @@ an offline build; MCP and HTTP classify synchronization as open-world execution 
 repository-controlled Cargo build scripts and proc macros still execute. Read-only
 status reads persisted state and never invokes package managers or compilers.
 
+A repository containing `Cargo.toml` but no `Cargo.lock` remains visible as a resolvable
+component. Its resolver plan is pinned to the complete source root and exact Cargo
+executable/policy. Once verified, the lock snapshot remains Trail environment metadata:
+the host projects it into isolated staging only after the immutable source root and
+refuses to replace a tracked path. Target-seed construction then uses the conventional
+`Cargo.lock` location with `--locked --offline`; generation keys retain both the complete
+source root and snapshot authority. Source discovery and planning never write a lockfile
+back to the repository.
+
 The initial Node adapter deliberately rejects workspace-root installs, local file/link
 dependencies, pnpm workspace roots, and Yarn Berry/PnP rather than publishing an empty,
 escaping, or incorrectly keyed layer. Those forms require explicit workspace-graph and
@@ -1117,7 +1126,7 @@ package installation logic.
 | --- | --- | --- |
 | Rust toolchain | `rust-toolchain.toml`, distribution digest, target components | `immutable_shared` toolchain |
 | Registry crates and Git checkouts | Cargo version, source registry, checksums | `cache_shared_content` with host-mediated indexes |
-| Compiled dependency seed | `Cargo.lock`, features, profiles, rustc identity, target, relevant build-script environment | optional `immutable_seed_private` lower for `target` |
+| Compiled dependency seed | source or Trail-managed `Cargo.lock` snapshot, complete source root, features, profiles, rustc identity, target, relevant build-script environment | optional `immutable_seed_private` lower for `target` |
 | Active target directory | source and commands continuously mutate it | `writable_private` at `target` |
 | Compiler cache | compiler identity, target, flags | `cache_shared_compiler` through sccache protocol |
 | Credentials | registry token | `secret_runtime`, injected only into Cargo command |

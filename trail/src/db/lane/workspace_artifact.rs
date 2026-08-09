@@ -4400,6 +4400,17 @@ impl Trail {
         }
         Ok(content.bytes)
     }
+
+    pub(crate) fn artifact_resolution_snapshot_content_by_id(
+        &self,
+        snapshot_id: &ObjectId,
+    ) -> Result<(ArtifactResolutionSnapshotV1, Vec<u8>)> {
+        let snapshot: ArtifactResolutionSnapshotV1 =
+            self.get_object(ARTIFACT_RESOLUTION_SNAPSHOT_KIND, snapshot_id)?;
+        validate_artifact_resolution_snapshot(&snapshot)?;
+        let bytes = self.artifact_resolution_snapshot_content(&snapshot)?;
+        Ok((snapshot, bytes))
+    }
 }
 
 fn normalized_resolution_authority_evidence(

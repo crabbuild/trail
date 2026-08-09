@@ -2130,6 +2130,7 @@ impl Trail {
                 strategy: "restricted-command-recipe-v1".to_string(),
             },
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {

@@ -580,6 +580,12 @@ but identical component keys converge to one artifact. For example:
 - CMake targets can share a toolchain and immutable install prefix while keeping
   configuration-specific build trees private.
 
+For a Cargo component without a tracked lockfile, Trail can bind a verified resolution
+snapshot to the complete source root and project those bytes only into isolated build
+staging. Cargo still observes a normal `Cargo.lock` and runs `--locked --offline`, while
+the repository, lane source upper, and later Git export remain unchanged. A different
+source root is a different proposal until a narrower input closure is certified.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own

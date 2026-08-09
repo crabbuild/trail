@@ -7,6 +7,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Cargo components without a source-tracked `Cargo.lock` are now reported as resolvable;
+  a verified Trail-managed lock snapshot can be projected into isolated staging for
+  real `cargo build --locked --offline` target-seed construction without entering source.
 - Artifact-v2 outputs can now replace a workspace layer's compatibility CAS shadow
   with desired-key authority, activate through ordinary lane generations, remain
   isolated through copy-on-write execution, export their immutable source, and release

@@ -166,6 +166,7 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 strategy: "python-venv-private-mounted-init-v2".to_string(),
             },
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             // Python virtual environments commonly embed absolute interpreter

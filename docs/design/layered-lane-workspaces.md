@@ -697,6 +697,14 @@ The safe default is:
   base root, lockfile, toolchain, target triple, feature/profile set, Cargo
   config, and relevant flags.
 
+Library repositories that intentionally omit `Cargo.lock` use the same construction
+path after an explicit resolution operation records the lock bytes as Trail metadata.
+The verified snapshot is projected only into the attempt-owned source staging tree; it
+is never added to the lane source upper or Git. Until certified Cargo input-closure
+analysis exists, both its proposal and target seed remain keyed by the complete source
+root, so even an unrelated source change requires a new lock snapshot rather than
+silently reusing dependency selection from another root.
+
 `cargo clean` creates lane-local whiteouts over a seed; it never deletes the
 shared layer. Workspace-crate incremental state stays private. Trail may
 promote a verified target seed after a clean successful build, but must never
