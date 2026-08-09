@@ -5776,7 +5776,9 @@ fn split_adapter_identity(identity: &str, fallback_major: u32) -> (String, Strin
     )
 }
 
-fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) -> Result<()> {
+pub(super) fn workspace_environment_artifact_contract_digest(
+    plan: &WorkspaceEnvironmentPlan,
+) -> Result<String> {
     #[derive(Serialize)]
     struct CanonicalOutput<'a> {
         name: &'a str,
@@ -5795,7 +5797,14 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
         executable_identity: &'a str,
         args: &'a [String],
         working_directory: &'a str,
-        environment: &'a BTreeMap<String, String>,
+        environment: BTreeMap<String, String>,
+    }
+    #[derive(Serialize)]
+    struct CanonicalCache<'a> {
+        name: &'a str,
+        protocol: &'a str,
+        access: &'a str,
+        compatibility: &'a BTreeMap<String, String>,
     }
     for command in plan
         .pre_commands
@@ -5831,6 +5840,16 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
             gate: output.gate.as_deref(),
         })
         .collect::<Vec<_>>();
+    let cache_paths = plan
+        .caches
+        .iter()
+        .map(|cache| {
+            (
+                cache.storage_path.to_string_lossy().into_owned(),
+                format!("trail-cache:{}", cache.name),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let commands = plan
         .pre_commands
         .iter()
@@ -5847,25 +5866,159 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
             executable_identity: &command.executable_identity,
             args: &command.args,
             working_directory: &command.working_directory,
-            environment: &command.environment,
+            environment: command
+                .environment
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        cache_paths
+                            .get(value)
+                            .cloned()
+                            .unwrap_or_else(|| value.clone()),
+                    )
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
+    let caches = plan
+        .caches
+        .iter()
+        .map(|cache| CanonicalCache {
+            name: &cache.name,
+            protocol: cache.protocol.as_str(),
+            access: cache.access.as_str(),
+            compatibility: &cache.compatibility,
+        })
+        .collect::<Vec<_>>();
+    let artifact_contract_digest = sha256_hex(&serde_json::to_vec(&serde_json::json!({
+        "contract_version": 1,
+        "adapter_identity": plan.adapter_identity,
+        "implementation_version": plan.implementation_version,
+        "distribution_digest": plan.distribution_digest,
+        "outputs": outputs,
+        "commands": commands,
+        "caches": caches,
+        "external_artifacts": workspace_external_artifacts_identity(&plan.external_artifacts)?,
+        "runtime_resources": workspace_runtime_resources_identity(&plan.runtime_resources)?,
+        "validation": format!("sandbox:{:?}", plan.sandbox_policy),
+        "platform": plan.layer_key.platform,
+        "architecture": plan.layer_key.architecture,
+        "portability_scope": plan.layer_key.portability_scope,
+    }))?);
+    Ok(artifact_contract_digest)
+}
+
+fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) -> Result<()> {
+    let artifact_contract_digest = workspace_environment_artifact_contract_digest(plan)?;
     plan.layer_key.inputs.insert(
         "host:artifact_contract_v1".to_string(),
-        sha256_hex(&serde_json::to_vec(&serde_json::json!({
-            "contract_version": 1,
-            "adapter_identity": plan.adapter_identity,
-            "implementation_version": plan.implementation_version,
-            "distribution_digest": plan.distribution_digest,
-            "outputs": outputs,
-            "commands": commands,
-            "validation": format!("sandbox:{:?}", plan.sandbox_policy),
-            "platform": plan.layer_key.platform,
-            "architecture": plan.layer_key.architecture,
-            "portability_scope": plan.layer_key.portability_scope,
-        }))?),
+        artifact_contract_digest.clone(),
+    );
+    let identity = workspace_environment_identity_contract_v3(plan, artifact_contract_digest)?;
+    plan.layer_key.inputs.insert(
+        "host:adapter_identity_protocol".to_string(),
+        trail_environment_adapter_sdk::PROTOCOL_V3.to_string(),
+    );
+    plan.layer_key.inputs.insert(
+        "host:adapter_identity_v3".to_string(),
+        sha256_hex(&serde_json::to_vec(&identity)?),
     );
     Ok(())
+}
+
+pub(super) fn workspace_environment_identity_contract_v3(
+    plan: &WorkspaceEnvironmentPlan,
+    artifact_contract_digest: String,
+) -> Result<trail_environment_adapter_sdk::AdapterIdentityContractV3> {
+    use trail_environment_adapter_sdk::{AdapterIdentityContractV3, AdapterPortability};
+
+    let mut semantic_identities = BTreeMap::from([(
+        "host_artifact_contract".to_string(),
+        artifact_contract_digest,
+    )]);
+    for cache in &plan.caches {
+        let contract = serde_json::json!({
+            "name": cache.name,
+            "protocol": cache.protocol.as_str(),
+            "access": cache.access.as_str(),
+            "compatibility": cache.compatibility,
+        });
+        semantic_identities.insert(
+            format!("performance_cache:{}", cache.name),
+            sha256_hex(&serde_json::to_vec(&contract)?),
+        );
+    }
+    if !plan.external_artifacts.is_empty() {
+        semantic_identities.insert(
+            "external_artifacts".to_string(),
+            sha256_hex(workspace_external_artifacts_identity(&plan.external_artifacts)?.as_bytes()),
+        );
+    }
+    if !plan.runtime_resources.is_empty() {
+        semantic_identities.insert(
+            "runtime_resources".to_string(),
+            sha256_hex(workspace_runtime_resources_identity(&plan.runtime_resources)?.as_bytes()),
+        );
+    }
+    let snapshot_ids = plan
+        .resolution_inputs
+        .iter()
+        .map(|input| input.snapshot_id.0.as_str())
+        .collect::<BTreeSet<_>>();
+    if !snapshot_ids.is_empty() {
+        semantic_identities.insert(
+            "resolution_snapshots".to_string(),
+            sha256_hex(
+                snapshot_ids
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("\0")
+                    .as_bytes(),
+            ),
+        );
+    }
+
+    let portability = if plan
+        .outputs
+        .iter()
+        .any(|output| output.scope == EnvironmentSharingScope::Host)
+        || plan.layer_key.portability_scope.contains("host")
+    {
+        AdapterPortability::Host
+    } else {
+        AdapterPortability::Platform
+    };
+    let portability_certified = plan.sandbox_policy
+        == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+        && !plan.outputs.is_empty()
+        && plan.outputs.iter().all(|output| {
+            matches!(
+                output.policy,
+                WorkspaceEnvironmentOutputPolicy::ImmutableShared
+                    | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+            )
+        });
+    let trust_scope = match plan.sandbox_policy {
+        WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin => "builtin",
+        WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe => "repository",
+        WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+        | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => "plugin",
+    };
+
+    Ok(AdapterIdentityContractV3 {
+        normalizer_version: "trail-host-environment-plan/v3".to_string(),
+        source_closure_complete: plan.source_projection.is_some(),
+        semantic_identities,
+        target: plan.layer_key.strategy.clone(),
+        platform: plan.layer_key.platform.clone(),
+        architecture: plan.layer_key.architecture.clone(),
+        abi: "host-default".to_string(),
+        portability,
+        portability_certified,
+        portability_scope: plan.layer_key.portability_scope.clone(),
+        trust_scope: trust_scope.to_string(),
+    })
 }
 
 fn parse_canonical_adapter_identity(identity: &str) -> Option<(String, String, u32)> {
@@ -7239,6 +7392,51 @@ mod tests {
             stale_reason: "test".to_string(),
         };
         (plan, command)
+    }
+
+    #[test]
+    fn host_v3_identity_projection_is_canonical_and_preserves_private_cache_semantics() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::HostExclusive);
+
+        add_host_canonical_environment_identity(&mut plan).unwrap();
+        let first_key = db.workspace_layer_cache_key(&plan.layer_key).unwrap();
+        assert_eq!(
+            plan.layer_key
+                .inputs
+                .get("host:adapter_identity_protocol")
+                .map(String::as_str),
+            Some(trail_environment_adapter_sdk::PROTOCOL_V3)
+        );
+        assert!(plan
+            .layer_key
+            .inputs
+            .get("host:adapter_identity_v3")
+            .is_some_and(|digest| digest.len() == 64));
+
+        add_host_canonical_environment_identity(&mut plan).unwrap();
+        assert_eq!(
+            db.workspace_layer_cache_key(&plan.layer_key).unwrap(),
+            first_key
+        );
+        let contract_digest = workspace_environment_artifact_contract_digest(&plan).unwrap();
+        let identity = workspace_environment_identity_contract_v3(&plan, contract_digest).unwrap();
+        assert_eq!(identity.trust_scope, "builtin");
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert!(identity
+            .semantic_identities
+            .contains_key("performance_cache:test-cache"));
+        assert_eq!(
+            plan.caches[0].access,
+            WorkspaceEnvironmentCacheAccess::HostExclusive
+        );
+        assert_eq!(
+            plan.outputs[0].policy,
+            WorkspaceEnvironmentOutputPolicy::WritablePrivate
+        );
     }
 
     #[test]

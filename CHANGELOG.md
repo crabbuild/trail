@@ -7,6 +7,11 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Normalized environment plans now carry a host-owned protocol-v3 identity-contract
+  digest alongside the exact legacy workspace-layer key. Go cache contracts exclude
+  machine-local cache paths, CMake remains layer-free and lane-private, OCI/runtime
+  declarations remain external metadata, and repository v2 keeps its independent
+  desired-key v2 identity.
 - Python environments can now bind an optional uv-generated, hash-bearing requirements
   snapshot, warm a performance-only wheel/download cache, and still keep `.venv`, its
   bytecode, and embedded path state entirely lane-private.

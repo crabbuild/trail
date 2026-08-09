@@ -2962,6 +2962,15 @@ portability = "host"
         assert_eq!(plan.outputs[0].mount_path, ".trail-generated/copy");
         assert_eq!(plan.inputs.len(), 1);
         assert_eq!(plan.inputs[0].source_path, "input.txt");
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &plan,
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&plan)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert_eq!(identity.trust_scope, "repository");
         let report = db
             .plan_workspace_environment("recipe-a", RECIPE_ADAPTER_IDENTITY, None)
             .unwrap();
@@ -3157,8 +3166,15 @@ validation = "path-contract"
         );
         assert_eq!(
             compiled.desired_key,
-            super::super::workspace_artifact::artifact_desired_key_v2(compiled.desired_material)
-                .unwrap()
+            super::super::workspace_artifact::artifact_desired_key_v2(
+                compiled.desired_material.clone()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            compiled.desired_material.adapter_protocol,
+            RECIPE_SCHEMA_V2,
+            "repository v2 retains its explicit desired-key protocol instead of being relabeled as plugin v3"
         );
     }
 

@@ -290,6 +290,48 @@ mod tests {
         .unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let mut db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let raw_plan = GO_VENDOR_ADAPTER.plan(&db, &source_root, "").unwrap();
+        let contract_digest =
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&raw_plan)
+                .unwrap();
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &raw_plan,
+            contract_digest.clone(),
+        )
+        .unwrap();
+        assert!(identity.source_closure_complete);
+        assert!(identity.portability_certified);
+        assert_eq!(identity.trust_scope, "builtin");
+        assert_eq!(identity.semantic_identities.len(), 3);
+        assert!(identity
+            .semantic_identities
+            .contains_key("performance_cache:module-store"));
+        assert!(identity
+            .semantic_identities
+            .contains_key("performance_cache:build-cache"));
+
+        let mut relocated_plan = raw_plan.clone();
+        for cache in &mut relocated_plan.caches {
+            let old_path = cache.storage_path.to_string_lossy().into_owned();
+            cache.storage_path = PathBuf::from(format!("relocated-cache-{}", cache.name));
+            let new_path = cache.storage_path.to_string_lossy().into_owned();
+            for command in relocated_plan.command.iter_mut() {
+                for value in command.environment.values_mut() {
+                    if value == &old_path {
+                        *value = new_path.clone();
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            super::workspace_environment::workspace_environment_artifact_contract_digest(
+                &relocated_plan,
+            )
+            .unwrap(),
+            contract_digest,
+            "host cache locations are execution bindings, not artifact identity"
+        );
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
         } else if cfg!(target_os = "windows") {

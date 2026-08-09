@@ -95,7 +95,7 @@
 - [x] 10.3 Change Node discovery to report `package.json` without a supported lock, add package-manager-specific frozen snapshots, and preserve dependency-seed plus content-cache isolation
 - [x] 10.4 Express Vite and Next.js fixtures as build components over Node resolution/dependencies, keeping framework caches/path-bound output private unless validation certifies reuse
 - [x] 10.5 Migrate Python resolution/download artifacts while retaining path-bound virtual environments and bytecode/tool caches as private or performance-only
-- [ ] 10.6 Map Go, CMake, OCI/runtime, and existing command recipes to v2/v3 identities without replacing their shipped private/external/cache semantics
+- [x] 10.6 Map Go, CMake, OCI/runtime, and existing command recipes to v2/v3 identities without replacing their shipped private/external/cache semantics
 - [ ] 10.7 Add Maven/Gradle-like, Bazel/Nix-like, and unknown custom fixtures through plugins or repository v2 rather than framework names in Trail core
 - [ ] 10.8 Remove adapter-specific resolution/publication shortcuts only after common-path correctness, compatibility, native isolation, and performance evidence passes
 

@@ -48,6 +48,22 @@ generation activation. The first built-ins are:
   metadata-only external-artifact declarations while the host retains mount authority
   and atomic generation activation.
 
+Every normalized plan now also receives a host-owned `AdapterIdentityContractV3`
+projection. Its digest enters the component key beside, rather than replacing, the exact
+`WorkspaceLayerKeyV1` compatibility/storage identity. The projection records adapter
+provenance, source-closure status, stable action/output policy, cache protocol and
+compatibility, external/runtime declarations, platform/ABI, portability, and trust
+scope. Host cache storage paths are rewritten to logical cache names before hashing, so
+moving `.trail` storage cannot change artifact correctness identity. This projection
+does not advertise or invoke plugin protocol v3 and grants no v3-only capability.
+
+The mapping deliberately preserves adapter semantics: Go's module/build stores remain
+performance-only while its vendor output remains an immutable private seed; CMake's
+path-bound build tree remains writable-private with no layer; OCI images and services
+remain provider-owned metadata with lane-specific allocation IDs; v1 command recipes
+remain conservative legacy plans, while `trail.environment/v2` recipes retain their
+independently compiled `ArtifactDesiredKeyV2` and repository trust ceiling.
+
 `trail env adapters` returns the compiled and installed adapter catalog, including versioned identity,
 selectors, component kind, discovery markers, implementation provenance, stability, and
 description without probing the repository or host tools. Discovery obtains candidate

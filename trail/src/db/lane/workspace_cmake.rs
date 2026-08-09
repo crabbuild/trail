@@ -228,6 +228,24 @@ mod tests {
             EnvironmentOutputPolicy::WritablePrivate
         );
         assert!(plan.tools.contains_key("cmake-executable"));
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let raw_plan = CMAKE_BUILD_TREE_ADAPTER
+            .plan(&db, &source_root, "")
+            .unwrap();
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &raw_plan,
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&raw_plan)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert_eq!(identity.trust_scope, "builtin");
+        assert_eq!(
+            raw_plan.outputs[0].policy,
+            WorkspaceEnvironmentOutputPolicy::WritablePrivate
+        );
+        assert!(raw_plan.caches.is_empty());
         let report = db
             .sync_workspace_environment_component("cmake", "trail/cmake-build@1", None, None)
             .unwrap();

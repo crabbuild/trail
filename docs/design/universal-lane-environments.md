@@ -599,6 +599,15 @@ components for lane-private `.vite` optimizer state and a validated immutable `d
 artifact. Separating those lifecycles prevents a portable build output from granting
 reuse to a path-bound cache, without adding Next.js or Vite branches to Trail core.
 
+The remaining shipped adapters use the same identity abstraction without changing
+their storage policy. Host normalization derives a protocol-v3 identity-contract digest
+for Go, CMake, OCI/runtime, and command plans while retaining the exact legacy layer key
+as a compatibility/storage identity. Logical cache protocol and compatibility enter the
+projection, but machine-local cache paths do not. Go vendor content can therefore remain
+an immutable seed backed by performance caches; CMake remains a layer-free private build
+tree; OCI remains provider-owned metadata with lane-private runtime allocation; and
+repository-v2 commands keep their independent desired-key v2 contract.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own
