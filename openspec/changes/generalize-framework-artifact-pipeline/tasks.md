@@ -74,7 +74,7 @@
 - [x] 8.2 Add v2 resolution, multiple typed action phases, validations, capability declarations, heterogeneous outputs, and source-export sections with strict unknown-field rejection
 - [x] 8.3 Compile v2 documents to the same proposal, resolution, graph, desired-key, output, and report models used by built-in and plugin adapters
 - [x] 8.4 Preserve fixed argv and bounded deterministic input expansion; reject shell interpolation, control flow, absolute host paths, forbidden child execution, raw secrets, provider sockets, and over-broad reuse
-- [ ] 8.5 Implement source-export planning with artifact/subtree identity, destination, collision mode, validation/gate, source pin, and explicit authorization
+- [x] 8.5 Implement source-export planning with artifact/subtree identity, destination, collision mode, validation/gate, source pin, and explicit authorization
 - [ ] 8.6 Execute source export through confined normal source writes with ignore, guardrail, secret, collision, diff, checkpoint, and Git-handoff behavior; never through artifact mounting
 - [ ] 8.7 Add v1 compatibility, parser snapshots, include/profile cycles, adversarial v2 documents, stale/conflicting export, ignored destination, secret-taint, custom framework, and source-diff E2E tests
 

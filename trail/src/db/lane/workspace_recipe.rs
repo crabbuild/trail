@@ -426,6 +426,8 @@ struct RecipeCapabilities {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RecipeSourceExport {
+    #[serde(default)]
+    name: Option<String>,
     from_output: String,
     source: String,
     target: String,
@@ -513,6 +515,30 @@ fn compile_recipe_validations(
         ));
     }
     Ok(compiled)
+}
+
+fn compile_recipe_source_exports(
+    component: &RecipeComponent,
+) -> Vec<ArtifactSourceExportContractV2> {
+    component
+        .source_exports
+        .iter()
+        .map(|export| ArtifactSourceExportContractV2 {
+            name: export
+                .name
+                .clone()
+                .unwrap_or_else(|| export.from_output.clone()),
+            output_name: export.from_output.clone(),
+            artifact_subpath: export.source.clone(),
+            destination: export.target.clone(),
+            collision_policy: export.collision.clone(),
+            required_validation: export.validation.clone().unwrap_or_else(|| {
+                super::workspace_artifact::HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL.into()
+            }),
+            required_gate: export.gate.clone(),
+            authorization_mode: export.mode.clone(),
+        })
+        .collect()
 }
 
 fn recipe_network_authorities(network: Option<&RecipeNetwork>) -> Result<Vec<String>> {
@@ -803,6 +829,8 @@ fn validate_recipe_v2_component(
         })
         .collect::<BTreeSet<_>>();
     for export in &component.source_exports {
+        let export_name = export.name.as_deref().unwrap_or(&export.from_output);
+        validate_recipe_output_name(export_name, &component.id)?;
         validate_recipe_output_name(&export.from_output, &component.id)?;
         if !output_names.contains(&export.from_output) {
             return Err(Error::InvalidInput(format!(
@@ -818,12 +846,30 @@ fn validate_recipe_v2_component(
                 component.id
             )));
         }
+        if !matches!(export.collision.as_str(), "fail" | "replace") {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export `{export_name}` collision mode must be `fail` or `replace`",
+                component.id
+            )));
+        }
         if let Some(validation) = &export.validation {
             validate_recipe_output_name(validation, &component.id)?;
         }
         if let Some(gate) = &export.gate {
             validate_recipe_output_name(gate, &component.id)?;
         }
+    }
+    let mut export_names = component
+        .source_exports
+        .iter()
+        .map(|export| export.name.as_deref().unwrap_or(&export.from_output))
+        .collect::<Vec<_>>();
+    export_names.sort_unstable();
+    if export_names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares duplicate source export names",
+            component.id
+        )));
     }
     Ok(())
 }
@@ -1229,21 +1275,7 @@ impl Trail {
                 gate: output.gate.clone(),
             })
             .collect::<Vec<_>>();
-        let source_exports = component
-            .source_exports
-            .iter()
-            .map(|export| ArtifactSourceExportContractV2 {
-                name: export.from_output.clone(),
-                artifact_subpath: export.source.clone(),
-                destination: export.target.clone(),
-                collision_policy: export.collision.clone(),
-                required_validation: export
-                    .validation
-                    .clone()
-                    .or_else(|| export.gate.clone())
-                    .unwrap_or_else(|| "host-structural".into()),
-            })
-            .collect::<Vec<_>>();
+        let source_exports = compile_recipe_source_exports(component);
         let mut actions = Vec::new();
         actions.push(self.compile_recipe_action_identity(
             "build",
@@ -1556,6 +1588,28 @@ impl Trail {
             )));
         }
         Ok(plans)
+    }
+
+    pub(crate) fn command_recipe_source_exports(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<Vec<ArtifactSourceExportContractV2>> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Err(Error::InvalidInput(format!(
+                "component `{component_id}` requires `{RECIPE_SCHEMA_V2}` for source export"
+            )));
+        }
+        Ok(compile_recipe_source_exports(&recipe.component))
     }
 
     pub(crate) fn command_recipe_plan_for_root(
@@ -3088,6 +3142,10 @@ validation = "path-contract"
         assert_eq!(compiled.outputs.len(), 2);
         assert_eq!(compiled.validations.len(), 1);
         assert_eq!(compiled.source_exports.len(), 1);
+        assert_eq!(compiled.source_exports[0].name, "seed");
+        assert_eq!(compiled.source_exports[0].output_name, "seed");
+        assert_eq!(compiled.source_exports[0].authorization_mode, "explicit");
+        assert_eq!(compiled.source_exports[0].required_gate, None);
         assert_eq!(
             compiled.desired_key,
             super::super::workspace_artifact::artifact_desired_key_v2(compiled.desired_material)

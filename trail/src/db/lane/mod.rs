@@ -25,6 +25,7 @@ mod patching;
 mod readiness;
 mod retirement;
 mod rewind;
+mod source_export;
 mod turns;
 mod workdir;
 // Phase-one artifact contracts are intentionally reachable only from their

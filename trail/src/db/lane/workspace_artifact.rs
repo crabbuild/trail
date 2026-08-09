@@ -27,7 +27,8 @@ const MAX_ARTIFACT_TREE_ENTRIES: u64 = 1_000_000;
 const MAX_ARTIFACT_TREE_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_ARTIFACT_TREE_DEPTH: usize = 256;
 const HOST_WORKSPACE_LAYER_SEAL_VALIDATOR: &str = "trail.host/workspace-layer-sealer@1";
-const HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL: &str = "trail.host.workspace-layer.structural-seal/v1";
+pub(crate) const HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL: &str =
+    "trail.host.workspace-layer.structural-seal/v1";
 const HOST_WORKSPACE_LAYER_POLICY_SEAL: &str = "trail.host.workspace-layer.policy-seal/v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4702,6 +4703,7 @@ pub(crate) fn artifact_desired_key_v2(
     material.validations.sort();
     for export in &material.source_exports {
         validate_resolution_text(&export.name, "source export name")?;
+        validate_resolution_text(&export.output_name, "source export output name")?;
         validate_resolution_relative_path(
             &export.artifact_subpath,
             "source export subpath",
@@ -4710,6 +4712,18 @@ pub(crate) fn artifact_desired_key_v2(
         validate_resolution_relative_path(&export.destination, "source export destination", false)?;
         validate_resolution_text(&export.collision_policy, "source export collision policy")?;
         validate_resolution_text(&export.required_validation, "source export validation")?;
+        if let Some(gate) = &export.required_gate {
+            validate_resolution_text(gate, "source export gate")?;
+        }
+        validate_resolution_text(&export.authorization_mode, "source export authorization")?;
+        if !matches!(export.collision_policy.as_str(), "fail" | "replace")
+            || export.authorization_mode != "explicit"
+        {
+            return Err(Error::InvalidInput(format!(
+                "source export `{}` has an unsupported collision or authorization mode",
+                export.name
+            )));
+        }
     }
     material.source_exports.sort();
     if material.build_environment.len() > MAX_RESOLUTION_ENVIRONMENT_NAMES {
@@ -6080,10 +6094,13 @@ mod tests {
             .insert("profile".into(), "strict".into());
         current.source_exports.push(ArtifactSourceExportContractV2 {
             name: "bindings".into(),
+            output_name: "target".into(),
             artifact_subpath: "generated".into(),
             destination: "src/generated".into(),
-            collision_policy: "reject".into(),
+            collision_policy: "fail".into(),
             required_validation: "tree".into(),
+            required_gate: None,
+            authorization_mode: "explicit".into(),
         });
         current.trust_scope = "signed-plugin".into();
         current.sandbox_policy = "native-strict".into();
@@ -6166,10 +6183,13 @@ mod tests {
         let mut value = base.clone();
         value.source_exports.push(ArtifactSourceExportContractV2 {
             name: "generated".into(),
+            output_name: "target".into(),
             artifact_subpath: "generated".into(),
             destination: "src/generated".into(),
-            collision_policy: "reject".into(),
+            collision_policy: "fail".into(),
             required_validation: "tree".into(),
+            required_gate: None,
+            authorization_mode: "explicit".into(),
         });
         variants.push(("export", value));
         let mut value = base.clone();

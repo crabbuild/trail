@@ -77,6 +77,10 @@ All notable changes to Trail are documented in this file. Trail follows
   validations, and exports, and rejects shells/control flow, indirect child launchers,
   absolute host paths, raw secrets, provider sockets, forbidden executable phases,
   capability escalation, compatible reuse, and host-wide reuse before tool resolution.
+- Source-export planning now pins the lane/source and active generation, desired and
+  artifact identities, exact file-or-directory subtree, destination content state,
+  collision policy, validation and gate receipts, and explicit authorization without
+  writing source or materializing the artifact.
 
 ### Changed
 

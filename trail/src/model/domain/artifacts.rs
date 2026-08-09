@@ -798,10 +798,80 @@ pub struct ArtifactOutputContractV2 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ArtifactSourceExportContractV2 {
     pub name: String,
+    pub output_name: String,
     pub artifact_subpath: String,
     pub destination: String,
     pub collision_policy: String,
     pub required_validation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_gate: Option<String>,
+    pub authorization_mode: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSourceExportCollisionModeV1 {
+    Fail,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSourceExportAuthorizationV1 {
+    ExplicitUser,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactSourceExportSubtreeV1 {
+    Directory { node_id: ArtifactTreeId },
+    File { node_id: ArtifactFileId },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSourceExportDestinationPinV1 {
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    pub entry_count: u64,
+    pub logical_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSourceExportGatePinV1 {
+    pub event_id: String,
+    pub kind: String,
+    pub source_root: ObjectId,
+    pub view_id: String,
+    pub view_generation: u64,
+}
+
+/// Immutable evidence required before generated artifact content may enter
+/// normal lane source. Execution must revalidate every pin and write through
+/// the ordinary source guardrail/checkpoint path.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactSourceExportPlanV1 {
+    pub version: u16,
+    pub lane_id: String,
+    pub lane: String,
+    pub component_id: String,
+    pub export_name: String,
+    pub output_name: String,
+    pub source_root: ObjectId,
+    pub generation_id: String,
+    pub generation_source_root: ObjectId,
+    pub desired_identity: ArtifactDesiredIdentityV1,
+    pub envelope_id: ArtifactEnvelopeId,
+    pub tree_root_id: ArtifactTreeId,
+    pub subtree: ArtifactSourceExportSubtreeV1,
+    pub artifact_subpath: String,
+    pub destination: String,
+    pub destination_pin: ArtifactSourceExportDestinationPinV1,
+    pub collision_mode: ArtifactSourceExportCollisionModeV1,
+    pub validation_receipt_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<ArtifactSourceExportGatePinV1>,
+    pub authorization: ArtifactSourceExportAuthorizationV1,
 }
 
 /// Canonical identity inputs for the framework-neutral artifact pipeline.
