@@ -453,26 +453,15 @@ fn cargo_resolution_snapshot(
     component_root: &str,
 ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>> {
     let proposal_key = cargo_resolution_proposal_key(source_root, component_root);
-    let Some((snapshot_id, snapshot)) =
-        db.artifact_resolution_snapshot_for_proposal(&proposal_key)?
-    else {
-        return Ok(None);
-    };
     let expected_component = CARGO_TARGET_SEED_ADAPTER.component_id(component_root)?;
-    if snapshot.source_root != *source_root
-        || snapshot.component_id != expected_component
-        || snapshot.adapter_identity != CARGO_TARGET_SEED_ADAPTER.identity()
-        || snapshot.snapshot_format != "cargo-lock-toml-v1"
-        || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
-        || !snapshot.secret_taint.is_clear()
-    {
-        return Err(Error::Corrupt(format!(
-            "Cargo resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
-        )));
-    }
-    let bytes = db.artifact_resolution_snapshot_content(&snapshot)?;
-    validate_cargo_lock_snapshot(&bytes)?;
-    Ok(Some((snapshot_id, snapshot, bytes)))
+    db.verified_workspace_environment_resolution_snapshot(
+        &proposal_key,
+        source_root,
+        &expected_component,
+        CARGO_TARGET_SEED_ADAPTER.identity(),
+        "cargo-lock-toml-v1",
+        validate_cargo_lock_snapshot,
+    )
 }
 
 fn validate_cargo_lock_snapshot(bytes: &[u8]) -> Result<()> {

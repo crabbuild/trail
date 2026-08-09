@@ -2595,6 +2595,40 @@ impl Trail {
         self.validate_workspace_environment_plan_common_with_tool_cache(plan, &mut tool_identities)
     }
 
+    pub(super) fn verified_workspace_environment_resolution_snapshot<F>(
+        &self,
+        proposal_key: &str,
+        source_root: &ObjectId,
+        component_id: &str,
+        adapter_identity: &str,
+        snapshot_format: &str,
+        validate_content: F,
+    ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>>
+    where
+        F: FnOnce(&[u8]) -> Result<()>,
+    {
+        let Some((snapshot_id, snapshot)) =
+            self.artifact_resolution_snapshot_for_proposal(proposal_key)?
+        else {
+            return Ok(None);
+        };
+        if snapshot.proposal_key != proposal_key
+            || snapshot.source_root != *source_root
+            || snapshot.component_id != component_id
+            || snapshot.adapter_identity != adapter_identity
+            || snapshot.snapshot_format != snapshot_format
+            || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
+            || !snapshot.secret_taint.is_clear()
+        {
+            return Err(Error::Corrupt(format!(
+                "environment resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
+            )));
+        }
+        let bytes = self.artifact_resolution_snapshot_content(&snapshot)?;
+        validate_content(&bytes)?;
+        Ok(Some((snapshot_id, snapshot, bytes)))
+    }
+
     fn validate_workspace_environment_plan_common_with_tool_cache(
         &self,
         plan: &WorkspaceEnvironmentPlan,

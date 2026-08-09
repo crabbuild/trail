@@ -97,7 +97,7 @@
 - [x] 10.5 Migrate Python resolution/download artifacts while retaining path-bound virtual environments and bytecode/tool caches as private or performance-only
 - [x] 10.6 Map Go, CMake, OCI/runtime, and existing command recipes to v2/v3 identities without replacing their shipped private/external/cache semantics
 - [x] 10.7 Add Maven/Gradle-like, Bazel/Nix-like, and unknown custom fixtures through plugins or repository v2 rather than framework names in Trail core
-- [ ] 10.8 Remove adapter-specific resolution/publication shortcuts only after common-path correctness, compatibility, native isolation, and performance evidence passes
+- [x] 10.8 Remove adapter-specific resolution/publication shortcuts only after common-path correctness, compatibility, native isolation, and performance evidence passes
 
 ## 11. Public Operations and Conformance
 

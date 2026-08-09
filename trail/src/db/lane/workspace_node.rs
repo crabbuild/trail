@@ -608,26 +608,16 @@ fn node_resolution_snapshot(
     spec: &NodeResolutionSpec,
 ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>> {
     let proposal_key = node_resolution_proposal_key(source_root, package_root, spec);
-    let Some((snapshot_id, snapshot)) =
-        db.artifact_resolution_snapshot_for_proposal(&proposal_key)?
-    else {
-        return Ok(None);
-    };
     let expected_component = NODE_WORKSPACE_ADAPTER.component_id(package_root)?;
-    if snapshot.source_root != *source_root
-        || snapshot.component_id != expected_component
-        || snapshot.adapter_identity != NODE_WORKSPACE_ADAPTER.identity()
-        || snapshot.snapshot_format != spec.snapshot_format()
-        || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
-        || !snapshot.secret_taint.is_clear()
-    {
-        return Err(Error::Corrupt(format!(
-            "Node resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
-        )));
-    }
-    let bytes = db.artifact_resolution_snapshot_content(&snapshot)?;
-    validate_node_lock_snapshot(spec, &bytes)?;
-    Ok(Some((snapshot_id, snapshot, bytes)))
+    let snapshot_format = spec.snapshot_format();
+    db.verified_workspace_environment_resolution_snapshot(
+        &proposal_key,
+        source_root,
+        &expected_component,
+        NODE_WORKSPACE_ADAPTER.identity(),
+        &snapshot_format,
+        |bytes| validate_node_lock_snapshot(spec, bytes),
+    )
 }
 
 fn validate_node_lock_snapshot(spec: &NodeResolutionSpec, bytes: &[u8]) -> Result<()> {

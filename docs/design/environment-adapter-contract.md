@@ -85,6 +85,15 @@ the public `trail env resolve` workflow: resolver process launch, provider integ
 and CLI/HTTP/MCP operations remain planned. Discovery reports unsupported installed
 plugins from their pinned marker and package metadata without launching the plugin.
 
+Snapshot consumption also crosses one host-owned verification boundary. Before a
+built-in can plan construction from a stored snapshot, Trail verifies the exact proposal
+key, source root, component and adapter identity, snapshot format, verified state, and
+clear secret taint, then loads the content object. Ecosystem code supplies only its
+deterministic proposal/format identity and content parser. Cargo, Node, and Python no
+longer duplicate storage lookup, provenance, verification-state, or taint decisions.
+Their planners still revalidate the current resolver executable and policy identity so a
+tool or authority change cannot reuse an otherwise well-formed snapshot.
+
 Command recipes and v1/v2 plugins may declare stable logical component dependencies.
 `sync all` validates missing nodes, duplicate/self edges, complete cycles, and mount
 collisions before running a command; it then runs a bounded deterministic ready queue,

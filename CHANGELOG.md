@@ -11,6 +11,7 @@ All notable changes to Trail are documented in this file. Trail follows
   identities by provider, safe reference, SHA-256 digest, and platform without creating
   layers or cleanup ownership; repository-v2 conformance fixtures cover JVM-like
   dependency/private-state and unknown custom pipelines without new core framework modes.
+
 - Normalized environment plans now carry a host-owned protocol-v3 identity-contract
   digest alongside the exact legacy workspace-layer key. Go cache contracts exclude
   machine-local cache paths, CMake remains layer-free and lane-private, OCI/runtime
@@ -137,6 +138,11 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Changed
 
+- Cargo, Node, and Python managed-resolution consumers now use one host-owned snapshot
+  verifier for proposal/source/component/adapter/format, verification state, secret taint,
+  and content loading. Production adapters continue to publish only through the common
+  CAS sealing and atomic generation-activation path; existing environment synchronization
+  entry points remain compatibility wrappers.
 - Changed omitted lane workdir mode to lazy qualified transparent `auto`.
 - Replaced the old environment sync spellings with `trail env sync all` and
   `trail env sync component`.

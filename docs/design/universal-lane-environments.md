@@ -648,6 +648,13 @@ content sealing, and manifest validation, while activation also requires a lane
 transaction. The bounded component-DAG scheduler remains independent of per-key
 singleflight, so unrelated ready components can build concurrently.
 
+All production adapter publication now enters through this common host path. Built-ins,
+plugins, and repository declarations return plans and candidates; they do not reserve
+layers, ingest CAS objects, publish manifests, or activate generations themselves. The
+older single-component synchronization library wrapper remains as a compatibility entry
+point, but delegates to the generation-oriented common synchronizer and grants no legacy
+publication shortcut.
+
 The host seal is taken only after the synchronous producer returns and the output has
 been copied into an attempt-owned staging tree that the producer does not control. Trail
 then revalidates the exact construction owner, source root, desired key, phase, and

@@ -442,26 +442,15 @@ fn python_resolution_snapshot(
     component_root: &str,
 ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>> {
     let proposal_key = python_resolution_proposal_key(source_root, component_root);
-    let Some((snapshot_id, snapshot)) =
-        db.artifact_resolution_snapshot_for_proposal(&proposal_key)?
-    else {
-        return Ok(None);
-    };
     let expected_component = PYTHON_VENV_ADAPTER.component_id(component_root)?;
-    if snapshot.source_root != *source_root
-        || snapshot.component_id != expected_component
-        || snapshot.adapter_identity != PYTHON_VENV_ADAPTER.identity()
-        || snapshot.snapshot_format != "python-requirements-hashes-v1"
-        || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
-        || !snapshot.secret_taint.is_clear()
-    {
-        return Err(Error::Corrupt(format!(
-            "Python resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
-        )));
-    }
-    let bytes = db.artifact_resolution_snapshot_content(&snapshot)?;
-    validate_python_requirements_snapshot(&bytes)?;
-    Ok(Some((snapshot_id, snapshot, bytes)))
+    db.verified_workspace_environment_resolution_snapshot(
+        &proposal_key,
+        source_root,
+        &expected_component,
+        PYTHON_VENV_ADAPTER.identity(),
+        "python-requirements-hashes-v1",
+        validate_python_requirements_snapshot,
+    )
 }
 
 fn validate_python_requirements_snapshot(bytes: &[u8]) -> Result<()> {
