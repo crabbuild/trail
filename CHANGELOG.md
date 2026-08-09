@@ -101,6 +101,10 @@ All notable changes to Trail are documented in this file. Trail follows
   rejecting oversized or unknown data, duplicate IDs, non-normalized paths, input and
   host pin drift, invalid graph/phase combinations, secret-taint underclaims, and any
   package/protocol/capability/certification mismatch before normalization.
+- Plugin inspection, installation, catalog/trust, and removal reports now expose one
+  shared protocol-capability record with selected protocol, resolution/export and host
+  evidence flags, certification ceiling, content policy, and host-attestation policy;
+  the HTTP/OpenAPI adapter catalog projects the same typed fields.
 
 ### Changed
 

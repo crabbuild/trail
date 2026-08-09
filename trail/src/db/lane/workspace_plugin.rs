@@ -351,6 +351,8 @@ impl Trail {
         package_directory: impl AsRef<Path>,
     ) -> Result<EnvironmentPluginPackageInspectionReport> {
         let prepared = prepare_environment_plugin_package(package_directory)?;
+        let protocol_capabilities =
+            environment_plugin_protocol_capabilities(&prepared.package.adapter);
         let distribution_material = adapter_package_distribution_material(
             &prepared.payload_material,
             prepared.signature.as_ref(),
@@ -366,6 +368,7 @@ impl Trail {
                 .as_ref()
                 .map(|signature| signature.publisher.clone()),
             publisher_key_id: prepared.signature.map(|signature| signature.key_id),
+            protocol_capabilities,
         })
     }
 
@@ -403,6 +406,7 @@ impl Trail {
             adapter_package_distribution_material(&payload_material, signature.as_ref())?;
         let distribution_hex = sha256_hex(&distribution_material);
         let distribution_digest = format!("sha256:{distribution_hex}");
+        let protocol_capabilities = environment_plugin_protocol_capabilities(&package.adapter);
         let executable_file = package.executable.path.clone();
         let installed = InstalledPluginManifest {
             package: package.clone(),
@@ -528,6 +532,7 @@ impl Trail {
             publisher_key_id,
             trust,
             certification_tier,
+            protocol_capabilities,
         })
     }
 
@@ -536,6 +541,12 @@ impl Trail {
         canonical_identity: &str,
     ) -> Result<EnvironmentPluginRemoveReport> {
         validate_plugin_identity(canonical_identity)?;
+        let protocol_capabilities = self
+            .environment_plugin_for_selector(canonical_identity)
+            .ok()
+            .flatten()
+            .map(|plugin| environment_plugin_protocol_capabilities(&plugin.manifest.adapter))
+            .unwrap_or_default();
         let existing = self
             .latest_environment_plugin_registry_record(canonical_identity)?
             .filter(|record| record.action == "install")
@@ -550,6 +561,7 @@ impl Trail {
         Ok(EnvironmentPluginRemoveReport {
             canonical_identity: canonical_identity.to_string(),
             removed_distribution_digest: existing,
+            protocol_capabilities,
         })
     }
 
@@ -2611,6 +2623,40 @@ pub(super) fn selected_environment_plugin_protocol(
     })
 }
 
+pub(super) fn environment_plugin_protocol_capabilities(
+    metadata: &trail_environment_adapter_sdk::AdapterMetadata,
+) -> EnvironmentPluginProtocolCapabilitiesReport {
+    let declares_v3 = metadata
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3);
+    let capabilities = &metadata.capabilities;
+    EnvironmentPluginProtocolCapabilitiesReport {
+        selected_protocol: negotiate_highest_mutual_protocol(
+            &[PROTOCOL_V2, PROTOCOL_V1],
+            &metadata.protocols,
+        )
+        .map(str::to_string),
+        resolution_capable: declares_v3 && capabilities.resolution,
+        source_export_capable: declares_v3 && capabilities.source_exports,
+        host_attestation_evidence_capable: declares_v3 && capabilities.host_attestation_evidence,
+        host_quarantine_evidence_capable: declares_v3 && capabilities.host_quarantine_evidence,
+        certification_ceiling: capabilities.certification_ceiling.as_str().into(),
+        content_policy: if declares_v3 {
+            "host_verified_local_cas"
+        } else {
+            "legacy_exact_layer"
+        }
+        .into(),
+        attestation_policy: if declares_v3 {
+            "host_authored_required"
+        } else {
+            "legacy_host_evidence"
+        }
+        .into(),
+    }
+}
+
 fn ensure_environment_plugin_supports_current_host(
     plugin: &InstalledEnvironmentPlugin,
 ) -> Result<()> {
@@ -3513,6 +3559,19 @@ mod tests {
                 .to_string()
                 .contains("shares no supported protocol")
         );
+
+        let mut plugin = plugin_with_protocols(&[PROTOCOL_V3, PROTOCOL_V2]);
+        plugin.manifest.adapter.capabilities.resolution = true;
+        plugin.manifest.adapter.capabilities.source_exports = true;
+        plugin.manifest.adapter.capabilities.certification_ceiling =
+            trail_environment_adapter_sdk::AdapterCertificationCeiling::LocalArtifact;
+        let report = environment_plugin_protocol_capabilities(&plugin.manifest.adapter);
+        assert_eq!(report.selected_protocol.as_deref(), Some(PROTOCOL_V2));
+        assert!(report.resolution_capable);
+        assert!(report.source_export_capable);
+        assert_eq!(report.certification_ceiling, "local_artifact");
+        assert_eq!(report.content_policy, "host_verified_local_cas");
+        assert_eq!(report.attestation_policy, "host_authored_required");
     }
 
     #[test]
@@ -3845,6 +3904,10 @@ max_response_bytes = 1048576
             .unwrap();
         assert_eq!(inspected.canonical_identity, "example/test@1");
         assert!(!inspected.signature_present);
+        assert_eq!(
+            inspected.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
 
         let installed = db
             .install_environment_adapter_plugin(package.path())
@@ -3855,6 +3918,10 @@ max_response_bytes = 1048576
         assert_eq!(installed.trust, "local_unsigned");
         assert_eq!(installed.certification_tier, "local-experimental");
         assert!(installed.publisher.is_none());
+        assert_eq!(
+            installed.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
         assert!(Path::new(&installed.package_path).is_dir());
         let catalog = db.workspace_environment_adapters().unwrap();
         let entry = catalog
@@ -3865,6 +3932,10 @@ max_response_bytes = 1048576
         assert_eq!(entry.source, "plugin");
         assert_eq!(entry.trust, "local_unsigned");
         assert_eq!(entry.certification_tier, "local-experimental");
+        assert_eq!(
+            entry.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
         assert_eq!(
             entry.identity.distribution_digest.as_deref(),
             Some(installed.distribution_digest.as_str())
@@ -3883,6 +3954,10 @@ max_response_bytes = 1048576
         assert_eq!(
             removed.removed_distribution_digest.as_deref(),
             Some(installed.distribution_digest.as_str())
+        );
+        assert_eq!(
+            removed.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
         );
         assert!(db
             .workspace_environment_adapters()

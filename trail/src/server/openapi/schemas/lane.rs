@@ -612,7 +612,7 @@ pub(super) fn lane_schemas() -> Value {
         },
         "EnvironmentAdapterCatalogEntryReport": {
             "type": "object",
-            "required": ["identity", "canonical_identity", "selectors", "kind", "layer_adapter_name", "discovery_markers", "protocols", "supported_operating_systems", "supported_architectures", "source", "publisher", "publisher_key_id", "trust", "certification_tier", "stability", "description"],
+            "required": ["identity", "canonical_identity", "selectors", "kind", "layer_adapter_name", "discovery_markers", "protocols", "protocol_capabilities", "supported_operating_systems", "supported_architectures", "source", "publisher", "publisher_key_id", "trust", "certification_tier", "stability", "description"],
             "additionalProperties": false,
             "properties": {
                 "identity": { "$ref": "#/components/schemas/EnvironmentAdapterIdentityReport" },
@@ -621,7 +621,8 @@ pub(super) fn lane_schemas() -> Value {
                 "kind": { "type": "string" },
                 "layer_adapter_name": { "type": "string" },
                 "discovery_markers": { "type": "array", "items": { "type": "string" } },
-                "protocols": { "type": "array", "items": { "type": "string", "enum": ["trail.environment-adapter/v1", "trail.environment-adapter/v2"] } },
+                "protocols": { "type": "array", "items": { "type": "string", "enum": ["trail.environment-adapter/v1", "trail.environment-adapter/v2", "trail.environment-adapter/v3"] } },
+                "protocol_capabilities": { "$ref": "#/components/schemas/EnvironmentPluginProtocolCapabilitiesReport" },
                 "supported_operating_systems": { "type": "array", "items": { "type": "string", "enum": ["linux", "macos", "windows"] } },
                 "supported_architectures": { "type": "array", "items": { "type": "string", "enum": ["aarch64", "x86_64"] } },
                 "source": { "type": "string", "enum": ["builtin", "recipe", "plugin"] },
@@ -631,6 +632,21 @@ pub(super) fn lane_schemas() -> Value {
                 "certification_tier": { "type": "string" },
                 "stability": { "type": "string" },
                 "description": { "type": "string" }
+            }
+        },
+        "EnvironmentPluginProtocolCapabilitiesReport": {
+            "type": "object",
+            "required": ["resolution_capable", "source_export_capable", "host_attestation_evidence_capable", "host_quarantine_evidence_capable", "certification_ceiling", "content_policy", "attestation_policy"],
+            "additionalProperties": false,
+            "properties": {
+                "selected_protocol": { "type": ["string", "null"], "enum": ["trail.environment-adapter/v1", "trail.environment-adapter/v2", "trail.environment-adapter/v3", null] },
+                "resolution_capable": { "type": "boolean" },
+                "source_export_capable": { "type": "boolean" },
+                "host_attestation_evidence_capable": { "type": "boolean" },
+                "host_quarantine_evidence_capable": { "type": "boolean" },
+                "certification_ceiling": { "type": "string", "enum": ["", "legacy_exact", "local_artifact", "portable_artifact"] },
+                "content_policy": { "type": "string", "enum": ["", "legacy_exact_layer", "host_verified_local_cas"] },
+                "attestation_policy": { "type": "string", "enum": ["", "legacy_host_evidence", "host_authored_required"] }
             }
         },
         "EnvironmentAdapterCatalogReport": {

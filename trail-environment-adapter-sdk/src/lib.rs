@@ -113,6 +113,16 @@ pub enum AdapterCertificationCeiling {
     PortableArtifact,
 }
 
+impl AdapterCertificationCeiling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyExact => "legacy_exact",
+            Self::LocalArtifact => "local_artifact",
+            Self::PortableArtifact => "portable_artifact",
+        }
+    }
+}
+
 fn is_default_v1_protocols(protocols: &[String]) -> bool {
     protocols == [PROTOCOL_V1]
 }

@@ -596,6 +596,7 @@ impl Trail {
                     .map(|marker| (*marker).to_string())
                     .collect(),
                 protocols: Vec::new(),
+                protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport::default(),
                 supported_operating_systems: metadata
                     .supported_operating_systems
                     .iter()
@@ -633,6 +634,8 @@ impl Trail {
             .collect::<BTreeMap<_, _>>();
         for plugin in self.installed_environment_plugins()? {
             let metadata = plugin.manifest.adapter;
+            let protocol_capabilities =
+                super::workspace_plugin::environment_plugin_protocol_capabilities(&metadata);
             let (namespace, name, contract_major) =
                 super::workspace_plugin::validate_plugin_identity(&metadata.canonical_identity)?;
             for selector in &metadata.selectors {
@@ -659,6 +662,7 @@ impl Trail {
                 layer_adapter_name: metadata.layer_adapter_name,
                 discovery_markers: metadata.discovery_markers,
                 protocols: metadata.protocols,
+                protocol_capabilities,
                 supported_operating_systems: metadata.supported_operating_systems,
                 supported_architectures: metadata.supported_architectures,
                 source: "plugin".to_string(),

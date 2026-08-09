@@ -299,6 +299,26 @@ pub struct EnvironmentAdapterIdentityReport {
     pub distribution_digest: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPluginProtocolCapabilitiesReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol: Option<String>,
+    #[serde(default)]
+    pub resolution_capable: bool,
+    #[serde(default)]
+    pub source_export_capable: bool,
+    #[serde(default)]
+    pub host_attestation_evidence_capable: bool,
+    #[serde(default)]
+    pub host_quarantine_evidence_capable: bool,
+    #[serde(default)]
+    pub certification_ceiling: String,
+    #[serde(default)]
+    pub content_policy: String,
+    #[serde(default)]
+    pub attestation_policy: String,
+}
+
 /// One adapter available to the environment host.
 ///
 /// Catalog entries describe discovery and compatibility only. They never grant
@@ -315,6 +335,8 @@ pub struct EnvironmentAdapterCatalogEntryReport {
     /// Built-ins and repository recipes use the in-process host contract and
     /// therefore report an empty list.
     pub protocols: Vec<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
     pub supported_operating_systems: Vec<String>,
     pub supported_architectures: Vec<String>,
     pub source: String,
@@ -343,6 +365,8 @@ pub struct EnvironmentPluginInstallReport {
     pub publisher_key_id: Option<String>,
     pub trust: String,
     pub certification_tier: String,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,12 +378,16 @@ pub struct EnvironmentPluginPackageInspectionReport {
     pub signature_present: bool,
     pub publisher: Option<String>,
     pub publisher_key_id: Option<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentPluginRemoveReport {
     pub canonical_identity: String,
     pub removed_distribution_digest: Option<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

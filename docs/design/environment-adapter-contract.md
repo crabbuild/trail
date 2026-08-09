@@ -385,6 +385,15 @@ copy, while removal remains available for recovery. Trust revocation also fails 
 packages closed immediately. Unsigned packages are visibly `local-experimental`; a
 signature authenticates origin but does not grant stable certification.
 
+Package inspection, installation, the adapter catalog/trust view, and removal reports
+share `protocol_capabilities`. It records the currently selected host protocol (or no
+mutual protocol), advertised resolution/source-export and host-evidence capability,
+certification ceiling, CAS content policy, and host-attestation policy. The report keeps
+package capability separate from selection: while v3 normalization is disabled, a
+v3/v2 package reports its v3 capability but selects v2, and a v3-only package reports no
+selected protocol. Removal captures the last readable package policy before appending
+the tombstone; inability to inspect corrupt retained bytes never prevents revocation.
+
 The host classifies current publisher-authenticated experimental packages and unsigned
 local packages as `locally_trusted_plugin` for execution. Only a separate durable
 conformance result may select `certified_signed_plugin`. That host-selected tier is
