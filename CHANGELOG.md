@@ -70,6 +70,9 @@ All notable changes to Trail are documented in this file. Trail follows
 - Version-2 repository documents now retain typed resolver, action-phase, validation,
   capability, heterogeneous-output, and source-export declarations with strict nested
   unknown-field rejection; v1 documents cannot opt into those fields implicitly.
+- Repository v2 pipelines now compile into Trail's shared discovery, resolution,
+  component-graph, desired-key v2, output, validation, and source-export models instead
+  of introducing a parallel framework-specific execution representation.
 
 ### Changed
 

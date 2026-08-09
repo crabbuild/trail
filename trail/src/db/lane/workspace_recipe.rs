@@ -1,6 +1,8 @@
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::ArtifactDesiredKeyV2;
+
 use super::workspace_environment::{
     resolve_workspace_tool_executable, validate_environment_output_contract, ResolvedWorkspaceTool,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCommand,
@@ -45,11 +47,46 @@ pub(crate) static COMMAND_RECIPE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMe
 
 #[derive(Clone, Debug)]
 struct CommandRecipe {
+    schema: RecipeSchemaVersion,
     specification_digest: String,
     specification_sources: BTreeMap<String, String>,
     profile_versions: BTreeMap<String, String>,
     defaults: RecipeEnvironment,
     component: RecipeComponent,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledRepositoryArtifactPipelineV2 {
+    pub(crate) proposal: EnvironmentDiscoveredComponentReport,
+    pub(crate) resolution_plan: Option<ArtifactResolutionPlanV1>,
+    pub(crate) graph_plan: WorkspaceEnvironmentPlan,
+    pub(crate) desired_material: ArtifactDesiredKeyMaterialV2,
+    pub(crate) desired_key: ArtifactDesiredKeyV2,
+    pub(crate) outputs: Vec<ArtifactOutputContractV2>,
+    pub(crate) validations: Vec<ArtifactValidationV1>,
+    pub(crate) source_exports: Vec<ArtifactSourceExportContractV2>,
+}
+
+impl CompiledRepositoryArtifactPipelineV2 {
+    fn into_graph_plan(self) -> Result<WorkspaceEnvironmentPlan> {
+        if self.proposal.component_id != self.graph_plan.component_id
+            || self.desired_material.component_id != self.graph_plan.component_id
+            || self
+                .resolution_plan
+                .as_ref()
+                .is_some_and(|plan| plan.component_id != self.graph_plan.component_id)
+            || self.desired_material.outputs != self.outputs
+            || self.desired_material.validations != self.validations
+            || self.desired_material.source_exports != self.source_exports
+            || super::workspace_artifact::artifact_desired_key_v2(self.desired_material)?
+                != self.desired_key
+        {
+            return Err(Error::Corrupt(
+                "compiled repository artifact pipeline models disagree".into(),
+            ));
+        }
+        Ok(self.graph_plan)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,6 +452,97 @@ fn default_fail_collision() -> String {
     "fail".to_string()
 }
 
+fn compile_recipe_validations(
+    validations: &[RecipeValidation],
+) -> Result<Vec<ArtifactValidationV1>> {
+    let mut compiled = validations
+        .iter()
+        .enumerate()
+        .map(|(index, validation)| {
+            let kind = match validation.kind.as_str() {
+                "structural" | "path_contract" => ArtifactValidationKindV1::Structural,
+                "loadability" => ArtifactValidationKindV1::Loadability,
+                "framework" => ArtifactValidationKindV1::Framework,
+                "policy" => ArtifactValidationKindV1::Policy,
+                "gate" => ArtifactValidationKindV1::Gate,
+                "reproducibility" => ArtifactValidationKindV1::Reproducibility,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "unsupported repository validation kind `{other}`"
+                    )))
+                }
+            };
+            let mut parameters = validation.parameters.clone();
+            if let Some(path) = &validation.path {
+                parameters.insert("path".into(), normalize_relative_path(path)?);
+            }
+            if !validation.command.is_empty() {
+                parameters.insert(
+                    "command".into(),
+                    serde_json::to_string(&validation.command)?,
+                );
+            }
+            if let Some(gate) = &validation.gate {
+                parameters.insert("gate".into(), gate.clone());
+            }
+            Ok(ArtifactValidationV1 {
+                name: validation
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("validation-{index}")),
+                kind,
+                required: validation.required,
+                parameters,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    compiled.sort();
+    if compiled.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(Error::InvalidInput(
+            "repository component declares duplicate validation names".into(),
+        ));
+    }
+    Ok(compiled)
+}
+
+fn recipe_network_authorities(network: Option<&RecipeNetwork>) -> Result<Vec<String>> {
+    match network {
+        None => Ok(Vec::new()),
+        Some(RecipeNetwork::Policy(policy)) if policy == "deny" => Ok(Vec::new()),
+        Some(RecipeNetwork::Policy(policy)) => Err(Error::InvalidInput(format!(
+            "repository resolver network policy `{policy}` must be `deny` or an exact authority list"
+        ))),
+        Some(RecipeNetwork::Authorities(authorities)) => Ok(authorities.authorities.clone()),
+    }
+}
+
+fn recipe_network_policy_identity(network: Option<&RecipeNetwork>) -> Result<String> {
+    let authorities = recipe_network_authorities(network)?;
+    if authorities.is_empty() {
+        Ok("deny".into())
+    } else {
+        Ok(format!("exact:{}", authorities.join(",")))
+    }
+}
+
+fn merge_recipe_identity_environment(
+    target: &mut BTreeMap<String, String>,
+    source: &BTreeMap<String, String>,
+    component_id: &str,
+) -> Result<()> {
+    for (name, value) in source {
+        validate_recipe_environment(name, value, component_id)?;
+        if let Some(previous) = target.insert(name.clone(), value.clone())
+            && previous != *value
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` declares conflicting identity environment values for `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Trail {
     pub(crate) fn command_recipe_discovery(
         &self,
@@ -432,14 +560,45 @@ impl Trail {
                     .as_ref()
                     .is_none_or(|root| root == &recipe.component.root)
             })
-            .map(|recipe| EnvironmentDiscoveredComponentReport {
-                component_id: recipe.component.id,
-                component_root: recipe.component.root,
-                kind: recipe.component.kind,
-                adapter_identity: RECIPE_ADAPTER_IDENTITY.to_string(),
-                status: EnvironmentComponentProposalStatus::Ready,
-                reasons: Vec::new(),
-                recovery_actions: Vec::new(),
+            .map(|recipe| {
+                let resolvable = recipe.schema == RecipeSchemaVersion::V2
+                    && recipe.component.resolution.is_some();
+                EnvironmentDiscoveredComponentReport {
+                    component_id: recipe.component.id.clone(),
+                    component_root: recipe.component.root,
+                    kind: recipe.component.kind,
+                    adapter_identity: RECIPE_ADAPTER_IDENTITY.to_string(),
+                    status: if resolvable {
+                        EnvironmentComponentProposalStatus::Resolvable
+                    } else {
+                        EnvironmentComponentProposalStatus::Ready
+                    },
+                    reasons: if resolvable {
+                        vec![EnvironmentProposalReasonReport {
+                            code: "resolution_snapshot_required".into(),
+                            message:
+                                "repository component declares an explicit resolution snapshot"
+                                    .into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    recovery_actions: if resolvable {
+                        vec![EnvironmentRecoveryActionReport {
+                            code: "resolve_component".into(),
+                            description: "resolve and pin the declared component snapshot".into(),
+                            command: Some(vec![
+                                "trail".into(),
+                                "env".into(),
+                                "resolve".into(),
+                                "--component".into(),
+                                recipe.component.id,
+                            ]),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                }
             })
             .collect())
     }
@@ -458,7 +617,342 @@ impl Trail {
                     "no `{RECIPE_ADAPTER_IDENTITY}` component named `{component_id}` exists in the pinned environment specification"
                 ))
             })?;
+        if recipe.schema == RecipeSchemaVersion::V2 {
+            return self
+                .compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                .into_graph_plan();
+        }
         self.plan_command_recipe(source_root, recipe)
+    }
+
+    #[cfg(test)]
+    fn compile_repository_artifact_pipeline_v2(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<CompiledRepositoryArtifactPipelineV2> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)
+    }
+
+    fn compile_repository_artifact_pipeline_v2_recipe(
+        &self,
+        source_root: &ObjectId,
+        recipe: CommandRecipe,
+    ) -> Result<CompiledRepositoryArtifactPipelineV2> {
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requires `{RECIPE_SCHEMA_V2}` for artifact-pipeline compilation",
+                recipe.component.id
+            )));
+        }
+        let graph_plan = self.plan_command_recipe(source_root, recipe.clone())?;
+        let component = &recipe.component;
+        let validations = compile_recipe_validations(&component.validations)?;
+        let resolution_plan = component
+            .resolution
+            .as_ref()
+            .map(|resolution| {
+                self.compile_recipe_resolution_plan(
+                    source_root,
+                    &recipe,
+                    &graph_plan,
+                    resolution,
+                    &validations,
+                )
+            })
+            .transpose()?;
+        let outputs = graph_plan
+            .outputs
+            .iter()
+            .map(|output| ArtifactOutputContractV2 {
+                name: output.name.clone(),
+                output_path: output.output_path.clone(),
+                mount_path: output.mount_path.clone(),
+                policy: output.policy,
+                reuse: output.reuse,
+                scope: output.scope,
+                publish: output.publish,
+                gate: output.gate.clone(),
+            })
+            .collect::<Vec<_>>();
+        let source_exports = component
+            .source_exports
+            .iter()
+            .map(|export| ArtifactSourceExportContractV2 {
+                name: export.from_output.clone(),
+                artifact_subpath: export.source.clone(),
+                destination: export.target.clone(),
+                collision_policy: export.collision.clone(),
+                required_validation: export
+                    .validation
+                    .clone()
+                    .or_else(|| export.gate.clone())
+                    .unwrap_or_else(|| "host-structural".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut actions = Vec::new();
+        actions.push(self.compile_recipe_action_identity(
+            "build",
+            ArtifactActionPhaseV2::Construct,
+            &component.build.command,
+            component.build.cwd.as_deref().unwrap_or("."),
+            &component.build.environment,
+        )?);
+        if let Some(resolution) = &component.resolution {
+            actions.push(self.compile_recipe_action_identity(
+                "resolve",
+                ArtifactActionPhaseV2::Resolve,
+                &resolution.command,
+                resolution.cwd.as_deref().unwrap_or("."),
+                &resolution.environment,
+            )?);
+        }
+        for (index, action) in component.actions.iter().enumerate() {
+            let phase = match action.phase {
+                RecipeActionPhase::Construct => ArtifactActionPhaseV2::Construct,
+                RecipeActionPhase::Validate => ArtifactActionPhaseV2::Validate,
+                RecipeActionPhase::MountedExecution | RecipeActionPhase::SourceExport => {
+                    ArtifactActionPhaseV2::Finalize
+                }
+            };
+            actions.push(self.compile_recipe_action_identity(
+                action.name.as_deref().unwrap_or({
+                    if index == 0 {
+                        "action"
+                    } else {
+                        "action-step"
+                    }
+                }),
+                phase,
+                &action.command,
+                action.cwd.as_deref().unwrap_or("."),
+                &action.environment,
+            )?);
+        }
+        actions.sort();
+
+        let mut build_environment = component.build.environment.clone();
+        if let Some(resolution) = &component.resolution {
+            merge_recipe_identity_environment(
+                &mut build_environment,
+                &resolution.environment,
+                &component.id,
+            )?;
+        }
+        for action in &component.actions {
+            merge_recipe_identity_environment(
+                &mut build_environment,
+                &action.environment,
+                &component.id,
+            )?;
+        }
+        let declared_inputs = graph_plan
+            .inputs
+            .iter()
+            .map(|input| ArtifactResolutionInputV1 {
+                source_path: input.source_path.clone(),
+                content_hash: input.entry.content_hash.clone(),
+                size_bytes: input.entry.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        let desired_material = ArtifactDesiredKeyMaterialV2 {
+            version: 2,
+            component_id: component.id.clone(),
+            adapter_identity: component.adapter.clone(),
+            adapter_implementation_version: env!("CARGO_PKG_VERSION").into(),
+            adapter_distribution_digest: "builtin:repository-environment-v2".into(),
+            adapter_protocol: RECIPE_SCHEMA_V2.into(),
+            resolution_snapshot_id: None,
+            source_closure: ArtifactSourceClosureV2 {
+                normalizer_version: "repository-inputs/v1".into(),
+                certified_complete: false,
+                complete_source_root: Some(source_root.clone()),
+                declared_inputs,
+            },
+            upstream_identities: BTreeMap::new(),
+            actions,
+            outputs: outputs.clone(),
+            validations: validations.clone(),
+            source_exports: source_exports.clone(),
+            build_environment,
+            target: "repository-declared".into(),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            abi: "host-default".into(),
+            // The host has normalized every output through
+            // `validate_environment_output_contract`; repository text alone
+            // never sets this bit and compatible reuse remains unavailable.
+            portability_certified: true,
+            portability_scope: "workspace".into(),
+            trust_scope: "repository".into(),
+            network_policy: recipe_network_policy_identity(
+                component
+                    .resolution
+                    .as_ref()
+                    .and_then(|resolution| resolution.network.as_ref()),
+            )?,
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            sandbox_policy: "restricted-repository-pipeline-v2".into(),
+        };
+        let desired_key =
+            super::workspace_artifact::artifact_desired_key_v2(desired_material.clone())?;
+        let proposal = EnvironmentDiscoveredComponentReport {
+            component_id: component.id.clone(),
+            component_root: component.root.clone(),
+            kind: component.kind.clone(),
+            adapter_identity: component.adapter.clone(),
+            status: if resolution_plan.is_some() {
+                EnvironmentComponentProposalStatus::Resolvable
+            } else {
+                EnvironmentComponentProposalStatus::Ready
+            },
+            reasons: resolution_plan.as_ref().map_or_else(Vec::new, |_| {
+                vec![EnvironmentProposalReasonReport {
+                    code: "resolution_snapshot_required".into(),
+                    message: "repository component declares an explicit resolution snapshot".into(),
+                }]
+            }),
+            recovery_actions: resolution_plan.as_ref().map_or_else(Vec::new, |_| {
+                vec![EnvironmentRecoveryActionReport {
+                    code: "resolve_component".into(),
+                    description: "resolve and pin the declared component snapshot".into(),
+                    command: Some(vec![
+                        "trail".into(),
+                        "env".into(),
+                        "resolve".into(),
+                        "--component".into(),
+                        component.id.clone(),
+                    ]),
+                }]
+            }),
+        };
+        Ok(CompiledRepositoryArtifactPipelineV2 {
+            proposal,
+            resolution_plan,
+            graph_plan,
+            desired_material,
+            desired_key,
+            outputs,
+            validations,
+            source_exports,
+        })
+    }
+
+    fn compile_recipe_resolution_plan(
+        &self,
+        source_root: &ObjectId,
+        recipe: &CommandRecipe,
+        graph_plan: &WorkspaceEnvironmentPlan,
+        resolution: &RecipeResolution,
+        validations: &[ArtifactValidationV1],
+    ) -> Result<ArtifactResolutionPlanV1> {
+        let program = resolution.command.first().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "repository component `{}` resolver command is empty",
+                recipe.component.id
+            ))
+        })?;
+        let tool = resolve_workspace_tool_executable(program)?;
+        let working_directory = resolution.cwd.clone().unwrap_or_else(|| ".".into());
+        let mut plan = ArtifactResolutionPlanV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            proposal_key: format!("repository_v2_{}", recipe.specification_digest),
+            source_root: source_root.clone(),
+            component_id: recipe.component.id.clone(),
+            adapter_identity: recipe.component.adapter.clone(),
+            policy_identity: sha256_hex(&serde_json::to_vec(&(
+                &resolution.capabilities,
+                &recipe.component.capabilities,
+            ))?),
+            program: program.clone(),
+            resolved_program: tool.path.to_string_lossy().into_owned(),
+            executable_identity: tool.identity,
+            argv: resolution.command.clone(),
+            working_directory: working_directory.clone(),
+            readable_inputs: graph_plan
+                .inputs
+                .iter()
+                .map(|input| ArtifactResolutionInputV1 {
+                    source_path: input.source_path.clone(),
+                    content_hash: input.entry.content_hash.clone(),
+                    size_bytes: input.entry.size_bytes,
+                })
+                .collect(),
+            candidate_output: normalize_relative_path(&join_recipe_path(
+                &working_directory,
+                &resolution.snapshot,
+            ))?,
+            allowed_authorities: recipe_network_authorities(resolution.network.as_ref())?,
+            credential_handles: Vec::new(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            environment_roles: resolution
+                .environment
+                .keys()
+                .map(|name| (name.clone(), ArtifactEnvironmentRoleV1::Identity))
+                .collect(),
+            limits: ArtifactActionLimitsV1 {
+                timeout_ms: 5 * 60 * 1_000,
+                stdout_bytes: 1024 * 1024,
+                stderr_bytes: 1024 * 1024,
+                candidate_bytes: 256 * 1024 * 1024,
+                candidate_entries: 100_000,
+                child_processes: resolution
+                    .capabilities
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.child_processes)
+                    .unwrap_or(1)
+                    .max(1),
+            },
+            snapshot_format: resolution.format.clone(),
+            validations: if validations.is_empty() {
+                vec![ArtifactValidationV1 {
+                    name: "snapshot-structure".into(),
+                    kind: ArtifactValidationKindV1::Structural,
+                    required: true,
+                    parameters: BTreeMap::new(),
+                }]
+            } else {
+                validations.to_vec()
+            },
+        };
+        super::workspace_artifact::normalize_artifact_resolution_plan(&mut plan)?;
+        Ok(plan)
+    }
+
+    fn compile_recipe_action_identity(
+        &self,
+        name: &str,
+        phase: ArtifactActionPhaseV2,
+        command: &[String],
+        working_directory: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<ArtifactActionIdentityV2> {
+        let program = command.first().ok_or_else(|| {
+            Error::InvalidInput(format!("repository action `{name}` command is empty"))
+        })?;
+        let tool = resolve_workspace_tool_executable(program)?;
+        let normalized_working_directory = normalize_recipe_path_allow_root(working_directory)?;
+        Ok(ArtifactActionIdentityV2 {
+            name: name.into(),
+            phase,
+            executable_identity: tool.identity,
+            argv: command.to_vec(),
+            working_directory: if normalized_working_directory.is_empty() {
+                ".".into()
+            } else {
+                normalized_working_directory
+            },
+            environment_names: environment.keys().cloned().collect(),
+        })
     }
 
     pub(crate) fn command_recipe_plans(
@@ -472,6 +966,14 @@ impl Trail {
         for recipe in recipes {
             if component_ids.contains(&recipe.component.id) {
                 let component_id = recipe.component.id.clone();
+                if recipe.schema == RecipeSchemaVersion::V2 {
+                    plans.insert(
+                        component_id,
+                        self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                            .into_graph_plan()?,
+                    );
+                    continue;
+                }
                 let program = recipe
                     .component
                     .build
@@ -522,7 +1024,15 @@ impl Trail {
             .filter(|recipe| recipe.component.root == component_root)
             .collect::<Vec<_>>();
         match matching.len() {
-            1 => self.plan_command_recipe(source_root, matching.remove(0)),
+            1 => {
+                let recipe = matching.remove(0);
+                if recipe.schema == RecipeSchemaVersion::V2 {
+                    self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                        .into_graph_plan()
+                } else {
+                    self.plan_command_recipe(source_root, recipe)
+                }
+            }
             0 => Err(Error::InvalidInput(format!(
                 "no `{RECIPE_ADAPTER_IDENTITY}` component is declared at `{}`",
                 display_recipe_root(&component_root)
@@ -627,6 +1137,7 @@ impl Trail {
             })?;
             let canonical = serde_json::to_vec(&(schema.as_str(), &component, &profile_versions))?;
             recipes.push(CommandRecipe {
+                schema,
                 specification_digest: sha256_hex(&canonical),
                 specification_sources: documents.specification_sources.clone(),
                 profile_versions,
@@ -1911,7 +2422,7 @@ command = ["cp", "input.txt", "generated/result.txt"]
 cwd = "."
 
 [component.resolve]
-command = ["tool", "resolve", "--snapshot", "generated.lock"]
+command = ["cp", "input.txt", "generated.lock"]
 cwd = "."
 network = { authorities = ["registry.example:443"] }
 snapshot = "generated.lock"
@@ -1928,14 +2439,14 @@ publication = "deny"
 [[component.action]]
 name = "construct"
 phase = "construct"
-command = ["tool", "build", "--offline"]
+command = ["cp", "input.txt", "generated/result.txt"]
 cwd = "."
 network = "deny"
 
 [[component.action]]
 name = "load-check"
 phase = "validate"
-command = ["tool", "check", "generated/result.txt"]
+command = ["cp", "generated/result.txt", "generated/checked.txt"]
 
 [[component.validation]]
 name = "path-contract"
@@ -2007,6 +2518,32 @@ validation = "path-contract"
         );
         assert_eq!(component.source_exports.len(), 1);
         assert_eq!(component.source_exports[0].target, "src/generated-client");
+
+        let compiled = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "custom.pipeline")
+            .unwrap();
+        assert_eq!(
+            compiled.proposal.status,
+            EnvironmentComponentProposalStatus::Resolvable
+        );
+        assert_eq!(compiled.graph_plan.component_id, "custom.pipeline");
+        assert_eq!(
+            compiled
+                .resolution_plan
+                .as_ref()
+                .unwrap()
+                .allowed_authorities,
+            vec!["registry.example:443"]
+        );
+        assert_eq!(compiled.desired_material.actions.len(), 4);
+        assert_eq!(compiled.outputs.len(), 2);
+        assert_eq!(compiled.validations.len(), 1);
+        assert_eq!(compiled.source_exports.len(), 1);
+        assert_eq!(
+            compiled.desired_key,
+            super::super::workspace_artifact::artifact_desired_key_v2(compiled.desired_material)
+                .unwrap()
+        );
     }
 
     #[test]

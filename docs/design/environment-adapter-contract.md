@@ -217,6 +217,16 @@ and a v1 document cannot gain any of these authorities by spelling a v2-only sec
 Compilation and execution still pass through the host-owned normalized models and
 capability checks; parsing a declaration never grants authority by itself.
 
+The v2 compiler does not create a second repository execution graph. It projects one
+validated document into the existing `EnvironmentDiscoveredComponentReport`, optional
+`ArtifactResolutionPlanV1`, `WorkspaceEnvironmentPlan`, `ArtifactDesiredKeyMaterialV2`
+and desired key, `ArtifactOutputContractV2`, `ArtifactValidationV1`, and
+`ArtifactSourceExportContractV2` types. Exact executable identities, selected pinned
+inputs, normalized output policy, platform identity, policy identity, and requested
+network authorities therefore participate in the same host-owned reports and identities
+as built-in and plugin adapters. A declared resolver produces a `resolvable` proposal;
+it does not run during discovery or compilation.
+
 ### Add a repository adapter without Rust
 
 Use `trail/command@1` when the adapter can be represented as pinned byte inputs, an argv
