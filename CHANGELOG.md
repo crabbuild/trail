@@ -57,6 +57,10 @@ All notable changes to Trail are documented in this file. Trail follows
   resolver candidates stay out of shared CAS, runtime-secret generations cannot promote
   private output, and producer receipts are rejected if tainted or sensitive while
   bounded failure evidence remains exact-value redacted.
+- Ready artifact envelopes now receive deterministic content-addressed host attestations
+  with typed producer, capability, policy, validation, portability, and taint evidence;
+  inspection and attachment verification detect state/signature tampering and recheck
+  current plugin package and publisher revocation.
 
 ### Changed
 

@@ -16,6 +16,7 @@ pub const ARTIFACT_TREE_ROOT_VERSION: u16 = 1;
 pub const ARTIFACT_ENVELOPE_VERSION: u16 = 1;
 pub const ARTIFACT_DIVERGENCE_EVIDENCE_VERSION: u16 = 1;
 pub const ARTIFACT_VALIDATION_RECEIPT_VERSION: u16 = 1;
+pub const ARTIFACT_ATTESTATION_VERSION: u16 = 1;
 
 pub const ARTIFACT_DIRECTORY_NODE_KIND: &str = "ArtifactDirectoryNode";
 pub const ARTIFACT_FILE_NODE_KIND: &str = "ArtifactFileNode";
@@ -26,6 +27,7 @@ pub const ARTIFACT_TREE_ROOT_KIND: &str = "ArtifactTreeRoot";
 pub const ARTIFACT_ENVELOPE_KIND: &str = "ArtifactEnvelope";
 pub const ARTIFACT_DIVERGENCE_EVIDENCE_KIND: &str = "ArtifactDivergenceEvidence";
 pub const ARTIFACT_VALIDATION_RECEIPT_KIND: &str = "ArtifactValidationReceipt";
+pub const ARTIFACT_ATTESTATION_KIND: &str = "ArtifactAttestation";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -141,6 +143,87 @@ pub struct ArtifactEnvelopeV1 {
     pub resolution_snapshot_id: Option<ObjectId>,
     #[serde(default)]
     pub validation_receipt_ids: Vec<ObjectId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAttestationSignatureV1 {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_hex: String,
+    pub signature_hex: String,
+}
+
+/// Deterministic host statement about one sealed artifact envelope.
+///
+/// Local storage paths and wall-clock observations are intentionally absent.
+/// Publisher and package fields identify trust evidence but do not grant trust;
+/// attachment rechecks their current local status.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAttestationStatementV1 {
+    pub version: u16,
+    pub envelope_id: ArtifactEnvelopeId,
+    pub desired_identity: ArtifactDesiredIdentityV1,
+    pub tree_root_id: ArtifactTreeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_snapshot_id: Option<ObjectId>,
+    #[serde(default)]
+    pub upstream_identities: BTreeMap<String, String>,
+    pub producer_identity: String,
+    pub producer_trust: ArtifactProducerTrustTierV1,
+    pub adapter_implementation_version: String,
+    pub adapter_distribution_digest: String,
+    pub adapter_protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_key_id: Option<String>,
+    #[serde(default)]
+    pub executable_identities: BTreeMap<String, String>,
+    pub platform: String,
+    pub architecture: String,
+    pub abi: String,
+    pub capability_ceiling: ArtifactCapabilityCeilingV1,
+    pub sandbox_enforcement: String,
+    pub network_policy: String,
+    pub script_policy: ArtifactScriptPolicyV1,
+    pub output_name: String,
+    pub output_policy: EnvironmentOutputPolicy,
+    pub portability_scope: String,
+    pub trust_scope: String,
+    #[serde(default)]
+    pub validation_receipt_ids: Vec<ObjectId>,
+    #[serde(default, skip_serializing_if = "ArtifactSecretTaintV1::is_clear")]
+    pub secret_taint: ArtifactSecretTaintV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAttestationV1 {
+    pub statement: ArtifactAttestationStatementV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ArtifactAttestationSignatureV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAttestationReportV1 {
+    pub attestation_id: ArtifactAttestationId,
+    pub object_id: ObjectId,
+    pub state: String,
+    pub attestation: ArtifactAttestationV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAttestationVerificationReportV1 {
+    pub attestation_id: ArtifactAttestationId,
+    pub envelope_id: ArtifactEnvelopeId,
+    pub state: String,
+    pub content_identity_valid: bool,
+    pub envelope_binding_valid: bool,
+    pub producer_trusted: bool,
+    pub signature_status: String,
+    pub valid: bool,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

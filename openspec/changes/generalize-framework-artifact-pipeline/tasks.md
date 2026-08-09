@@ -65,7 +65,7 @@
 - [x] 7.4 Implement explicit quarantine list/show/resolve operations and policy-controlled lane-private fallback without relabeling candidates or clearing evidence implicitly
 - [x] 7.5 Define and enforce phase-specific capability ceilings for reviewed built-ins, certified signed plugins, locally trusted plugins, and repository declarations
 - [x] 7.6 Add secret-taint propagation so secret-consuming producers are private, non-promotable, and non-exportable and secret bytes never enter identities, objects, logs, reports, or caches
-- [ ] 7.7 Implement deterministic `ArtifactAttestationV1` creation, storage, inspection, attachment validation, optional signature fields, and package/publisher revocation checks
+- [x] 7.7 Implement deterministic `ArtifactAttestationV1` creation, storage, inspection, attachment validation, optional signature fields, and package/publisher revocation checks
 - [ ] 7.8 Add divergent-producer, malicious-plan, undeclared-write, denied-network, child-process, secret-leak, unsafe-output, revoked-package, unsupported-sandbox, and attestation-tamper tests
 
 ## 8. trail.environment/v2 and Source Export

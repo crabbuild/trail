@@ -630,6 +630,18 @@ and attachment rejects missing, duplicate, failed, stale-digest, or mismatched e
 Package-specific trust and revocation remain additional attachment requirements rather
 than being inferred from content safety.
 
+The same publication savepoint now creates one deterministic `ArtifactAttestationV1`.
+Its identity covers the envelope and desired/tree/source/snapshot/upstream identities,
+producer tier and package/publisher identity, executable/tool identities, host platform,
+phase capability ceiling, sandbox/network/script policies, output/share contract,
+validation receipts, and clear secret-taint result. It excludes wall-clock observations
+and local storage paths. Inspection returns the immutable statement and current database
+state; verification recomputes content identity and envelope binding. Optional Ed25519
+signature envelopes are parsed and verified when present, including local signing-key
+revocation. Unsigned local host attestations remain valid but are labeled `unsigned`.
+Attachment rechecks current plugin distribution digest and publisher key, so publisher
+trust removal or package removal blocks reuse without mutating prior evidence.
+
 Garbage collection considers active generations, retained predecessors, checkpoints,
 running operations, open backend references, and leases. Logical and physical byte
 accounting are reported separately so shared-space savings remain visible.

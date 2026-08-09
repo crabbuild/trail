@@ -3049,6 +3049,7 @@ fn validate_plugin_catalog(plugins: &[InstalledEnvironmentPlugin]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
@@ -3428,6 +3429,40 @@ max_response_bytes = 1048576
         let trust = db.environment_adapter_publisher_trust().unwrap();
         assert_eq!(trust.keys.len(), 1);
         assert_eq!(trust.keys[0].key_id, trusted.key_id);
+        let artifact = tempfile::tempdir().unwrap();
+        fs::write(artifact.path().join("plugin-output"), "signed output\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(
+                &WorkspaceLayerKeyV1 {
+                    kind: "generated".into(),
+                    adapter: "example/signed@1".into(),
+                    adapter_version: 1,
+                    inputs: BTreeMap::from([("source_root".into(), "fixture-source".into())]),
+                    tool_versions: BTreeMap::from([(
+                        "adapter".into(),
+                        installed.executable_digest.clone(),
+                    )]),
+                    platform: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    portability_scope: "host".into(),
+                    strategy: "signed-plugin-test".into(),
+                },
+                artifact.path(),
+            )
+            .unwrap();
+        let (envelope_id, tree_id) = db
+            .conn
+            .query_row(
+                "SELECT envelope_id,tree_root_id FROM workspace_layer_artifact_shadows
+                 WHERE layer_id=?1",
+                params![layer.layer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id).unwrap();
+        let tree_id = ArtifactTreeId::parse(tree_id).unwrap();
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
         db.remove_environment_adapter_publisher_key(&trusted.key_id)
             .unwrap();
         assert!(db
@@ -3435,6 +3470,11 @@ max_response_bytes = 1048576
             .unwrap_err()
             .to_string()
             .contains("no longer has a valid trusted publisher"));
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher trust cannot be verified"));
         assert!(db
             .environment_adapter_publisher_trust()
             .unwrap()
@@ -3444,6 +3484,8 @@ max_response_bytes = 1048576
         db.trust_environment_adapter_publisher_key(&key_document)
             .unwrap();
         assert!(db.workspace_environment_adapters().is_ok());
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
         let signature_path = package.path().join(PLUGIN_PACKAGE_SIGNATURE);
         let mut signature: AdapterPackageSignature =
             toml::from_str(&fs::read_to_string(&signature_path).unwrap()).unwrap();
@@ -3460,6 +3502,11 @@ max_response_bytes = 1048576
             .remove_environment_adapter_plugin("example/signed@1")
             .unwrap();
         assert!(removed.removed_distribution_digest.is_some());
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err()
+            .to_string()
+            .contains("producer package is removed or revoked"));
     }
 
     #[test]

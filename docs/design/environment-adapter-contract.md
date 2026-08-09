@@ -927,6 +927,15 @@ redacted before storage. In the current resolver API a declared credential handl
 be distinguished from one actually consumed, so shared resolution fails closed. A future
 private resolver-output store may preserve such output without weakening this rule.
 
+Adapters do not author or publish artifact attestations. After host sealing, Trail creates
+the deterministic attestation from validated host evidence and stores it as a separate
+content-addressed object so signatures and trust observations do not alter artifact tree
+identity. Attachment requires an exact statement/envelope match and current producer
+trust. For plugin producers, the installed distribution digest, publisher, and publisher
+key must still match; tombstoned packages and removed publisher trust fail closed.
+Optional signatures cover the canonical attestation statement and are never interpreted
+as adapter certification or publication authority.
+
 ## Plugin protocol and capabilities
 
 The implemented v1/v2 transport is a natively sandboxed subprocess using one

@@ -1,8 +1,9 @@
 use super::*;
 use crate::ids::{
-    ArtifactAttemptId, ArtifactBlobId, ArtifactChunkId, ArtifactChunkListId, ArtifactDesiredKeyV2,
-    ArtifactEnvelopeId, ArtifactFileId, ArtifactQuarantineId, ArtifactTreeId,
+    ArtifactAttemptId, ArtifactAttestationId, ArtifactBlobId, ArtifactChunkId, ArtifactChunkListId,
+    ArtifactDesiredKeyV2, ArtifactEnvelopeId, ArtifactFileId, ArtifactQuarantineId, ArtifactTreeId,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 const MAX_RESOLUTION_INPUTS: usize = 16_384;
 const MAX_RESOLUTION_ARGV: usize = 1_024;
@@ -3047,8 +3048,10 @@ impl Trail {
 
     pub(crate) fn put_artifact_envelope_under_write_lock(
         &self,
-        envelope: ArtifactEnvelopeV1,
+        mut envelope: ArtifactEnvelopeV1,
     ) -> Result<(ArtifactEnvelopeId, bool)> {
+        envelope.validation_receipt_ids.sort();
+        envelope.validation_receipt_ids.dedup();
         let desired_key = match &envelope.desired_identity {
             ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key.clone(),
             ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => desired_key.0.clone(),
@@ -3175,6 +3178,7 @@ impl Trail {
                     )?;
                 }
             }
+            self.create_artifact_attestation_under_write_lock(&envelope_id, &envelope)?;
             Ok(quarantined)
         })();
         match publication {
@@ -3247,7 +3251,390 @@ impl Trail {
                     "artifact envelope `{envelope_id}` has invalid validation evidence: {error}"
                 ))
             })?;
+        self.verify_artifact_attestations_for_attachment(envelope_id, &envelope)?;
         Ok(envelope)
+    }
+
+    pub fn artifact_attestation(
+        &self,
+        attestation_id: &ArtifactAttestationId,
+    ) -> Result<ArtifactAttestationReportV1> {
+        let (envelope_id, object_id, producer_identity, trust_scope, state) = self
+            .conn
+            .query_row(
+                "SELECT envelope_id,object_id,producer_identity,trust_scope,state
+                 FROM artifact_attestations WHERE attestation_id=?1",
+                params![attestation_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::ObjectNotFound {
+                kind: "artifact attestation",
+                id: attestation_id.0.clone(),
+            })?;
+        let object_id = ObjectId(object_id);
+        let attestation: ArtifactAttestationV1 =
+            self.get_object(ARTIFACT_ATTESTATION_KIND, &object_id)?;
+        let (actual_id, _) = encode_artifact_attestation(attestation.clone())?;
+        if actual_id != *attestation_id
+            || attestation.statement.envelope_id.0 != envelope_id
+            || attestation.statement.producer_identity != producer_identity
+            || attestation.statement.trust_scope != trust_scope
+        {
+            return Err(Error::Corrupt(format!(
+                "artifact attestation `{attestation_id}` database identity disagrees with its object"
+            )));
+        }
+        Ok(ArtifactAttestationReportV1 {
+            attestation_id: attestation_id.clone(),
+            object_id,
+            state,
+            attestation,
+        })
+    }
+
+    pub fn artifact_attestations_for_envelope(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+    ) -> Result<Vec<ArtifactAttestationReportV1>> {
+        let mut statement = self.conn.prepare(
+            "SELECT attestation_id FROM artifact_attestations
+             WHERE envelope_id=?1 ORDER BY attestation_id",
+        )?;
+        let ids = statement
+            .query_map(params![envelope_id.0], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                ArtifactAttestationId::parse(id)
+                    .map_err(Error::Corrupt)
+                    .and_then(|id| self.artifact_attestation(&id))
+            })
+            .collect()
+    }
+
+    pub fn verify_artifact_attestation(
+        &self,
+        attestation_id: &ArtifactAttestationId,
+    ) -> Result<ArtifactAttestationVerificationReportV1> {
+        let report = self.artifact_attestation(attestation_id)?;
+        let statement = &report.attestation.statement;
+        let mut diagnostics = Vec::new();
+        let content_identity_valid = encode_artifact_attestation(report.attestation.clone())
+            .is_ok_and(|(actual, _)| actual == *attestation_id);
+        if !content_identity_valid {
+            diagnostics.push("attestation content identity mismatch".into());
+        }
+        let envelope_binding_valid = self
+            .get_artifact_cas_object::<ArtifactEnvelopeV1>(
+                &statement.envelope_id.0,
+                ARTIFACT_ENVELOPE_KIND,
+                ARTIFACT_ENVELOPE_VERSION,
+            )
+            .is_ok_and(|envelope| artifact_attestation_matches_envelope(statement, &envelope));
+        if !envelope_binding_valid {
+            diagnostics.push("attestation does not match its exact artifact envelope".into());
+        }
+        let producer_trusted =
+            self.artifact_attestation_producer_trusted(statement, &mut diagnostics);
+        let (signature_status, signature_valid) =
+            self.verify_artifact_attestation_signature(&report.attestation, &mut diagnostics)?;
+        if report.state != "valid" {
+            diagnostics.push(format!("attestation database state is `{}`", report.state));
+        }
+        let valid = report.state == "valid"
+            && content_identity_valid
+            && envelope_binding_valid
+            && producer_trusted
+            && signature_valid;
+        Ok(ArtifactAttestationVerificationReportV1 {
+            attestation_id: attestation_id.clone(),
+            envelope_id: statement.envelope_id.clone(),
+            state: report.state,
+            content_identity_valid,
+            envelope_binding_valid,
+            producer_trusted,
+            signature_status,
+            valid,
+            diagnostics,
+        })
+    }
+
+    fn create_artifact_attestation_under_write_lock(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        envelope: &ArtifactEnvelopeV1,
+    ) -> Result<ArtifactAttestationId> {
+        let statement = self.artifact_attestation_statement(envelope_id, envelope)?;
+        let attestation = ArtifactAttestationV1 {
+            statement,
+            signature: None,
+        };
+        let (attestation_id, _) = encode_artifact_attestation(attestation.clone())?;
+        let object_id = self.put_object(
+            ARTIFACT_ATTESTATION_KIND,
+            ARTIFACT_ATTESTATION_VERSION,
+            &attestation,
+        )?;
+        self.conn.execute(
+            "INSERT INTO artifact_attestations(
+                 attestation_id,envelope_id,object_id,producer_identity,trust_scope,state,
+                 created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,'valid',?6,?6)
+             ON CONFLICT(attestation_id) DO UPDATE SET updated_at=excluded.updated_at",
+            params![
+                attestation_id.0,
+                envelope_id.0,
+                object_id.0,
+                attestation.statement.producer_identity,
+                attestation.statement.trust_scope,
+                now_ts(),
+            ],
+        )?;
+        Ok(attestation_id)
+    }
+
+    fn artifact_attestation_statement(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        envelope: &ArtifactEnvelopeV1,
+    ) -> Result<ArtifactAttestationStatementV1> {
+        let mut source_root = None;
+        let mut upstream_identities = BTreeMap::new();
+        let mut executable_identities = BTreeMap::new();
+        let (
+            producer_identity,
+            producer_trust,
+            implementation,
+            distribution,
+            protocol,
+            platform,
+            architecture,
+        ) = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { canonical_key, .. } => {
+                source_root = canonical_key
+                    .inputs
+                    .get("source_root")
+                    .filter(|value| value.starts_with("object_"))
+                    .map(|value| ObjectId(value.clone()));
+                upstream_identities = canonical_key.inputs.clone();
+                executable_identities = canonical_key.tool_versions.clone();
+                let plugin = self
+                    .installed_environment_plugins()?
+                    .into_iter()
+                    .find(|plugin| {
+                        plugin.manifest.adapter.canonical_identity == canonical_key.adapter
+                    });
+                if let Some(plugin) = plugin {
+                    (
+                        canonical_key.adapter.clone(),
+                        ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+                        plugin.manifest.adapter.implementation_version,
+                        plugin.distribution_digest,
+                        "trail.environment-adapter/v2".to_string(),
+                        canonical_key.platform.clone(),
+                        canonical_key.architecture.clone(),
+                    )
+                } else {
+                    (
+                        canonical_key.adapter.clone(),
+                        ArtifactProducerTrustTierV1::ReviewedBuiltin,
+                        canonical_key.adapter_version.to_string(),
+                        format!("builtin:{}", canonical_key.adapter),
+                        "workspace-layer/v1".to_string(),
+                        canonical_key.platform.clone(),
+                        canonical_key.architecture.clone(),
+                    )
+                }
+            }
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { .. } => (
+                envelope.component_id.clone(),
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+                "unspecified".to_string(),
+                "repository-declaration".to_string(),
+                "artifact-envelope/v1".to_string(),
+                std::env::consts::OS.to_string(),
+                std::env::consts::ARCH.to_string(),
+            ),
+        };
+        let plugin = self
+            .installed_environment_plugins()?
+            .into_iter()
+            .find(|plugin| plugin.manifest.adapter.canonical_identity == producer_identity);
+        let (publisher, publisher_key_id) = plugin
+            .map(|plugin| (plugin.publisher, plugin.publisher_key_id))
+            .unwrap_or((None, None));
+        let statement = ArtifactAttestationStatementV1 {
+            version: ARTIFACT_ATTESTATION_VERSION,
+            envelope_id: envelope_id.clone(),
+            desired_identity: envelope.desired_identity.clone(),
+            tree_root_id: envelope.tree_root_id.clone(),
+            source_root,
+            resolution_snapshot_id: envelope.resolution_snapshot_id.clone(),
+            upstream_identities,
+            producer_identity,
+            producer_trust,
+            adapter_implementation_version: implementation,
+            adapter_distribution_digest: distribution,
+            adapter_protocol: protocol,
+            publisher,
+            publisher_key_id,
+            executable_identities,
+            platform,
+            architecture,
+            abi: "host-default".into(),
+            capability_ceiling: ArtifactCapabilityCeilingV1::for_phase(
+                producer_trust,
+                ArtifactExecutionPhaseV1::Construct,
+            ),
+            sandbox_enforcement: "host-sealed-candidate".into(),
+            network_policy: "producer-plan-enforced".into(),
+            script_policy: ArtifactScriptPolicyV1::AllowDeclared,
+            output_name: envelope.output_name.clone(),
+            output_policy: envelope.output_policy,
+            portability_scope: envelope.portability_scope.clone(),
+            trust_scope: envelope.trust_scope.clone(),
+            validation_receipt_ids: envelope.validation_receipt_ids.clone(),
+            secret_taint: envelope.secret_taint.clone(),
+        };
+        validate_artifact_attestation_statement(&statement)?;
+        Ok(statement)
+    }
+
+    fn verify_artifact_attestations_for_attachment(
+        &self,
+        envelope_id: &ArtifactEnvelopeId,
+        envelope: &ArtifactEnvelopeV1,
+    ) -> Result<()> {
+        let attestations = self.artifact_attestations_for_envelope(envelope_id)?;
+        if attestations.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "artifact envelope `{envelope_id}` has no host attestation"
+            )));
+        }
+        for attestation in attestations {
+            if !artifact_attestation_matches_envelope(&attestation.attestation.statement, envelope)
+            {
+                return Err(Error::Corrupt(format!(
+                    "artifact attestation `{}` does not match envelope `{envelope_id}`",
+                    attestation.attestation_id
+                )));
+            }
+            let verification = self.verify_artifact_attestation(&attestation.attestation_id)?;
+            if !verification.valid {
+                return Err(Error::Corrupt(format!(
+                    "artifact attestation `{}` cannot authorize attachment: {}",
+                    attestation.attestation_id,
+                    verification.diagnostics.join("; ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn artifact_attestation_producer_trusted(
+        &self,
+        statement: &ArtifactAttestationStatementV1,
+        diagnostics: &mut Vec<String>,
+    ) -> bool {
+        if !matches!(
+            statement.producer_trust,
+            ArtifactProducerTrustTierV1::CertifiedSignedPlugin
+                | ArtifactProducerTrustTierV1::LocallyTrustedPlugin
+        ) {
+            return true;
+        }
+        let plugins = match self.installed_environment_plugins() {
+            Ok(plugins) => plugins,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "producer package or publisher trust cannot be verified: {error}"
+                ));
+                return false;
+            }
+        };
+        let Some(plugin) = plugins.into_iter().find(|plugin| {
+            plugin.manifest.adapter.canonical_identity == statement.producer_identity
+        }) else {
+            diagnostics.push("producer package is removed or revoked".into());
+            return false;
+        };
+        if plugin.distribution_digest != statement.adapter_distribution_digest {
+            diagnostics.push("producer package digest no longer matches the attestation".into());
+            return false;
+        }
+        if plugin.publisher != statement.publisher
+            || plugin.publisher_key_id != statement.publisher_key_id
+        {
+            diagnostics.push("producer publisher identity is removed, revoked, or changed".into());
+            return false;
+        }
+        true
+    }
+
+    fn verify_artifact_attestation_signature(
+        &self,
+        attestation: &ArtifactAttestationV1,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<(String, bool)> {
+        let Some(signature) = &attestation.signature else {
+            return Ok(("unsigned".into(), true));
+        };
+        if signature.algorithm != "ed25519" {
+            diagnostics.push("unsupported artifact attestation signature algorithm".into());
+            return Ok(("unsupported".into(), false));
+        }
+        let public_key = match decode_artifact_attestation_hex::<32>(
+            &signature.public_key_hex,
+            "artifact attestation public key",
+        ) {
+            Ok(public_key) => public_key,
+            Err(error) => {
+                diagnostics.push(error.to_string());
+                return Ok(("invalid".into(), false));
+            }
+        };
+        let expected_key_id = artifact_attestation_signing_key_id(&public_key);
+        if signature.key_id != expected_key_id {
+            diagnostics.push("artifact attestation key ID does not match its public key".into());
+            return Ok(("invalid".into(), false));
+        }
+        if self.attestation_key_revocation(&expected_key_id)?.is_some() {
+            diagnostics.push("artifact attestation signing key is revoked".into());
+            return Ok(("revoked".into(), false));
+        }
+        let verifying_key = match VerifyingKey::from_bytes(&public_key) {
+            Ok(key) => key,
+            Err(error) => {
+                diagnostics.push(format!("invalid artifact attestation public key: {error}"));
+                return Ok(("invalid".into(), false));
+            }
+        };
+        let signature_bytes = match decode_artifact_attestation_hex::<64>(
+            &signature.signature_hex,
+            "artifact attestation signature",
+        ) {
+            Ok(signature) => signature,
+            Err(error) => {
+                diagnostics.push(error.to_string());
+                return Ok(("invalid".into(), false));
+            }
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let statement_bytes = cbor(&attestation.statement)?;
+        if verifying_key.verify(&statement_bytes, &signature).is_err() {
+            diagnostics.push("artifact attestation signature verification failed".into());
+            return Ok(("invalid".into(), false));
+        }
+        Ok(("verified".into(), true))
     }
 
     fn validate_envelope_validation_receipts(&self, envelope: &ArtifactEnvelopeV1) -> Result<()> {
@@ -4826,6 +5213,174 @@ fn encode_artifact_envelope(
     ))
 }
 
+fn encode_artifact_attestation(
+    attestation: ArtifactAttestationV1,
+) -> Result<(ArtifactAttestationId, Vec<u8>)> {
+    validate_artifact_attestation_statement(&attestation.statement)?;
+    if let Some(signature) = &attestation.signature {
+        validate_resolution_text(&signature.algorithm, "attestation signature algorithm")?;
+        validate_resolution_text(&signature.key_id, "attestation signature key id")?;
+        decode_artifact_attestation_hex::<32>(
+            &signature.public_key_hex,
+            "artifact attestation public key",
+        )?;
+        decode_artifact_attestation_hex::<64>(
+            &signature.signature_hex,
+            "artifact attestation signature",
+        )?;
+    }
+    let bytes = cbor(&attestation)?;
+    Ok((ArtifactAttestationId::new(&bytes), bytes))
+}
+
+fn validate_artifact_attestation_statement(
+    statement: &ArtifactAttestationStatementV1,
+) -> Result<()> {
+    if statement.version != ARTIFACT_ATTESTATION_VERSION {
+        return Err(Error::InvalidInput(
+            "artifact attestation has an unsupported version".into(),
+        ));
+    }
+    for (value, field) in [
+        (
+            &statement.producer_identity,
+            "attestation producer identity",
+        ),
+        (
+            &statement.adapter_implementation_version,
+            "attestation adapter implementation version",
+        ),
+        (
+            &statement.adapter_distribution_digest,
+            "attestation adapter distribution digest",
+        ),
+        (&statement.adapter_protocol, "attestation adapter protocol"),
+        (&statement.platform, "attestation platform"),
+        (&statement.architecture, "attestation architecture"),
+        (&statement.abi, "attestation ABI"),
+        (
+            &statement.sandbox_enforcement,
+            "attestation sandbox enforcement",
+        ),
+        (&statement.network_policy, "attestation network policy"),
+        (&statement.output_name, "attestation output name"),
+        (
+            &statement.portability_scope,
+            "attestation portability scope",
+        ),
+        (&statement.trust_scope, "attestation trust scope"),
+    ] {
+        validate_resolution_text(value, field)?;
+    }
+    for (value, field) in [
+        (statement.publisher.as_deref(), "attestation publisher"),
+        (
+            statement.publisher_key_id.as_deref(),
+            "attestation publisher key id",
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_resolution_text(value, field)?;
+        }
+    }
+    validate_attestation_identity_map(
+        &statement.upstream_identities,
+        "attestation upstream identity",
+    )?;
+    validate_attestation_identity_map(
+        &statement.executable_identities,
+        "attestation executable identity",
+    )?;
+    if statement.validation_receipt_ids.len() > MAX_RESOLUTION_VALIDATIONS
+        || !statement
+            .validation_receipt_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(Error::InvalidInput(
+            "artifact attestation validation receipts are excessive, duplicated, or not canonical"
+                .into(),
+        ));
+    }
+    validate_artifact_secret_taint(&statement.secret_taint)?;
+    if !statement.secret_taint.is_clear() {
+        return Err(Error::InvalidInput(
+            "secret-tainted output cannot be attested for shared attachment".into(),
+        ));
+    }
+    if statement.capability_ceiling.publication_authority
+        || statement.capability_ceiling.producer_trust != statement.producer_trust
+    {
+        return Err(Error::InvalidInput(
+            "artifact attestation capability evidence is inconsistent or grants publication authority"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attestation_identity_map(values: &BTreeMap<String, String>, field: &str) -> Result<()> {
+    if values.len() > MAX_RESOLUTION_INPUTS {
+        return Err(Error::InvalidInput(format!(
+            "artifact {field} count exceeds {MAX_RESOLUTION_INPUTS}"
+        )));
+    }
+    for (name, value) in values {
+        validate_resolution_text(name, field)?;
+        if value.len() > MAX_RESOLUTION_TEXT_BYTES
+            || value
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        {
+            return Err(Error::InvalidInput(format!(
+                "artifact {field} value is oversized or contains control characters"
+            )));
+        }
+        if is_sensitive_json_key(name) || contains_sensitive_text(value) {
+            return Err(Error::InvalidInput(format!(
+                "artifact {field} may contain secret material"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn artifact_attestation_matches_envelope(
+    statement: &ArtifactAttestationStatementV1,
+    envelope: &ArtifactEnvelopeV1,
+) -> bool {
+    statement.desired_identity == envelope.desired_identity
+        && statement.tree_root_id == envelope.tree_root_id
+        && statement.resolution_snapshot_id == envelope.resolution_snapshot_id
+        && statement.output_name == envelope.output_name
+        && statement.output_policy == envelope.output_policy
+        && statement.portability_scope == envelope.portability_scope
+        && statement.trust_scope == envelope.trust_scope
+        && statement.validation_receipt_ids == envelope.validation_receipt_ids
+        && statement.secret_taint == envelope.secret_taint
+}
+
+fn decode_artifact_attestation_hex<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(value)
+        .map_err(|error| Error::InvalidInput(format!("invalid {field}: {error}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| Error::InvalidInput(format!("invalid {field} length")))
+}
+
+fn artifact_attestation_signing_key_id(public_key: &[u8; 32]) -> String {
+    format!(
+        "attestation_key_{}",
+        sha256_hex(
+            &[
+                b"trail-artifact-attestation-key-v1\0".as_slice(),
+                public_key
+            ]
+            .concat()
+        )
+    )
+}
+
 fn artifact_tree_id(kind: &str, bytes: &[u8]) -> ArtifactTreeId {
     ArtifactTreeId::new(&artifact_identity_seed(kind, bytes))
 }
@@ -6082,6 +6637,64 @@ mod tests {
             .put_artifact_envelope_under_write_lock(envelope.clone())
             .unwrap();
         assert!(!quarantined);
+        let attestations = db.artifact_attestations_for_envelope(&envelope_id).unwrap();
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(
+            attestations[0].attestation.statement.envelope_id,
+            envelope_id
+        );
+        assert_eq!(attestations[0].attestation.statement.tree_root_id, tree_id);
+        assert_eq!(attestations[0].attestation.signature, None);
+        let verification = db
+            .verify_artifact_attestation(&attestations[0].attestation_id)
+            .unwrap();
+        assert!(verification.valid);
+        assert_eq!(verification.signature_status, "unsigned");
+        let mut invalid_signed = attestations[0].attestation.clone();
+        invalid_signed.signature = Some(ArtifactAttestationSignatureV1 {
+            algorithm: "ed25519".into(),
+            key_id: "fixture-key".into(),
+            public_key_hex: "00".repeat(32),
+            signature_hex: "00".repeat(64),
+        });
+        let mut signature_diagnostics = Vec::new();
+        let (_, signature_valid) = db
+            .verify_artifact_attestation_signature(&invalid_signed, &mut signature_diagnostics)
+            .unwrap();
+        assert!(!signature_valid);
+        assert!(!signature_diagnostics.is_empty());
+        let (same_envelope_id, _) = db
+            .put_artifact_envelope_under_write_lock(envelope.clone())
+            .unwrap();
+        assert_eq!(same_envelope_id, envelope_id);
+        assert_eq!(
+            db.artifact_attestations_for_envelope(&envelope_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        db.conn
+            .execute(
+                "UPDATE artifact_attestations SET state='revoked' WHERE attestation_id=?1",
+                params![&attestations[0].attestation_id.0],
+            )
+            .unwrap();
+        assert!(
+            !db.verify_artifact_attestation(&attestations[0].attestation_id)
+                .unwrap()
+                .valid
+        );
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err()
+            .to_string()
+            .contains("database state is `revoked`"));
+        db.conn
+            .execute(
+                "UPDATE artifact_attestations SET state='valid' WHERE attestation_id=?1",
+                params![&attestations[0].attestation_id.0],
+            )
+            .unwrap();
         assert_eq!(
             db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
                 .unwrap()
@@ -6888,15 +7501,6 @@ mod tests {
                     tree_id.0,
                     binding_identity,
                 ],
-            )
-            .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO artifact_attestations(
-                     attestation_id,envelope_id,object_id,producer_identity,trust_scope,state,
-                     created_at,updated_at)
-                 VALUES('artifact_attestation_backup',?1,?2,'trail-test','builtin','valid',1,1)",
-                params![envelope_id.0, snapshot_id.0],
             )
             .unwrap();
         let cache_path = workspace.path().join(".trail/cache/namespaces/backup");
@@ -7895,7 +8499,11 @@ mod tests {
             .conn
             .query_row(
                 "SELECT COALESCE(SUM(LENGTH(o.bytes)),0)
-                 FROM artifact_objects a JOIN objects o ON o.object_id=a.object_id",
+                 FROM objects o
+                 WHERE o.object_id IN (
+                     SELECT object_id FROM artifact_objects
+                     UNION SELECT object_id FROM artifact_attestations
+                 )",
                 [],
                 |row| row.get::<_, u64>(0),
             )

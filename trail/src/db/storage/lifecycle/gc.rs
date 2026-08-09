@@ -106,6 +106,10 @@ impl Trail {
                 // traced before this point and their foreign keys fail closed
                 // if a new root type is ever omitted.
                 self.conn.execute(
+                    "DELETE FROM artifact_attestations WHERE object_id=?1",
+                    params![object_id],
+                )?;
+                self.conn.execute(
                     "DELETE FROM artifact_envelopes WHERE object_id=?1",
                     params![object_id],
                 )?;
@@ -230,6 +234,27 @@ impl Trail {
                     return Err(Error::Corrupt(format!(
                         "garbage-collection encountered unsupported artifact kind `{other}`"
                     )))
+                }
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT a.object_id,e.object_id
+                 FROM artifact_attestations a
+                 JOIN artifact_envelopes e ON e.envelope_id=a.envelope_id
+                 ORDER BY a.attestation_id",
+            )?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (attestation_object, envelope_object) = row?;
+                if candidate_ids.contains(&attestation_object)
+                    && candidate_ids.contains(&envelope_object)
+                {
+                    edges
+                        .entry(attestation_object)
+                        .or_default()
+                        .insert(envelope_object);
                 }
             }
         }
@@ -530,19 +555,6 @@ impl Trail {
         }
         {
             let mut statement = self.conn.prepare(
-                "SELECT envelope_id,object_id FROM artifact_attestations
-                 ORDER BY attestation_id",
-            )?;
-            for row in statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })? {
-                let (envelope, object) = row?;
-                pending_artifacts.insert((envelope, ARTIFACT_ENVELOPE_KIND.into()));
-                pending_objects.insert(object);
-            }
-        }
-        {
-            let mut statement = self.conn.prepare(
                 "SELECT incumbent_envelope_id,candidate_envelope_id,evidence_object_id
                  FROM artifact_quarantines ORDER BY quarantine_id",
             )?;
@@ -731,6 +743,24 @@ impl Trail {
                             .extend(envelope.resolution_snapshot_id.into_iter().map(|id| id.0));
                         pending_objects
                             .extend(envelope.validation_receipt_ids.into_iter().map(|id| id.0));
+                        let mut statement = self.conn.prepare(
+                            "SELECT a.object_id FROM artifact_attestations a
+                             JOIN artifact_envelopes e ON e.envelope_id=a.envelope_id
+                             WHERE e.object_id=?1 ORDER BY a.attestation_id",
+                        )?;
+                        for object_id in statement
+                            .query_map(params![&object_id], |row| row.get::<_, String>(0))?
+                        {
+                            pending_objects.insert(object_id?);
+                        }
+                    }
+                    ARTIFACT_ATTESTATION_KIND => {
+                        require_gc_object_version(&kind, version, ARTIFACT_ATTESTATION_VERSION)?;
+                        let attestation: ArtifactAttestationV1 = from_cbor(&bytes)?;
+                        pending_artifacts.insert((
+                            attestation.statement.envelope_id.0,
+                            ARTIFACT_ENVELOPE_KIND.into(),
+                        ));
                     }
                     ARTIFACT_RESOLUTION_PLAN_KIND => {
                         require_gc_object_version(
@@ -944,6 +974,7 @@ fn is_artifact_gc_kind(kind: &str) -> bool {
             | ARTIFACT_CHUNK_KIND
             | ARTIFACT_TREE_ROOT_KIND
             | ARTIFACT_ENVELOPE_KIND
+            | ARTIFACT_ATTESTATION_KIND
     )
 }
 
