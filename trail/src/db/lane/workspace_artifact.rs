@@ -13,6 +13,11 @@ const MAX_RESOLUTION_ENVIRONMENT_NAMES: usize = 256;
 const MAX_RESOLUTION_VALIDATIONS: usize = 256;
 const MAX_RESOLUTION_PREDECESSORS: usize = 16_384;
 const MAX_RESOLUTION_TEXT_BYTES: usize = 4 * 1024;
+const MAX_RESOLUTION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+const MAX_RESOLUTION_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESOLUTION_CANDIDATE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESOLUTION_CANDIDATE_ENTRIES: u64 = 1_000_000;
+const MAX_RESOLUTION_CHILD_PROCESSES: u32 = 256;
 const ARTIFACT_DESIRED_KEY_MATERIAL_VERSION: u16 = 2;
 const ARTIFACT_WHOLE_BLOB_MAX_BYTES: usize = 1024 * 1024;
 const ARTIFACT_CHUNK_MIN_BYTES: usize = 256 * 1024;
@@ -4500,6 +4505,17 @@ pub(crate) fn normalize_artifact_resolution_plan(
             "artifact resolver limits must all be non-zero".into(),
         ));
     }
+    if plan.limits.timeout_ms > MAX_RESOLUTION_TIMEOUT_MS
+        || plan.limits.stdout_bytes > MAX_RESOLUTION_CAPTURE_BYTES
+        || plan.limits.stderr_bytes > MAX_RESOLUTION_CAPTURE_BYTES
+        || plan.limits.candidate_bytes > MAX_RESOLUTION_CANDIDATE_BYTES
+        || plan.limits.candidate_entries > MAX_RESOLUTION_CANDIDATE_ENTRIES
+        || plan.limits.child_processes > MAX_RESOLUTION_CHILD_PROCESSES
+    {
+        return Err(Error::InvalidInput(format!(
+            "artifact resolver limits exceed host ceilings: timeout_ms<={MAX_RESOLUTION_TIMEOUT_MS}, capture_bytes<={MAX_RESOLUTION_CAPTURE_BYTES}, candidate_bytes<={MAX_RESOLUTION_CANDIDATE_BYTES}, candidate_entries<={MAX_RESOLUTION_CANDIDATE_ENTRIES}, child_processes<={MAX_RESOLUTION_CHILD_PROCESSES}"
+        )));
+    }
     if plan.validations.is_empty() || plan.validations.len() > MAX_RESOLUTION_VALIDATIONS {
         return Err(Error::InvalidInput(format!(
             "artifact resolution plan must contain between 1 and {MAX_RESOLUTION_VALIDATIONS} validations"
@@ -5908,6 +5924,48 @@ mod tests {
         (temp, db, source_root)
     }
 
+    #[test]
+    fn malicious_resolution_plans_are_rejected_before_attempt_publication() {
+        let (_temp, db, source_root) = initialized_resolution_fixture();
+        let base = executable_fixture_plan(&db, source_root);
+
+        let mut traversing_output = base.clone();
+        traversing_output.proposal_key = "proposal_traversing_output".into();
+        traversing_output.candidate_output = "../Cargo.lock".into();
+
+        let mut absolute_workdir = base.clone();
+        absolute_workdir.proposal_key = "proposal_absolute_workdir".into();
+        absolute_workdir.working_directory = "/tmp".into();
+
+        let mut control_argument = base.clone();
+        control_argument.proposal_key = "proposal_control_argument".into();
+        control_argument
+            .argv
+            .push("--config\ncredential=leak".into());
+
+        let mut excessive_limits = base;
+        excessive_limits.proposal_key = "proposal_excessive_limits".into();
+        excessive_limits.limits.timeout_ms = MAX_RESOLUTION_TIMEOUT_MS + 1;
+        excessive_limits.limits.stdout_bytes = MAX_RESOLUTION_CAPTURE_BYTES + 1;
+        excessive_limits.limits.candidate_bytes = MAX_RESOLUTION_CANDIDATE_BYTES + 1;
+        excessive_limits.limits.candidate_entries = MAX_RESOLUTION_CANDIDATE_ENTRIES + 1;
+        excessive_limits.limits.child_processes = MAX_RESOLUTION_CHILD_PROCESSES + 1;
+
+        for (plan, expected) in [
+            (traversing_output, "path must stay inside the workspace"),
+            (absolute_workdir, "path must stay inside the workspace"),
+            (control_argument, "control characters"),
+            (excessive_limits, "exceed host ceilings"),
+        ] {
+            let error = db.begin_artifact_resolution_attempt(plan).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected malicious-plan rejection: {error}"
+            );
+        }
+        assert!(db.artifact_resolution_attempts().unwrap().is_empty());
+    }
+
     fn fixture_desired_material(source_root: ObjectId) -> ArtifactDesiredKeyMaterialV2 {
         ArtifactDesiredKeyMaterialV2 {
             version: 2,
@@ -6752,6 +6810,82 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("secret material"));
+    }
+
+    #[test]
+    fn attachment_fails_closed_for_tampered_attestation_references_and_bytes() {
+        let (workspace, db, source_root) = initialized_resolution_fixture();
+        let candidate = tempfile::tempdir().unwrap();
+        fs::write(candidate.path().join("artifact.bin"), b"attested output\n").unwrap();
+        let (tree_id, _) = db.ingest_artifact_tree(candidate.path()).unwrap();
+        let desired_key = artifact_desired_key_v2(fixture_desired_material(source_root)).unwrap();
+        let (envelope_id, quarantined) = db
+            .put_artifact_envelope_under_write_lock(ArtifactEnvelopeV1 {
+                version: ARTIFACT_ENVELOPE_VERSION,
+                desired_identity: ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key },
+                tree_root_id: tree_id.clone(),
+                component_id: "cargo:root".into(),
+                output_name: "target".into(),
+                output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                portability_scope: "workspace".into(),
+                trust_scope: "builtin".into(),
+                secret_taint: ArtifactSecretTaintV1::Clear,
+                resolution_snapshot_id: None,
+                validation_receipt_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(!quarantined);
+        let attestation = db
+            .artifact_attestations_for_envelope(&envelope_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE artifact_attestations SET producer_identity='tampered-producer'
+                 WHERE attestation_id=?1",
+                params![attestation.attestation_id.0],
+            )
+            .unwrap();
+        let reference_error = db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err();
+        assert!(reference_error
+            .to_string()
+            .contains("database identity disagrees"));
+
+        db.conn
+            .execute(
+                "UPDATE artifact_attestations SET producer_identity=?1
+                 WHERE attestation_id=?2",
+                params![
+                    attestation.attestation.statement.producer_identity,
+                    attestation.attestation_id.0
+                ],
+            )
+            .unwrap();
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![attestation.object_id.0],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        let byte_error = reopened
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err();
+        assert!(
+            byte_error.to_string().contains("attestation")
+                || byte_error.to_string().contains("object")
+                || byte_error.to_string().contains("CBOR")
+                || byte_error.to_string().contains("serialization error"),
+            "unexpected tampered-attestation rejection: {byte_error}"
+        );
     }
 
     #[test]

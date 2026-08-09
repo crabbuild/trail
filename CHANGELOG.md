@@ -61,6 +61,9 @@ All notable changes to Trail are documented in this file. Trail follows
   with typed producer, capability, policy, validation, portability, and taint evidence;
   inspection and attachment verification detect state/signature tampering and recheck
   current plugin package and publisher revocation.
+- Resolver plans now fail before attempt publication when paths, arguments, or declared
+  resource limits exceed host ceilings; native command-recipe tests also prove nested
+  child execution remains denied.
 
 ### Changed
 

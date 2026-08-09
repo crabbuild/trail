@@ -2776,6 +2776,22 @@ portability = "host"
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn restricted_command_recipe_denies_child_process_execution() {
+        let (_workspace, db) =
+            open_recipe_lane(&["env", "cp", "input.txt", "generated/copied-by-child.txt"]);
+        let error = db
+            .sync_workspace_environment("recipe-a", RECIPE_ADAPTER_IDENTITY, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("failed with"));
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+        assert!(db
+            .active_environment_generation("recipe-a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn restricted_command_recipe_never_publishes_an_escaping_symlink() {
         let (_workspace, db) =
             open_recipe_lane(&["ln", "-s", "/etc/passwd", "generated/passwd-link"]);

@@ -927,6 +927,12 @@ redacted before storage. In the current resolver API a declared credential handl
 be distinguished from one actually consumed, so shared resolution fails closed. A future
 private resolver-output store may preserve such output without weakening this rule.
 
+Resolver declarations are also capped by host ceilings before an attempt record or
+subprocess can be created: one hour of wall time, 16 MiB for each captured stream,
+1 GiB and 1,000,000 entries for the candidate, and 256 child processes. Declared limits
+must be non-zero and may narrow these ceilings, never expand them. Repository-relative
+path and control-character validation runs in the same pre-attempt boundary.
+
 Adapters do not author or publish artifact attestations. After host sealing, Trail creates
 the deterministic attestation from validated host evidence and stores it as a separate
 content-addressed object so signatures and trust observations do not alter artifact tree
