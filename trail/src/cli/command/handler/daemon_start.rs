@@ -1421,6 +1421,13 @@ fn verify_secure_socket_leaf_identity(
     Ok(identity)
 }
 
+fn socket_leaf_identity_matches(
+    expected: SocketLeafIdentity,
+    captured: SocketLeafIdentity,
+) -> bool {
+    expected == captured
+}
+
 fn publish_owner_file(authority: &SecureAuthority, name: &str, bytes: &[u8]) -> Result<()> {
     let tmp = format!(".{name}.{}.tmp", random_hex(12)?);
     let mut file = openat_file(
@@ -1582,7 +1589,7 @@ fn remove_socket_leaf_if_identity(
     authority.trail_directory.sync_all()?;
 
     let captured = verify_socket_leaf_owner(&authority.trail_directory, &quarantine, Some(0o600))?;
-    if captured.device != expected.device || captured.inode != expected.inode {
+    if !socket_leaf_identity_matches(expected, captured) {
         let restore = renameat_noreplace(&authority.trail_directory, &quarantine, leaf);
         let _ = authority.trail_directory.sync_all();
         return match restore {
@@ -1833,4 +1840,25 @@ pub(super) fn workspace_from_context(ctx: &RuntimeContext) -> Result<PathBuf> {
         })
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| Error::InvalidInput("workspace path is unavailable".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{socket_leaf_identity_matches, SocketLeafIdentity};
+
+    #[test]
+    fn socket_leaf_identity_rejects_creation_time_reuse() {
+        let expected = SocketLeafIdentity {
+            device: 7,
+            inode: 11,
+            ctime_sec: 13,
+            ctime_nsec: 17,
+        };
+        let substituted = SocketLeafIdentity {
+            ctime_nsec: 19,
+            ..expected
+        };
+
+        assert!(!socket_leaf_identity_matches(expected, substituted));
+    }
 }
