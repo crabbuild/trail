@@ -30,7 +30,7 @@ docker run --rm --pull=never --privileged \
   bash -lc '
 set -euo pipefail
 export PATH=/usr/local/cargo/bin:/usr/bin:$PATH
-sccache_version=0.16.0
+sccache_version=0.17.0
 curl -fsSL \
   "https://github.com/mozilla/sccache/releases/download/v${sccache_version}/sccache-v${sccache_version}-x86_64-unknown-linux-musl.tar.gz" \
   | tar -xz -C /tmp
