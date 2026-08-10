@@ -190,7 +190,10 @@ class CliScaleBenchSourceTests(unittest.TestCase):
 
         self.assertIn("workflow_call:", native)
         self.assertIn('default: "100000"', native)
-        self.assertIn("default: true", native)
+        workflow_call = native.split("workflow_call:", 1)[1].split("  push:", 1)[0]
+        require_cow = workflow_call.split("require_cow:", 1)[1]
+        self.assertIn("default: false", require_cow)
+        self.assertNotIn("default: true", require_cow)
         self.assertIn("exact-sha-native-ledger:", automation)
         self.assertIn("needs: [release-please, exact-sha-native-ledger]", automation)
         self.assertIn('plan-jobs = ["./changed-path-ledger-native"]', cargo)
