@@ -4,6 +4,7 @@ use super::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::db::change_ledger::secure_fs::SecureDirectory;
 use std::ffi::OsString;
+use std::io::Read;
 use std::process::Stdio;
 use std::thread;
 
@@ -15,10 +16,37 @@ const MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS: usize = 64;
 const PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS: u64 = 30;
 const MAX_RESOLVER_SOURCE_ENTRIES: u64 = 1_000_000;
 const MAX_RESOLVER_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 struct BoundedResolverPipe {
     bytes: Vec<u8>,
     original_bytes: u64,
+}
+
+struct BoundedEnvironmentCommandDiagnostic {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_bounded_environment_command_diagnostic(
+    mut reader: impl Read + Send + 'static,
+) -> thread::JoinHandle<std::io::Result<BoundedEnvironmentCommandDiagnostic>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES);
+        let mut truncated = false;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES.saturating_sub(bytes.len());
+            let retained = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            truncated |= retained != read;
+        }
+        Ok(BoundedEnvironmentCommandDiagnostic { bytes, truncated })
+    })
 }
 
 /// One repository file that the host projects into an adapter-owned staging
@@ -4992,7 +5020,7 @@ impl Trail {
             .env("TEMP", &isolated_tmp)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -5005,16 +5033,45 @@ impl Trail {
         for name in &command_plan.remove_environment {
             command.env_remove(name);
         }
-        let status = command.status().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
             Error::InvalidInput(format!(
                 "failed to launch `{}` for component `{}`: {err}",
                 command_plan.program, plan.component_id
             ))
         })?;
-        if !status.success() {
-            return Err(Error::InvalidInput(format!(
-                "environment build for component `{}` failed with {status}",
+        let stderr = child.stderr.take().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "environment build for component `{}` lost its diagnostic pipe",
                 plan.component_id
+            ))
+        })?;
+        let diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
+        let status = child.wait();
+        let diagnostic = diagnostic
+            .join()
+            .map_err(|_| {
+                Error::Corrupt(format!(
+                    "environment build diagnostic reader for component `{}` panicked",
+                    plan.component_id
+                ))
+            })?
+            .map_err(Error::Io)?;
+        let status = status?;
+        if !status.success() {
+            let truncated = diagnostic.truncated;
+            let diagnostic_text =
+                redact_sensitive_text(&String::from_utf8_lossy(&diagnostic.bytes));
+            let diagnostic_text = diagnostic_text.trim();
+            let details = if diagnostic_text.is_empty() {
+                String::new()
+            } else if truncated {
+                format!(": {diagnostic_text} [truncated]")
+            } else {
+                format!(": {diagnostic_text}")
+            };
+            return Err(Error::InvalidInput(format!(
+                "environment build for component `{}` failed with {status}{details}",
+                plan.component_id,
             )));
         }
         Ok(())
@@ -8075,6 +8132,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("mounted execution above"));
+    }
+
+    #[test]
+    fn environment_command_diagnostics_are_bounded_while_draining_the_pipe() {
+        let input = vec![b'x'; MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES + 1];
+        let diagnostic = spawn_bounded_environment_command_diagnostic(std::io::Cursor::new(input))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            diagnostic.bytes.len(),
+            MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES
+        );
+        assert!(diagnostic.truncated);
     }
 
     #[test]
