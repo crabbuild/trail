@@ -1145,19 +1145,37 @@ impl crate::Trail {
             });
         }
         let mut exact_paths = Vec::new();
+        let mut directory_prefixes = Vec::new();
         for path in std::mem::take(&mut candidates.exact_paths) {
-            if sparse_selection_intersects(selected, path.as_str())
-                || self.pinned_worktree_path_is_visible(&pinned, path.as_str())?
+            let visible = self.pinned_worktree_path_is_visible(&pinned, path.as_str())?;
+            if !sparse_selection_intersects(selected, path.as_str()) && !visible {
+                continue;
+            }
+            if visible
+                && self
+                    .read_pinned_candidate_path(&pinned, policy, path.as_str(), false)?
+                    .is_none()
             {
+                // Native observers may report a directory as an exact event
+                // rather than a complete prefix. Comparing that path directly
+                // would expand every baseline descendant and invent deletions
+                // for intentionally absent sparse siblings. Normalize the
+                // directory into the same sparse-aware expansion used for
+                // complete prefix evidence.
+                directory_prefixes.push(path.as_str().to_string());
+            } else {
                 exact_paths.push(path);
             }
         }
         let selected = selected.iter().cloned().collect::<BTreeSet<_>>();
-        let prefixes = std::mem::take(&mut candidates.prefixes)
+        let mut prefixes = std::mem::take(&mut candidates.prefixes)
             .into_iter()
             .filter(|prefix| prefix.complete)
             .map(|prefix| prefix.path.as_str().to_string())
             .collect::<Vec<_>>();
+        prefixes.extend(directory_prefixes);
+        prefixes.sort();
+        prefixes.dedup();
         for prefix in &prefixes {
             for path in selected.iter().filter(|path| {
                 path.as_str() == prefix

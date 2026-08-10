@@ -901,10 +901,20 @@ pub(super) fn validate_qualified_filesystem_proof(
             *prefix_flags.entry(record.path.as_str()).or_default() |= flags;
         }
     }
+    for (prefix, flags) in &mut prefix_flags {
+        *flags |= exact_flags.get(prefix).copied().unwrap_or_default();
+    }
     let paths_covered = intent_paths.iter().all(|(path, required)| {
         exact_flags
             .get(path.as_str())
             .is_some_and(|observed| observed & required != 0)
+            || prefix_flags.iter().any(|(prefix, observed)| {
+                (path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/')))
+                    && observed & required != 0
+            })
     });
     let prefixes_covered = intent_prefixes.iter().all(|(prefix, reason, required)| {
         reason == "provider_complete"
