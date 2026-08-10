@@ -3,6 +3,20 @@
 All notable changes to Trail are documented in this file. Trail follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/crabbuild/trail/compare/v0.2.0...v0.3.0) (2026-08-10)
+
+
+### Features
+
+* generalize framework artifact pipeline ([#21](https://github.com/crabbuild/trail/issues/21)) ([0925f4d](https://github.com/crabbuild/trail/commit/0925f4d37026acfb64dd4fbabf12dcc264f2b1ee))
+* optimize large repository lanes ([#19](https://github.com/crabbuild/trail/issues/19)) ([1b240b8](https://github.com/crabbuild/trail/commit/1b240b8db8c86162ad309ee0571b9a0785b8dfcc))
+
+
+### Bug Fixes
+
+* harden daemon cleanup and Windows backup publication ([#17](https://github.com/crabbuild/trail/issues/17)) ([89f1f14](https://github.com/crabbuild/trail/commit/89f1f146deac79bcfb6e92bcf30118e54453e249))
+* harden layered workspace qualification and daemon authority ([#22](https://github.com/crabbuild/trail/issues/22)) ([e23f7c9](https://github.com/crabbuild/trail/commit/e23f7c93d139b0a8f43342e2b4a11b9ca2b7621d))
+
 ## [Unreleased]
 
 ### Fixed
