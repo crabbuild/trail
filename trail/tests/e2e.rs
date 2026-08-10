@@ -23989,6 +23989,11 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(cleanup.changed_paths[0].path, "README.md");
 
     let api_workdir = workdir_parent.path().join("api-bot");
+    let api_workdir_mode = if native_cow_supported {
+        "native-cow"
+    } else {
+        "portable-copy"
+    };
     let api_response = trail::server::handle_http_request(
         &mut db,
         &api_request(
@@ -23997,14 +24002,33 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             serde_json::json!({
                 "name": "api-bot",
                 "from_ref": "main",
-                "workdir_mode": "native-cow",
+                "workdir_mode": api_workdir_mode,
                 "workdir": api_workdir
             }),
         ),
     );
     assert_eq!(api_response.status, 201);
     let api_spawn: serde_json::Value = api_response.body_json().unwrap();
-    assert_eq!(api_spawn["workdir_mode"], "native-cow");
+    assert_eq!(api_spawn["workdir_mode"], api_workdir_mode);
+    if native_cow_supported {
+        assert_eq!(api_spawn["workdir_backend"], "clone");
+        assert_eq!(api_spawn["materialization"]["copied_files"], 0);
+        assert!(
+            api_spawn["materialization"]["cloned_files"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    } else {
+        assert_eq!(api_spawn["workdir_backend"], "copy");
+        assert_eq!(api_spawn["materialization"]["cloned_files"], 0);
+        assert!(
+            api_spawn["materialization"]["copied_files"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
     assert_eq!(
         PathBuf::from(api_spawn["workdir"].as_str().unwrap())
             .canonicalize()
