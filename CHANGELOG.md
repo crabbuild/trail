@@ -186,6 +186,11 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Managed Cargo target seeds on Linux now isolate each sccache cache behind a
+  stable abstract Unix-domain endpoint and compile in the attempt-owned client,
+  preventing a persistent cache server from retaining a deleted staging
+  directory as its temporary root. Other platforms continue with Cargo
+  incremental compilation instead of sharing sccache's process-wide TCP daemon.
 - Initial changed-path reconciliation now retries bounded, typed SQLite busy/locked
   contention, so high-fan-out lane creation reaches observer readiness instead of
   escalating a transient WAL writer collision to committed repair.

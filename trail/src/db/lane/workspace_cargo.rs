@@ -32,6 +32,12 @@ static CARGO_TARGET_SEED_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
             "Locked Cargo target seed keyed by the complete source root and Rust toolchain identity",
     };
 
+#[cfg(target_os = "linux")]
+fn sccache_server_endpoint(cache_path: &Path) -> String {
+    let digest = sha256_hex(cache_path.to_string_lossy().as_bytes());
+    format!("\\x00trail-sccache-{}", &digest[..32])
+}
+
 impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
         &CARGO_TARGET_SEED_ADAPTER_METADATA
@@ -228,7 +234,7 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
             .find_map(|line| line.strip_prefix("host: "))
             .unwrap_or("unknown")
             .to_string();
-        let has_sccache = command_is_available("sccache");
+        let has_sccache = cfg!(target_os = "linux") && command_is_available("sccache");
         let mut tool_versions = BTreeMap::from([
             ("cargo".to_string(), cargo_version.clone()),
             ("rustc-vV".to_string(), rustc_identity.clone()),
@@ -304,9 +310,17 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
                 "SCCACHE_DIR".to_string(),
                 sccache_cache.storage_path.to_string_lossy().into_owned(),
             );
-            // A long-lived sccache server can outlive an attempt-owned temp
-            // directory. Cache I/O loss must degrade to rustc, not fail the
-            // deterministic target-seed build.
+            #[cfg(target_os = "linux")]
+            environment.insert(
+                "SCCACHE_SERVER_UDS".to_string(),
+                sccache_server_endpoint(&sccache_cache.storage_path),
+            );
+            // Keep compiler execution in the attempt-owned client so a
+            // long-lived cache server never retains the deleted build
+            // directory as its process temp root.
+            environment.insert("SCCACHE_CLIENT_SIDE".to_string(), "1".to_string());
+            // Cache I/O loss must degrade to rustc, not fail the deterministic
+            // target-seed build.
             environment.insert(
                 "SCCACHE_IGNORE_SERVER_IO_ERROR".to_string(),
                 "1".to_string(),
@@ -546,6 +560,16 @@ mod tests {
         } else {
             LaneWorkdirMode::FuseCow
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sccache_server_endpoint_is_stable_and_cache_scoped() {
+        let first = sccache_server_endpoint(Path::new("/cache/one"));
+        assert_eq!(first, sccache_server_endpoint(Path::new("/cache/one")));
+        assert_ne!(first, sccache_server_endpoint(Path::new("/cache/two")));
+
+        assert!(first.starts_with("\\x00trail-sccache-"));
     }
 
     #[test]
