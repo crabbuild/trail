@@ -4,14 +4,14 @@ use sha2::{Digest, Sha256};
 const APPROVED_PRODUCER_INVENTORY_SHA256: &str =
     "af2cca0566976a6d6f6cea00e99fe5089c91e357ca1d0a50fd5397edcda32833";
 const APPROVED_RAW_MUTATION_INVENTORY_SHA256: &str =
-    "50fbeb5ffd0fc0c755d6a006b62ef442532d6b70e0899931117125e39c8945dd";
+    "9ceb707794c74ba7c122bf4bafe05929a5809d504f487bee61477dae5c228995";
 const APPROVED_ACTIVATION_AUDIT_SHA256: &str =
-    "acf0bad41d21c0abce86a958c3015cda09ed6f126fd1403e7abc67c4251b589e";
+    "2f07aeb176f4c521c224965ff903658ae8b2300f58bca851fd2db7e4304bfc39";
 const ACTIVATION_AUDIT_MANIFEST: &str = concat!(
     "trail-changed-path-activation-v1\n",
     "schema=1\n",
     "producer=af2cca0566976a6d6f6cea00e99fe5089c91e357ca1d0a50fd5397edcda32833\n",
-    "raw=50fbeb5ffd0fc0c755d6a006b62ef442532d6b70e0899931117125e39c8945dd\n",
+    "raw=9ceb707794c74ba7c122bf4bafe05929a5809d504f487bee61477dae5c228995\n",
     "linux_suite=changed_path_ledger_linux\n",
     "macos_suite=changed_path_ledger_macos\n",
     "recovery_suite=changed_path_ledger_recovery\n",

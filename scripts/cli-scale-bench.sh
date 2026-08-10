@@ -355,33 +355,6 @@ with urllib.request.urlopen(request, timeout=30) as response:
 PY
 }
 
-run_without_daemon_endpoint() {
-  local scale="$1"
-  local name="$2"
-  local bin="$3"
-  local repo="$4"
-  shift 4
-  run_timed "$scale" "$name" bash -s -- "$bin" "$repo" "$@" <<'SH'
-set -euo pipefail
-bin="$1"
-repo="$2"
-shift 2
-endpoint="$repo/.trail/daemon.json"
-hidden="$repo/.trail/daemon.json.persisted-snapshot-bench"
-restore_endpoint() {
-  if [ -f "$hidden" ]; then
-    mv "$hidden" "$endpoint"
-  fi
-}
-trap restore_endpoint EXIT
-rm -f "$hidden"
-if [ -f "$endpoint" ]; then
-  mv "$endpoint" "$hidden"
-fi
-"$bin" --workspace "$repo" --json "$@"
-SH
-}
-
 daemon_rss_bytes() {
   local pid="$1"
   if ps -p "$pid" >/dev/null 2>&1; then
@@ -1282,8 +1255,8 @@ print("daemon hot cache did not become ready", file=sys.stderr)
 sys.exit(1)
 PY
     run_http_timed "$scale" daemon_status "$DAEMON_URL" GET /v1/status
-    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_status "$BIN" "$REPO" status
-    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_record_clean "$BIN" "$REPO" record -m "scale persisted snapshot clean record"
+    run_timed "$scale" daemon_authoritative_status "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
+    run_timed "$scale" daemon_authoritative_record_clean "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json record -m "scale authoritative clean record"
     python3 - "$WORK/daemon-spawn.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
@@ -1343,7 +1316,7 @@ for i in range(max(1, min(25, files // 400))):
     with path.open("a") as fh:
         fh.write(f"\n// daemon CLI workspace record {i}\n")
 PY
-    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_diff_dirty "$BIN" "$REPO" diff --dirty
+    run_timed "$scale" daemon_authoritative_diff_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json diff --dirty
     run_timed "$scale" daemon_cli_record_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json record -m "scale daemon CLI dirty record"
     run_timed "$scale" daemon_cli_status_after_record "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
     run_timed "$scale" daemon_cli_agent_spawn "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane spawn daemonclibot --from main --no-materialize

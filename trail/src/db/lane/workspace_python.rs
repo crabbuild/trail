@@ -538,7 +538,8 @@ mod tests {
         ready: &Path,
         phase: &str,
     ) {
-        for _ in 0..1_000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if ready.is_file() {
                 return;
             }

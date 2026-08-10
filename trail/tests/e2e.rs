@@ -24140,7 +24140,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
                 "arguments": {
                     "name": "mcp-bot",
                     "from_ref": "main",
-                    "workdir_mode": "native-cow",
+                    "workdir_mode": api_workdir_mode,
                     "workdir": mcp_workdir
                 }
             }
@@ -24150,8 +24150,27 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(mcp_spawn["result"]["isError"], false);
     assert_eq!(
         mcp_spawn["result"]["structuredContent"]["workdir_mode"],
-        "native-cow"
+        api_workdir_mode
     );
+    if native_cow_supported {
+        assert_eq!(
+            mcp_spawn["result"]["structuredContent"]["workdir_backend"],
+            "clone"
+        );
+        assert_eq!(
+            mcp_spawn["result"]["structuredContent"]["materialization"]["copied_files"],
+            0
+        );
+    } else {
+        assert_eq!(
+            mcp_spawn["result"]["structuredContent"]["workdir_backend"],
+            "copy"
+        );
+        assert_eq!(
+            mcp_spawn["result"]["structuredContent"]["materialization"]["cloned_files"],
+            0
+        );
+    }
     assert_eq!(
         PathBuf::from(
             mcp_spawn["result"]["structuredContent"]["workdir"]

@@ -190,7 +190,10 @@ class CliScaleBenchSourceTests(unittest.TestCase):
 
         self.assertIn("workflow_call:", native)
         self.assertIn('default: "100000"', native)
-        self.assertIn("default: true", native)
+        workflow_call = native.split("workflow_call:", 1)[1].split("  push:", 1)[0]
+        require_cow = workflow_call.split("require_cow:", 1)[1]
+        self.assertIn("default: false", require_cow)
+        self.assertNotIn("default: true", require_cow)
         self.assertIn("exact-sha-native-ledger:", automation)
         self.assertIn("needs: [release-please, exact-sha-native-ledger]", automation)
         self.assertIn('plan-jobs = ["./changed-path-ledger-native"]', cargo)
@@ -220,6 +223,19 @@ class CliScaleBenchSourceTests(unittest.TestCase):
             with self.subTest(workflow=relative):
                 source = (ROOT / relative).read_text()
                 self.assertIn("agent_git_plumbing_commands=5", source)
+
+    def test_daemon_scale_probes_use_the_authenticated_authority(self):
+        source = SCRIPT.read_text()
+        self.assertNotIn("run_without_daemon_endpoint", source)
+        for operation in [
+            "daemon_authoritative_status",
+            "daemon_authoritative_record_clean",
+            "daemon_authoritative_diff_dirty",
+        ]:
+            self.assertIn(operation, source)
+            for relative in [".github/workflows/ci.yml", ".github/workflows/scale.yml"]:
+                self.assertIn(operation, (ROOT / relative).read_text())
+        self.assertNotIn("daemon_persisted_snapshot_", source)
 
     def test_path_index_patch_and_bounded_record_reports_are_extracted(self):
         source = SCRIPT.read_text()

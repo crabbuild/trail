@@ -5,6 +5,14 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Changed-path daemon authority now follows workspace generation changes and
+  hands off atomically between automatic and explicit daemons. Sparse lane
+  hydration also narrows native directory events to authenticated selections
+  and visible files instead of treating intentionally absent siblings as
+  deletions.
+
 ### Added
 
 - Added deterministic 10k/100k/1M artifact and source scale matrices for
@@ -186,6 +194,12 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Managed Cargo target seeds on Linux with sccache 0.17 or newer now isolate
+  each cache behind a stable abstract Unix-domain endpoint and compile in the
+  attempt-owned client, preventing a persistent cache server from retaining a
+  deleted staging directory as its temporary root. Older sccache versions and
+  other platforms continue with Cargo incremental compilation instead of
+  sharing an unsafe process-global compiler daemon.
 - Initial changed-path reconciliation now retries bounded, typed SQLite busy/locked
   contention, so high-fan-out lane creation reaches observer readiness instead of
   escalating a transient WAL writer collision to committed repair.

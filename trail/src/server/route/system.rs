@@ -12,6 +12,7 @@ struct LedgerFenceRequest {
     executable_identity: String,
     scope_id: String,
     expected_epoch: u64,
+    daemon_launch_nonce: String,
 }
 
 pub(super) fn handle_system_route(
@@ -56,7 +57,10 @@ pub(super) fn handle_system_route(
     if request.method == "POST"
         && matches!(
             path,
-            "/v1/ledger/challenge" | "/v1/ledger/fence" | "/v1/ledger/reconcile"
+            "/v1/ledger/challenge"
+                | "/v1/ledger/fence"
+                | "/v1/ledger/reconcile"
+                | "/v1/ledger/retire"
         )
     {
         let body: LedgerFenceRequest = serde_json::from_slice(&request.body)?;
@@ -72,14 +76,21 @@ pub(super) fn handle_system_route(
                 "changed-path ledger RPC identity mismatch".into(),
             ));
         }
-        let proof = if path == "/v1/ledger/challenge" {
+        let proof = if matches!(path, "/v1/ledger/challenge" | "/v1/ledger/retire") {
             let proof = super::super::workspace_changed_path_ready_proof(db)?;
-            if proof.scope_id != body.scope_id || proof.epoch != body.expected_epoch {
+            if proof.scope_id != body.scope_id
+                || proof.epoch < body.expected_epoch
+                || proof.daemon_launch_nonce != body.daemon_launch_nonce
+            {
                 return Err(Error::DaemonUnavailable(
                     "changed-path daemon challenge scope or epoch mismatch".into(),
                 ));
             }
-            proof
+            if path == "/v1/ledger/retire" {
+                super::super::retire_workspace_changed_path_daemon(db)?
+            } else {
+                proof
+            }
         } else if path == "/v1/ledger/reconcile" {
             super::super::workspace_changed_path_reconcile(
                 db,

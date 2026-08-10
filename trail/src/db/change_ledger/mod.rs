@@ -41,13 +41,14 @@ pub(crate) use daemon::{
     materialized_lane_scope_id, persisted_workspace_daemon_owner, policy_runtime_restart_required,
     prepare_materialized_lane_controlled_projection, prepare_materialized_lane_daemon,
     prepare_workspace_controlled_projection, prepare_workspace_daemon,
-    prepare_workspace_daemon_launch, prepare_workspace_daemon_verified_replacement,
-    retire_materialized_lane_daemon, verified_stale_workspace_owner_for_launch,
-    with_materialized_lane_controlled_interval, with_workspace_controlled_interval,
-    workspace_daemon_fence, workspace_daemon_full_reconcile, workspace_daemon_ready_proof,
-    workspace_daemon_reconcile, ChangedPathDaemonRegistry, PersistedWorkspaceDaemonOwner,
-    VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,
-    WorkspaceDaemonRuntime,
+    prepare_workspace_daemon_launch, prepare_workspace_daemon_launch_after_revoked_owner,
+    prepare_workspace_daemon_verified_replacement, restart_workspace_daemon_if_target_changed,
+    retire_materialized_lane_daemon, retire_workspace_daemon,
+    verified_stale_workspace_owner_for_launch, with_materialized_lane_controlled_interval,
+    with_workspace_controlled_interval, workspace_daemon_fence, workspace_daemon_full_reconcile,
+    workspace_daemon_ready_proof, workspace_daemon_reconcile, ChangedPathDaemonRegistry,
+    PersistedWorkspaceDaemonOwner, VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity,
+    WorkspaceDaemonProof, WorkspaceDaemonRuntime,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{

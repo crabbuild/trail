@@ -328,9 +328,9 @@ Important hot-path rows:
 - `agent_git_apply_missing_mapping`
 - `daemon_wait_for_health`
 - `daemon_wait_for_hot_cache`
-- `daemon_persisted_snapshot_status`
-- `daemon_persisted_snapshot_record_clean`
-- `daemon_persisted_snapshot_diff_dirty`
+- `daemon_authoritative_status`
+- `daemon_authoritative_record_clean`
+- `daemon_authoritative_diff_dirty`
 - `lane_apply_patch`
 - `lane_readiness`
 - `lane_merge_queue_run`
@@ -345,7 +345,7 @@ Important hot-path rows:
 - `daemon_cli_history`
 - `daemon_cli_code_from`
 
-`git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate Trail handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
+`git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_authoritative_*` rows measure status, clean record, and dirty diff through the single authenticated observer authority. Separate local handles no longer borrow a live daemon's persisted watcher snapshot because that would bypass the observer-owner fence. Use `daemon_cli_*` rows for repeated agent-command hot paths.
 
 The `agent_git_apply_*` rows exercise the high-level committed Git handoff,
 not only Trail's internal lane merge. The mapped fixture creates a
@@ -442,7 +442,7 @@ The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with t
 | 100k files | 29.59s | 0.43s | 1.86s | 1.65s | 0.07s | 0.67s | 0.63s | 0.03s | 0.30s |
 | 1M files | 418.39s | 24.94s | 31.16s | 30.55s | 0.11s | 0.80s | 0.78s | 0.05s | 0.44s |
 
-The fresh 100k run at `/Volumes/Workspace/trail-cli-scale-codex-100k-git-daemon-20260625/100000` used no backup or materialized-workdir cases and passed 31 threshold checks. Its Git fallback rows measured `git_dirty_status=1.52s`, `git_dirty_diff=2.52s`, `git_dirty_record=1.86s`, and `git_status_after_dirty_record=0.90s`. Its persisted daemon snapshot rows measured `daemon_persisted_snapshot_status=0.01s`, `daemon_persisted_snapshot_record_clean=0.01s`, and `daemon_persisted_snapshot_diff_dirty=0.65s`.
+The fresh 100k run at `/Volumes/Workspace/trail-cli-scale-codex-100k-git-daemon-20260625/100000` used no backup or materialized-workdir cases and passed 31 threshold checks. Its Git fallback rows measured `git_dirty_status=1.52s`, `git_dirty_diff=2.52s`, `git_dirty_record=1.86s`, and `git_status_after_dirty_record=0.90s`. Its legacy pre-authority persisted-snapshot probes measured 0.01s, 0.01s, and 0.65s; current qualification uses the `daemon_authoritative_*` rows instead.
 
 The fresh 1M Git+daemon run at `/Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000` used no backup or materialized-workdir cases. It produced 1,000,029 source files, 75.9 MiB source bytes, 1.46 GiB SQLite, 1,000,460 objects, 452.5 MiB `TextContent` object bytes, and 667.5 MiB `repo_prolly_nodes` bytes. It passed 31 calibrated hot-path and storage threshold checks:
 
@@ -450,8 +450,8 @@ The fresh 1M Git+daemon run at `/Volumes/Workspace/trail-cli-scale-codex-1m-git-
 python3 scripts/check-cli-scale-thresholds.py \
   /Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000/results.tsv \
   daemon_wait_for_health=60 daemon_wait_for_hot_cache=120 \
-  daemon_status=5 daemon_persisted_snapshot_status=5 \
-  daemon_persisted_snapshot_record_clean=5 daemon_persisted_snapshot_diff_dirty=10 \
+  daemon_status=5 daemon_authoritative_status=5 \
+  daemon_authoritative_record_clean=5 daemon_authoritative_diff_dirty=10 \
   daemon_cli_status=5 daemon_cli_record_dirty=10 \
   daemon_cli_lane_readiness=5 daemon_cli_lane_trace_summary=5 \
   daemon_cli_merge_dry_run=10 daemon_cli_session_start=10 \

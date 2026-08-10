@@ -817,8 +817,10 @@ impl Trail {
             self,
             &branch.lane_id,
         )?;
+        let intended_writes =
+            self.sparse_hydration_write_files(&workdir_path, &target_files, force)?;
         let evidence = crate::db::change_ledger::IntentEvidence {
-            exact_paths: target_files
+            exact_paths: intended_writes
                 .keys()
                 .map(|path| crate::db::change_ledger::LedgerPath::parse(path))
                 .collect::<Result<Vec<_>>>()?,
@@ -855,11 +857,19 @@ impl Trail {
                         if comparison.summaries.is_empty() {
                             Ok(())
                         } else {
+                            let paths = comparison
+                                .summaries
+                                .iter()
+                                .take(5)
+                                .map(|summary| summary.path.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             Err(Error::ChangeLedgerReconcileRequired {
                                 scope: expected.scope_id.to_text(),
                                 state: "stale_baseline".into(),
-                                reason: "sparse hydration pinned verification did not match its target root"
-                                    .into(),
+                                reason: format!(
+                                    "sparse hydration pinned verification did not match its target root for: {paths}"
+                                ),
                                 command: format!("trail lane status {}", branch.lane_id),
                             })
                         }

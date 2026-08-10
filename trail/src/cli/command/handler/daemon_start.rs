@@ -222,13 +222,43 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
         }
         Err(error) => return Err(error),
     }
-    let Some(actual_start) = process_start_identity(endpoint.pid) else {
-        if peer_completed_workspace_daemon_retirement(&authority)? {
-            return Ok(());
+    let retired = match daemon_rpc::authenticated_ledger_retire(&endpoint) {
+        Ok(retired) => retired,
+        Err(error @ Error::DaemonUnavailable(_)) => {
+            if peer_completed_workspace_daemon_retirement(&authority)? {
+                return Ok(());
+            }
+            return Err(error);
         }
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            if peer_completed_workspace_daemon_retirement(&authority)? {
+                return Ok(());
+            }
+            return Err(Error::Io(error));
+        }
+        Err(error) => return Err(error),
+    };
+    if retired.protocol_version != endpoint.protocol_version
+        || retired.pid != endpoint.pid
+        || retired.process_start_identity != endpoint.process_start_identity
+        || retired.executable_identity != endpoint.executable_identity
+        || retired.owner_nonce != endpoint.owner_nonce
+        || retired.workspace_identity != endpoint.workspace_identity
+        || retired.scope_id != endpoint.scope_id
+        || retired.epoch < endpoint.epoch
+        || retired.daemon_launch_nonce != endpoint.daemon_launch_nonce
+        || retired.folded_offset > retired.durable_offset
+    {
         return Err(Error::DaemonUnavailable(
-            "workspace daemon process identity disappeared before retirement".into(),
+            "workspace daemon retirement proof identity mismatch".into(),
         ));
+    }
+    let Some(actual_start) = process_start_identity(endpoint.pid) else {
+        // The exact launch has already returned an authenticated retirement
+        // proof and revoked its observer owner. If it exits before SIGTERM,
+        // withdraw only that still-matching publication ourselves.
+        remove_stale_publication(&authority, &endpoint)?;
+        return Ok(());
     };
     if actual_start != endpoint.process_start_identity {
         return Err(Error::DaemonUnavailable(
@@ -238,9 +268,8 @@ pub(super) fn retire_workspace_daemon_after_external_generation_change(
     let result = unsafe { libc::kill(endpoint.pid as i32, libc::SIGTERM) };
     if result != 0 {
         let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound
-            && peer_completed_workspace_daemon_retirement(&authority)?
-        {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            remove_stale_publication(&authority, &endpoint)?;
             return Ok(());
         }
         return Err(Error::Io(error));
@@ -428,10 +457,11 @@ fn classify_endpoint(
         || proof.owner_nonce != endpoint.owner_nonce
         || proof.workspace_identity != endpoint.workspace_identity
         || proof.scope_id != endpoint.scope_id
-        || proof.epoch != endpoint.epoch
+        || proof.epoch < endpoint.epoch
         || proof.daemon_launch_nonce != endpoint.daemon_launch_nonce
         || proof.live_fence_sequence < endpoint.live_fence_sequence
         || proof.durable_offset < endpoint.durable_offset
+        || proof.folded_offset < endpoint.folded_offset
         || proof.folded_offset > proof.durable_offset
     {
         return Err(Error::DaemonUnavailable(
@@ -1581,8 +1611,11 @@ fn test_socket_bound_boundary(leaf: &str) -> Result<()> {
         return Ok(());
     };
     let barrier = PathBuf::from(barrier);
-    fs::write(barrier.join("bound"), leaf.as_bytes())?;
     fs::write(barrier.join("pid"), std::process::id().to_string())?;
+    // `bound` is the readiness sentinel. Publish it last so a reader that
+    // observes it can also consume the completed PID file without racing a
+    // just-created empty inode.
+    fs::write(barrier.join("bound"), leaf.as_bytes())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !barrier.join("continue").exists() {
         if Instant::now() >= deadline {

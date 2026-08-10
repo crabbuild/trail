@@ -1999,8 +1999,8 @@ mod tests {
             "barrier acknowledged before the earlier spill and finish were projected"
         );
         assert!(
-            ingress.spill.finish_path_for("barrier-order").is_file(),
-            "timed-out finalization lost its durable finish marker"
+            preserved_spill_state(&ingress.spill.dir).1,
+            "timed-out finalization lost its durable canonical or claimed finish marker"
         );
         drop(writer_lock);
         assert!(
@@ -2008,8 +2008,8 @@ mod tests {
             "barrier did not acknowledge after spill replay and finish projection"
         );
         assert!(
-            !ingress.spill.finish_path_for("barrier-order").exists(),
-            "finish marker remained after terminal projection was acknowledged"
+            !preserved_spill_state(&ingress.spill.dir).1,
+            "canonical or claimed finish marker remained after terminal projection was acknowledged"
         );
     }
 

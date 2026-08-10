@@ -32,6 +32,29 @@ static CARGO_TARGET_SEED_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
             "Locked Cargo target seed keyed by the complete source root and Rust toolchain identity",
     };
 
+#[cfg(target_os = "linux")]
+fn sccache_server_endpoint(cache_path: &Path) -> String {
+    let digest = sha256_hex(cache_path.to_string_lossy().as_bytes());
+    format!("\\x00trail-sccache-{}", &digest[..32])
+}
+
+fn sccache_supports_client_side(identity: &str) -> bool {
+    let Some(version) = identity
+        .split_whitespace()
+        .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))
+    else {
+        return false;
+    };
+    let mut numbers = version.split('.');
+    let Some(major) = numbers.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(minor) = numbers.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    major > 0 || minor >= 17
+}
+
 impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
         &CARGO_TARGET_SEED_ADAPTER_METADATA
@@ -228,7 +251,14 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
             .find_map(|line| line.strip_prefix("host: "))
             .unwrap_or("unknown")
             .to_string();
-        let has_sccache = command_is_available("sccache");
+        let sccache_version = if cfg!(target_os = "linux") {
+            command_identity("sccache", &["--version"])
+                .ok()
+                .filter(|identity| sccache_supports_client_side(identity))
+        } else {
+            None
+        };
+        let has_sccache = sccache_version.is_some();
         let mut tool_versions = BTreeMap::from([
             ("cargo".to_string(), cargo_version.clone()),
             ("rustc-vV".to_string(), rustc_identity.clone()),
@@ -277,9 +307,9 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
         if let Some(toolchain) = &rustup_toolchain {
             environment.insert("RUSTUP_TOOLCHAIN".to_string(), toolchain.clone());
         }
-        if has_sccache {
+        if let Some(sccache_version) = sccache_version.as_ref() {
             let sccache_tool = resolve_workspace_tool_executable("sccache")?;
-            let sccache_version = command_identity("sccache", &["--version"])?;
+            let sccache_version = sccache_version.clone();
             let sccache_cache = db.declare_workspace_environment_cache(
                 self.identity(),
                 "sccache",
@@ -304,9 +334,17 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
                 "SCCACHE_DIR".to_string(),
                 sccache_cache.storage_path.to_string_lossy().into_owned(),
             );
-            // A long-lived sccache server can outlive an attempt-owned temp
-            // directory. Cache I/O loss must degrade to rustc, not fail the
-            // deterministic target-seed build.
+            #[cfg(target_os = "linux")]
+            environment.insert(
+                "SCCACHE_SERVER_UDS".to_string(),
+                sccache_server_endpoint(&sccache_cache.storage_path),
+            );
+            // Keep compiler execution in the attempt-owned client so a
+            // long-lived cache server never retains the deleted build
+            // directory as its process temp root.
+            environment.insert("SCCACHE_CLIENT_SIDE".to_string(), "1".to_string());
+            // Cache I/O loss must degrade to rustc, not fail the deterministic
+            // target-seed build.
             environment.insert(
                 "SCCACHE_IGNORE_SERVER_IO_ERROR".to_string(),
                 "1".to_string(),
@@ -527,13 +565,6 @@ fn command_identity(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn command_is_available(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +577,24 @@ mod tests {
         } else {
             LaneWorkdirMode::FuseCow
         }
+    }
+
+    #[test]
+    fn sccache_client_side_capability_is_version_gated() {
+        assert!(!sccache_supports_client_side("sccache 0.16.0"));
+        assert!(sccache_supports_client_side("sccache 0.17.0"));
+        assert!(sccache_supports_client_side("sccache 1.0.0"));
+        assert!(!sccache_supports_client_side("sccache unknown"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sccache_server_endpoint_is_stable_and_cache_scoped() {
+        let first = sccache_server_endpoint(Path::new("/cache/one"));
+        assert_eq!(first, sccache_server_endpoint(Path::new("/cache/one")));
+        assert_ne!(first, sccache_server_endpoint(Path::new("/cache/two")));
+
+        assert!(first.starts_with("\\x00trail-sccache-"));
     }
 
     #[test]

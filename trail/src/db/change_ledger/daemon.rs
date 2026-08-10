@@ -127,6 +127,26 @@ pub(crate) fn prepare_workspace_daemon(
     prepare_workspace_daemon_inner(db, replace_stale_owner, None, None)
 }
 
+pub(crate) fn restart_workspace_daemon_if_target_changed(db: &Trail) -> Result<()> {
+    let target = workspace_daemon_target(db)?;
+    let matches = {
+        let registry = daemon_registry(db);
+        let Some(runtime) = registry.workspace.as_ref() else {
+            return Ok(());
+        };
+        runtime.matches_target(&target)?
+    };
+    if matches {
+        return Ok(());
+    }
+    let runtime = daemon_registry(db).workspace.take().ok_or_else(|| {
+        Error::DaemonUnavailable(
+            "changed-path observer runtime disappeared before baseline restart".into(),
+        )
+    })?;
+    runtime.restart(db)
+}
+
 pub(crate) fn prepare_workspace_daemon_verified_replacement(
     db: &Trail,
     verified_stale_owner: VerifiedStaleWorkspaceOwner,
@@ -218,6 +238,13 @@ pub(crate) fn prepare_workspace_daemon_launch(
     )
 }
 
+pub(crate) fn prepare_workspace_daemon_launch_after_revoked_owner(
+    db: &Trail,
+    launch: WorkspaceDaemonLaunchIdentity,
+) -> Result<WorkspaceDaemonProof> {
+    prepare_workspace_daemon_inner(db, true, None, Some(launch))
+}
+
 fn workspace_scope_needs_restore_rebind(db: &Trail) -> Result<bool> {
     let scope_id = workspace_daemon_target(db)?.identity.scope_id;
     db.conn
@@ -262,9 +289,12 @@ pub(crate) fn verified_stale_workspace_owner_for_launch(
     let binding = db
         .conn
         .query_row(
-            "SELECT scope_id,epoch,owner_token,daemon_pid,daemon_process_start_identity
-             FROM changed_path_observer_owners
-             WHERE daemon_launch_nonce=?1",
+            "SELECT owner.scope_id,owner.epoch,owner.owner_token,owner.daemon_pid,
+                    owner.daemon_process_start_identity
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope
+               ON scope.scope_id=owner.scope_id AND scope.epoch=owner.epoch
+             WHERE owner.daemon_launch_nonce=?1",
             params![daemon_launch_nonce],
             |row| {
                 Ok((
@@ -432,6 +462,16 @@ pub(crate) fn workspace_daemon_ready_proof(db: &Trail) -> Result<WorkspaceDaemon
             Error::DaemonUnavailable("changed-path observer runtime is unavailable".into())
         })?
         .current_proof()
+}
+
+pub(crate) fn retire_workspace_daemon(db: &Trail) -> Result<WorkspaceDaemonProof> {
+    let runtime = daemon_registry(db).workspace.take().ok_or_else(|| {
+        Error::DaemonUnavailable("changed-path observer runtime is unavailable".into())
+    })?;
+    let proof = runtime.current_proof()?;
+    runtime.observer.shutdown()?;
+    drop(runtime);
+    Ok(proof)
 }
 
 pub(crate) fn prepare_materialized_lane_daemon(
@@ -1194,6 +1234,7 @@ pub(crate) struct WorkspaceDaemonRuntime {
     tail_anchor: Option<ObserverFence>,
     last_cut: Option<EvidenceCut>,
     daemon_launch_nonce: Option<String>,
+    daemon_launch: Option<WorkspaceDaemonLaunchIdentity>,
     #[cfg(all(test, target_os = "macos"))]
     inject_policy_drift_after_end: bool,
 }
@@ -1822,6 +1863,7 @@ impl WorkspaceDaemonRuntime {
             tail_anchor: None,
             last_cut: None,
             daemon_launch_nonce: launch.map(|launch| launch.nonce.clone()),
+            daemon_launch: launch.cloned(),
             #[cfg(all(test, target_os = "macos"))]
             inject_policy_drift_after_end: false,
         })
@@ -1834,6 +1876,12 @@ impl WorkspaceDaemonRuntime {
             && self.expected.ref_generation == target.baseline.ref_generation
             && self.expected.baseline_root == target.baseline.root_id
             && self.expected.filesystem_identity == root_identity(&target.root)?)
+    }
+
+    pub(super) fn restart(self, db: &Trail) -> Result<()> {
+        let launch = self.daemon_launch.clone();
+        drop(self);
+        prepare_workspace_daemon_inner(db, true, None, launch).map(|_| ())
     }
 
     fn validate_request(&self, scope_id: Option<&str>, epoch: Option<u64>) -> Result<()> {
@@ -2953,6 +3001,80 @@ mod tests {
         assert_eq!(binding.2, i64::from(launch.pid));
         assert_eq!(binding.3, launch.process_start_identity);
         assert_eq!(binding.4, "active");
+    }
+
+    #[test]
+    fn live_workspace_baseline_restart_preserves_the_daemon_launch_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("tracked.txt"), b"baseline\n").unwrap();
+        crate::Trail::init(
+            temp.path(),
+            "main",
+            crate::InitImportMode::WorkingTree,
+            false,
+        )
+        .unwrap();
+        let db = crate::Trail::open(temp.path()).unwrap();
+        let launch = WorkspaceDaemonLaunchIdentity {
+            nonce: "8b".repeat(32),
+            pid: std::process::id(),
+            process_start_identity: "workspace-baseline-restart-test".into(),
+        };
+        let first = prepare_workspace_daemon_launch(&db, launch.clone(), None).unwrap();
+        assert_eq!(first.epoch, 1);
+
+        db.conn
+            .execute(
+                "UPDATE refs SET generation=generation+1 WHERE name='refs/branches/main'",
+                [],
+            )
+            .unwrap();
+        restart_workspace_daemon_if_target_changed(&db).unwrap();
+        let restarted = workspace_daemon_ready_proof(&db).unwrap();
+        assert_eq!(restarted.epoch, 2);
+        assert_eq!(restarted.daemon_launch_nonce, Some(launch.nonce.clone()));
+
+        let binding: (i64, i64, String, i64, String, String) = db
+            .conn
+            .query_row(
+                "SELECT scope.epoch,scope.ref_generation,owner.daemon_launch_nonce,
+                        owner.daemon_pid,owner.daemon_process_start_identity,owner.lease_state
+                 FROM changed_path_scopes scope
+                 JOIN changed_path_observer_owners owner
+                   ON owner.scope_id=scope.scope_id AND owner.epoch=scope.epoch",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(binding.0, 2);
+        assert_eq!(binding.1, 2);
+        assert_eq!(binding.2, launch.nonce);
+        assert_eq!(binding.3, i64::from(launch.pid));
+        assert_eq!(binding.4, launch.process_start_identity);
+        assert_eq!(binding.5, "active");
+
+        let handoff = verified_stale_workspace_owner_for_launch(
+            &db,
+            launch.pid,
+            &launch.process_start_identity,
+            &launch.nonce,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(handoff.epoch, 2);
+        assert_eq!(handoff.observer_owner_token, restarted.observer_owner_token);
+
+        restart_workspace_daemon_if_target_changed(&db).unwrap();
+        assert_eq!(workspace_daemon_ready_proof(&db).unwrap().epoch, 2);
     }
 
     #[test]

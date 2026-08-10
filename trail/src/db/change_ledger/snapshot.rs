@@ -6,7 +6,7 @@
 use super::types::{trail_atomic_temp_target, trail_case_probe_token};
 use super::{
     BaselineIdentity, CandidateSnapshot, EvidenceAcknowledgementToken, EvidenceCut, ExpectedScope,
-    IntentEvidence,
+    IntentEvidence, LedgerPath,
 };
 use crate::db::storage::file_kind_from_index;
 use crate::db::{DiskFile, DiskManifest, OperationMetricsDelta};
@@ -537,6 +537,11 @@ pub(crate) fn run_materialized_lane_snapshot_flow() -> std::result::Result<(), S
 
     let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
     fs::write(temp.path().join("tracked.txt"), b"baseline\n").map_err(|error| error.to_string())?;
+    fs::create_dir(temp.path().join("tree")).map_err(|error| error.to_string())?;
+    fs::write(temp.path().join("tree/selected.txt"), b"selected\n")
+        .map_err(|error| error.to_string())?;
+    fs::write(temp.path().join("tree/sibling.txt"), b"sibling\n")
+        .map_err(|error| error.to_string())?;
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)
         .map_err(|error| error.to_string())?;
     let mut db = Trail::open(temp.path()).map_err(|error| error.to_string())?;
@@ -607,6 +612,53 @@ pub(crate) fn run_materialized_lane_snapshot_flow() -> std::result::Result<(), S
         != Some(lane_hash.as_str())
     {
         return Err("replacement-root reconciliation used the retired watcher root".into());
+    }
+
+    let sparse = db
+        .spawn_lane_with_workdir_paths(
+            "sparse-prefix",
+            Some("main"),
+            true,
+            None,
+            None,
+            None,
+            &["tracked.txt".into()],
+        )
+        .map_err(|error| format!("spawn sparse-prefix lane: {error}"))?;
+    let sparse_workdir = std::path::PathBuf::from(
+        sparse
+            .workdir
+            .ok_or_else(|| "sparse-prefix lane was not materialized".to_string())?,
+    );
+    let read = db
+        .read_lane_file_with_hydration("sparse-prefix", "tree/selected.txt", None, false, false)
+        .map_err(|error| format!("sparse prefix hydration: {error}"))?;
+    if !read
+        .hydrated_paths
+        .iter()
+        .any(|path| path == "tree/selected.txt")
+        || sparse_workdir.join("tree/sibling.txt").exists()
+    {
+        return Err("sparse prefix hydration materialized the wrong file set".into());
+    }
+    db.read_lane_file_with_hydration("sparse-prefix", "tree/sibling.txt", Some(true), false, true)
+        .map_err(|error| format!("sequential sparse neighbor hydration: {error}"))?;
+    if !sparse_workdir.join("tree/selected.txt").is_file()
+        || !sparse_workdir.join("tree/sibling.txt").is_file()
+    {
+        return Err("sequential sparse neighbor hydration lost a selected file".into());
+    }
+    let (after_sparse_hydration, _) = db
+        .compare_materialized_lane_candidates(
+            "sparse-prefix",
+            CandidateMaterialization::ManifestOnly,
+        )
+        .map_err(|error| format!("post-hydration sparse comparison: {error}"))?;
+    if !after_sparse_hydration.summaries.is_empty() {
+        return Err(format!(
+            "sparse prefix candidate treated absent siblings as deletions: {:?}",
+            after_sparse_hydration.summaries
+        ));
     }
     Ok(())
 }
@@ -1093,23 +1145,62 @@ impl crate::Trail {
             });
         }
         let mut exact_paths = Vec::new();
+        let mut directory_prefixes = Vec::new();
         for path in std::mem::take(&mut candidates.exact_paths) {
-            if sparse_selection_intersects(selected, path.as_str())
-                || self.pinned_worktree_path_is_visible(&pinned, path.as_str())?
+            let visible = self.pinned_worktree_path_is_visible(&pinned, path.as_str())?;
+            if !sparse_selection_intersects(selected, path.as_str()) && !visible {
+                continue;
+            }
+            if visible
+                && self
+                    .read_pinned_candidate_path(&pinned, policy, path.as_str(), false)?
+                    .is_none()
             {
+                // Native observers may report a directory as an exact event
+                // rather than a complete prefix. Comparing that path directly
+                // would expand every baseline descendant and invent deletions
+                // for intentionally absent sparse siblings. Normalize the
+                // directory into the same sparse-aware expansion used for
+                // complete prefix evidence.
+                directory_prefixes.push(path.as_str().to_string());
+            } else {
                 exact_paths.push(path);
             }
         }
-        candidates.exact_paths = exact_paths;
-        let mut prefixes = Vec::new();
-        for prefix in std::mem::take(&mut candidates.prefixes) {
-            if sparse_selection_intersects(selected, prefix.path.as_str())
-                || self.pinned_worktree_path_is_visible(&pinned, prefix.path.as_str())?
-            {
-                prefixes.push(prefix);
+        let selected = selected.iter().cloned().collect::<BTreeSet<_>>();
+        let mut prefixes = std::mem::take(&mut candidates.prefixes)
+            .into_iter()
+            .filter(|prefix| prefix.complete)
+            .map(|prefix| prefix.path.as_str().to_string())
+            .collect::<Vec<_>>();
+        prefixes.extend(directory_prefixes);
+        prefixes.sort();
+        prefixes.dedup();
+        for prefix in &prefixes {
+            for path in selected.iter().filter(|path| {
+                path.as_str() == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }) {
+                exact_paths.push(LedgerPath::parse(path)?);
             }
         }
-        candidates.prefixes = prefixes;
+        let matcher = policy.recording_matcher()?;
+        self.visit_pinned_worktree_prefix_files(
+            &pinned,
+            &matcher,
+            &prefixes,
+            &selected,
+            false,
+            |file| {
+                exact_paths.push(LedgerPath::parse(&file.path)?);
+                Ok(())
+            },
+        )?;
+        exact_paths.sort();
+        exact_paths.dedup();
+        candidates.exact_paths = exact_paths;
         if !self.verify_pinned_worktree_root(&pinned)? {
             return Err(crate::Error::ChangeLedgerReconcileRequired {
                 scope: candidates.expected.scope_id.to_text(),
@@ -1152,12 +1243,6 @@ impl crate::Trail {
                 selection_used.replace(Some(sparse_selection.clone()));
                 let mut candidates = candidates.clone();
                 if let Some(selection) = sparse_selection.as_ref() {
-                    // Full reconciliation deliberately notices baseline files that
-                    // are absent on disk. In a sparse lane, absence outside the
-                    // authenticated materialized selection is not a deletion. Keep
-                    // selected/intersecting paths plus any currently visible path
-                    // (a newly created file outside the selection), and discard
-                    // only baseline-only absences.
                     let pinned = db.open_pinned_worktree_root(policy)?;
                     if db.pinned_worktree_root_identity(&pinned)
                         != candidates.expected.filesystem_identity
@@ -1243,6 +1328,7 @@ impl crate::Trail {
         if daemon_missing {
             super::prepare_workspace_daemon(self, true)?;
         }
+        super::restart_workspace_daemon_if_target_changed(self)?;
         let mut runtime = self
             .changed_path_daemon_registry
             .lock()
@@ -1260,8 +1346,7 @@ impl crate::Trail {
             .err()
             .is_some_and(super::policy_runtime_restart_required)
         {
-            drop(runtime);
-            super::prepare_workspace_daemon(self, true)?;
+            runtime.restart(self)?;
             runtime = self
                 .changed_path_daemon_registry
                 .lock()
