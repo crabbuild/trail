@@ -30,6 +30,7 @@ const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 // final CAS and SQLite commit.
 const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONTENTION_RETRY_JITTER: AtomicU64 = AtomicU64::new(1);
 type PersistedPrefixScopeRow = (
     String,
     String,
@@ -661,7 +662,7 @@ pub(crate) fn reconcile_full_with_tail(
 ) -> Result<(ChangeLedgerReconcileReport, ObserverFence)> {
     let mut retries = 0;
     loop {
-        let mut attempt = begin_reconciliation(
+        let mut attempt = match begin_reconciliation(
             trail,
             ledger,
             observer,
@@ -669,33 +670,42 @@ pub(crate) fn reconcile_full_with_tail(
             policy,
             ReconcileMode::Full,
             reason,
-        )
-        .map_err(|error| sqlite_reconciliation_stage(error, "begin"))?;
-        if let Err(error) = attempt.observe(trail, ledger, observer, policy) {
-            let error = sqlite_reconciliation_stage(error, "observe");
-            if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) {
+        ) {
+            Ok(attempt) => attempt,
+            Err(error)
+                if retries < MAX_IDENTITY_RACE_RETRIES
+                    && is_retryable_reconciliation_race(&error) =>
+            {
                 retries += 1;
+                reconciliation_retry_delay(retries);
                 continue;
             }
-            return Err(error);
+            Err(error) => return Err(sqlite_reconciliation_stage(error, "begin")),
+        };
+        if let Err(error) = attempt.observe(trail, ledger, observer, policy) {
+            if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_reconciliation_race(&error) {
+                retries += 1;
+                reconciliation_retry_delay(retries);
+                continue;
+            }
+            return Err(sqlite_reconciliation_stage(error, "observe"));
         }
         let retained_tail = attempt.end_fence.clone().ok_or_else(|| {
             Error::InvalidInput("reconciliation produced no retained observer tail".into())
         })?;
-        match attempt
-            .publish(trail, ledger, policy)
-            .map_err(|error| sqlite_reconciliation_stage(error, "publish"))
-        {
+        match attempt.publish(trail, ledger, policy) {
             Ok(mut report) => {
                 report.retries = retries;
                 return Ok((report, retained_tail));
             }
             Err(error)
-                if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) =>
+                if retries < MAX_IDENTITY_RACE_RETRIES
+                    && is_retryable_reconciliation_race(&error) =>
             {
                 retries += 1;
+                reconciliation_retry_delay(retries);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(sqlite_reconciliation_stage(error, "publish")),
         }
     }
 }
@@ -939,6 +949,29 @@ fn is_retryable_identity_race(error: &Error) -> bool {
         || message.contains("changed while it was read")
         || message.contains("workspace root identity changed")
         || message.contains("directory identity changed")
+}
+
+fn is_retryable_reconciliation_race(error: &Error) -> bool {
+    is_retryable_identity_race(error) || is_retryable_sqlite_contention(error)
+}
+
+fn is_retryable_sqlite_contention(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn reconciliation_retry_delay(retry: u64) {
+    let base_millis = 25_u64.saturating_mul(1_u64 << retry.min(3));
+    let jitter = NEXT_CONTENTION_RETRY_JITTER.fetch_add(1, Ordering::Relaxed) % 31;
+    std::thread::sleep(std::time::Duration::from_millis(
+        base_millis.saturating_add(jitter),
+    ));
 }
 
 impl ReconciliationAttempt {
@@ -3005,6 +3038,28 @@ mod tests {
         ProviderIdentity, RecordingPolicySnapshot, ScopeIdentity, ScopeKind,
     };
     use crate::{InitImportMode, ObjectId};
+
+    #[test]
+    fn reconciliation_retries_only_typed_sqlite_contention() {
+        let sqlite_error = |code| {
+            Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(is_retryable_reconciliation_race(&sqlite_error(
+            rusqlite::ffi::SQLITE_BUSY
+        )));
+        assert!(is_retryable_reconciliation_race(&sqlite_error(
+            rusqlite::ffi::SQLITE_LOCKED
+        )));
+        assert!(!is_retryable_reconciliation_race(&sqlite_error(
+            rusqlite::ffi::SQLITE_IOERR
+        )));
+        assert!(!is_retryable_reconciliation_race(
+            &Error::DaemonUnavailable("database is locked".into())
+        ));
+    }
 
     struct FakeQualifiedObserver {
         began: AtomicBool,

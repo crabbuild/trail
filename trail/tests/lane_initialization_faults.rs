@@ -1722,10 +1722,12 @@ fn sixty_four_unrelated_initializations_reach_observer_ready_without_owners() {
     let _authority = AuthorityOverride;
     let workspace = Arc::new(temp.path().to_path_buf());
     let start = Arc::new(Barrier::new(OBSERVERS + 1));
+    let open_lock = Arc::new(Mutex::new(()));
     let handles = (0..OBSERVERS)
         .map(|index| {
             let workspace = Arc::clone(&workspace);
             let start = Arc::clone(&start);
+            let open_lock = Arc::clone(&open_lock);
             thread::spawn(move || {
                 struct WorkerAuthorityOverride;
                 impl Drop for WorkerAuthorityOverride {
@@ -1736,7 +1738,12 @@ fn sixty_four_unrelated_initializations_reach_observer_ready_without_owners() {
                 trail::test_support::set_changed_path_authority_override(true);
                 let _authority = WorkerAuthorityOverride;
                 let lane = format!("observer-{index:02}");
-                let mut db = Trail::open(&*workspace).unwrap();
+                let mut db = {
+                    let _open = open_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Trail::open(&*workspace).unwrap()
+                };
                 start.wait();
                 let result = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                     &lane,

@@ -186,6 +186,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Initial changed-path reconciliation now retries bounded, typed SQLite busy/locked
+  contention, so high-fan-out lane creation reaches observer readiness instead of
+  escalating a transient WAL writer collision to committed repair.
 - Linux observer fences now live under the authenticated private
   `.trail/observer-fences/` directory and ignore foreign fence nonces, preventing
   overlapping observer recovery from reporting internal sentinels as untracked source.
