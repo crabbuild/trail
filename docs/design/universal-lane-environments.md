@@ -278,6 +278,16 @@ embedded in source URLs. Publication is an atomic rename or equivalent transacti
 a private staging location. Published immutable content is never repaired in place: a
 bad artifact becomes `corrupt`, references are quarantined, and a new artifact is built.
 
+Validation declarations are framework-neutral and typed as `structural`,
+`loadability`, `framework`, `policy`, `gate`, or `reproducibility`; the legacy
+`ecosystem` wire value remains inspectable under its original meaning. A host-run
+validation emits a canonical `ArtifactValidationReceiptV1` bound to the exact
+desired identity, artifact tree, declaration, validator identity, and validated
+input digest. Receipt evidence is bounded, deterministically ordered, and
+secret-rejected. Wall-clock time and local paths are excluded from receipt
+identity. Only passing receipts with exact desired/tree bindings may enter a
+ready envelope, and attachment revalidates those object identities and bindings.
+
 ## Environment generations
 
 An environment generation is an immutable selection of component instances and
@@ -385,6 +395,21 @@ The command record references the generation, so later inspection can answer whi
 compiler, lockfile, dependency tree, service image, and policy were active. Directly
 entering a lane shell remains possible, but commands outside `env exec` receive weaker
 reproducibility evidence and readiness can report that distinction.
+
+Managed preparation is fail-closed and does not perform resolution as a side effect.
+It records `missing_resolution_policy = explicit`, the exact source/view/generation,
+the status and verified snapshot identity of every discovered component, and the exact
+artifact envelope/tree binding for every active reusable output. Any non-ready proposal
+terminates preparation with deterministic resolver recovery argv before graph sync or
+command launch.
+
+Finalization records checkpoint, runtime-disposal, and unmount status together with the
+policy-derived decision for each output (`dispose`, retain private state, preserve a
+verified artifact, await a declared publication trigger, or replan). A source-root
+change invalidates every pending seal or promotion decision; it never silently attaches
+the candidate to the post-command source identity. Exec, test, eval, terminal-agent,
+and materialized ACP paths share these typed receipts rather than defining transport-
+specific lifecycle semantics.
 
 ## Filesystem bindings
 
@@ -570,6 +595,41 @@ but identical component keys converge to one artifact. For example:
 - CMake targets can share a toolchain and immutable install prefix while keeping
   configuration-specific build trees private.
 
+For a Cargo component without a tracked lockfile, Trail can bind a verified resolution
+snapshot to the complete source root and project those bytes only into isolated build
+staging. Cargo still observes a normal `Cargo.lock` and runs `--locked --offline`, while
+the repository, lane source upper, and later Git export remain unchanged. A different
+source root is a different proposal until a narrower input closure is certified.
+
+Node uses the same metadata projection with ecosystem policy left in adapter data:
+`packageManager` selects an npm, pnpm, Yarn, or Bun snapshot format and fixed resolver
+argv, while the common host validates source/snapshot identity and prevents source
+replacement. All managers converge on a frozen dependency seed plus a performance-only
+download cache and lane-private COW upper; Trail core does not gain manager-specific
+workspace or storage modes.
+
+Framework composition follows the same rule. The repository-v2 Next fixture binds
+`.next` as writable-private state over a typed Node dependency. Vite uses separate
+components for lane-private `.vite` optimizer state and a validated immutable `dist`
+artifact. Separating those lifecycles prevents a portable build output from granting
+reuse to a path-bound cache, without adding Next.js or Vite branches to Trail core.
+
+The remaining shipped adapters use the same identity abstraction without changing
+their storage policy. Host normalization derives a protocol-v3 identity-contract digest
+for Go, CMake, OCI/runtime, and command plans while retaining the exact legacy layer key
+as a compatibility/storage identity. Logical cache protocol and compatibility enter the
+projection, but machine-local cache paths do not. Go vendor content can therefore remain
+an immutable seed backed by performance caches; CMake remains a layer-free private build
+tree; OCI remains provider-owned metadata with lane-private runtime allocation; and
+repository-v2 commands keep their independent desired-key v2 contract.
+
+Conformance fixtures also cover ecosystems that have no built-in adapter. A
+Maven/Gradle-like checksum graph plus private build state and an unknown custom generator
+compile through repository v2. Bazel/Nix-like content stores compile through the generic
+plugin `verified_external` identity: Trail records provider/reference/digest/platform
+metadata but creates no layer, cache, runtime, or cleanup claim. These are compositions
+of common contracts, not framework switches in the lane backend.
+
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
 built once and become available to both, but each lane attaches it through its own
@@ -590,10 +650,64 @@ Trail uses distinct leases for:
 - cache maintenance;
 - garbage collection.
 
-Build waiters may stream progress and either reuse the published result or retry after a
-failed lease. Leases contain owner operation, heartbeat, expiry, and recovery metadata.
-No lease alone proves safety: publication also requires staging ownership and manifest
-validation, while activation also requires a lane transaction.
+The cache-key file lock remains the fast exclusion boundary. Each lock owner also records
+a durable construction attempt with a monotonically increasing owner generation, exact
+PID/start identity, source-root pin, heartbeat, and `reserved`, `building`, `validating`,
+`publishing`, or `completed` phase. Contenders record durable waiter rows. Completion
+releases those waiters; cancellation records their terminal state without invoking a
+second builder. Trail only replaces an owner when process liveness proves the exact
+PID/start identity dead or mismatched—an indeterminate identity is never stolen.
+
+No lock or attempt row alone proves safety: publication also requires staging ownership,
+content sealing, and manifest validation, while activation also requires a lane
+transaction. The bounded component-DAG scheduler remains independent of per-key
+singleflight, so unrelated ready components can build concurrently.
+
+All production adapter publication now enters through this common host path. Built-ins,
+plugins, and repository declarations return plans and candidates; they do not reserve
+layers, ingest CAS objects, publish manifests, or activate generations themselves. The
+older single-component synchronization library wrapper remains as a compatibility entry
+point, but delegates to the generation-oriented common synchronizer and grants no legacy
+publication shortcut.
+
+The host seal is taken only after the synchronous producer returns and the output has
+been copied into an attempt-owned staging tree that the producer does not control. Trail
+then revalidates the exact construction owner, source root, desired key, phase, and
+cancellation fence; enforces configured byte quotas; validates normalized contained
+paths, regular file metadata, confined links, and secret policy; ingests the complete
+bounded tree into CAS; and rescans the staging tree to reject mutation during sealing.
+Only after the staged tree is immutable and agrees with its CAS manifest does Trail
+publish the ready envelope.
+
+The built-in migration bridge keeps a workspace layer only as a compatibility
+materialization. After Trail verifies that an artifact-v2 envelope names the same tree,
+output contract, and portability, that desired-key envelope replaces the legacy CAS
+shadow as the durable authority. Ordinary activation records an exact generation
+binding to that envelope. Native lane views continue to read the immutable lower while
+copy-up writes remain private to the lane; source export reads the authoritative CAS
+tree rather than the private upper. Retirement removes the generation binding before
+workspace-layer and object garbage collection independently reclaim the disposable
+materialization and unreachable authoritative objects.
+
+Every compatibility workspace-layer envelope carries two required deterministic host
+receipts. The structural seal records path/content/limit/secret/tree checks; the policy
+seal records producer termination or disconnection, unchanged desired pins, and local
+host authorization. Both receipts are bound to the exact desired identity and tree,
+and attachment rejects missing, duplicate, failed, stale-digest, or mismatched evidence.
+Package-specific trust and revocation remain additional attachment requirements rather
+than being inferred from content safety.
+
+The same publication savepoint now creates one deterministic `ArtifactAttestationV1`.
+Its identity covers the envelope and desired/tree/source/snapshot/upstream identities,
+producer tier and package/publisher identity, executable/tool identities, host platform,
+phase capability ceiling, sandbox/network/script policies, output/share contract,
+validation receipts, and clear secret-taint result. It excludes wall-clock observations
+and local storage paths. Inspection returns the immutable statement and current database
+state; verification recomputes content identity and envelope binding. Optional Ed25519
+signature envelopes are parsed and verified when present, including local signing-key
+revocation. Unsigned local host attestations remain valid but are labeled `unsigned`.
+Attachment rechecks current plugin distribution digest and publisher key, so publisher
+trust removal or package removal blocks reuse without mutating prior evidence.
 
 Garbage collection considers active generations, retained predecessors, checkpoints,
 running operations, open backend references, and leases. Logical and physical byte
@@ -601,14 +715,54 @@ accounting are reported separately so shared-space savings remain visible.
 
 ## Adapter trust model
 
-Trail supports three adapter tiers:
+Trail distinguishes four producer trust tiers:
 
 1. **Built-in adapters** run as reviewed Trail code with narrowly scoped host APIs.
-2. **Declarative recipes** describe probes, commands, inputs, outputs, and policies; the
+2. **Certified signed plugins** have both authenticated package provenance and a separate
+   durable conformance certification.
+3. **Locally trusted plugins** include unsigned local packages and publisher-authenticated
+   packages that have not completed conformance certification. A signature authenticates
+   origin; it does not certify behavior or widen execution authority.
+4. **Repository declarations** describe probes, commands, inputs, outputs, and policies; the
    Trail host executes them in a sandbox.
-3. **Capability-constrained plugins** use a versioned WASI/component interface or
-   equivalent isolated protocol. They request filesystem, process, network, secret, and
-   runtime capabilities explicitly.
+
+The host computes a ceiling from producer tier and phase before considering any adapter
+request. The current framework-neutral matrix is:
+
+| Phase | Reviewed built-in | Certified/local plugin | Repository declaration |
+| --- | --- | --- | --- |
+| Discovery/planning | no process, network, writes, or secrets | same | same |
+| Resolution | exact authorities, pinned inputs, opaque credential handles | exact authorities, declared inputs, isolated candidate | same plugin ceiling |
+| Construction | reviewed built-in process graph and managed legacy network; candidate plus host caches | declared executable, offline, declared inputs, candidate plus certified host caches | declared executable, offline, declared inputs, candidate only |
+| Validation | offline candidate read and receipt-only write | same, with declared executable | same |
+| Mounted execution | lane view and declared bindings; runtime injection is host-owned | deny-by-default native sandbox over the lane view and bindings | unavailable |
+| Source export | artifact candidate read and one confined destination | same | same |
+
+No executable tier or phase has publication authority. Adapters may request less than
+their ceiling, never more. Repository plans cannot request mounted execution, provider
+authority, complete source projection, or host cache writes. Plugin plans remain under
+the local-plugin ceiling until a future durable certification record says otherwise.
+Reviewed built-ins retain an explicitly identified managed-network compatibility ceiling
+while their ecosystem actions migrate to separate resolver and offline-constructor phases.
+Repository v2 documents are rejected during side-effect-free loading when fixed argv
+contains a shell, interpolation/control token, indirect launcher, absolute host path,
+secret-bearing value, or provider socket. Their exact resolver authorities and input
+expansion are finite and canonical, and their outputs cannot claim compatible or
+host-wide reuse. Native enforcement remains mandatory later; early validation is not a
+substitute for the execution sandbox.
+
+Secret consumption is a one-way trust transition. The host represents it with a typed
+`clear` or `tainted` result containing canonical, non-secret channel classes only. A
+resolver candidate with exact-value redactions is terminated as
+`secret_tainted_output_private_only`: Trail may retain bounded redacted failure evidence,
+but it does not store the snapshot candidate or publish a shared envelope. Because the
+current resolver request cannot prove that a declared credential handle was unused,
+credential-capable resolver publication fails closed before shared snapshot reuse or
+creation. Runtime secret access similarly taints the active environment generation;
+writable-private outputs from that generation cannot be promoted. Producer receipts are
+checked for both typed taint and accidental sensitive fields before they become durable.
+Source export remains a planned v2 operation and must apply the same taint check before
+reading candidate bytes or writing repository source.
 
 Adapters never receive raw database access, shared artifact mutation, arbitrary host
 paths, or undeclared secrets. They return plans and observations. The host validates
@@ -732,6 +886,19 @@ policy decisions, stale reasons, operation links, and redaction rules. Long-runn
 build, verification, and runtime operations use Trail operations with progress events
 and cancellation rather than blocking opaque requests.
 
+The shared Rust operation layer now exposes artifact inspection, attach/sample/full/
+reproducibility-evidence verification, quarantine list/show/resolve, bounded content
+reachability, workspace/envelope CAS accounting, resolution reports, and source-export
+reports. CLI, HTTP/OpenAPI, and MCP adapters must project these models directly; they may
+not reinterpret trust, quarantine, reachability, or byte-accounting state. The public
+transport wiring uses those shared operations and report models.
+
+`ManagedExecutionLifecycleReport` includes additive `preparation` and `finalization`
+objects. OpenAPI describes the same resolution pins, output pins, sealing decisions,
+and cleanup status fields emitted by Rust, CLI, and HTTP-facing reports. ACP retains the
+same receipt in its durable prompt-completion or interruption event without changing
+ACP wire frames.
+
 ## Readiness, claims, and Git handoff
 
 Environment readiness is one input to lane readiness; it does not replace task claims
@@ -834,9 +1001,10 @@ backend:
 - `trail/cmake-build@1` provisions a layer-free private build tree and defers configure
   to the mounted lane so absolute cache paths remain valid;
 - `trail/python-venv@1` provisions a layer-free private `.venv`, keys it by dependency
-  manifests/locks and interpreter identity, and automatically initializes it through an
-  ephemeral candidate view at the final mountpoint so embedded prefix paths remain valid
-  without weakening atomic generation activation;
+  manifests/locks and interpreter identity, optionally binds a hash-bearing managed
+  requirements snapshot to a performance-only wheel/download cache, and automatically
+  initializes it through an ephemeral candidate view at the final mountpoint so embedded
+  prefixes and bytecode stay lane-private without weakening atomic generation activation;
 - existing layer references are imported into an initial environment generation without
   copying tree content.
 

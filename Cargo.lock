@@ -700,6 +700,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2938,6 +2944,7 @@ dependencies = [
  "dokan",
  "dokan-sys",
  "ed25519-dalek",
+ "fastcdc",
  "flate2",
  "fsevent-sys",
  "fuser",
@@ -2959,6 +2966,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "serde",
+ "serde_bytes",
  "serde_cbor",
  "serde_json",
  "sha2",
@@ -2978,6 +2986,7 @@ dependencies = [
  "walkdir",
  "widestring 0.4.3",
  "winapi",
+ "xattr",
  "zip",
 ]
 
@@ -2987,6 +2996,7 @@ version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "proptest",
  "serde",
  "serde_bytes",
  "serde_cbor",

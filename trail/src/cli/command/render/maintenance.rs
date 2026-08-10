@@ -66,6 +66,21 @@ pub(crate) fn render_backup_create(
                 "SQLite".to_string(),
                 format!("{} bytes", report.sqlite_bytes),
             ),
+            (
+                "Retained private views".to_string(),
+                report.retained_private_views.to_string(),
+            ),
+            (
+                "Rebuildable materializations".to_string(),
+                format!(
+                    "{} ({} bytes omitted)",
+                    report.rebuildable_materializations, report.rebuildable_materialization_bytes
+                ),
+            ),
+            (
+                "Rebuildable performance caches".to_string(),
+                report.rebuildable_performance_caches.to_string(),
+            ),
         ]));
     if !report.fsck_errors.is_empty() {
         document = document.block(UiBlock::Checklist(
@@ -108,6 +123,14 @@ pub(crate) fn render_backup_verify(
         ("Refs".to_string(), report.checked_refs.to_string()),
         ("Roots".to_string(), report.checked_roots.to_string()),
         ("Text objects".to_string(), report.checked_texts.to_string()),
+        (
+            "Retained private views".to_string(),
+            report.retained_private_views.to_string(),
+        ),
+        (
+            "Rebuildable materializations".to_string(),
+            report.rebuildable_materializations.to_string(),
+        ),
     ]));
     if !report.errors.is_empty() {
         document = document.block(UiBlock::Checklist(
@@ -141,6 +164,14 @@ pub(crate) fn render_backup_restore(
             (
                 "Rewritten workdirs".to_string(),
                 report.rewritten_workdirs.to_string(),
+            ),
+            (
+                "Restored private views".to_string(),
+                report.restored_private_views.to_string(),
+            ),
+            (
+                "Rebuildable materializations".to_string(),
+                report.rebuildable_materializations.to_string(),
             ),
         ])),
         options,

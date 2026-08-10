@@ -25,8 +25,15 @@ mod patching;
 mod readiness;
 mod retirement;
 mod rewind;
+mod source_export;
 mod turns;
 mod workdir;
+// Phase-one artifact contracts are intentionally reachable only from their
+// qualification tests until explicit resolve and CAS publication operations
+// activate them in later OpenSpec tasks.
+#[allow(dead_code)]
+mod workspace_artifact;
+pub(crate) use workspace_artifact::validate_artifact_validation_receipt;
 mod workspace_cargo;
 mod workspace_cmake;
 mod workspace_environment;

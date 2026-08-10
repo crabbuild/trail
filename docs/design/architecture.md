@@ -122,6 +122,37 @@ Trail uses a hybrid storage model:
 
 The design separates durable object truth from derived indexes. If derived indexes are damaged or stale, `index rebuild` reconstructs them from reachable operation and message objects.
 
+Framework artifacts use the same authority split rather than a parallel cache
+database. Source roots and environment proposals pin repository state;
+resolution snapshots preserve dependency selection as environment metadata;
+desired keys identify the complete correctness contract; artifact Merkle roots
+identify produced bytes; and verified envelopes bind content to output policy,
+validation, trust, attestation, and provenance. Generation bindings attach ready
+envelopes to lanes. Filesystem layer directories are reconstructible
+materializations, while generated, scratch, runtime, and seeded writable uppers
+remain lane private.
+
+```mermaid
+flowchart LR
+    Source["Pinned source root"] --> Proposal["Proposal / optional resolution snapshot"]
+    Proposal --> Desired["Desired key"]
+    Desired --> Build["Host-owned construction and validation"]
+    Build --> Tree["CAS content root"]
+    Tree --> Envelope["Ready artifact envelope"]
+    Envelope --> Generation["Environment generation binding"]
+    Generation --> Lower["Lazy or verified immutable materialization"]
+    Lower --> Upper["Fresh lane-private upper"]
+    Upper -. "explicit promotion" .-> Build
+    Envelope -. "declared source export" .-> Source
+```
+
+Adapters plan this graph but never become an execution or publication
+authority. Trail resolves tools, narrows capabilities, owns subprocesses and
+attempt fences, validates candidates, publishes CAS objects/envelopes, activates
+generations, and performs recovery and collection. NFS, FUSE, and Dokan adapt
+ordinary filesystem requests to the shared manifest/upper core; they do not own
+artifact identity or lifecycle decisions.
+
 ```mermaid
 flowchart LR
     Refs["Refs<br/>branches and agents"] --> Ops["Operation objects<br/>parents, before_root, after_root"]
@@ -176,6 +207,13 @@ Advisory leases are separate from the write lock. The write lock protects databa
 - Materialized workdirs should not be trusted if their manifest is missing or dirty without recording/sync.
 - Ignored and internal paths should not be recorded accidentally.
 - Derived indexes may be rebuilt, but object history and refs are the durable source of truth.
+- A ready artifact envelope points to a complete validated content graph; a
+  materialization is never its only copy.
+- A lane generation binds exact desired, envelope, tree, and output identities;
+  private copy-up bytes and whiteouts never alter the immutable lower.
+- Resolution and construction attempts are fenced by exact owner identity.
+  Recovery may activate the exact prepared successor or leave collectable
+  unbound content, but it cannot invent a partial active generation.
 
 ## Failure Modes
 

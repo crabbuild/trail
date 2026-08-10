@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::{Error, Result, Trail};
+use crate::{ArtifactEnvelopeId, ArtifactQuarantineId, Error, Result, Trail};
 
 use super::{response::pretty_json, types::*, utils::from_arguments};
 
@@ -18,6 +18,14 @@ fn resource_read_response(db: &mut Trail, args: ResourceReadArgs) -> Result<Valu
         ),
         RESOURCE_DOCTOR => ("application/json", pretty_json(&db.doctor()?)?),
         RESOURCE_LANES => ("application/json", pretty_json(&db.list_lanes()?)?),
+        RESOURCE_ARTIFACT_SPACE => (
+            "application/json",
+            pretty_json(&db.workspace_artifact_space()?)?,
+        ),
+        RESOURCE_ARTIFACT_QUARANTINES => (
+            "application/json",
+            pretty_json(&db.artifact_quarantine_list_report()?)?,
+        ),
         RESOURCE_LANE_MERGE_QUEUE => (
             "application/json",
             pretty_json(&db.list_lane_merge_queue()?)?,
@@ -108,6 +116,33 @@ fn resource_read_response(db: &mut Trail, args: ResourceReadArgs) -> Result<Valu
 }
 
 fn templated_resource(db: &mut Trail, uri: &str) -> Result<(&'static str, String)> {
+    if let Some(artifact_id) = template_uri_argument(
+        uri,
+        "trail://workspace/artifacts/",
+        "",
+        RESOURCE_ARTIFACT_TEMPLATE,
+    )? {
+        let artifact = ArtifactEnvelopeId::parse(&artifact_id).map_err(|error| {
+            Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+        })?;
+        return Ok((
+            "application/json",
+            pretty_json(&db.inspect_artifact(&artifact)?)?,
+        ));
+    }
+    if let Some(quarantine_id) = template_uri_argument(
+        uri,
+        "trail://workspace/artifact-quarantines/",
+        "",
+        RESOURCE_ARTIFACT_QUARANTINE_TEMPLATE,
+    )? {
+        let quarantine = ArtifactQuarantineId::parse(&quarantine_id)
+            .map_err(|error| Error::InvalidInput(format!("invalid quarantine ID: {error}")))?;
+        return Ok((
+            "application/json",
+            pretty_json(&db.artifact_quarantine(&quarantine)?)?,
+        ));
+    }
     if let Some(selector) = template_uri_argument(
         uri,
         "trail://workspace/agent-tasks/",

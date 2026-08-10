@@ -4,8 +4,50 @@ use super::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::db::change_ledger::secure_fs::SecureDirectory;
 use std::ffi::OsString;
+use std::io::Read;
 use std::process::Stdio;
 use std::thread;
+
+const MAX_ENVIRONMENT_PROPOSALS: usize = 100_000;
+const MAX_ENVIRONMENT_PROPOSAL_REASONS: usize = 16;
+const MAX_ENVIRONMENT_RECOVERY_ACTIONS: usize = 16;
+const MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES: usize = 4 * 1024;
+const MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS: usize = 64;
+const PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS: u64 = 30;
+const MAX_RESOLVER_SOURCE_ENTRIES: u64 = 1_000_000;
+const MAX_RESOLVER_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+
+struct BoundedResolverPipe {
+    bytes: Vec<u8>,
+    original_bytes: u64,
+}
+
+struct BoundedEnvironmentCommandDiagnostic {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_bounded_environment_command_diagnostic(
+    mut reader: impl Read + Send + 'static,
+) -> thread::JoinHandle<std::io::Result<BoundedEnvironmentCommandDiagnostic>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES);
+        let mut truncated = false;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES.saturating_sub(bytes.len());
+            let retained = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            truncated |= retained != read;
+        }
+        Ok(BoundedEnvironmentCommandDiagnostic { bytes, truncated })
+    })
+}
 
 /// One repository file that the host projects into an adapter-owned staging
 /// directory. Adapters describe the mapping; they never receive writable
@@ -15,6 +57,20 @@ pub(crate) struct WorkspaceEnvironmentInput {
     pub(crate) source_path: String,
     pub(crate) staging_path: String,
     pub(crate) entry: FileEntry,
+}
+
+/// One verified resolver snapshot projected into adapter-owned staging. The
+/// bytes remain environment metadata in Trail's object store rather than
+/// becoming mergeable source merely because a framework requires a lockfile
+/// at a conventional repository path while it runs.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceEnvironmentResolutionInput {
+    pub(crate) snapshot_id: ObjectId,
+    pub(crate) source_root: ObjectId,
+    pub(crate) source_path: String,
+    pub(crate) staging_path: String,
+    pub(crate) content_hash: String,
+    pub(crate) size_bytes: u64,
 }
 
 /// A command plan is deliberately argv-based. Trail owns the working
@@ -334,6 +390,40 @@ pub(crate) enum WorkspaceEnvironmentSandboxPolicy {
     RestrictedPluginMounted,
 }
 
+fn workspace_environment_capability_ceiling(
+    producer_trust: ArtifactProducerTrustTierV1,
+    phase: ArtifactExecutionPhaseV1,
+) -> ArtifactCapabilityCeilingV1 {
+    ArtifactCapabilityCeilingV1::for_phase(producer_trust, phase)
+}
+
+fn environment_plugin_producer_trust_tier(
+    plugin: &super::workspace_plugin::InstalledEnvironmentPlugin,
+) -> Result<ArtifactProducerTrustTierV1> {
+    match (
+        plugin.publisher.as_deref(),
+        plugin.publisher_key_id.as_deref(),
+        plugin.trust.as_str(),
+    ) {
+        (Some(_), Some(_), "publisher_signed")
+            if plugin.certification_tier.starts_with("certified-") =>
+        {
+            Ok(ArtifactProducerTrustTierV1::CertifiedSignedPlugin)
+        }
+        (Some(_), Some(_), "publisher_signed") | (None, None, "local_unsigned") => {
+            // Publisher authentication proves package origin but does not by
+            // itself certify the adapter's behavior. Until conformance
+            // certification is durable, both forms retain the local-plugin
+            // execution ceiling.
+            Ok(ArtifactProducerTrustTierV1::LocallyTrustedPlugin)
+        }
+        _ => Err(Error::Corrupt(format!(
+            "installed adapter `{}` has inconsistent producer trust evidence",
+            plugin.manifest.adapter.canonical_identity
+        ))),
+    }
+}
+
 /// Normalized plan emitted by every built-in environment adapter.
 ///
 /// The layer key and output contract are data so the host can validate and
@@ -354,6 +444,9 @@ pub(crate) struct WorkspaceEnvironmentPlan {
     pub(crate) resolved_dependencies: Vec<ResolvedWorkspaceEnvironmentDependency>,
     pub(crate) layer_key: WorkspaceLayerKeyV1,
     pub(crate) inputs: Vec<WorkspaceEnvironmentInput>,
+    /// Verified resolution metadata projected after the immutable source root.
+    /// Host validation forbids these entries from replacing tracked source.
+    pub(crate) resolution_inputs: Vec<WorkspaceEnvironmentResolutionInput>,
     /// Optional complete pinned source projection for adapters such as Cargo
     /// whose build graph can include arbitrary workspace source files. The
     /// host streams this root in bounded chunks during explicit sync.
@@ -416,6 +509,48 @@ pub(crate) struct WorkspaceEnvironmentAdapterMetadata {
     pub(crate) description: &'static str,
 }
 
+/// Side-effect-free adapter result for a recognized component root. Planning
+/// and resolution stay separate so discovery can report incomplete framework
+/// state without invoking ecosystem tooling.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceEnvironmentAdapterProposal {
+    pub(crate) status: EnvironmentComponentProposalStatus,
+    pub(crate) reasons: Vec<EnvironmentProposalReasonReport>,
+    pub(crate) recovery_actions: Vec<EnvironmentRecoveryActionReport>,
+}
+
+impl WorkspaceEnvironmentAdapterProposal {
+    pub(crate) fn ready() -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Ready,
+            reasons: Vec::new(),
+            recovery_actions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn blocked(
+        reason: EnvironmentProposalReasonReport,
+        recovery_action: EnvironmentRecoveryActionReport,
+    ) -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Blocked,
+            reasons: vec![reason],
+            recovery_actions: vec![recovery_action],
+        }
+    }
+
+    pub(crate) fn resolvable(
+        reason: EnvironmentProposalReasonReport,
+        recovery_action: EnvironmentRecoveryActionReport,
+    ) -> Self {
+        Self {
+            status: EnvironmentComponentProposalStatus::Resolvable,
+            reasons: vec![reason],
+            recovery_actions: vec![recovery_action],
+        }
+    }
+}
+
 /// Ecosystem code is restricted to discovery and deterministic planning.
 /// Trail remains responsible for executing, validating, publishing, binding,
 /// persisting, and reporting the resulting environment.
@@ -444,6 +579,26 @@ pub(crate) trait WorkspaceEnvironmentAdapter: Sync {
     fn component_id(&self, component_root: &str) -> Result<String>;
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool>;
+
+    fn resolution_plan(
+        &self,
+        _db: &Trail,
+        _source_root: &ObjectId,
+        _component_root: &str,
+    ) -> Result<Option<ArtifactResolutionPlanV1>> {
+        Ok(None)
+    }
+
+    fn propose(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Option<WorkspaceEnvironmentAdapterProposal>> {
+        Ok(self
+            .detect(db, source_root, component_root)?
+            .then(WorkspaceEnvironmentAdapterProposal::ready))
+    }
 
     fn plan(
         &self,
@@ -513,6 +668,7 @@ impl Trail {
                     .map(|marker| (*marker).to_string())
                     .collect(),
                 protocols: Vec::new(),
+                protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport::default(),
                 supported_operating_systems: metadata
                     .supported_operating_systems
                     .iter()
@@ -550,6 +706,8 @@ impl Trail {
             .collect::<BTreeMap<_, _>>();
         for plugin in self.installed_environment_plugins()? {
             let metadata = plugin.manifest.adapter;
+            let protocol_capabilities =
+                super::workspace_plugin::environment_plugin_protocol_capabilities(&metadata);
             let (namespace, name, contract_major) =
                 super::workspace_plugin::validate_plugin_identity(&metadata.canonical_identity)?;
             for selector in &metadata.selectors {
@@ -576,6 +734,7 @@ impl Trail {
                 layer_adapter_name: metadata.layer_adapter_name,
                 discovery_markers: metadata.discovery_markers,
                 protocols: metadata.protocols,
+                protocol_capabilities,
                 supported_operating_systems: metadata.supported_operating_systems,
                 supported_architectures: metadata.supported_architectures,
                 source: "plugin".to_string(),
@@ -787,7 +946,7 @@ impl Trail {
     ) -> Result<EnvironmentDiscoveryReport> {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
-        let mut roots = BTreeSet::new();
+        let mut roots = BTreeMap::<String, BTreeSet<String>>::new();
         let plugins = self.installed_environment_plugins()?;
         if !plugins.is_empty() {
             // This also rejects selectors that collide with built-ins before
@@ -805,11 +964,26 @@ impl Trail {
                 .flat_map(|plugin| plugin.manifest.adapter.discovery_markers.iter().cloned()),
         );
         if let Some(component_root) = component_root {
-            roots.insert(if component_root.trim_matches('/').is_empty() {
+            let root = if component_root.trim_matches('/').is_empty() {
                 String::new()
             } else {
                 normalize_relative_path(component_root)?
-            });
+            };
+            let mut present = BTreeSet::new();
+            for marker in &discovery_markers {
+                if marker.contains('/') {
+                    continue;
+                }
+                let marker_path = if root.is_empty() {
+                    marker.clone()
+                } else {
+                    format!("{root}/{marker}")
+                };
+                if self.root_file_entry(&head.root_id, &marker_path)?.is_some() {
+                    present.insert(marker.clone());
+                }
+            }
+            roots.insert(root, present);
         } else {
             self.for_each_root_file_chunk(&head.root_id, 1024, |chunk| {
                 for (path, _) in chunk {
@@ -817,11 +991,14 @@ impl Trail {
                     if !discovery_markers.contains(file_name) {
                         continue;
                     }
-                    roots.insert(
-                        path.rsplit_once('/')
-                            .map(|(parent, _)| parent.to_string())
-                            .unwrap_or_default(),
-                    );
+                    roots
+                        .entry(
+                            path.rsplit_once('/')
+                                .map(|(parent, _)| parent.to_string())
+                                .unwrap_or_default(),
+                        )
+                        .or_default()
+                        .insert(file_name.to_string());
                 }
                 Ok(())
             })?;
@@ -829,19 +1006,44 @@ impl Trail {
 
         let mut components = Vec::new();
         let mut conflicts = Vec::new();
-        for root in roots {
+        for (root, present_markers) in roots {
             for adapter in builtin_environment_adapters() {
-                if adapter.detect(self, &head.root_id, &root)? {
+                if !adapter
+                    .metadata()
+                    .discovery_markers
+                    .iter()
+                    .any(|marker| present_markers.contains(*marker))
+                {
+                    continue;
+                }
+                if let Some(proposal) = adapter.propose(self, &head.root_id, &root)? {
                     components.push(EnvironmentDiscoveredComponentReport {
                         component_id: adapter.component_id(&root)?,
                         component_root: root.clone(),
                         kind: adapter.kind().to_string(),
                         adapter_identity: adapter.identity().to_string(),
+                        status: proposal.status,
+                        reasons: proposal.reasons,
+                        recovery_actions: proposal.recovery_actions,
                     });
                 }
             }
             for plugin in &plugins {
+                if !plugin
+                    .manifest
+                    .adapter
+                    .discovery_markers
+                    .iter()
+                    .any(|marker| present_markers.contains(marker))
+                {
+                    continue;
+                }
                 if !super::workspace_plugin::environment_plugin_supports_current_host(plugin) {
+                    components.push(
+                        super::workspace_plugin::unsupported_environment_plugin_proposal(
+                            plugin, &root,
+                        )?,
+                    );
                     continue;
                 }
                 if let Some(component) =
@@ -852,6 +1054,12 @@ impl Trail {
             }
         }
         components.extend(self.command_recipe_discovery(&head.root_id, component_root)?);
+        if components.len() > MAX_ENVIRONMENT_PROPOSALS {
+            return Err(Error::InvalidInput(format!(
+                "environment discovery produced {} component proposals; maximum is {MAX_ENVIRONMENT_PROPOSALS}",
+                components.len()
+            )));
+        }
         components.sort_by(|left, right| {
             (
                 &left.component_root,
@@ -864,6 +1072,41 @@ impl Trail {
                     &right.adapter_identity,
                 ))
         });
+        let ambiguous_ids = components
+            .iter()
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, component| {
+                *counts.entry(component.component_id.clone()).or_default() += 1;
+                counts
+            })
+            .into_iter()
+            .filter_map(|(component_id, count)| (count > 1).then_some(component_id))
+            .collect::<BTreeSet<_>>();
+        for component in &mut components {
+            if ambiguous_ids.contains(&component.component_id) {
+                component.status = EnvironmentComponentProposalStatus::Ambiguous;
+                component.reasons.push(EnvironmentProposalReasonReport {
+                    code: "component_identity_conflict".to_string(),
+                    message: format!(
+                        "multiple adapters proposed logical component `{}`",
+                        component.component_id
+                    ),
+                });
+            }
+            for action in &mut component.recovery_actions {
+                if action.code == "resolve_component" {
+                    action.command = Some(vec![
+                        "trail".into(),
+                        "env".into(),
+                        "resolve".into(),
+                        "component".into(),
+                        component.component_id.clone(),
+                        "--lane".into(),
+                        lane.to_string(),
+                    ]);
+                }
+            }
+            normalize_environment_component_proposal(component)?;
+        }
         for duplicate in components.windows(2) {
             if duplicate[0].component_id == duplicate[1].component_id {
                 conflicts.push(EnvironmentDiscoveryConflictReport {
@@ -883,6 +1126,460 @@ impl Trail {
             source_root: head.root_id,
             components,
             conflicts,
+        })
+    }
+
+    /// Resolve one discovered component by running its host-validated resolver
+    /// plan against an isolated projection of the exact lane source root.
+    pub fn resolve_workspace_environment_component(
+        &self,
+        lane: &str,
+        component_id: &str,
+        component_root: Option<&str>,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionComponentReportV1> {
+        let discovery = self.discover_workspace_environment(lane, component_root)?;
+        let matching = discovery
+            .components
+            .iter()
+            .filter(|component| component.component_id == component_id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1
+            || matching[0].status == EnvironmentComponentProposalStatus::Ambiguous
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is missing or ambiguous; inspect `trail env discover {lane}` and select one component root with `--path`"
+            )));
+        }
+        let component = matching[0];
+        if !matches!(
+            component.status,
+            EnvironmentComponentProposalStatus::Resolvable
+                | EnvironmentComponentProposalStatus::Ready
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is `{}` and has no resolver plan; inspect `trail env discover {lane}`",
+                component.status.as_str()
+            )));
+        }
+        let plan = if component.adapter_identity
+            == super::workspace_recipe::COMMAND_RECIPE_ADAPTER_METADATA.canonical_identity
+        {
+            self.command_recipe_resolution_plan(&discovery.source_root, component_id)?
+        } else if let Some(adapter) = builtin_environment_adapters()
+            .into_iter()
+            .find(|adapter| adapter.identity() == component.adapter_identity)
+        {
+            adapter.resolution_plan(self, &discovery.source_root, &component.component_root)?
+        } else {
+            return Err(Error::InvalidInput(format!(
+                "environment adapter `{}` does not expose a host-executable v3 resolver plan; inspect `trail env discover {lane}`",
+                component.adapter_identity
+            )));
+        }
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "environment component `{component_id}` reported resolvable but produced no resolver plan"
+            ))
+        })?;
+        if component.status == EnvironmentComponentProposalStatus::Ready
+            && self
+                .artifact_resolution_snapshot_for_proposal(&plan.proposal_key)?
+                .is_none()
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{component_id}` is ready from source authority and has no Trail-managed resolver snapshot to reuse"
+            )));
+        }
+        if plan.source_root != discovery.source_root
+            || plan.component_id != component.component_id
+            || plan.adapter_identity != component.adapter_identity
+        {
+            return Err(Error::Corrupt(format!(
+                "environment component `{component_id}` resolver plan disagrees with discovery"
+            )));
+        }
+        let reviewed_builtin = builtin_environment_adapters()
+            .into_iter()
+            .any(|adapter| adapter.identity() == component.adapter_identity);
+        if !reviewed_builtin {
+            return Err(Error::InvalidInput(
+                "resolver execution for repository and plugin components requires the restricted native resolver sandbox, which is not yet wired to this operation; the resolver was not launched"
+                    .to_string(),
+            ));
+        }
+        self.resolve_artifact_component_with_executor(plan, refresh, |plan, fence| {
+            self.execute_reviewed_builtin_resolution_plan(lane, plan, fence)
+        })
+    }
+
+    /// Resolve every currently resolvable component in deterministic discovery
+    /// order. Ready components need no snapshot; incomplete states fail closed
+    /// with the discovery command that explains their recovery.
+    pub fn resolve_all_workspace_environment_components(
+        &self,
+        lane: &str,
+        component_root: Option<&str>,
+        refresh: bool,
+    ) -> Result<ArtifactResolutionBatchReportV1> {
+        let discovery = self.discover_workspace_environment(lane, component_root)?;
+        if !discovery.conflicts.is_empty()
+            || discovery.components.iter().any(|component| {
+                matches!(
+                    component.status,
+                    EnvironmentComponentProposalStatus::Blocked
+                        | EnvironmentComponentProposalStatus::Unsupported
+                        | EnvironmentComponentProposalStatus::Ambiguous
+                )
+            })
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment resolution is incomplete or ambiguous; inspect `trail env discover {lane}`"
+            )));
+        }
+        let mut components = Vec::new();
+        for component in &discovery.components {
+            let requires_resolution = component.status
+                == EnvironmentComponentProposalStatus::Resolvable
+                || (component.status == EnvironmentComponentProposalStatus::Ready
+                    && self.has_current_artifact_resolution_snapshot(
+                        &discovery.source_root,
+                        &component.component_id,
+                        &component.adapter_identity,
+                    )?);
+            if !requires_resolution {
+                continue;
+            }
+            components.push(self.resolve_workspace_environment_component(
+                lane,
+                &component.component_id,
+                Some(&component.component_root),
+                refresh,
+            )?);
+        }
+        Ok(ArtifactResolutionBatchReportV1 {
+            source_root: discovery.source_root,
+            refresh_requested: refresh,
+            components,
+        })
+    }
+
+    fn execute_reviewed_builtin_resolution_plan(
+        &self,
+        lane: &str,
+        plan: &ArtifactResolutionPlanV1,
+        fence: &super::workspace_artifact::ArtifactResolutionAttemptFence,
+    ) -> super::workspace_artifact::ArtifactResolutionExecutorResult {
+        let fail = |code: &str, error: &dyn std::fmt::Display| {
+            super::workspace_artifact::ArtifactResolutionExecutorFailure::from_error(code, error)
+        };
+        if !plan.allowed_authorities.is_empty() || !plan.credential_handles.is_empty() {
+            return Err(fail(
+                "resolver_authority_not_enforceable",
+                &"reviewed built-in resolution currently permits only offline, credential-free plans",
+            ));
+        }
+        let actual_identity = workspace_tool_identity_for_path(Path::new(&plan.resolved_program))
+            .map_err(|error| fail("resolver_tool_identity_failed", &error))?;
+        if actual_identity != plan.executable_identity {
+            return Err(fail(
+                "resolver_tool_identity_changed",
+                &format!(
+                    "resolver executable identity changed after planning: expected `{}`, found `{actual_identity}`",
+                    plan.executable_identity
+                ),
+            ));
+        }
+        let branch = self
+            .lane_branch(lane)
+            .map_err(|error| fail("resolver_source_pin_failed", &error))?;
+        if branch.head_root != plan.source_root {
+            return Err(fail(
+                "resolver_source_changed",
+                &"lane source changed after resolver planning",
+            ));
+        }
+
+        let staging_parent = self
+            .workspace_environment_staging_parent()
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+        let staging = tempfile::Builder::new()
+            .prefix("trail-resolution-")
+            .tempdir_in(staging_parent)
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+        let project = staging.path().join("project");
+        let isolated_home = staging.path().join("home");
+        let isolated_tmp = staging.path().join("tmp");
+        fs::create_dir_all(&project)
+            .and_then(|_| fs::create_dir_all(&isolated_home))
+            .and_then(|_| fs::create_dir_all(&isolated_tmp))
+            .map_err(|error| fail("resolver_staging_failed", &error))?;
+
+        let mut source_entries = 0_u64;
+        let mut source_bytes = 0_u64;
+        let mut source_hashes = BTreeMap::new();
+        self.for_each_root_file_chunk(&plan.source_root, 1024, |chunk| {
+            for (path, entry) in chunk {
+                source_entries = source_entries.saturating_add(1);
+                source_bytes = source_bytes.saturating_add(entry.size_bytes);
+                if source_entries > MAX_RESOLVER_SOURCE_ENTRIES
+                    || source_bytes > MAX_RESOLVER_SOURCE_BYTES
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "resolver source projection exceeds {MAX_RESOLVER_SOURCE_ENTRIES} entries or {MAX_RESOLVER_SOURCE_BYTES} bytes"
+                    )));
+                }
+                self.materialize_workspace_environment_input(&project, &path, &entry)?;
+                let projected = safe_join(&project, &path)?;
+                let mut permissions = fs::metadata(&projected)?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&projected, permissions)?;
+                source_hashes.insert(path, entry.content_hash);
+            }
+            Ok(())
+        })
+        .map_err(|error| fail("resolver_source_projection_failed", &error))?;
+
+        let candidate_path = safe_join(&project, &plan.candidate_output)
+            .map_err(|error| fail("resolver_candidate_path_invalid", &error))?;
+        if candidate_path.exists() {
+            return Err(fail(
+                "resolver_candidate_would_replace_source",
+                &format!(
+                    "resolver candidate `{}` already exists in pinned source",
+                    plan.candidate_output
+                ),
+            ));
+        }
+        if let Some(parent) = candidate_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| fail("resolver_candidate_parent_failed", &error))?;
+        }
+        let working_directory = if plan.working_directory == "." {
+            project.clone()
+        } else {
+            safe_join(&project, &plan.working_directory)
+                .map_err(|error| fail("resolver_working_directory_invalid", &error))?
+        };
+        if !working_directory.is_dir() {
+            return Err(fail(
+                "resolver_working_directory_missing",
+                &format!(
+                    "resolver working directory `{}` does not exist",
+                    plan.working_directory
+                ),
+            ));
+        }
+
+        let mut command = Command::new(&plan.resolved_program);
+        command
+            .args(&plan.argv[1..])
+            .current_dir(&working_directory)
+            .env_clear()
+            .env("HOME", &isolated_home)
+            .env("TMPDIR", &isolated_tmp)
+            .env("TMP", &isolated_tmp)
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if plan.program == "cargo" {
+            let rustup_home = std::env::var_os("RUSTUP_HOME").or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup").into_os_string())
+            });
+            if let Some(rustup_home) = rustup_home.filter(|path| Path::new(path).is_dir()) {
+                command.env("RUSTUP_HOME", rustup_home);
+            }
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| fail("resolver_process_spawn_failed", &error))?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(fail(
+                "resolver_capture_failed",
+                &"resolver stdout pipe was not created",
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(fail(
+                "resolver_capture_failed",
+                &"resolver stderr pipe was not created",
+            ));
+        };
+        let stdout_limit = plan.limits.stdout_bytes;
+        let stderr_limit = plan.limits.stderr_bytes;
+        let stdout_reader = thread::spawn(move || read_bounded_resolver_pipe(stdout, stdout_limit));
+        let stderr_reader = thread::spawn(move || read_bounded_resolver_pipe(stderr, stderr_limit));
+        let started = Instant::now();
+        let mut last_heartbeat = started;
+        let timeout = Duration::from_millis(plan.limits.timeout_ms);
+        let (status, timed_out, cancelled) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status, false, false),
+                Ok(None) if started.elapsed() < timeout => {
+                    if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                        let active = match self.heartbeat_artifact_resolution_attempt(fence) {
+                            Ok(active) => active,
+                            Err(error) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return Err(fail("resolver_heartbeat_failed", &error));
+                            }
+                        };
+                        if !active {
+                            let _ = child.kill();
+                            let status = child
+                                .wait()
+                                .map_err(|error| fail("resolver_process_wait_failed", &error))?;
+                            break (status, false, true);
+                        }
+                        last_heartbeat = Instant::now();
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .map_err(|error| fail("resolver_process_wait_failed", &error))?;
+                    break (status, true, false);
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(fail("resolver_process_wait_failed", &error));
+                }
+            }
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| {
+                fail(
+                    "resolver_capture_failed",
+                    &"resolver stdout reader panicked",
+                )
+            })?
+            .map_err(|error| fail("resolver_capture_failed", &error))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| {
+                fail(
+                    "resolver_capture_failed",
+                    &"resolver stderr reader panicked",
+                )
+            })?
+            .map_err(|error| fail("resolver_capture_failed", &error))?;
+        if timed_out
+            || cancelled
+            || !status.success()
+            || stdout.original_bytes > stdout_limit
+            || stderr.original_bytes > stderr_limit
+        {
+            return Err(Box::new(
+                super::workspace_artifact::ArtifactResolutionExecutorFailure {
+                    code: if timed_out {
+                        "resolver_process_timed_out"
+                    } else if cancelled {
+                        "resolver_cancelled"
+                    } else if !status.success() {
+                        "resolver_process_failed"
+                    } else {
+                        "resolver_capture_limit_exceeded"
+                    }
+                    .into(),
+                    message: if timed_out {
+                        format!(
+                            "resolver exceeded its {} ms timeout",
+                            plan.limits.timeout_ms
+                        )
+                    } else if cancelled {
+                        "resolver was cancelled or lost its owner fence".into()
+                    } else if !status.success() {
+                        format!("resolver exited with status {status}")
+                    } else {
+                        "resolver output exceeded its declared capture limit".into()
+                    },
+                    contacted_authorities: Vec::new(),
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                    stdout_original_bytes: stdout.original_bytes,
+                    stderr_original_bytes: stderr.original_bytes,
+                    redactions: Vec::new(),
+                    cancelled,
+                },
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(&candidate_path)
+            .map_err(|error| fail("resolver_candidate_missing", &error))?;
+        if !metadata.file_type().is_file() || metadata.len() > plan.limits.candidate_bytes {
+            return Err(fail(
+                "resolver_candidate_invalid",
+                &format!(
+                    "resolver candidate `{}` is not a bounded regular file",
+                    plan.candidate_output
+                ),
+            ));
+        }
+        let snapshot_bytes = fs::read(&candidate_path)
+            .map_err(|error| fail("resolver_candidate_read_failed", &error))?;
+        for (path, expected_hash) in &source_hashes {
+            let projected = safe_join(&project, path)
+                .map_err(|error| fail("resolver_source_revalidation_failed", &error))?;
+            let actual_hash = sha256_hex(
+                &fs::read(&projected)
+                    .map_err(|error| fail("resolver_source_revalidation_failed", &error))?,
+            );
+            if actual_hash != *expected_hash {
+                return Err(fail(
+                    "resolver_modified_source",
+                    &format!("resolver modified pinned source input `{path}`"),
+                ));
+            }
+        }
+        for entry in walkdir::WalkDir::new(&project).follow_links(false) {
+            let entry = entry.map_err(|error| fail("resolver_output_scan_failed", &error))?;
+            if entry.path() == project || entry.file_type().is_dir() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&project)
+                .map_err(|error| fail("resolver_output_scan_failed", &error))?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative != plan.candidate_output && !source_hashes.contains_key(&relative) {
+                return Err(fail(
+                    "resolver_undeclared_output",
+                    &format!("resolver produced undeclared path `{relative}`"),
+                ));
+            }
+        }
+        let current = self
+            .lane_branch(lane)
+            .map_err(|error| fail("resolver_source_revalidation_failed", &error))?;
+        if current.head_root != plan.source_root {
+            return Err(fail(
+                "resolver_source_changed",
+                &"lane source changed while the resolver was running",
+            ));
+        }
+        Ok(ArtifactResolutionCandidateV1 {
+            snapshot_bytes,
+            resolved_identities: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            contacted_authorities: Vec::new(),
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            redactions: Vec::new(),
         })
     }
 
@@ -1208,6 +1905,16 @@ impl Trail {
                     content_hash: input.entry.content_hash,
                     size_bytes: input.entry.size_bytes,
                 })
+                .chain(
+                    plan.resolution_inputs
+                        .into_iter()
+                        .map(|input| EnvironmentPlanInputReport {
+                            source_path: input.source_path,
+                            staging_path: input.staging_path,
+                            content_hash: input.content_hash,
+                            size_bytes: input.size_bytes,
+                        }),
+                )
                 .collect(),
             tools,
             commands,
@@ -1747,8 +2454,12 @@ impl Trail {
                 "building",
                 None,
             )?;
-            let prepared =
-                self.prepare_workspace_environment_artifacts(&view.view_id, &plan, &cache_key);
+            let prepared = self.prepare_workspace_environment_artifacts(
+                &view.view_id,
+                &source_root,
+                &plan,
+                &cache_key,
+            );
             let mut prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
@@ -1979,9 +2690,11 @@ impl Trail {
                     None,
                 )?;
             }
-            let mut prepared = match self
-                .prepare_workspace_environment_artifacts_parallel(&view.view_id, &planned)
-            {
+            let mut prepared = match self.prepare_workspace_environment_artifacts_parallel(
+                &view.view_id,
+                &discovery.source_root,
+                &planned,
+            ) {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     let reason = format!(
@@ -2169,6 +2882,10 @@ impl Trail {
                 plan.component_id
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            ArtifactProducerTrustTierV1::ReviewedBuiltin,
+        )?;
         self.validate_workspace_environment_plan_common(plan)
     }
 
@@ -2205,6 +2922,10 @@ impl Trail {
                 "command recipe `{expected_component_id}` returned an inconsistent identity, policy, or action plan"
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            ArtifactProducerTrustTierV1::RepositoryDeclaration,
+        )?;
         self.validate_workspace_environment_plan_common_with_tool_cache(plan, tool_identities)
     }
 
@@ -2254,7 +2975,118 @@ impl Trail {
                 "plugin component `{expected_component_id}` returned an inconsistent identity, provenance, or policy plan"
             )));
         }
+        self.validate_workspace_environment_capability_ceilings(
+            plan,
+            environment_plugin_producer_trust_tier(plugin)?,
+        )?;
         self.validate_workspace_environment_plan_common(plan)
+    }
+
+    fn validate_workspace_environment_capability_ceilings(
+        &self,
+        plan: &WorkspaceEnvironmentPlan,
+        producer_trust: ArtifactProducerTrustTierV1,
+    ) -> Result<()> {
+        use ArtifactExecutionPhaseV1 as Phase;
+        use ArtifactFilesystemReadCapabilityV1 as Read;
+        use ArtifactFilesystemWriteCapabilityV1 as Write;
+        use ArtifactProcessCapabilityV1 as Process;
+        use ArtifactProducerTrustTierV1 as Trust;
+
+        let expected_sandbox = match producer_trust {
+            Trust::ReviewedBuiltin => {
+                plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+            }
+            Trust::RepositoryDeclaration => {
+                plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            }
+            Trust::CertifiedSignedPlugin | Trust::LocallyTrustedPlugin => matches!(
+                plan.sandbox_policy,
+                WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+                    | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                    | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
+            ),
+        };
+        if !expected_sandbox {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a sandbox policy above its {:?} producer ceiling",
+                plan.component_id, producer_trust
+            )));
+        }
+
+        let planning =
+            workspace_environment_capability_ceiling(producer_trust, Phase::DiscoveryPlanning);
+        let resolver = workspace_environment_capability_ceiling(producer_trust, Phase::Resolve);
+        let constructor =
+            workspace_environment_capability_ceiling(producer_trust, Phase::Construct);
+        let mounted =
+            workspace_environment_capability_ceiling(producer_trust, Phase::MountedExecution);
+        let validator = workspace_environment_capability_ceiling(producer_trust, Phase::Validate);
+        let exporter =
+            workspace_environment_capability_ceiling(producer_trust, Phase::SourceExport);
+        if [
+            &planning,
+            &resolver,
+            &constructor,
+            &mounted,
+            &validator,
+            &exporter,
+        ]
+        .into_iter()
+        .any(|ceiling| ceiling.publication_authority)
+        {
+            return Err(Error::Corrupt(
+                "artifact capability policy granted publication authority to executable code"
+                    .into(),
+            ));
+        }
+        if !plan.pre_commands.is_empty()
+            && (resolver.processes == Process::Deny || producer_trust != Trust::ReviewedBuiltin)
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a resolver command above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if plan.command.is_some() && constructor.processes == Process::Deny {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests constructor process execution above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if !plan.mounted_commands.is_empty()
+            && (mounted.processes == Process::Deny
+                || mounted.filesystem_read != Read::LaneView
+                || mounted.filesystem_write != Write::LaneBindings)
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests mounted execution above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if plan.source_projection.is_some()
+            && constructor.filesystem_read != Read::PinnedSourceClosure
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests a complete source projection above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if !plan.caches.is_empty() && constructor.filesystem_write != Write::CandidateAndHostCache {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests host cache writes above its producer ceiling",
+                plan.component_id
+            )));
+        }
+        if producer_trust == Trust::RepositoryDeclaration
+            && (!plan.external_artifacts.is_empty() || !plan.runtime_resources.is_empty())
+        {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requests provider authority above the repository-declaration ceiling",
+                plan.component_id
+            )));
+        }
+        Ok(())
     }
 
     fn validate_workspace_environment_plan_common(
@@ -2263,6 +3095,40 @@ impl Trail {
     ) -> Result<()> {
         let mut tool_identities = BTreeMap::new();
         self.validate_workspace_environment_plan_common_with_tool_cache(plan, &mut tool_identities)
+    }
+
+    pub(super) fn verified_workspace_environment_resolution_snapshot<F>(
+        &self,
+        proposal_key: &str,
+        source_root: &ObjectId,
+        component_id: &str,
+        adapter_identity: &str,
+        snapshot_format: &str,
+        validate_content: F,
+    ) -> Result<Option<(ObjectId, ArtifactResolutionSnapshotV1, Vec<u8>)>>
+    where
+        F: FnOnce(&[u8]) -> Result<()>,
+    {
+        let Some((snapshot_id, snapshot)) =
+            self.artifact_resolution_snapshot_for_proposal(proposal_key)?
+        else {
+            return Ok(None);
+        };
+        if snapshot.proposal_key != proposal_key
+            || snapshot.source_root != *source_root
+            || snapshot.component_id != component_id
+            || snapshot.adapter_identity != adapter_identity
+            || snapshot.snapshot_format != snapshot_format
+            || snapshot.verification_state != ArtifactResolutionVerificationStateV1::Verified
+            || !snapshot.secret_taint.is_clear()
+        {
+            return Err(Error::Corrupt(format!(
+                "environment resolution snapshot {snapshot_id} does not match proposal `{proposal_key}`"
+            )));
+        }
+        let bytes = self.artifact_resolution_snapshot_content(&snapshot)?;
+        validate_content(&bytes)?;
+        Ok(Some((snapshot_id, snapshot, bytes)))
     }
 
     fn validate_workspace_environment_plan_common_with_tool_cache(
@@ -2377,10 +3243,16 @@ impl Trail {
                 plan.component_id
             )));
         }
-        let mut external_names = BTreeSet::new();
+        let mut external_names = BTreeMap::new();
         for artifact in &plan.external_artifacts {
             validate_workspace_environment_external_artifact(artifact)?;
-            if !external_names.insert(&artifact.name) {
+            if external_names
+                .insert(
+                    artifact.name.as_str(),
+                    artifact.artifact_type == "oci_image" && artifact.provider == "oci",
+                )
+                .is_some()
+            {
                 return Err(Error::InvalidInput(format!(
                     "component `{}` repeats external artifact `{}`",
                     plan.component_id, artifact.name
@@ -2411,9 +3283,12 @@ impl Trail {
                     plan.component_id, resource.name
                 )));
             }
-            if !external_names.contains(&resource.artifact_name) {
+            if !external_names
+                .get(resource.artifact_name.as_str())
+                .is_some_and(|is_oci_image| *is_oci_image)
+            {
                 return Err(Error::InvalidInput(format!(
-                    "component `{}` runtime resource `{}` references missing external artifact `{}`",
+                    "component `{}` runtime resource `{}` references missing or non-OCI external artifact `{}`",
                     plan.component_id, resource.name, resource.artifact_name
                 )));
             }
@@ -2630,6 +3505,67 @@ impl Trail {
                 )));
             }
         }
+        for input in &plan.resolution_inputs {
+            normalize_relative_path(&input.source_path)?;
+            let staging = normalize_relative_path(&input.staging_path)?;
+            let Some((projection_root, staging_root)) = &plan.source_projection else {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution metadata requires a pinned source projection",
+                    plan.component_id
+                )));
+            };
+            let expected_staging = format!("{staging_root}/{}", input.source_path);
+            if projection_root != &input.source_root || staging != expected_staging {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input `{}` is not bound to its pinned source projection",
+                    plan.component_id, input.source_path
+                )));
+            }
+            if !plan
+                .layer_key
+                .inputs
+                .values()
+                .any(|value| value == &input.content_hash)
+                || !plan
+                    .layer_key
+                    .inputs
+                    .values()
+                    .any(|value| value == &format!("snapshot:{}", input.snapshot_id.0))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input {} is absent from its artifact identity",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            if !staging_paths.insert(staging.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` maps more than one input to `{staging}`",
+                    plan.component_id
+                )));
+            }
+            let (snapshot, bytes) =
+                self.artifact_resolution_snapshot_content_by_id(&input.snapshot_id)?;
+            if snapshot.source_root != input.source_root
+                || snapshot.component_id != plan.component_id
+                || snapshot.adapter_identity != plan.adapter_identity
+                || snapshot.content_sha256 != input.content_hash
+                || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != input.size_bytes
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input {} does not match its pinned plan",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            if self
+                .root_file_entry(&input.source_root, &input.source_path)?
+                .is_some()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution input `{}` would replace tracked source",
+                    plan.component_id, input.source_path
+                )));
+            }
+        }
         if let Some((_, staging_root)) = &plan.source_projection {
             normalize_relative_path(staging_root)?;
         }
@@ -2677,6 +3613,7 @@ impl Trail {
     fn prepare_workspace_environment_artifacts(
         &self,
         view_id: &str,
+        source_root: &ObjectId,
         plan: &WorkspaceEnvironmentPlan,
         component_key: &str,
     ) -> Result<PreparedEnvironmentArtifacts> {
@@ -2706,10 +3643,11 @@ impl Trail {
             WorkspaceEnvironmentOutputPolicy::ImmutableShared
             | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => {
                 let prior = self.workspace_layer_by_cache_key(component_key)?;
-                let layer = self
-                    .build_workspace_layer_singleflight(&plan.layer_key, |build_dir| {
-                        self.execute_workspace_environment_plan(plan, build_dir)
-                    })?;
+                let layer = self.build_workspace_layer_singleflight(
+                    &plan.layer_key,
+                    source_root,
+                    |build_dir| self.execute_workspace_environment_plan(plan, build_dir),
+                )?;
                 let hit = prior
                     .as_ref()
                     .is_some_and(|candidate| candidate.state == "ready");
@@ -2922,6 +3860,7 @@ impl Trail {
     fn prepare_workspace_environment_artifacts_parallel(
         &self,
         view_id: &str,
+        source_root: &ObjectId,
         planned: &[(WorkspaceEnvironmentPlan, String, Option<String>)],
     ) -> Result<Vec<PreparedEnvironmentArtifacts>> {
         let concurrency = usize::try_from(
@@ -2936,7 +3875,7 @@ impl Trail {
             return planned
                 .iter()
                 .map(|(plan, key, _)| {
-                    self.prepare_workspace_environment_artifacts(view_id, plan, key)
+                    self.prepare_workspace_environment_artifacts(view_id, source_root, plan, key)
                 })
                 .collect();
         }
@@ -2972,6 +3911,7 @@ impl Trail {
             }
             let workspace = self.workspace_root().to_path_buf();
             let view_id = view_id.to_string();
+            let source_root = source_root.clone();
             let wave = thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(ready.len());
                 for (component_id, index) in &ready {
@@ -2980,12 +3920,27 @@ impl Trail {
                     let key = planned[*index].1.clone();
                     let workspace = workspace.clone();
                     let view_id = view_id.clone();
+                    let source_root = source_root.clone();
                     handles.push((
                         *index,
                         component_id,
                         scope.spawn(move || {
                             let db = Trail::open(&workspace)?;
-                            db.prepare_workspace_environment_artifacts(&view_id, &plan, &key)
+                            // External builds run concurrently, while each
+                            // immutable publication remains serialized by the
+                            // workspace lock. A worker can still meet the
+                            // preceding worker's WAL commit briefly after the
+                            // handoff, so wait within the construction lease
+                            // instead of escaping a transient SQLITE_BUSY.
+                            db.conn.busy_timeout(Duration::from_secs(
+                                PARALLEL_ENVIRONMENT_SQLITE_WAIT_SECS,
+                            ))?;
+                            db.prepare_workspace_environment_artifacts(
+                                &view_id,
+                                &source_root,
+                                &plan,
+                                &key,
+                            )
                         }),
                     ));
                 }
@@ -3237,6 +4192,8 @@ impl Trail {
                     layer_id: layer_id.map(str::to_string),
                     mount_path: output.mount_path.clone(),
                     storage_path,
+                    artifact_tree_id: None,
+                    artifact_subpath: String::new(),
                     kind: plan.kind.clone(),
                     priority: 100,
                 });
@@ -3461,7 +4418,10 @@ impl Trail {
             .env("HOME", &isolated_home)
             .env("TMPDIR", &isolated_tmp)
             .env("TMP", &isolated_tmp)
-            .env("TEMP", &isolated_tmp);
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
             command
                 .env("TRAIL_WORKSPACE", self.workspace_root())
@@ -3783,6 +4743,26 @@ impl Trail {
                 &input.entry,
             )?;
         }
+        for input in &plan.resolution_inputs {
+            let (snapshot, bytes) =
+                self.artifact_resolution_snapshot_content_by_id(&input.snapshot_id)?;
+            if snapshot.source_root != input.source_root
+                || snapshot.component_id != plan.component_id
+                || snapshot.adapter_identity != plan.adapter_identity
+                || snapshot.content_sha256 != input.content_hash
+                || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != input.size_bytes
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` resolution snapshot {} changed after planning",
+                    plan.component_id, input.snapshot_id
+                )));
+            }
+            self.materialize_workspace_environment_resolution_input(
+                build_dir,
+                &input.staging_path,
+                &bytes,
+            )?;
+        }
         let mut outputs = Vec::with_capacity(plan.outputs.len());
         for declaration in &plan.outputs {
             let output = safe_join(build_dir, &declaration.output_path)?;
@@ -4037,7 +5017,10 @@ impl Trail {
             .env("HOME", &isolated_home)
             .env("TMPDIR", &isolated_tmp)
             .env("TMP", &isolated_tmp)
-            .env("TEMP", &isolated_tmp);
+            .env("TEMP", &isolated_tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -4050,16 +5033,45 @@ impl Trail {
         for name in &command_plan.remove_environment {
             command.env_remove(name);
         }
-        let status = command.status().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
             Error::InvalidInput(format!(
                 "failed to launch `{}` for component `{}`: {err}",
                 command_plan.program, plan.component_id
             ))
         })?;
-        if !status.success() {
-            return Err(Error::InvalidInput(format!(
-                "environment build for component `{}` failed with {status}",
+        let stderr = child.stderr.take().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "environment build for component `{}` lost its diagnostic pipe",
                 plan.component_id
+            ))
+        })?;
+        let diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
+        let status = child.wait();
+        let diagnostic = diagnostic
+            .join()
+            .map_err(|_| {
+                Error::Corrupt(format!(
+                    "environment build diagnostic reader for component `{}` panicked",
+                    plan.component_id
+                ))
+            })?
+            .map_err(Error::Io)?;
+        let status = status?;
+        if !status.success() {
+            let truncated = diagnostic.truncated;
+            let diagnostic_text =
+                redact_sensitive_text(&String::from_utf8_lossy(&diagnostic.bytes));
+            let diagnostic_text = diagnostic_text.trim();
+            let details = if diagnostic_text.is_empty() {
+                String::new()
+            } else if truncated {
+                format!(": {diagnostic_text} [truncated]")
+            } else {
+                format!(": {diagnostic_text}")
+            };
+            return Err(Error::InvalidInput(format!(
+                "environment build for component `{}` failed with {status}{details}",
+                plan.component_id,
             )));
         }
         Ok(())
@@ -4352,6 +5364,37 @@ impl Trail {
             .write(true)
             .open(&destination)?
             .set_modified(SystemTime::UNIX_EPOCH)?;
+        Ok(())
+    }
+
+    fn materialize_workspace_environment_resolution_input(
+        &self,
+        build_dir: &Path,
+        staging_path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let destination = safe_join(build_dir, staging_path)?;
+        if destination.exists() {
+            return Err(Error::InvalidInput(format!(
+                "resolution input `{staging_path}` would replace projected source"
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)?;
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        let mut permissions = output.metadata()?.permissions();
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        #[cfg(unix)]
+        permissions.set_mode(0o644);
+        fs::set_permissions(&destination, permissions)?;
+        output.set_modified(SystemTime::UNIX_EPOCH)?;
         Ok(())
     }
 
@@ -5073,6 +6116,105 @@ impl Trail {
     }
 }
 
+fn normalize_environment_component_proposal(
+    component: &mut EnvironmentDiscoveredComponentReport,
+) -> Result<()> {
+    if component.reasons.len() > MAX_ENVIRONMENT_PROPOSAL_REASONS {
+        return Err(Error::InvalidInput(format!(
+            "environment component `{}` has {} proposal reasons; maximum is {MAX_ENVIRONMENT_PROPOSAL_REASONS}",
+            component.component_id,
+            component.reasons.len()
+        )));
+    }
+    if component.recovery_actions.len() > MAX_ENVIRONMENT_RECOVERY_ACTIONS {
+        return Err(Error::InvalidInput(format!(
+            "environment component `{}` has {} recovery actions; maximum is {MAX_ENVIRONMENT_RECOVERY_ACTIONS}",
+            component.component_id,
+            component.recovery_actions.len()
+        )));
+    }
+    for reason in &component.reasons {
+        validate_environment_proposal_token(&reason.code, "reason code")?;
+        validate_environment_proposal_text(&reason.message, "reason message")?;
+    }
+    for action in &component.recovery_actions {
+        validate_environment_proposal_token(&action.code, "recovery action code")?;
+        validate_environment_proposal_text(&action.description, "recovery action description")?;
+        if let Some(command) = &action.command {
+            if command.is_empty() || command.len() > MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS {
+                return Err(Error::InvalidInput(format!(
+                    "environment recovery action `{}` command must contain between 1 and {MAX_ENVIRONMENT_RECOVERY_COMMAND_ARGS} arguments",
+                    action.code
+                )));
+            }
+            for argument in command {
+                validate_environment_proposal_text(argument, "recovery command argument")?;
+            }
+        }
+    }
+    component
+        .reasons
+        .sort_by(|left, right| (&left.code, &left.message).cmp(&(&right.code, &right.message)));
+    component.recovery_actions.sort_by(|left, right| {
+        (&left.code, &left.description, &left.command).cmp(&(
+            &right.code,
+            &right.description,
+            &right.command,
+        ))
+    });
+    Ok(())
+}
+
+fn validate_environment_proposal_token(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment proposal {field} `{value}` is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_environment_proposal_text(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES
+        || value.chars().any(|character| character == '\0')
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment proposal {field} is empty, oversized, or contains NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_resolver_pipe<R: Read>(
+    mut reader: R,
+    limit: u64,
+) -> std::io::Result<BoundedResolverPipe> {
+    let mut bytes = Vec::with_capacity(usize::try_from(limit.min(64 * 1024)).unwrap_or(0));
+    let mut original_bytes = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        original_bytes = original_bytes.saturating_add(read as u64);
+        let retained = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let remaining = limit.saturating_sub(retained);
+        let keep = read.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        bytes.extend_from_slice(&buffer[..keep]);
+    }
+    Ok(BoundedResolverPipe {
+        bytes,
+        original_bytes,
+    })
+}
+
 fn run_supervised_mounted_plugin_process(
     command: &mut Command,
 ) -> Result<std::process::ExitStatus> {
@@ -5238,7 +6380,9 @@ fn split_adapter_identity(identity: &str, fallback_major: u32) -> (String, Strin
     )
 }
 
-fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) -> Result<()> {
+pub(super) fn workspace_environment_artifact_contract_digest(
+    plan: &WorkspaceEnvironmentPlan,
+) -> Result<String> {
     #[derive(Serialize)]
     struct CanonicalOutput<'a> {
         name: &'a str,
@@ -5257,7 +6401,14 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
         executable_identity: &'a str,
         args: &'a [String],
         working_directory: &'a str,
-        environment: &'a BTreeMap<String, String>,
+        environment: BTreeMap<String, String>,
+    }
+    #[derive(Serialize)]
+    struct CanonicalCache<'a> {
+        name: &'a str,
+        protocol: &'a str,
+        access: &'a str,
+        compatibility: &'a BTreeMap<String, String>,
     }
     for command in plan
         .pre_commands
@@ -5293,6 +6444,16 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
             gate: output.gate.as_deref(),
         })
         .collect::<Vec<_>>();
+    let cache_paths = plan
+        .caches
+        .iter()
+        .map(|cache| {
+            (
+                cache.storage_path.to_string_lossy().into_owned(),
+                format!("trail-cache:{}", cache.name),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let commands = plan
         .pre_commands
         .iter()
@@ -5309,25 +6470,159 @@ fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) 
             executable_identity: &command.executable_identity,
             args: &command.args,
             working_directory: &command.working_directory,
-            environment: &command.environment,
+            environment: command
+                .environment
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        cache_paths
+                            .get(value)
+                            .cloned()
+                            .unwrap_or_else(|| value.clone()),
+                    )
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
+    let caches = plan
+        .caches
+        .iter()
+        .map(|cache| CanonicalCache {
+            name: &cache.name,
+            protocol: cache.protocol.as_str(),
+            access: cache.access.as_str(),
+            compatibility: &cache.compatibility,
+        })
+        .collect::<Vec<_>>();
+    let artifact_contract_digest = sha256_hex(&serde_json::to_vec(&serde_json::json!({
+        "contract_version": 1,
+        "adapter_identity": plan.adapter_identity,
+        "implementation_version": plan.implementation_version,
+        "distribution_digest": plan.distribution_digest,
+        "outputs": outputs,
+        "commands": commands,
+        "caches": caches,
+        "external_artifacts": workspace_external_artifacts_identity(&plan.external_artifacts)?,
+        "runtime_resources": workspace_runtime_resources_identity(&plan.runtime_resources)?,
+        "validation": format!("sandbox:{:?}", plan.sandbox_policy),
+        "platform": plan.layer_key.platform,
+        "architecture": plan.layer_key.architecture,
+        "portability_scope": plan.layer_key.portability_scope,
+    }))?);
+    Ok(artifact_contract_digest)
+}
+
+fn add_host_canonical_environment_identity(plan: &mut WorkspaceEnvironmentPlan) -> Result<()> {
+    let artifact_contract_digest = workspace_environment_artifact_contract_digest(plan)?;
     plan.layer_key.inputs.insert(
         "host:artifact_contract_v1".to_string(),
-        sha256_hex(&serde_json::to_vec(&serde_json::json!({
-            "contract_version": 1,
-            "adapter_identity": plan.adapter_identity,
-            "implementation_version": plan.implementation_version,
-            "distribution_digest": plan.distribution_digest,
-            "outputs": outputs,
-            "commands": commands,
-            "validation": format!("sandbox:{:?}", plan.sandbox_policy),
-            "platform": plan.layer_key.platform,
-            "architecture": plan.layer_key.architecture,
-            "portability_scope": plan.layer_key.portability_scope,
-        }))?),
+        artifact_contract_digest.clone(),
+    );
+    let identity = workspace_environment_identity_contract_v3(plan, artifact_contract_digest)?;
+    plan.layer_key.inputs.insert(
+        "host:adapter_identity_protocol".to_string(),
+        trail_environment_adapter_sdk::PROTOCOL_V3.to_string(),
+    );
+    plan.layer_key.inputs.insert(
+        "host:adapter_identity_v3".to_string(),
+        sha256_hex(&serde_json::to_vec(&identity)?),
     );
     Ok(())
+}
+
+pub(super) fn workspace_environment_identity_contract_v3(
+    plan: &WorkspaceEnvironmentPlan,
+    artifact_contract_digest: String,
+) -> Result<trail_environment_adapter_sdk::AdapterIdentityContractV3> {
+    use trail_environment_adapter_sdk::{AdapterIdentityContractV3, AdapterPortability};
+
+    let mut semantic_identities = BTreeMap::from([(
+        "host_artifact_contract".to_string(),
+        artifact_contract_digest,
+    )]);
+    for cache in &plan.caches {
+        let contract = serde_json::json!({
+            "name": cache.name,
+            "protocol": cache.protocol.as_str(),
+            "access": cache.access.as_str(),
+            "compatibility": cache.compatibility,
+        });
+        semantic_identities.insert(
+            format!("performance_cache:{}", cache.name),
+            sha256_hex(&serde_json::to_vec(&contract)?),
+        );
+    }
+    if !plan.external_artifacts.is_empty() {
+        semantic_identities.insert(
+            "external_artifacts".to_string(),
+            sha256_hex(workspace_external_artifacts_identity(&plan.external_artifacts)?.as_bytes()),
+        );
+    }
+    if !plan.runtime_resources.is_empty() {
+        semantic_identities.insert(
+            "runtime_resources".to_string(),
+            sha256_hex(workspace_runtime_resources_identity(&plan.runtime_resources)?.as_bytes()),
+        );
+    }
+    let snapshot_ids = plan
+        .resolution_inputs
+        .iter()
+        .map(|input| input.snapshot_id.0.as_str())
+        .collect::<BTreeSet<_>>();
+    if !snapshot_ids.is_empty() {
+        semantic_identities.insert(
+            "resolution_snapshots".to_string(),
+            sha256_hex(
+                snapshot_ids
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("\0")
+                    .as_bytes(),
+            ),
+        );
+    }
+
+    let portability = if plan
+        .outputs
+        .iter()
+        .any(|output| output.scope == EnvironmentSharingScope::Host)
+        || plan.layer_key.portability_scope.contains("host")
+    {
+        AdapterPortability::Host
+    } else {
+        AdapterPortability::Platform
+    };
+    let portability_certified = plan.sandbox_policy
+        == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+        && !plan.outputs.is_empty()
+        && plan.outputs.iter().all(|output| {
+            matches!(
+                output.policy,
+                WorkspaceEnvironmentOutputPolicy::ImmutableShared
+                    | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+            )
+        });
+    let trust_scope = match plan.sandbox_policy {
+        WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin => "builtin",
+        WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe => "repository",
+        WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+        | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => "plugin",
+    };
+
+    Ok(AdapterIdentityContractV3 {
+        normalizer_version: "trail-host-environment-plan/v3".to_string(),
+        source_closure_complete: plan.source_projection.is_some(),
+        semantic_identities,
+        target: plan.layer_key.strategy.clone(),
+        platform: plan.layer_key.platform.clone(),
+        architecture: plan.layer_key.architecture.clone(),
+        abi: "host-default".to_string(),
+        portability,
+        portability_certified,
+        portability_scope: plan.layer_key.portability_scope.clone(),
+        trust_scope: trust_scope.to_string(),
+    })
 }
 
 fn parse_canonical_adapter_identity(identity: &str) -> Option<(String, String, u32)> {
@@ -5910,8 +7205,6 @@ pub(super) fn validate_environment_external_artifact_report(
         || !artifact.name.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
         })
-        || artifact.artifact_type != "oci_image"
-        || artifact.provider != "oci"
         || artifact.cleanup_owner != "external"
     {
         return Err(Error::InvalidInput(format!(
@@ -5935,42 +7228,92 @@ pub(super) fn validate_environment_external_artifact_report(
             artifact.name
         )));
     }
-    let (repository, reference_digest) = artifact.reference.rsplit_once('@').ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "external OCI artifact `{}` must use a digest-pinned reference",
+    match artifact.artifact_type.as_str() {
+        "oci_image" if artifact.provider == "oci" => {
+            let (repository, reference_digest) =
+                artifact.reference.rsplit_once('@').ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "external OCI artifact `{}` must use a digest-pinned reference",
+                        artifact.name
+                    ))
+                })?;
+            if repository.is_empty()
+                || repository.len() > 2048
+                || repository.contains('@')
+                || repository.starts_with('/')
+                || repository.ends_with('/')
+                || !repository
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
+                || reference_digest != artifact.digest
+            {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` has an invalid or mismatched reference",
+                    artifact.name
+                )));
+            }
+            let Some((operating_system, architecture)) = artifact.platform.split_once('/') else {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` requires an os/architecture platform",
+                    artifact.name
+                )));
+            };
+            if !matches!(operating_system, "linux" | "windows")
+                || !matches!(architecture, "amd64" | "arm64")
+            {
+                return Err(Error::InvalidInput(format!(
+                    "external OCI artifact `{}` uses unsupported platform `{}`",
+                    artifact.name, artifact.platform
+                )));
+            }
+            Ok(())
+        }
+        "verified_external"
+            if valid_external_identity_token(&artifact.provider)
+                && valid_external_reference(&artifact.reference)
+                && valid_external_platform(&artifact.platform) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::InvalidInput(format!(
+            "external artifact `{}` has an unsupported type, provider, reference, or platform contract",
             artifact.name
-        ))
-    })?;
-    if repository.is_empty()
-        || repository.len() > 2048
-        || repository.contains('@')
-        || repository.starts_with('/')
-        || repository.ends_with('/')
-        || !repository
+        ))),
+    }
+}
+
+fn valid_external_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+}
+
+fn valid_external_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && !may_contain_sensitive_text(value)
+        && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
-        || reference_digest != artifact.digest
-    {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` has an invalid or mismatched reference",
-            artifact.name
-        )));
-    }
-    let Some((operating_system, architecture)) = artifact.platform.split_once('/') else {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` requires an os/architecture platform",
-            artifact.name
-        )));
-    };
-    if !matches!(operating_system, "linux" | "windows")
-        || !matches!(architecture, "amd64" | "arm64")
-    {
-        return Err(Error::InvalidInput(format!(
-            "external OCI artifact `{}` uses unsupported platform `{}`",
-            artifact.name, artifact.platform
-        )));
-    }
-    Ok(())
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:+@=".contains(&byte))
+}
+
+fn valid_external_platform(value: &str) -> bool {
+    value == "any"
+        || (!value.is_empty()
+            && value.len() <= 128
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && value.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "."
+                    && segment != ".."
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+            }))
 }
 
 struct WorkspaceEnvironmentCacheUseGuard {
@@ -6270,7 +7613,7 @@ pub(super) fn validate_environment_component_identity(component_id: &str) -> Res
     Ok(())
 }
 
-fn workspace_tool_identity_for_path(path: &Path) -> Result<String> {
+pub(crate) fn workspace_tool_identity_for_path(path: &Path) -> Result<String> {
     let canonical = fs::canonicalize(path)?;
     if !canonical.is_file() {
         return Err(Error::InvalidInput(format!(
@@ -6466,6 +7809,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn phase_capability_ceilings_are_total_deny_publication_and_do_not_elevate_signatures() {
+        use ArtifactExecutionPhaseV1 as Phase;
+        use ArtifactNetworkCapabilityV1 as Network;
+        use ArtifactProcessCapabilityV1 as Process;
+        use ArtifactProducerTrustTierV1 as Trust;
+
+        let tiers = [
+            Trust::ReviewedBuiltin,
+            Trust::CertifiedSignedPlugin,
+            Trust::LocallyTrustedPlugin,
+            Trust::RepositoryDeclaration,
+        ];
+        let phases = [
+            Phase::DiscoveryPlanning,
+            Phase::Resolve,
+            Phase::Construct,
+            Phase::Validate,
+            Phase::MountedExecution,
+            Phase::SourceExport,
+        ];
+        for tier in tiers {
+            for phase in phases {
+                let ceiling = workspace_environment_capability_ceiling(tier, phase);
+                assert_eq!(ceiling.producer_trust, tier);
+                assert_eq!(ceiling.phase, phase);
+                assert!(!ceiling.publication_authority);
+            }
+        }
+        assert_eq!(
+            workspace_environment_capability_ceiling(Trust::ReviewedBuiltin, Phase::Construct,)
+                .network,
+            Network::ReviewedBuiltinManaged
+        );
+        for tier in [
+            Trust::CertifiedSignedPlugin,
+            Trust::LocallyTrustedPlugin,
+            Trust::RepositoryDeclaration,
+        ] {
+            assert_eq!(
+                workspace_environment_capability_ceiling(tier, Phase::Construct).network,
+                Network::Deny
+            );
+        }
+        assert_eq!(
+            workspace_environment_capability_ceiling(
+                Trust::RepositoryDeclaration,
+                Phase::MountedExecution,
+            )
+            .processes,
+            Process::Deny
+        );
+        let signed = workspace_environment_capability_ceiling(
+            Trust::CertifiedSignedPlugin,
+            Phase::Construct,
+        );
+        let mut local =
+            workspace_environment_capability_ceiling(Trust::LocallyTrustedPlugin, Phase::Construct);
+        local.producer_trust = Trust::CertifiedSignedPlugin;
+        assert_eq!(signed, local);
+    }
+
+    #[test]
     fn workspace_environment_staging_parent_is_trail_owned() {
         let workspace = tempfile::tempdir().unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -6616,6 +8021,7 @@ mod tests {
                 strategy: "cache-test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -6638,6 +8044,108 @@ mod tests {
             stale_reason: "test".to_string(),
         };
         (plan, command)
+    }
+
+    #[test]
+    fn host_v3_identity_projection_is_canonical_and_preserves_private_cache_semantics() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::HostExclusive);
+
+        add_host_canonical_environment_identity(&mut plan).unwrap();
+        let first_key = db.workspace_layer_cache_key(&plan.layer_key).unwrap();
+        assert_eq!(
+            plan.layer_key
+                .inputs
+                .get("host:adapter_identity_protocol")
+                .map(String::as_str),
+            Some(trail_environment_adapter_sdk::PROTOCOL_V3)
+        );
+        assert!(plan
+            .layer_key
+            .inputs
+            .get("host:adapter_identity_v3")
+            .is_some_and(|digest| digest.len() == 64));
+
+        add_host_canonical_environment_identity(&mut plan).unwrap();
+        assert_eq!(
+            db.workspace_layer_cache_key(&plan.layer_key).unwrap(),
+            first_key
+        );
+        let contract_digest = workspace_environment_artifact_contract_digest(&plan).unwrap();
+        let identity = workspace_environment_identity_contract_v3(&plan, contract_digest).unwrap();
+        assert_eq!(identity.trust_scope, "builtin");
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert!(identity
+            .semantic_identities
+            .contains_key("performance_cache:test-cache"));
+        assert_eq!(
+            plan.caches[0].access,
+            WorkspaceEnvironmentCacheAccess::HostExclusive
+        );
+        assert_eq!(
+            plan.outputs[0].policy,
+            WorkspaceEnvironmentOutputPolicy::WritablePrivate
+        );
+    }
+
+    #[test]
+    fn inferred_plan_authority_cannot_exceed_the_selected_producer_tier() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, command) =
+            cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::HostExclusive);
+        db.validate_workspace_environment_capability_ceilings(
+            &plan,
+            ArtifactProducerTrustTierV1::ReviewedBuiltin,
+        )
+        .unwrap();
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sandbox policy above"));
+
+        plan.sandbox_policy = WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe;
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("host cache writes above"));
+        plan.caches.clear();
+        plan.command = None;
+        plan.mounted_commands = vec![command];
+        assert!(db
+            .validate_workspace_environment_capability_ceilings(
+                &plan,
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("mounted execution above"));
+    }
+
+    #[test]
+    fn environment_command_diagnostics_are_bounded_while_draining_the_pipe() {
+        let input = vec![b'x'; MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES + 1];
+        let diagnostic = spawn_bounded_environment_command_diagnostic(std::io::Cursor::new(input))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            diagnostic.bytes.len(),
+            MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES
+        );
+        assert!(diagnostic.truncated);
     }
 
     #[test]
@@ -6711,11 +8219,15 @@ mod tests {
         fs::write(plan.caches[0].storage_path.join("entry"), "cached\n").unwrap();
 
         let (sender, receiver) = std::sync::mpsc::channel();
-        let workspace_path = workspace.path().to_path_buf();
+        // Open the competing handle before measuring cache-lock contention.
+        // Under parallel test load, open recovery may legitimately hold the
+        // workspace mutation lock for longer than the short cache timeout;
+        // that is a different serialization boundary from the host-exclusive
+        // namespace lease this test is intended to exercise.
+        let concurrent = Trail::open(workspace.path()).unwrap();
         let concurrent_plan = plan.clone();
         let concurrent_command = command.clone();
         let worker = thread::spawn(move || {
-            let concurrent = Trail::open(workspace_path).unwrap();
             let guard = concurrent
                 .acquire_workspace_environment_cache_uses(&concurrent_plan, &concurrent_command)
                 .unwrap();
@@ -6914,6 +8426,7 @@ mod tests {
                 strategy: "mounted-failure-candidate".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,
@@ -7249,6 +8762,7 @@ mod tests {
                         strategy: "dependency-scale-test".to_string(),
                     },
                     inputs: Vec::new(),
+                    resolution_inputs: Vec::new(),
                     source_projection: None,
                     pre_commands: Vec::new(),
                     command: None,
@@ -7312,6 +8826,7 @@ mod tests {
                     strategy: "typed-edge-test".to_string(),
                 },
                 inputs: Vec::new(),
+                resolution_inputs: Vec::new(),
                 source_projection: None,
                 pre_commands: Vec::new(),
                 command: None,
@@ -7431,6 +8946,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -7457,6 +8973,190 @@ mod tests {
             .run_workspace_environment_command(&plan, &command, build.path())
             .unwrap_err();
         assert!(error.to_string().contains("changed after"));
+    }
+
+    #[test]
+    fn component_proposal_evidence_is_sorted_and_bounded() {
+        let mut proposal = EnvironmentDiscoveredComponentReport {
+            component_id: "component".to_string(),
+            component_root: String::new(),
+            kind: "dependency".to_string(),
+            adapter_identity: "test/adapter@1".to_string(),
+            status: EnvironmentComponentProposalStatus::Blocked,
+            reasons: vec![
+                EnvironmentProposalReasonReport {
+                    code: "z_reason".to_string(),
+                    message: "last".to_string(),
+                },
+                EnvironmentProposalReasonReport {
+                    code: "a_reason".to_string(),
+                    message: "first".to_string(),
+                },
+            ],
+            recovery_actions: vec![
+                EnvironmentRecoveryActionReport {
+                    code: "z_action".to_string(),
+                    description: "last".to_string(),
+                    command: None,
+                },
+                EnvironmentRecoveryActionReport {
+                    code: "a_action".to_string(),
+                    description: "first".to_string(),
+                    command: Some(vec!["trail".to_string(), "env".to_string()]),
+                },
+            ],
+        };
+        normalize_environment_component_proposal(&mut proposal).unwrap();
+        assert_eq!(proposal.reasons[0].code, "a_reason");
+        assert_eq!(proposal.recovery_actions[0].code, "a_action");
+
+        proposal.reasons[0].message = "x".repeat(MAX_ENVIRONMENT_PROPOSAL_TEXT_BYTES + 1);
+        let error = normalize_environment_component_proposal(&mut proposal).unwrap_err();
+        assert!(error.to_string().contains("oversized"));
+    }
+
+    #[test]
+    fn manifest_only_cargo_and_node_components_are_reported_without_resolution_side_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"manifest-only\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"manifest-only","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "manifest-only",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let discovery = db
+            .discover_workspace_environment("manifest-only", None)
+            .unwrap();
+        assert!(discovery.conflicts.is_empty());
+        assert_eq!(discovery.components.len(), 2);
+        for component in &discovery.components {
+            assert_eq!(
+                component.status,
+                EnvironmentComponentProposalStatus::Resolvable
+            );
+            assert_eq!(
+                component.recovery_actions[0].command,
+                Some(vec![
+                    "trail".into(),
+                    "env".into(),
+                    "resolve".into(),
+                    "component".into(),
+                    component.component_id.clone(),
+                    "--lane".into(),
+                    "manifest-only".into(),
+                ])
+            );
+            assert_eq!(component.reasons.len(), 1);
+            assert_eq!(component.reasons[0].code, "resolution_snapshot_missing");
+            assert_eq!(component.recovery_actions.len(), 1);
+        }
+        assert!(!workspace.path().join("Cargo.lock").exists());
+        assert!(!workspace.path().join("package-lock.json").exists());
+        assert!(!workspace.path().join("pnpm-lock.yaml").exists());
+        assert!(!workspace.path().join("yarn.lock").exists());
+        assert!(!workspace.path().join("bun.lock").exists());
+    }
+
+    #[test]
+    fn host_resolver_executes_cargo_in_isolated_staging_and_reuses_snapshot() {
+        if resolve_workspace_tool_executable("cargo").is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"host-resolver\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "resolve-cargo",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let first = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.decision, ArtifactResolutionDecisionV1::Resolved);
+        assert!(first.attempt.is_some());
+        assert!(!workspace.path().join("Cargo.lock").exists());
+        let second = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert_eq!(second.decision, ArtifactResolutionDecisionV1::Reused);
+        assert!(second.attempt.is_none());
+        let refreshed = db
+            .resolve_workspace_environment_component(
+                "resolve-cargo",
+                "cargo-target-seed",
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(refreshed.decision, ArtifactResolutionDecisionV1::Refreshed);
+        assert_eq!(
+            refreshed.snapshot.predecessor_snapshot_id,
+            Some(first.snapshot_id)
+        );
+        assert!(refreshed.attempt.is_some());
+        let batch = db
+            .resolve_all_workspace_environment_components("resolve-cargo", None, false)
+            .unwrap();
+        assert_eq!(batch.components.len(), 1);
+        assert_eq!(
+            batch.components[0].decision,
+            ArtifactResolutionDecisionV1::Reused
+        );
     }
 
     #[test]
@@ -7592,6 +9292,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {
@@ -7684,6 +9385,7 @@ mod tests {
                 strategy: "test".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command),

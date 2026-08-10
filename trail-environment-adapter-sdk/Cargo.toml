@@ -19,6 +19,7 @@ thiserror.workspace = true
 [dev-dependencies]
 ed25519-dalek.workspace = true
 hex.workspace = true
+proptest = "=1.8.0"
 sha2.workspace = true
 toml.workspace = true
 

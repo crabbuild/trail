@@ -14,6 +14,9 @@ on:
       - "scripts/verify-windows-command-recipe-sandbox.ps1"
       - "scripts/verify-macos-nfs-framework-layers.sh"
       - "scripts/verify-environment-adapter-plugin.sh"
+      - "scripts/verify-artifact-adapter-conformance.sh"
+      - "scripts/verify-artifact-real-tool-gates.sh"
+      - "scripts/verify-artifact-native-cow-matrix.py"
       - "scripts/verify-windows-environment-adapter-plugin.ps1"
       - "trail-environment-adapter-sdk/**"
       - ".github/workflows/layered-workspaces.yml"
@@ -46,9 +49,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p trail-environment-adapter-sdk --locked
       - run: cargo test -p trail view_core_ --no-default-features
       - if: ${{ runner.os != 'Windows' }}
         run: cargo test -p trail workspace_layer --no-default-features
+
+  artifact-common-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-artifact-adapter-conformance.sh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-common-contract-target
+
+  artifact-real-tool-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: sudo chmod 666 /dev/fuse
+      - run: node --version && npm --version && cmake --version && python3 --version
+      - run: scripts/verify-artifact-real-tool-gates.sh
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
 
   fuse-conformance:
     runs-on: ubuntu-latest
@@ -60,6 +87,9 @@ jobs:
       - run: sudo chmod 666 /dev/fuse
       - run: cmake --version && cc --version && make --version
       - run: cargo test -p trail fuse_adapter_runs_shared_mounted_view_suite -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - run: cargo test -p trail fuse_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
       - run: cargo test -p trail real_cmake_configure_build_and_clean_stay_lane_private -- --nocapture
@@ -77,6 +107,19 @@ jobs:
       - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
         env:
           TRAIL_RUN_FUSE_COW_TESTS: "1"
+      - name: Qualify CAS-backed FUSE artifact lifecycle
+        run: >-
+          python3 scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/fuse-linux.json"
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-fuse-linux
+          path: ${{ runner.temp }}/artifact-native-cow/fuse-linux.json
+          if-no-files-found: error
 
   rust-cache-isolation:
     runs-on: ubuntu-latest
@@ -132,6 +175,9 @@ jobs:
       - run: cargo test -p trail nfs_adapter_runs_shared_mounted_view_suite -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
       - run: cargo test -p trail real_nfs_mount_records_new_modified_and_renamed_files -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
@@ -163,6 +209,19 @@ jobs:
       - run: cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - name: Qualify CAS-backed NFS artifact lifecycle
+        run: >-
+          python3 scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/nfs-macos.json"
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-nfs-macos
+          path: ${{ runner.temp }}/artifact-native-cow/nfs-macos.json
+          if-no-files-found: error
 
   nfs-framework-bench:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_macos_framework_bench }}
@@ -185,6 +244,7 @@ jobs:
         run: |
           $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
           cargo test -p trail dokan_adapter_runs_shared_mounted_view_suite -- --nocapture
+          cargo test -p trail dokan_mount_reads_artifact_manifest_without_layer_materialization -- --nocapture
           cargo test -p trail foreground_dokan_mount_stops_through_a_separate_trail_handle -- --nocapture
           cargo test -p trail daemon_owned_dokan_mount_returns_ready_and_unmounts_asynchronously -- --nocapture
           cargo test -p trail real_windows_cmake_build_and_clean_stay_lane_private -- --nocapture
@@ -194,12 +254,39 @@ jobs:
           cargo test -p trail sync_all_initializes_nested_python_components_at_final_lane_paths -- --nocapture
       - run: ./scripts/verify-windows-command-recipe-sandbox.ps1
       - run: ./scripts/verify-windows-environment-adapter-plugin.ps1
+      - name: Qualify CAS-backed Dokan artifact lifecycle
+        shell: pwsh
+        run: >-
+          python scripts/verify-artifact-native-cow-matrix.py
+          --output "${{ runner.temp }}/artifact-native-cow/dokan-windows.json"
+        env:
+          TRAIL_RUN_DOKAN_COW_TESTS: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-artifact-native-cow-target
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: artifact-native-cow-dokan-windows
+          path: ${{ runner.temp }}/artifact-native-cow/dokan-windows.json
+          if-no-files-found: error
 
   million-path-scale:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_scale }}
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /Volumes/Workspace/crabbuild-target/trail-layered-scale
+      TRAIL_SCALE_EVIDENCE_DIR: /Volumes/Workspace/trail-layered-scale-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Prepare isolated scale storage
+        run: |
+          sudo mkdir -p "$CARGO_TARGET_DIR" "$TRAIL_SCALE_EVIDENCE_DIR"
+          sudo chown -R "$(id -u):$(id -g)" /Volumes/Workspace
       - run: scripts/verify-layered-lane-scale.sh
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: layered-lane-scale-evidence
+          path: /Volumes/Workspace/trail-layered-scale-evidence
+          if-no-files-found: error

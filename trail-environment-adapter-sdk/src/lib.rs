@@ -10,15 +10,41 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+mod protocol_v3;
+pub use protocol_v3::*;
+
 pub const PROTOCOL_V1: &str = "trail.environment-adapter/v1";
 /// Adds host-sandboxed actions that execute against Trail's ephemeral mounted
 /// candidate view. V1 remains the default for packages that do not declare a
 /// protocol list, so existing adapters keep their exact behavior.
 pub const PROTOCOL_V2: &str = "trail.environment-adapter/v2";
+/// Adds incomplete proposals, explicit resolution, typed artifact phases,
+/// validation/capability contracts, generated-source exports, and host-owned
+/// attestation/quarantine evidence without changing v1/v2 wire meanings.
+pub const PROTOCOL_V3: &str = "trail.environment-adapter/v3";
+/// Exact protocol identities in descending semantic version order.
+pub const ADAPTER_PROTOCOLS_HIGHEST_FIRST: [&str; 3] = [PROTOCOL_V3, PROTOCOL_V2, PROTOCOL_V1];
 pub const PACKAGE_SCHEMA_V1: &str = "trail.environment-adapter-package/v1";
 pub const PACKAGE_SIGNATURE_SCHEMA_V1: &str = "trail.environment-adapter-signature/v1";
 pub const TRUSTED_PUBLISHER_KEY_SCHEMA_V1: &str = "trail.environment-adapter-publisher-key/v1";
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Select the highest exact protocol identity supported by both peers.
+/// Prefixes, aliases, unknown future versions, and list order never influence
+/// the result.
+pub fn negotiate_highest_mutual_protocol(
+    host_protocols: &[&str],
+    package_protocols: &[String],
+) -> Option<&'static str> {
+    ADAPTER_PROTOCOLS_HIGHEST_FIRST
+        .into_iter()
+        .find(|candidate| {
+            host_protocols.contains(candidate)
+                && package_protocols
+                    .iter()
+                    .any(|protocol| protocol == candidate)
+        })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +72,10 @@ pub struct AdapterMetadata {
         skip_serializing_if = "is_default_v1_protocols"
     )]
     pub protocols: Vec<String>,
+    /// V3-only declarations. Missing metadata grants no v3 semantics and is
+    /// omitted from legacy package serialization.
+    #[serde(default, skip_serializing_if = "AdapterPackageCapabilities::is_denied")]
+    pub capabilities: AdapterPackageCapabilities,
     #[serde(default = "default_supported_operating_systems")]
     pub supported_operating_systems: Vec<String>,
     #[serde(default = "default_supported_architectures")]
@@ -56,6 +86,41 @@ pub struct AdapterMetadata {
 
 fn default_adapter_protocols() -> Vec<String> {
     vec![PROTOCOL_V1.to_string()]
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdapterPackageCapabilities {
+    pub resolution: bool,
+    pub source_exports: bool,
+    pub host_attestation_evidence: bool,
+    pub host_quarantine_evidence: bool,
+    pub certification_ceiling: AdapterCertificationCeiling,
+}
+
+impl AdapterPackageCapabilities {
+    pub fn is_denied(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterCertificationCeiling {
+    #[default]
+    LegacyExact,
+    LocalArtifact,
+    PortableArtifact,
+}
+
+impl AdapterCertificationCeiling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyExact => "legacy_exact",
+            Self::LocalArtifact => "local_artifact",
+            Self::PortableArtifact => "portable_artifact",
+        }
+    }
 }
 
 fn is_default_v1_protocols(protocols: &[String]) -> bool {
@@ -314,6 +379,27 @@ impl AdapterExternalArtifact {
             provider: "oci".to_string(),
             reference,
             digest,
+            platform: platform.into(),
+            cleanup_owner: "external".to_string(),
+        }
+    }
+
+    /// A provider-owned immutable store entry that Trail records by exact
+    /// reference and SHA-256 digest without manufacturing a filesystem layer.
+    /// The provider remains responsible for storage and cleanup.
+    pub fn verified_external(
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        reference: impl Into<String>,
+        digest: impl Into<String>,
+        platform: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            artifact_type: "verified_external".to_string(),
+            provider: provider.into(),
+            reference: reference.into(),
+            digest: digest.into(),
             platform: platform.into(),
             cleanup_owner: "external".to_string(),
         }
@@ -1076,8 +1162,9 @@ fn validate_adapter_external_artifacts(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         });
-        let valid_reference =
-            artifact
+        let valid_oci = artifact.artifact_type == "oci_image"
+            && artifact.provider == "oci"
+            && artifact
                 .reference
                 .rsplit_once('@')
                 .is_some_and(|(repository, digest)| {
@@ -1087,22 +1174,24 @@ fn validate_adapter_external_artifacts(
                         && repository
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:".contains(&byte))
-                });
+                })
+            && matches!(
+                artifact.platform.as_str(),
+                "linux/amd64" | "linux/arm64" | "windows/amd64" | "windows/arm64"
+            );
+        let valid_verified_external = artifact.artifact_type == "verified_external"
+            && valid_external_identity_token(&artifact.provider)
+            && valid_external_reference(&artifact.reference)
+            && valid_external_platform(&artifact.platform);
         if artifact.name.is_empty()
             || artifact.name.len() > 128
             || !artifact.name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
             })
             || index > 0 && artifacts[index - 1].name == artifact.name
-            || artifact.artifact_type != "oci_image"
-            || artifact.provider != "oci"
             || artifact.cleanup_owner != "external"
             || !valid_digest
-            || !valid_reference
-            || !matches!(
-                artifact.platform.as_str(),
-                "linux/amd64" | "linux/arm64" | "windows/amd64" | "windows/arm64"
-            )
+            || !(valid_oci || valid_verified_external)
         {
             return Err(AdapterPlanBuildError::InvalidExternalArtifact {
                 artifact: artifact.name.clone(),
@@ -1110,6 +1199,55 @@ fn validate_adapter_external_artifacts(
         }
     }
     Ok(())
+}
+
+fn valid_external_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+}
+
+fn valid_external_reference(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && ![
+            "authorization",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "api_key",
+            "api-key",
+            "apikey",
+            "private_key",
+            "private-key",
+            "bearer",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/:+@=".contains(&byte))
+}
+
+fn valid_external_platform(value: &str) -> bool {
+    value == "any"
+        || (!value.is_empty()
+            && value.len() <= 128
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && value.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "."
+                    && segment != ".."
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+            }))
 }
 
 fn validate_adapter_runtime_resources(
@@ -1123,8 +1261,13 @@ fn validate_adapter_runtime_resources(
     }
     let artifact_names = artifacts
         .iter()
-        .map(|artifact| artifact.name.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|artifact| {
+            (
+                artifact.name.as_str(),
+                artifact.artifact_type == "oci_image" && artifact.provider == "oci",
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     resources.sort_by(|left, right| left.name.cmp(&right.name));
     for resource in resources.iter_mut() {
         resource
@@ -1155,7 +1298,9 @@ fn validate_adapter_runtime_resources(
             || index > 0 && resources[index - 1].name == resource.name
             || resource.runtime_type != "container"
             || resource.provider != "oci"
-            || !artifact_names.contains(resource.artifact_name.as_str())
+            || !artifact_names
+                .get(resource.artifact_name.as_str())
+                .is_some_and(|is_oci_image| *is_oci_image)
             || resource.container_port == 0
             || resource.protocol != "tcp"
             || resource.health_type != "tcp"
@@ -1659,9 +1804,46 @@ pub fn serve_once(
     write_frame(&mut io::stdout().lock(), &response, MAX_FRAME_BYTES)
 }
 
+pub fn serve_once_v3(
+    handler: impl FnOnce(AdapterRequestV3) -> AdapterResponseV3,
+) -> Result<(), ProtocolError> {
+    let request = read_frame(&mut io::stdin().lock(), MAX_FRAME_BYTES)?;
+    let response = handler(request);
+    write_frame(&mut io::stdout().lock(), &response, MAX_FRAME_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_negotiation_selects_highest_exact_mutual_identity() {
+        let package = vec![
+            PROTOCOL_V1.to_string(),
+            "trail.environment-adapter/v30".to_string(),
+            PROTOCOL_V3.to_string(),
+            PROTOCOL_V2.to_string(),
+        ];
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3], &package),
+            Some(PROTOCOL_V3)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1, PROTOCOL_V2], &package),
+            Some(PROTOCOL_V2)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(&[PROTOCOL_V1], &package),
+            Some(PROTOCOL_V1)
+        );
+        assert_eq!(
+            negotiate_highest_mutual_protocol(
+                &[PROTOCOL_V3],
+                &["trail.environment-adapter/v3-preview".to_string()]
+            ),
+            None
+        );
+    }
 
     #[test]
     fn framed_protocol_round_trips_binary_pinned_files() {
@@ -1866,6 +2048,62 @@ mod tests {
     }
 
     #[test]
+    fn v2_builder_supports_bazel_nix_like_external_stores_without_framework_modes() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plan = AdapterPlanV2::builder("external-stores", "external")
+            .identity_input("stores.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "content-addressed-store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "remote-action-cache",
+                "remote-cas",
+                "cas://objects/example-action",
+                digest,
+                "any",
+            ))
+            .stale_reason("verified external store identities changed")
+            .build()
+            .unwrap();
+
+        assert!(plan.actions.is_empty());
+        assert!(plan.outputs.is_empty());
+        assert!(plan.caches.is_empty());
+        assert_eq!(plan.external_artifacts.len(), 2);
+        assert!(plan
+            .external_artifacts
+            .iter()
+            .all(|artifact| artifact.artifact_type == "verified_external"));
+        let decoded: AdapterPlanV2 =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+
+        let runtime = AdapterPlanV2::builder("invalid-runtime", "external")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .runtime_resource(AdapterRuntimeResource::oci_container(
+                "invalid-container",
+                "store",
+                8080,
+            ))
+            .stale_reason("invalid external runtime")
+            .build();
+        assert!(matches!(
+            runtime,
+            Err(AdapterPlanBuildError::InvalidRuntimeResource { .. })
+        ));
+    }
+
+    #[test]
     fn v2_builder_preserves_typed_dependency_semantics() {
         let plan = AdapterPlanV2::builder("application", "runtime")
             .build_requires("compiler")
@@ -1993,6 +2231,7 @@ sha256 = "sha256:00"
         )
         .unwrap();
         assert_eq!(manifest.adapter.protocols, [PROTOCOL_V1]);
+        assert!(manifest.adapter.capabilities.is_denied());
         let encoded = serde_cbor::to_vec(&manifest).unwrap();
         let value: serde_cbor::Value = serde_cbor::from_slice(&encoded).unwrap();
         let serde_cbor::Value::Map(package) = value else {
@@ -2005,6 +2244,46 @@ sha256 = "sha256:00"
             panic!("adapter metadata did not encode as a CBOR map");
         };
         assert!(!adapter.contains_key(&serde_cbor::Value::Text("protocols".to_string())));
+        assert!(!adapter.contains_key(&serde_cbor::Value::Text("capabilities".to_string())));
+    }
+
+    #[test]
+    fn protocol_v3_package_capabilities_are_explicit_and_round_trip() {
+        let manifest: AdapterPackageManifest = toml::from_str(
+            r#"schema = "trail.environment-adapter-package/v1"
+[adapter]
+canonical_identity = "example/test@1"
+implementation_version = "1"
+selectors = ["example/test@1"]
+kind = "generated"
+layer_adapter_name = "test"
+discovery_markers = ["test.adapter"]
+protocols = ["trail.environment-adapter/v3"]
+stability = "experimental"
+description = "test"
+
+[adapter.capabilities]
+resolution = true
+source_exports = true
+host_attestation_evidence = true
+host_quarantine_evidence = true
+certification_ceiling = "local_artifact"
+
+[executable]
+path = "adapter"
+sha256 = "sha256:00"
+"#,
+        )
+        .unwrap();
+        assert!(manifest.adapter.capabilities.resolution);
+        assert!(manifest.adapter.capabilities.source_exports);
+        assert_eq!(
+            manifest.adapter.capabilities.certification_ceiling,
+            AdapterCertificationCeiling::LocalArtifact
+        );
+        let decoded: AdapterPackageManifest =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(decoded, manifest);
     }
 
     #[test]

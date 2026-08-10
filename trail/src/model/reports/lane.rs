@@ -299,6 +299,26 @@ pub struct EnvironmentAdapterIdentityReport {
     pub distribution_digest: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPluginProtocolCapabilitiesReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol: Option<String>,
+    #[serde(default)]
+    pub resolution_capable: bool,
+    #[serde(default)]
+    pub source_export_capable: bool,
+    #[serde(default)]
+    pub host_attestation_evidence_capable: bool,
+    #[serde(default)]
+    pub host_quarantine_evidence_capable: bool,
+    #[serde(default)]
+    pub certification_ceiling: String,
+    #[serde(default)]
+    pub content_policy: String,
+    #[serde(default)]
+    pub attestation_policy: String,
+}
+
 /// One adapter available to the environment host.
 ///
 /// Catalog entries describe discovery and compatibility only. They never grant
@@ -315,6 +335,8 @@ pub struct EnvironmentAdapterCatalogEntryReport {
     /// Built-ins and repository recipes use the in-process host contract and
     /// therefore report an empty list.
     pub protocols: Vec<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
     pub supported_operating_systems: Vec<String>,
     pub supported_architectures: Vec<String>,
     pub source: String,
@@ -343,6 +365,8 @@ pub struct EnvironmentPluginInstallReport {
     pub publisher_key_id: Option<String>,
     pub trust: String,
     pub certification_tier: String,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,12 +378,16 @@ pub struct EnvironmentPluginPackageInspectionReport {
     pub signature_present: bool,
     pub publisher: Option<String>,
     pub publisher_key_id: Option<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentPluginRemoveReport {
     pub canonical_identity: String,
     pub removed_distribution_digest: Option<String>,
+    #[serde(default)]
+    pub protocol_capabilities: EnvironmentPluginProtocolCapabilitiesReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -744,12 +772,55 @@ pub struct EnvironmentGenerationReport {
     pub retired_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentComponentProposalStatus {
+    #[default]
+    Ready,
+    Resolvable,
+    Blocked,
+    Unsupported,
+    Ambiguous,
+}
+
+impl EnvironmentComponentProposalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Resolvable => "resolvable",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentProposalReasonReport {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentRecoveryActionReport {
+    pub code: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentDiscoveredComponentReport {
     pub component_id: String,
     pub component_root: String,
     pub kind: String,
     pub adapter_identity: String,
+    #[serde(default)]
+    pub status: EnvironmentComponentProposalStatus,
+    #[serde(default)]
+    pub reasons: Vec<EnvironmentProposalReasonReport>,
+    #[serde(default)]
+    pub recovery_actions: Vec<EnvironmentRecoveryActionReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -948,6 +1019,29 @@ pub enum PhysicalSharing {
     Unknown,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactStorageAccountingReport {
+    /// Sum of logical file bytes across distinct artifact tree roots in scope.
+    pub logical_bytes: u64,
+    /// Encoded authoritative object bytes referenced by exactly one artifact.
+    pub unique_authoritative_bytes: u64,
+    /// Encoded authoritative object bytes referenced by multiple artifacts.
+    pub cross_artifact_shared_bytes: u64,
+    /// Filesystem-allocated bytes in reconstructible artifact/layer materializations.
+    pub materialized_bytes: u64,
+    /// Filesystem-allocated bytes owned by lane-private source/generated/scratch state.
+    pub lane_private_bytes: u64,
+    /// Persisted bytes created specifically by prefetch. OS page-cache warming is excluded.
+    pub prefetched_bytes: u64,
+    /// Filesystem-allocated bytes in content projections created on demand.
+    pub demand_loaded_bytes: u64,
+    /// Independently reclaimable cache bytes in the report scope.
+    pub reclaimable_bytes: u64,
+    /// Measured bytes whose artifact/cache ownership cannot be classified safely.
+    pub unknown_bytes: u64,
+    /// Exact byte bases and attribution boundary used by this report.
+    pub accounting: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSpaceReport {
@@ -975,6 +1069,8 @@ pub struct WorkspaceSpaceReport {
     pub physical_sharing: PhysicalSharing,
     #[serde(default)]
     pub physical_sharing_evidence: String,
+    #[serde(default)]
+    pub artifact_storage: ArtifactStorageAccountingReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -999,6 +1095,191 @@ pub struct WorkspaceExecReport {
     pub command: Vec<String>,
     pub exit_code: i32,
     pub lifecycle: ManagedExecutionLifecycleReport,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedExecutionMissingResolutionPolicy {
+    #[default]
+    Explicit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionResolutionPin {
+    pub component_id: String,
+    pub adapter_identity: String,
+    pub status: EnvironmentComponentProposalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_command: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionOutputPin {
+    pub component_id: String,
+    pub output_name: String,
+    pub component_key: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub storage_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_envelope_id: Option<ArtifactEnvelopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_tree_root_id: Option<ArtifactTreeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_binding_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionPreparationReceipt {
+    pub source_root: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_generation: Option<u64>,
+    pub missing_resolution_policy: ManagedExecutionMissingResolutionPolicy,
+    pub resolution_pins: Vec<ManagedExecutionResolutionPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_generation: Option<String>,
+    pub output_pins: Vec<ManagedExecutionOutputPin>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionSealingDecision {
+    pub component_id: String,
+    pub output_name: String,
+    pub policy: EnvironmentOutputPolicy,
+    pub publication: EnvironmentPublicationTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionFinalizationReceipt {
+    pub source_root_before: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root_after: Option<ObjectId>,
+    pub source_changed: bool,
+    pub checkpoint_status: String,
+    pub disposal_status: String,
+    pub unmount_status: String,
+    pub complete: bool,
+    pub sealing_decisions: Vec<ManagedExecutionSealingDecision>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactAdapterConformanceStatusV1 {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAdapterConformanceCheckV1 {
+    pub stage: String,
+    pub applicable: bool,
+    pub status: ArtifactAdapterConformanceStatusV1,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactAdapterCertificationReportV1 {
+    pub schema: String,
+    pub producer_family: String,
+    pub adapter_identity: String,
+    pub trust_tier: ArtifactProducerTrustTierV1,
+    pub status: ArtifactAdapterConformanceStatusV1,
+    pub authority_effect: String,
+    pub checks: Vec<ArtifactAdapterConformanceCheckV1>,
+}
+
+impl ArtifactAdapterCertificationReportV1 {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.schema != "trail.artifact-adapter-certification/v1" {
+            return Err("unsupported artifact adapter certification schema".to_string());
+        }
+        if self.authority_effect != "evidence_only" {
+            return Err("artifact adapter certification cannot grant authority".to_string());
+        }
+        if self.producer_family.is_empty()
+            || self.producer_family.len() > 64
+            || self.adapter_identity.is_empty()
+            || self.adapter_identity.len() > 256
+        {
+            return Err("artifact adapter certification identity is empty or oversized".to_string());
+        }
+        let expected = [
+            "discovery",
+            "resolution",
+            "identity",
+            "validation",
+            "sealing",
+            "cow",
+            "recovery",
+            "invalidation",
+            "export",
+            "retirement",
+            "collection",
+        ];
+        if self.checks.len() != expected.len()
+            || self
+                .checks
+                .iter()
+                .zip(expected)
+                .any(|(check, expected)| check.stage != expected)
+        {
+            return Err("artifact adapter certification checks are not complete and canonical"
+                .to_string());
+        }
+        for check in &self.checks {
+            if check.evidence.is_empty()
+                || check.evidence.len() > 32
+                || check
+                    .evidence
+                    .iter()
+                    .any(|item| item.is_empty() || item.len() > 512)
+            {
+                return Err(format!(
+                    "artifact adapter certification stage `{}` has empty or oversized evidence",
+                    check.stage
+                ));
+            }
+            if !check
+                .evidence
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            {
+                return Err(format!(
+                    "artifact adapter certification stage `{}` evidence is not canonical",
+                    check.stage
+                ));
+            }
+            if check.applicable
+                && check.status != ArtifactAdapterConformanceStatusV1::Passed
+                && self.status == ArtifactAdapterConformanceStatusV1::Passed
+            {
+                return Err(format!(
+                    "artifact adapter certification cannot pass while required stage `{}` is not passed",
+                    check.stage
+                ));
+            }
+            if !check.applicable && check.status != ArtifactAdapterConformanceStatusV1::Skipped {
+                return Err(format!(
+                    "non-applicable artifact adapter certification stage `{}` must be skipped",
+                    check.stage
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1035,6 +1316,8 @@ pub struct ManagedExecutionLifecycleReport {
     pub surface: String,
     pub command_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<ManagedExecutionPreparationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<WorkspaceCheckpointReport>,
@@ -1046,6 +1329,8 @@ pub struct ManagedExecutionLifecycleReport {
     pub disposal_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<LaneRecordReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<ManagedExecutionFinalizationReceipt>,
     pub phases: Vec<ManagedExecutionPhaseReceipt>,
 }
 
@@ -1104,6 +1389,8 @@ pub struct WorkspaceCacheGcReport {
     pub reclaimed_bytes: u64,
     pub candidates: Vec<WorkspaceCacheGcEntry>,
     pub deleted: Vec<WorkspaceCacheGcEntry>,
+    #[serde(default)]
+    pub artifact_storage: ArtifactStorageAccountingReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1457,6 +1744,153 @@ mod workdir_mode_tests {
     }
 
     #[test]
+    fn legacy_discovered_component_defaults_to_ready_proposal_status() {
+        let report: EnvironmentDiscoveredComponentReport = serde_json::from_value(
+            serde_json::json!({
+                "component_id": "node",
+                "component_root": "",
+                "kind": "dependency",
+                "adapter_identity": "trail/node@1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(report.status, EnvironmentComponentProposalStatus::Ready);
+        assert!(report.reasons.is_empty());
+        assert!(report.recovery_actions.is_empty());
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["reasons"], serde_json::json!([]));
+        assert_eq!(value["recovery_actions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn managed_execution_receipts_are_additive_and_wire_stable() {
+        let legacy: ManagedExecutionLifecycleReport = serde_json::from_value(
+            serde_json::json!({
+                "execution_id": "exec-legacy",
+                "surface": "lane_exec",
+                "command_fingerprint": "command",
+                "phases": []
+            }),
+        )
+        .unwrap();
+        assert!(legacy.preparation.is_none());
+        assert!(legacy.finalization.is_none());
+
+        let current: ManagedExecutionLifecycleReport = serde_json::from_value(
+            serde_json::json!({
+                "execution_id": "exec-current",
+                "surface": "lane_test",
+                "command_fingerprint": "command",
+                "preparation": {
+                    "source_root": "object_source",
+                    "view_id": "view-1",
+                    "view_generation": 7,
+                    "missing_resolution_policy": "explicit",
+                    "resolution_pins": [{
+                        "component_id": "node",
+                        "adapter_identity": "trail/node@1",
+                        "status": "ready",
+                        "snapshot_id": "object_lock"
+                    }],
+                    "environment_generation": "generation-1",
+                    "output_pins": [{
+                        "component_id": "node",
+                        "output_name": "dependencies",
+                        "component_key": "desired-key",
+                        "policy": "immutable_seed_private",
+                        "storage_identity": "storage-key"
+                    }]
+                },
+                "finalization": {
+                    "source_root_before": "object_source",
+                    "source_root_after": "object_after",
+                    "source_changed": true,
+                    "checkpoint_status": "succeeded",
+                    "disposal_status": "succeeded",
+                    "unmount_status": "succeeded",
+                    "complete": true,
+                    "sealing_decisions": [{
+                        "component_id": "node",
+                        "output_name": "dependencies",
+                        "policy": "immutable_seed_private",
+                        "publication": "never",
+                        "decision": "retain_private_delta",
+                        "reason": "private copy-on-write output is never published"
+                    }],
+                    "errors": []
+                },
+                "phases": []
+            }),
+        )
+        .unwrap();
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(
+            value["preparation"]["missing_resolution_policy"],
+            "explicit"
+        );
+        assert_eq!(
+            value["preparation"]["resolution_pins"][0]["status"],
+            "ready"
+        );
+        assert_eq!(
+            value["finalization"]["sealing_decisions"][0]["decision"],
+            "retain_private_delta"
+        );
+    }
+
+    #[test]
+    fn artifact_adapter_certification_is_complete_canonical_and_evidence_only() {
+        let stages = [
+            "discovery",
+            "resolution",
+            "identity",
+            "validation",
+            "sealing",
+            "cow",
+            "recovery",
+            "invalidation",
+            "export",
+            "retirement",
+            "collection",
+        ];
+        let report = ArtifactAdapterCertificationReportV1 {
+            schema: "trail.artifact-adapter-certification/v1".into(),
+            producer_family: "plugin_v3".into(),
+            adapter_identity: "example/fixture@1".into(),
+            trust_tier: ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+            status: ArtifactAdapterConformanceStatusV1::Passed,
+            authority_effect: "evidence_only".into(),
+            checks: stages
+                .into_iter()
+                .map(|stage| ArtifactAdapterConformanceCheckV1 {
+                    stage: stage.into(),
+                    applicable: true,
+                    status: ArtifactAdapterConformanceStatusV1::Passed,
+                    evidence: vec![format!("fixture:{stage}")],
+                })
+                .collect(),
+        };
+        report.validate().unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["status"], "passed");
+        assert_eq!(value["authority_effect"], "evidence_only");
+        assert_eq!(value["checks"][0]["stage"], "discovery");
+        assert_eq!(value["checks"][10]["stage"], "collection");
+
+        let mut skipped = report.clone();
+        skipped.checks[5].status = ArtifactAdapterConformanceStatusV1::Skipped;
+        assert!(skipped.validate().unwrap_err().contains("required stage `cow`"));
+        let mut authority = report;
+        authority.authority_effect = "certified_signed_plugin".into();
+        assert!(authority
+            .validate()
+            .unwrap_err()
+            .contains("cannot grant authority"));
+    }
+
+    #[test]
     fn legacy_patch_and_record_reports_default_path_index_metrics() {
         let patch: LanePatchReport = serde_json::from_value(serde_json::json!({
             "lane_id": "lane-1",
@@ -1500,10 +1934,133 @@ mod workdir_mode_tests {
         assert_eq!(report.clone_count, 0);
         assert_eq!(report.physical_sharing, PhysicalSharing::Unknown);
         assert_eq!(report.physical_sharing_evidence, "");
+        assert_eq!(
+            report.artifact_storage,
+            ArtifactStorageAccountingReport::default()
+        );
+
+        let cache: WorkspaceCacheGcReport = serde_json::from_value(serde_json::json!({
+            "dry_run": true,
+            "retention_secs": 60,
+            "cache_physical_bytes_before": 10,
+            "reclaimable_bytes": 5,
+            "reclaimed_bytes": 0,
+            "candidates": [],
+            "deleted": []
+        }))
+        .unwrap();
+        assert_eq!(
+            cache.artifact_storage,
+            ArtifactStorageAccountingReport::default()
+        );
+    }
+
+    #[test]
+    fn artifact_storage_accounting_wire_fields_are_stable() {
+        let report = ArtifactStorageAccountingReport {
+            logical_bytes: 1,
+            unique_authoritative_bytes: 2,
+            cross_artifact_shared_bytes: 3,
+            materialized_bytes: 4,
+            lane_private_bytes: 5,
+            prefetched_bytes: 6,
+            demand_loaded_bytes: 7,
+            reclaimable_bytes: 8,
+            unknown_bytes: 9,
+            accounting: "fixture".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "logical_bytes": 1,
+                "unique_authoritative_bytes": 2,
+                "cross_artifact_shared_bytes": 3,
+                "materialized_bytes": 4,
+                "lane_private_bytes": 5,
+                "prefetched_bytes": 6,
+                "demand_loaded_bytes": 7,
+                "reclaimable_bytes": 8,
+                "unknown_bytes": 9,
+                "accounting": "fixture"
+            })
+        );
     }
 
     #[test]
     fn environment_artifact_contract_enums_are_stable_and_reject_unknown_values() {
+        for (kind, wire) in [
+            (ArtifactValidationKindV1::Structural, "structural"),
+            (ArtifactValidationKindV1::Loadability, "loadability"),
+            (ArtifactValidationKindV1::Framework, "framework"),
+            (ArtifactValidationKindV1::Policy, "policy"),
+            (ArtifactValidationKindV1::Gate, "gate"),
+            (
+                ArtifactValidationKindV1::Reproducibility,
+                "reproducibility",
+            ),
+            (ArtifactValidationKindV1::Ecosystem, "ecosystem"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactValidationKindV1>(wire.into()).unwrap(),
+                kind
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactValidationKindV1>("custom".into()).is_err()
+        );
+        for (tier, wire) in [
+            (
+                ArtifactProducerTrustTierV1::ReviewedBuiltin,
+                "reviewed_builtin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::CertifiedSignedPlugin,
+                "certified_signed_plugin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+                "locally_trusted_plugin",
+            ),
+            (
+                ArtifactProducerTrustTierV1::RepositoryDeclaration,
+                "repository_declaration",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(tier).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactProducerTrustTierV1>(wire.into()).unwrap(),
+                tier
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactProducerTrustTierV1>("remote_trusted".into())
+                .is_err()
+        );
+        for (phase, wire) in [
+            (
+                ArtifactExecutionPhaseV1::DiscoveryPlanning,
+                "discovery_planning",
+            ),
+            (ArtifactExecutionPhaseV1::Resolve, "resolve"),
+            (ArtifactExecutionPhaseV1::Construct, "construct"),
+            (ArtifactExecutionPhaseV1::Validate, "validate"),
+            (
+                ArtifactExecutionPhaseV1::MountedExecution,
+                "mounted_execution",
+            ),
+            (ArtifactExecutionPhaseV1::SourceExport, "source_export"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ArtifactExecutionPhaseV1>(wire.into()).unwrap(),
+                phase
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArtifactExecutionPhaseV1>("publish".into()).is_err()
+        );
+
         for (policy, wire) in [
             (EnvironmentOutputPolicy::ImmutableShared, "immutable_shared"),
             (

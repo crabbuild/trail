@@ -289,6 +289,16 @@ pub struct BackupCreateReport {
     pub sqlite_bytes: u64,
     pub sqlite_sha256: String,
     pub worktree_bytes: u64,
+    #[serde(default)]
+    pub retained_private_views: u64,
+    #[serde(default)]
+    pub retained_private_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_materializations: u64,
+    #[serde(default)]
+    pub rebuildable_materialization_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_performance_caches: u64,
     pub fsck_errors: Vec<String>,
 }
 
@@ -303,6 +313,16 @@ pub struct BackupVerifyReport {
     pub checked_texts: u64,
     pub sqlite_bytes: Option<u64>,
     pub sqlite_sha256: Option<String>,
+    #[serde(default)]
+    pub retained_private_views: u64,
+    #[serde(default)]
+    pub retained_private_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_materializations: u64,
+    #[serde(default)]
+    pub rebuildable_materialization_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_performance_caches: u64,
     pub errors: Vec<String>,
 }
 
@@ -316,6 +336,16 @@ pub struct BackupRestoreReport {
     pub replaced_existing: bool,
     pub restored_trailignore: bool,
     pub rewritten_workdirs: u64,
+    #[serde(default)]
+    pub restored_private_views: u64,
+    #[serde(default)]
+    pub retained_private_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_materializations: u64,
+    #[serde(default)]
+    pub rebuildable_materialization_bytes: u64,
+    #[serde(default)]
+    pub rebuildable_performance_caches: u64,
     pub checked_refs: u64,
     pub checked_roots: u64,
     pub checked_texts: u64,
@@ -362,5 +392,29 @@ mod maintenance_tests {
 
         assert!(report.path_index_repaired_roots.is_empty());
         assert!(report.path_index_repaired_refs.is_empty());
+    }
+
+    #[test]
+    fn legacy_backup_restore_report_defaults_portable_artifact_fields() {
+        let report: BackupRestoreReport = serde_json::from_value(serde_json::json!({
+            "workspace": "/workspace",
+            "db_dir": "/workspace/.trail",
+            "backup_path": "/backup",
+            "workspace_id": "workspace_00000000000000000000000000000000",
+            "branch": "main",
+            "replaced_existing": false,
+            "restored_trailignore": false,
+            "rewritten_workdirs": 0,
+            "checked_refs": 0,
+            "checked_roots": 0,
+            "checked_texts": 0
+        }))
+        .unwrap();
+
+        assert_eq!(report.restored_private_views, 0);
+        assert_eq!(report.retained_private_bytes, 0);
+        assert_eq!(report.rebuildable_materializations, 0);
+        assert_eq!(report.rebuildable_materialization_bytes, 0);
+        assert_eq!(report.rebuildable_performance_caches, 0);
     }
 }

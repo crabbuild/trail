@@ -22,6 +22,8 @@ pub struct ManagedExecutionContext {
     pub workdir: PathBuf,
     pub environment: Vec<(String, String)>,
     pub environment_generation: Option<String>,
+    preparation: ManagedExecutionPreparationReceipt,
+    sealing_decisions: Vec<ManagedExecutionSealingDecision>,
     mount: Option<Box<dyn Any + Send>>,
     phases: Vec<ManagedExecutionPhaseReceipt>,
     #[cfg(test)]
@@ -133,6 +135,38 @@ impl Trail {
                 return Err(error);
             }
         };
+        let resolution_pins = self.managed_execution_resolution_pins(&discovered)?;
+        if let Some(unresolved) = resolution_pins
+            .iter()
+            .find(|pin| pin.status != EnvironmentComponentProposalStatus::Ready)
+        {
+            let recovery = unresolved
+                .recovery_command
+                .as_ref()
+                .map(|command| command.join(" "))
+                .unwrap_or_else(|| format!("trail env discover {lane}"));
+            let error = Error::InvalidInput(format!(
+                "managed execution requires explicit resolution for environment component `{}` ({}); run `{recovery}`",
+                unresolved.component_id,
+                unresolved.status.as_str()
+            ));
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "discover_plan",
+                "failed",
+                Some(&error.to_string()),
+                Some(serde_json::json!({
+                    "missing_resolution_policy": ManagedExecutionMissingResolutionPolicy::Explicit,
+                    "resolution_pins": resolution_pins,
+                    "recovery_command": unresolved.recovery_command,
+                })),
+            )?;
+            return Err(error);
+        }
         if view.is_none() && !discovered.components.is_empty() {
             self.push_managed_execution_phase(
                 &mut phases,
@@ -207,6 +241,8 @@ impl Trail {
                 "component_count": discovered.components.len(),
                 "graph_nodes": graph.total_nodes,
                 "graph_edges": graph.total_edges,
+                "missing_resolution_policy": ManagedExecutionMissingResolutionPolicy::Explicit,
+                "resolution_pins": resolution_pins,
             })),
         )?;
 
@@ -284,6 +320,16 @@ impl Trail {
             self.active_environment_generation(lane)?
         } else {
             None
+        };
+        let (output_pins, sealing_decisions) = if let Some(generation) = &active_generation {
+            let bindings =
+                self.artifact_generation_bindings_for_generation(&generation.generation_id)?;
+            (
+                managed_execution_output_pins(generation, &bindings)?,
+                managed_execution_sealing_decisions(generation),
+            )
+        } else {
+            (Vec::new(), Vec::new())
         };
         if let (Some(view), Some(generation)) = (&view, &active_generation) {
             let cancelled = AtomicBool::new(false);
@@ -514,11 +560,25 @@ impl Trail {
             lane: lane.to_string(),
             lane_id: branch.lane_id,
             command_fingerprint,
-            source_root: head.root_id,
-            view,
+            source_root: head.root_id.clone(),
+            view: view.clone(),
             workdir,
             environment,
-            environment_generation: active_generation.map(|generation| generation.generation_id),
+            environment_generation: active_generation
+                .as_ref()
+                .map(|generation| generation.generation_id.clone()),
+            preparation: ManagedExecutionPreparationReceipt {
+                source_root: head.root_id.clone(),
+                view_id: view.as_ref().map(|view| view.view_id.clone()),
+                view_generation: view.as_ref().map(|view| view.generation),
+                missing_resolution_policy: ManagedExecutionMissingResolutionPolicy::Explicit,
+                resolution_pins,
+                environment_generation: active_generation
+                    .as_ref()
+                    .map(|generation| generation.generation_id.clone()),
+                output_pins,
+            },
+            sealing_decisions,
             mount,
             phases,
             #[cfg(test)]
@@ -701,16 +761,65 @@ impl Trail {
             None,
         );
 
+        let source_root_after = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.root_id.clone());
+        let source_changed = source_root_after
+            .as_ref()
+            .is_some_and(|root| root != &context.source_root);
+        let mut sealing_decisions = context.sealing_decisions.clone();
+        if source_changed {
+            for decision in &mut sealing_decisions {
+                if decision.decision.starts_with("await_") {
+                    decision.decision = "replan_required".to_string();
+                    decision.reason =
+                        "identity-bearing lane source changed during execution; replan before sealing"
+                            .to_string();
+                }
+            }
+        }
+        let checkpoint_status = if checkpoint_error.is_some() {
+            "failed"
+        } else {
+            "succeeded"
+        };
+        let disposal_status = if disposal_error.is_some() {
+            "failed"
+        } else if has_runtime {
+            "succeeded"
+        } else {
+            "skipped"
+        };
+        let unmount_status = if had_mount { "succeeded" } else { "skipped" };
+        let errors = checkpoint_error
+            .iter()
+            .chain(disposal_error.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let finalization = ManagedExecutionFinalizationReceipt {
+            source_root_before: context.source_root.clone(),
+            source_root_after,
+            source_changed,
+            checkpoint_status: checkpoint_status.to_string(),
+            disposal_status: disposal_status.to_string(),
+            unmount_status: unmount_status.to_string(),
+            complete: errors.is_empty(),
+            sealing_decisions,
+            errors,
+        };
+
         ManagedExecutionLifecycleReport {
             execution_id: context.execution_id,
             surface: context.surface,
             command_fingerprint: context.command_fingerprint,
+            preparation: Some(context.preparation),
             environment_generation: context.environment_generation,
             checkpoint,
             checkpoint_error,
             checkpoint_error_code,
             disposal_error,
             recorded,
+            finalization: Some(finalization),
             phases: context.phases,
         }
     }
@@ -1146,6 +1255,37 @@ impl Trail {
         }
         Ok(report)
     }
+
+    fn managed_execution_resolution_pins(
+        &self,
+        discovery: &EnvironmentDiscoveryReport,
+    ) -> Result<Vec<ManagedExecutionResolutionPin>> {
+        discovery
+            .components
+            .iter()
+            .map(|component| {
+                let snapshot = self.artifact_resolution_snapshot_for_component(
+                    &discovery.source_root,
+                    &component.component_id,
+                    &component.adapter_identity,
+                )?;
+                let (snapshot_id, proposal_key) = snapshot
+                    .map(|(snapshot_id, snapshot)| (Some(snapshot_id), Some(snapshot.proposal_key)))
+                    .unwrap_or((None, None));
+                Ok(ManagedExecutionResolutionPin {
+                    component_id: component.component_id.clone(),
+                    adapter_identity: component.adapter_identity.clone(),
+                    status: component.status.clone(),
+                    proposal_key,
+                    snapshot_id,
+                    recovery_command: component
+                        .recovery_actions
+                        .iter()
+                        .find_map(|action| action.command.clone()),
+                })
+            })
+            .collect()
+    }
 }
 
 fn managed_execution_id(lane: &str, surface: &str, command: &[String]) -> Result<String> {
@@ -1177,6 +1317,105 @@ fn managed_environment_is_current(
         })
 }
 
+fn managed_execution_output_pins(
+    generation: &EnvironmentGenerationReport,
+    bindings: &[ArtifactGenerationBindingReportV1],
+) -> Result<Vec<ManagedExecutionOutputPin>> {
+    let bindings = bindings
+        .iter()
+        .map(|binding| {
+            (
+                (binding.component_id.as_str(), binding.output_name.as_str()),
+                binding,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut pins = Vec::new();
+    for component in &generation.components {
+        for output in &component.outputs {
+            let binding = bindings
+                .get(&(component.component_id.as_str(), output.name.as_str()))
+                .copied();
+            if output.policy.has_immutable_layer() && binding.is_none() {
+                return Err(Error::Corrupt(format!(
+                    "managed execution cannot pin immutable output `{}/{}` because generation `{}` has no artifact binding",
+                    component.component_id, output.name, generation.generation_id
+                )));
+            }
+            if let Some(binding) = binding
+                && binding.desired_key != component.component_key
+            {
+                return Err(Error::Corrupt(format!(
+                    "managed execution artifact binding for `{}/{}` disagrees with generation component identity",
+                    component.component_id, output.name
+                )));
+            }
+            pins.push(ManagedExecutionOutputPin {
+                component_id: component.component_id.clone(),
+                output_name: output.name.clone(),
+                component_key: component.component_key.clone(),
+                policy: output.policy,
+                storage_identity: output.storage_identity.clone(),
+                artifact_binding_id: binding.map(|binding| binding.binding_id.clone()),
+                artifact_envelope_id: binding.map(|binding| binding.envelope_id.clone()),
+                artifact_tree_root_id: binding.map(|binding| binding.tree_root_id.clone()),
+                artifact_binding_identity: binding.map(|binding| binding.binding_identity.clone()),
+            });
+        }
+    }
+    Ok(pins)
+}
+
+fn managed_execution_sealing_decisions(
+    generation: &EnvironmentGenerationReport,
+) -> Vec<ManagedExecutionSealingDecision> {
+    generation
+        .components
+        .iter()
+        .flat_map(|component| {
+            component.outputs.iter().map(|output| {
+                let (decision, reason) = match (output.policy, output.publish) {
+                    (EnvironmentOutputPolicy::Disposable, _) => {
+                        ("dispose", "disposable output is never sealed or promoted")
+                    }
+                    (_, EnvironmentPublicationTrigger::SuccessfulGate) => (
+                        "await_successful_gate",
+                        "seal only after the named successful gate revalidates its pins",
+                    ),
+                    (_, EnvironmentPublicationTrigger::OnSync) => (
+                        "await_sync",
+                        "seal only during a later environment synchronization",
+                    ),
+                    (_, EnvironmentPublicationTrigger::Manual) => (
+                        "await_manual_promotion",
+                        "retain private changes until explicit promotion",
+                    ),
+                    (EnvironmentOutputPolicy::ImmutableShared, _) => (
+                        "preserve_verified_artifact",
+                        "mounted immutable content is already sealed and cannot be modified",
+                    ),
+                    (EnvironmentOutputPolicy::ImmutableSeedPrivate, _) => (
+                        "retain_private_delta",
+                        "writes remain in the lane-private upper",
+                    ),
+                    (EnvironmentOutputPolicy::WritablePrivate, _) => {
+                        ("retain_private", "writable output remains lane-private")
+                    }
+                };
+                ManagedExecutionSealingDecision {
+                    component_id: component.component_id.clone(),
+                    output_name: output.name.clone(),
+                    policy: output.policy,
+                    publication: output.publish,
+                    gate: output.gate.clone(),
+                    decision: decision.to_string(),
+                    reason: reason.to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
 fn workspace_checkpoint_from_lane_record(record: LaneRecordReport) -> WorkspaceCheckpointReport {
     WorkspaceCheckpointReport {
         view_id: String::new(),
@@ -1197,6 +1436,7 @@ fn workspace_checkpoint_from_lane_record(record: LaneRecordReport) -> WorkspaceC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ArtifactEnvelopeId, ArtifactTreeId};
 
     fn hot_generation(manifest: &str) -> EnvironmentGenerationReport {
         EnvironmentGenerationReport {
@@ -1425,5 +1665,139 @@ mod tests {
                     .is_some_and(|error| error.contains("injected cleanup failure"))
         }));
         assert!(report.phases.iter().any(|phase| phase.phase == "unmount"));
+        let preparation = report.preparation.as_ref().unwrap();
+        assert_eq!(
+            preparation.missing_resolution_policy,
+            ManagedExecutionMissingResolutionPolicy::Explicit
+        );
+        assert!(preparation.resolution_pins.is_empty());
+        assert!(preparation.output_pins.is_empty());
+        let finalization = report.finalization.as_ref().unwrap();
+        assert!(!finalization.complete);
+        assert_eq!(finalization.disposal_status, "failed");
+        assert!(finalization
+            .errors
+            .iter()
+            .any(|error| error.contains("injected cleanup failure")));
+    }
+
+    #[test]
+    fn managed_preparation_requires_explicit_resolution_with_exact_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='managed-resolution'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(root.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "needs-resolution",
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let error = db
+            .prepare_managed_lane_execution(
+                "needs-resolution",
+                "lane_exec",
+                &["cargo".into(), "test".into()],
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains(
+            "managed execution requires explicit resolution for environment component `cargo-target-seed` (resolvable)"
+        ));
+        assert!(error
+            .to_string()
+            .contains("trail env resolve component cargo-target-seed --lane needs-resolution"));
+    }
+
+    #[test]
+    fn managed_output_pins_and_sealing_decisions_are_exact_and_deterministic() {
+        let envelope_id =
+            ArtifactEnvelopeId::parse(format!("artifact_envelope_{}", "a".repeat(64))).unwrap();
+        let tree_root_id =
+            ArtifactTreeId::parse(format!("artifact_tree_{}", "b".repeat(64))).unwrap();
+        let generation = EnvironmentGenerationReport {
+            generation_id: "envgen-test".into(),
+            view_id: "view-test".into(),
+            generation_sequence: 1,
+            source_root: ObjectId("source-root".into()),
+            specification_digest: "specification".into(),
+            predecessor_generation_id: None,
+            state: "active".into(),
+            components: vec![EnvironmentGenerationComponentReport {
+                component_id: "fixture".into(),
+                adapter_identity: "trail/fixture@1".into(),
+                kind: "generated".into(),
+                component_key: "desired-key".into(),
+                layer_id: Some("layer-test".into()),
+                mount_path: Some("generated".into()),
+                dependencies: Vec::new(),
+                outputs: vec![
+                    EnvironmentGenerationOutputReport {
+                        name: "shared".into(),
+                        policy: EnvironmentOutputPolicy::ImmutableShared,
+                        reuse: EnvironmentReuseMode::Exact,
+                        scope: EnvironmentSharingScope::Workspace,
+                        publish: EnvironmentPublicationTrigger::Never,
+                        gate: None,
+                        storage_identity: "layer-test".into(),
+                        layer_id: Some("layer-test".into()),
+                        manifest_object_id: Some("manifest-test".into()),
+                        publication_id: None,
+                        mount_path: "generated".into(),
+                        layer_subpath: String::new(),
+                    },
+                    EnvironmentGenerationOutputReport {
+                        name: "private".into(),
+                        policy: EnvironmentOutputPolicy::WritablePrivate,
+                        reuse: EnvironmentReuseMode::None,
+                        scope: EnvironmentSharingScope::Lane,
+                        publish: EnvironmentPublicationTrigger::Manual,
+                        gate: None,
+                        storage_identity: "private-test".into(),
+                        layer_id: None,
+                        manifest_object_id: None,
+                        publication_id: None,
+                        mount_path: "private".into(),
+                        layer_subpath: String::new(),
+                    },
+                ],
+                caches: Vec::new(),
+                external_artifacts: Vec::new(),
+                runtime_resources: Vec::new(),
+            }],
+            created_at: 1,
+            activated_at: Some(1),
+            retired_at: None,
+        };
+        let bindings = vec![ArtifactGenerationBindingReportV1 {
+            binding_id: "binding-test".into(),
+            generation_id: generation.generation_id.clone(),
+            component_id: "fixture".into(),
+            output_name: "shared".into(),
+            desired_key: "desired-key".into(),
+            envelope_id: envelope_id.clone(),
+            tree_root_id: tree_root_id.clone(),
+            binding_identity: "artifact-binding-test".into(),
+            created_at: 1,
+        }];
+
+        let pins = managed_execution_output_pins(&generation, &bindings).unwrap();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].artifact_envelope_id, Some(envelope_id));
+        assert_eq!(pins[0].artifact_tree_root_id, Some(tree_root_id));
+        assert!(pins[1].artifact_envelope_id.is_none());
+        let decisions = managed_execution_sealing_decisions(&generation);
+        assert_eq!(decisions[0].decision, "preserve_verified_artifact");
+        assert_eq!(decisions[1].decision, "await_manual_promotion");
     }
 }

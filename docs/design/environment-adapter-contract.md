@@ -26,9 +26,11 @@ generation activation. The first built-ins are:
 - `trail/python-venv@1`: recognizes `pyproject.toml` and the common uv, Poetry, PDM,
   Pipenv, and requirements lock/manifest files, provisions a layer-free lane-private
   `.venv`, and keys it by every present dependency file plus the resolved Python
-  executable. Trail automatically creates the virtual environment through an ephemeral
-  candidate view at the lane's final mountpoint, so scripts and prefix metadata embed
-  the correct absolute path without exposing partial state;
+  executable. An optional uv-generated hash-bearing requirements snapshot remains Trail
+  metadata and warms a shared performance-only wheel/download cache. Trail automatically
+  creates the virtual environment through an ephemeral candidate view at the lane's final
+  mountpoint, so scripts, bytecode, and prefix metadata stay private and embed the correct
+  absolute path without exposing partial state;
 - `trail/oci-image@1`: reads `trail.oci.toml`, accepts only lowercase SHA-256
   digest-pinned OCI references with an explicit platform, and records provider-owned
   image identities without commands, caches, mounts, or manufactured directories;
@@ -46,6 +48,22 @@ generation activation. The first built-ins are:
   metadata-only external-artifact declarations while the host retains mount authority
   and atomic generation activation.
 
+Every normalized plan now also receives a host-owned `AdapterIdentityContractV3`
+projection. Its digest enters the component key beside, rather than replacing, the exact
+`WorkspaceLayerKeyV1` compatibility/storage identity. The projection records adapter
+provenance, source-closure status, stable action/output policy, cache protocol and
+compatibility, external/runtime declarations, platform/ABI, portability, and trust
+scope. Host cache storage paths are rewritten to logical cache names before hashing, so
+moving `.trail` storage cannot change artifact correctness identity. This projection
+does not advertise or invoke plugin protocol v3 and grants no v3-only capability.
+
+The mapping deliberately preserves adapter semantics: Go's module/build stores remain
+performance-only while its vendor output remains an immutable private seed; CMake's
+path-bound build tree remains writable-private with no layer; OCI images and services
+remain provider-owned metadata with lane-specific allocation IDs; v1 command recipes
+remain conservative legacy plans, while `trail.environment/v2` recipes retain their
+independently compiled `ArtifactDesiredKeyV2` and repository trust ceiling.
+
 `trail env adapters` returns the compiled and installed adapter catalog, including versioned identity,
 selectors, component kind, discovery markers, implementation provenance, stability, and
 description without probing the repository or host tools. Discovery obtains candidate
@@ -58,6 +76,25 @@ proposal before atomically activating all mounts as one generation. `trail env s
 reports logical component identity separately from adapter identity. CLI, HTTP/OpenAPI,
 MCP, and Rust APIs share this state. Existing `trail deps` behavior remains a Node
 compatibility surface.
+
+The Rust library and CLI share the common resolution-snapshot boundary:
+`resolve_artifact_component` and `resolve_all_artifact_components` accept normalized
+executor candidates, validate pinned source/tool/policy identity, reuse snapshots until
+an explicit refresh, and own durable attempt evidence and publication. The public
+`trail env resolve` operation selects the exact discovered component and runs reviewed
+built-in offline, credential-free plans in host-owned isolated staging before entering
+that publication boundary. Restricted repository/plugin resolver execution and aligned
+HTTP/MCP operations remain planned. Discovery reports unsupported installed plugins
+from their pinned marker and package metadata without launching the plugin.
+
+Snapshot consumption also crosses one host-owned verification boundary. Before a
+built-in can plan construction from a stored snapshot, Trail verifies the exact proposal
+key, source root, component and adapter identity, snapshot format, verified state, and
+clear secret taint, then loads the content object. Ecosystem code supplies only its
+deterministic proposal/format identity and content parser. Cargo, Node, and Python no
+longer duplicate storage lookup, provenance, verification-state, or taint decisions.
+Their planners still revalidate the current resolver executable and policy identity so a
+tool or authority change cannot reuse an otherwise well-formed snapshot.
 
 Command recipes and v1/v2 plugins may declare stable logical component dependencies.
 `sync all` validates missing nodes, duplicate/self edges, complete cycles, and mount
@@ -116,10 +153,28 @@ an offline build; MCP and HTTP classify synchronization as open-world execution 
 repository-controlled Cargo build scripts and proc macros still execute. Read-only
 status reads persisted state and never invokes package managers or compilers.
 
+A repository containing `Cargo.toml` but no `Cargo.lock` remains visible as a resolvable
+component. Its resolver plan is pinned to the complete source root and exact Cargo
+executable/policy. Once verified, the lock snapshot remains Trail environment metadata:
+the host projects it into isolated staging only after the immutable source root and
+refuses to replace a tracked path. Target-seed construction then uses the conventional
+`Cargo.lock` location with `--locked --offline`; generation keys retain both the complete
+source root and snapshot authority. Source discovery and planning never write a lockfile
+back to the repository.
+
 The initial Node adapter deliberately rejects workspace-root installs, local file/link
 dependencies, pnpm workspace roots, and Yarn Berry/PnP rather than publishing an empty,
 escaping, or incorrectly keyed layer. Those forms require explicit workspace-graph and
 link contracts before they can graduate.
+
+Without a source lockfile, `packageManager` selects an npm, pnpm, Yarn, or Bun resolution
+contract (npm is the deterministic default). Each manager has its own snapshot format,
+candidate path, and fixed lock-only argv. The verified snapshot is projected into a
+complete pinned-source staging tree and participates in layer identity by both content
+digest and snapshot authority. Frozen installation still produces the ordinary
+`immutable_seed_private` `node_modules` lower, while downloads remain in the existing
+performance-only content-store namespace and every lane receives a private writable
+upper. Unsupported managers remain visible as blocked proposals.
 
 The first public Rust protocol crate is `trail-environment-adapter-sdk`. Local executable
 packages remain `experimental`: Trail verifies and content-addresses them, records
@@ -193,6 +248,64 @@ Promotion is evidence-based. A useful repository recipe can become a profile; a 
 that needs semantic code can become an isolated plugin; a widely used, fully certified
 plugin can be proposed as a built-in. Component and adapter identities change explicitly
 when semantics change, so promotion never silently reinterprets an existing generation.
+
+Repository documents at `trail.environment.toml` or `.trail/environment.toml` now
+recognize both `trail.environment/v1` and the explicitly opted-in
+`trail.environment/v2` header. Version 1 retains its existing paths, defaults,
+includes/profiles, validation, and normalized identity. Every file in one include graph
+must declare the same version. The v2 header initially accepts the existing restricted
+command shape and adds strictly typed `component.resolve`, repeated `component.action`,
+repeated `component.validation`, `component.capabilities`, heterogeneous
+`component.output`, and repeated `component.source_export` sections. Resolver and action
+commands remain argv arrays. Network authority lists, candidate snapshot format/path,
+phase names, capability requests, validation requirements, output policies, and export
+collision intent are represented as separate fields. Unknown fields fail deserialization,
+and a v1 document cannot gain any of these authorities by spelling a v2-only section.
+Compilation and execution still pass through the host-owned normalized models and
+capability checks; parsing a declaration never grants authority by itself.
+
+Before discovery returns a v2 proposal, Trail also applies the repository-declaration
+ceiling without resolving a tool or running repository code. Every command is a bounded
+fixed argv vector naming one direct non-shell executable. Shell interpolation and control
+operators, indirect process launchers, absolute host paths, raw secret-bearing values,
+and provider-socket references are rejected. Resolver authorities are exact, bounded,
+sorted, and deduplicated; construction and validation remain offline. Mounted-execution
+and executable source-export phases are unavailable to repository declarations. Input
+declarations and their deterministic expansion are separately bounded, and repository
+outputs may request only exact workspace reuse or lane-private non-reuse—not compatible
+or host-wide reuse. These checks narrow authoring early; the host repeats its normal
+sandbox, plan, sealing, and output-contract checks at execution boundaries.
+
+The v2 compiler does not create a second repository execution graph. It projects one
+validated document into the existing `EnvironmentDiscoveredComponentReport`, optional
+`ArtifactResolutionPlanV1`, `WorkspaceEnvironmentPlan`, `ArtifactDesiredKeyMaterialV2`
+and desired key, `ArtifactOutputContractV2`, `ArtifactValidationV1`, and
+`ArtifactSourceExportContractV2` types. Exact executable identities, selected pinned
+inputs, normalized output policy, platform identity, policy identity, and requested
+network authorities therefore participate in the same host-owned reports and identities
+as built-in and plugin adapters. A declared resolver produces a `resolvable` proposal;
+it does not run during discovery or compilation.
+
+Source-export declarations compile into a separate, read-only planning operation before
+any generated bytes can enter source. The plan pins the canonical lane and source root,
+active environment generation and its source root, desired identity, ready envelope,
+complete tree root, selected directory/file object, output-relative artifact path,
+repository-relative destination and its current content digest, collision mode, exact
+passed validation receipt, optional successful gate receipt, and explicit-user
+authorization. `fail` refuses an existing destination during planning; `replace` merely
+permits execution to consider the pinned destination and does not bypass later source
+guardrails. Planning reads CAS objects directly and never materializes or mounts the
+artifact into source.
+
+Execution repeats the complete plan and rejects any mismatch before mutation. It reads
+the pinned directory/file objects directly from CAS with finite file/count/byte limits,
+rejects symlinked export trees, computes `fail` or pinned `replace` edits, and submits one
+ordinary structured lane patch. That shared path enforces repository-relative path and
+case safety, `.trailignore`, hard private-path guardrails, patch/file limits, secret
+scanning, exact lane-head compare-and-swap, atomic root publication, changed-path diff,
+and workdir projection. The resulting operation is the source checkpoint; its report
+includes the normal changed paths and a `trail lane merge ... --dry-run` Git-handoff
+command. Artifact mounts and generated uppers are never used as the write mechanism.
 
 ### Add a repository adapter without Rust
 
@@ -319,6 +432,23 @@ copy, while removal remains available for recovery. Trust revocation also fails 
 packages closed immediately. Unsigned packages are visibly `local-experimental`; a
 signature authenticates origin but does not grant stable certification.
 
+Package inspection, installation, the adapter catalog/trust view, and removal reports
+share `protocol_capabilities`. It records the currently selected host protocol (or no
+mutual protocol), advertised resolution/source-export and host-evidence capability,
+certification ceiling, CAS content policy, and host-attestation policy. The report keeps
+package capability separate from selection: while v3 normalization is disabled, a
+v3/v2 package reports its v3 capability but selects v2, and a v3-only package reports no
+selected protocol. Removal captures the last readable package policy before appending
+the tombstone; inability to inspect corrupt retained bytes never prevents revocation.
+
+The host classifies current publisher-authenticated experimental packages and unsigned
+local packages as `locally_trusted_plugin` for execution. Only a separate durable
+conformance result may select `certified_signed_plugin`. That host-selected tier is
+combined with the action phase to produce `ArtifactCapabilityCeilingV1`; the normalized
+plan is rejected if its inferred reads, writes, caches, processes, provider use, mounted
+execution, network, or secret channels exceed that ceiling. No tier can request direct
+publication authority.
+
 The adapter catalog reports each package's planner protocols, supported operating systems,
 and architectures. Unsupported plugins remain inspectable but are not auto-discovered or
 executed on the current host. `lane readiness` replans every installed component from
@@ -357,6 +487,43 @@ and repair. Native launchers add process/file/memory limits to the denied-by-def
 filesystem, network, shell, and child-process sandbox. Ed25519 publisher signatures and
 the host trust store authenticate local packages today. Signed catalogs, independent
 certification attestations, and WASI transport remain distribution work.
+
+The framework-neutral artifact fixture runs reviewed-built-in, local protocol-v3
+plugin, and repository-v2 producer profiles through the same host-owned stages:
+discovery normalization, explicit resolution, desired identity, validation, sealing,
+COW isolation, reopen recovery, invalidation, source export, lane retirement, and
+last-reference collection. It emits `trail.artifact-adapter-certification/v1` JSON with
+one canonical check per stage. A required skip or failure keeps the report unverified;
+the report always carries `authority_effect = "evidence_only"` and cannot elevate a
+plugin trust tier or grant publication capability.
+
+Run the deterministic fixture and write its machine-readable report with:
+
+```sh
+CARGO_TARGET_DIR=/Volumes/Workspace/crabbuild-target/trail-<checkout> \
+  scripts/verify-artifact-adapter-conformance.sh /absolute/path/certification.json
+```
+
+This synthetic common-contract evidence complements, but does not replace, real-tool
+and native NFS/FUSE/Dokan qualification. Those unavailable gates remain explicitly
+unverified.
+
+The blocking Linux real-tool gate maps representative shapes to executable tests:
+
+| Shape | Gate evidence |
+| --- | --- |
+| Dependency resolution/install | Cargo resolver snapshot and npm managed-lock frozen install |
+| Compiled incremental tree | Cargo target seed builds once and is reused |
+| Framework/bundler composition | Node dependencies plus distinct Next.js/Vite build and private-cache components |
+| Path-bound private state | Real Python virtual environments and CMake configure/build trees |
+| External metadata | Bazel/Nix-like verified external-store normalization without fake Trail layers |
+| Custom pipeline | Repository-v2 Maven/Gradle-like and unknown generator components |
+| Source export | CAS subtree export through normal guarded source checkpointing |
+
+Run all gates with `scripts/verify-artifact-real-tool-gates.sh`. A missing
+required executable fails the gate; it is never converted into passing evidence. Native
+mount, multi-lane, and real Next.js/Vite build evidence remains in the owning-platform
+qualification jobs.
 
 ## Design principles
 
@@ -902,6 +1069,30 @@ Adapters declare which command argument or output fields may echo credentials so
 host can add structured redaction. This declaration supplements, but never replaces,
 host-wide exact-value redaction and secret scanning.
 
+Receiving a secret value taints the producer output; a non-secret provider/version
+reference alone does not. Taint metadata contains only canonical channel classes, never
+provider names, handles, paths, or values. Tainted candidates may remain in lane-private
+storage, but the host rejects resolution-snapshot publication, shared artifact sealing,
+private-output promotion, and source export. Bounded attempt evidence is exact-value
+redacted before storage. In the current resolver API a declared credential handle cannot
+be distinguished from one actually consumed, so shared resolution fails closed. A future
+private resolver-output store may preserve such output without weakening this rule.
+
+Resolver declarations are also capped by host ceilings before an attempt record or
+subprocess can be created: one hour of wall time, 16 MiB for each captured stream,
+1 GiB and 1,000,000 entries for the candidate, and 256 child processes. Declared limits
+must be non-zero and may narrow these ceilings, never expand them. Repository-relative
+path and control-character validation runs in the same pre-attempt boundary.
+
+Adapters do not author or publish artifact attestations. After host sealing, Trail creates
+the deterministic attestation from validated host evidence and stores it as a separate
+content-addressed object so signatures and trust observations do not alter artifact tree
+identity. Attachment requires an exact statement/envelope match and current producer
+trust. For plugin producers, the installed distribution digest, publisher, and publisher
+key must still match; tombstoned packages and removed publisher trust fail closed.
+Optional signatures cover the canonical attestation statement and are never interpreted
+as adapter certification or publication authority.
+
 ## Plugin protocol and capabilities
 
 The implemented v1/v2 transport is a natively sandboxed subprocess using one
@@ -913,6 +1104,49 @@ the same models. Local plugins are installed by digest and declare:
 - bounded repository-relative read patterns and file/byte limits;
 - timeout and response-size limits;
 - one executable digest and experimental stability.
+
+The SDK's protocol-v3 wire layer is separate from v1/v2 and carries explicit host
+ceilings. It models incomplete proposals, resolution plans and verified snapshot input,
+typed artifact phases, input roles, validation and capability contracts, identity
+declarations, explicit source exports, attestation requirements, secret taint, and
+quarantine policy. Only Trail-authored object references can appear as attestation or
+quarantine evidence in an adapter request. Adapter responses cannot publish those
+objects or acquire mutation authority. Both request and response expose bounded
+validation before semantic host normalization; exact protocol negotiation and complete
+host-side validation remain mandatory trust boundaries.
+
+Negotiation compares exact identities and chooses the highest mutual value from v3,
+v2, then v1; caller ordering and unknown version-like prefixes have no effect. Until the
+host completes v3 normalization, its advertised host set remains v1/v2, so a multi-version
+package deterministically falls back while a v3-only package is not invoked. Canonical
+v1/v2 compatibility projections preserve their existing commands, outputs, caches, and
+external/runtime declarations but carry a structurally empty v3-only section. Missing
+legacy fields can therefore never imply proposal, resolver, validation, capability,
+identity-certification, export, attestation, or quarantine semantics.
+
+The SDK v3 builder provides early authoring validation and deterministic set ordering.
+Package metadata separately declares resolution/export and host-evidence capabilities
+plus a certification ceiling; omission is deny-all legacy behavior. These declarations
+are maximum requests, not grants: package trust, host policy, protocol selection, and
+native enforcement may only narrow them.
+
+Trail's v3 exchange validator does not trust builder use. It rechecks request and
+response ceilings, exact protocol/request/package/source/host pins, canonical proposal
+evidence, complete typed-input equality, normalized paths, duplicate component/action/
+validation/output/export identities, graph and phase/output compatibility, conservative
+secret taint, package resolution/export/evidence declarations, and certification
+ceiling. Unknown required fields and enum values fail CBOR decoding. Multi-version
+packages continue negotiating v2 until the v3 invocation/normalization path is enabled,
+so merely installing a v3 declaration cannot bypass this validator.
+
+The SDK freezes representative proposal request/response frames as length-prefixed CBOR
+hex fixtures and decodes them on every test run. Contract tests also exercise truncated
+headers and bodies, declared and encoded size overruns, legacy-only negotiation, and
+property-generated protocol order/duplication/unknown-version combinations. The layered
+workspace CI matrix runs these SDK contracts on Linux, macOS, and Windows. Trail's host
+tests separately repeat malicious response, package mismatch, capability ceiling,
+platform-identity, publisher-signature, and revocation checks; native plugin scripts own
+the operating-system sandbox evidence.
 
 The planner capability set is deliberately fixed rather than open-ended: bounded pinned
 bytes in, discovery or plan data out, no direct repository reads or writes, no child
@@ -961,13 +1195,20 @@ The following mappings show how one policy vocabulary fits very different toolch
 Next.js and Vite are profiles composed over the Node adapter. They do not duplicate
 package installation logic.
 
+The executable conformance fixture represents Next.js state as a writable-private
+component depending on `node`. Vite is split into an immutable validated `dist`
+component and an independently keyed writable-private optimizer-cache component, both
+depending on `node`. Splitting outputs with different lifecycles avoids relabeling a
+path-bound cache as reusable merely because a sibling build output is portable. These
+are repository-v2 compositions, not framework names or new COW modes in Trail core.
+
 ### Rust and Cargo
 
 | Concern | Inputs | Policy/binding |
 | --- | --- | --- |
 | Rust toolchain | `rust-toolchain.toml`, distribution digest, target components | `immutable_shared` toolchain |
 | Registry crates and Git checkouts | Cargo version, source registry, checksums | `cache_shared_content` with host-mediated indexes |
-| Compiled dependency seed | `Cargo.lock`, features, profiles, rustc identity, target, relevant build-script environment | optional `immutable_seed_private` lower for `target` |
+| Compiled dependency seed | source or Trail-managed `Cargo.lock` snapshot, complete source root, features, profiles, rustc identity, target, relevant build-script environment | optional `immutable_seed_private` lower for `target` |
 | Active target directory | source and commands continuously mutate it | `writable_private` at `target` |
 | Compiler cache | compiler identity, target, flags | `cache_shared_compiler` through sccache protocol |
 | Credentials | registry token | `secret_runtime`, injected only into Cargo command |
@@ -990,6 +1231,20 @@ is conservative.
 CMake adapters must account for absolute paths in `CMakeCache.txt`. A private build tree
 cannot be promoted to a portable immutable artifact merely because compilation
 succeeded.
+
+### Framework-neutral conformance shapes
+
+Executable fixtures intentionally avoid adding Maven, Gradle, Bazel, Nix, or arbitrary
+custom framework modes to Trail core. Maven/Gradle-like dependency checksum output and
+lane-private build/daemon state are separate `trail.environment/v2` command components.
+An unknown custom generator uses the same component, validation, desired-key v2, and
+explicit source-export contracts.
+
+Bazel/Nix-like provider stores use a protocol-v2 plugin metadata component containing
+sorted `verified_external` entries. Each entry binds a provider token, opaque bounded
+reference, SHA-256 digest, and platform identity. It has no action, cache, output,
+runtime allocation, or Trail-owned cleanup. OCI runtime declarations remain restricted
+to `oci_image`, so a generic store reference cannot be relabeled as a container image.
 
 The implemented `trail/cmake-build@1` adapter covers the safe first slice: discovery,
 deterministic host/tool compatibility identity, atomic lane-private build-directory
@@ -1055,9 +1310,13 @@ compatible re-sync preserves the private environment and creates no shared layer
 Additional native fixtures cover multi-component `env sync all`, initializer failure,
 undeclared source writes, kill-point recovery, and abandoned-candidate cleanup.
 
-Sharing interpreter distributions and wheel/download content safely remains a separate
-typed-cache slice; Trail must not represent a path-bearing virtual environment itself as
-a portable immutable artifact without relocation validation.
+An optional resolver plan pins the complete source root, exact uv executable, offline
+hash-generation policy, and `pyproject.toml`, then stores the resulting
+`requirements.lock` as verified environment metadata. The host projects it only into
+attempt staging and runs hash-required `pip download` into a host-owned
+`cache_shared_content` namespace. Evicting that cache affects performance only. Trail
+still must not represent a path-bearing virtual environment, its bytecode, or embedded
+scripts as a portable immutable artifact without relocation validation.
 
 | Concern | Inputs | Policy/binding |
 | --- | --- | --- |

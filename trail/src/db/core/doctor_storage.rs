@@ -257,6 +257,8 @@ pub(super) fn push_workspace_views_check(db: &Trail, checks: &mut Vec<DoctorChec
         }
         errors.extend(db.validate_workspace_layer_publications_integrity()?);
         errors.extend(db.validate_workspace_cache_authorities_integrity()?);
+        errors.extend(db.validate_artifact_cas_integrity()?);
+        errors.extend(db.validate_workspace_artifact_layout_integrity()?);
         Ok(serde_json::json!({
             "views": rows.len(),
             "errors": errors,

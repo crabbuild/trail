@@ -80,6 +80,12 @@ fn resource_completion_candidates(
         (RESOURCE_APPROVAL_TEMPLATE, "approval_id") => approval_completion_candidates(db),
         (RESOURCE_RUN_TEMPLATE, "run_id") => run_completion_candidates(db),
         (RESOURCE_SPAN_TEMPLATE, "span_id") => span_completion_candidates(db),
+        (RESOURCE_ARTIFACT_TEMPLATE, "artifact_id") => db.artifact_envelope_ids(),
+        (RESOURCE_ARTIFACT_QUARANTINE_TEMPLATE, "quarantine_id") => Ok(db
+            .list_artifact_quarantines()?
+            .into_iter()
+            .map(|record| record.quarantine_id.0)
+            .collect()),
         (
             RESOURCE_LANE_TEMPLATE
             | RESOURCE_LANE_STATUS_TEMPLATE
@@ -93,7 +99,9 @@ fn resource_completion_candidates(
             | RESOURCE_CONFLICT_TEMPLATE
             | RESOURCE_APPROVAL_TEMPLATE
             | RESOURCE_RUN_TEMPLATE
-            | RESOURCE_SPAN_TEMPLATE,
+            | RESOURCE_SPAN_TEMPLATE
+            | RESOURCE_ARTIFACT_TEMPLATE
+            | RESOURCE_ARTIFACT_QUARANTINE_TEMPLATE,
             _,
         ) => Ok(Vec::new()),
         (other, _) => Err(Error::InvalidInput(format!(

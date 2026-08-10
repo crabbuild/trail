@@ -51,10 +51,10 @@ Trail already has the right starting points:
 - Persistent lane uppers, whiteouts, workdir manifests, sessions, turns,
   checkpoints, gates, readiness, merge queues, and safe Git apply.
 
-The current overlay implementations expose one Trail root as a lower layer and
-one lane directory as an upper layer. They do not expose ignored dependencies or
-generated artifacts, eagerly load the root file map, and implement overlapping
-filesystem behavior separately for FUSE, NFS, and Dokan.
+The shared `ViewCore` now exposes a lazy Trail root plus immutable environment
+artifact manifests as lower layers and class-specific lane directories as
+uppers. FUSE, NFS, and Dokan are protocol adapters over those common lookup,
+ranged-read, copy-up, whiteout, rename, and directory semantics.
 
 This design evolves that foundation into a **layered lane workspace**:
 
@@ -111,6 +111,11 @@ Generated and dependency directories frequently dominate the source checkout:
 - Cargo `target` directories can exceed the source tree by orders of magnitude.
 - Python environments, Java/Gradle caches, generated SDKs, and editor indexes
   add similar amplification.
+
+Python keeps the path-bearing virtual environment and bytecode in the lane-private
+generated upper. A hash-bearing managed requirements snapshot may warm a shared,
+evictable wheel/download content cache, but that cache never becomes environment
+authority and `.venv` is never promoted as a portable layer without relocation proof.
 
 Filesystem reflinks reduce data-block duplication, but do not remove directory
 entry and inode cost, do not help on every filesystem, and do not by themselves
@@ -227,23 +232,38 @@ The transparent COW modes already establish several correct invariants:
 - Mount failure is explicit rather than silently becoming a full copy.
 - macOS NFS mount state is persisted for stale-mount recovery.
 
-The principal gaps are:
+CAS-backed artifacts also have a reconstructible real-directory cache under
+`.trail/cache/artifact-materializations`. Its identity combines the verified
+artifact tree root with the real-directory backend compatibility key. Trail
+stages and verifies complete content before atomic publication, revalidates and
+re-seals entries on reuse, and rebuilds missing or corrupt cache directories
+from authoritative CAS objects. Copies into mutable layer or lane state prefer
+native clone/reflink support and fall back to independent file copies; Trail
+does not use hard links that could alias mutable bytes back into this cache.
 
-1. The lower layer includes only files in the Trail root. Default-ignored paths
-   such as `node_modules` and `target` are neither visible nor shared.
-2. Overlay mounts load the complete root into memory rather than using lazy
-   lookup and directory iteration.
-3. Lower-file reads materialize complete file contents into memory.
-4. FUSE, NFS, and Dokan contain separate implementations of lookup, copy-up,
-   whiteout, rename, and directory behavior.
-5. A single upper mixes source changes with generated and dependency changes.
-6. Checkpoint detection still relies partly on manifests or scans instead of an
+When one lane forks another, immutable environment outputs are inherited only
+after output-level CAS compatibility checks. Trail revalidates the exact desired
+key, ready envelope, complete tree, current adapter implementation/distribution
+and package trust, sharing and portability scopes, and the child view backend.
+Rejected sibling outputs are not copied merely because another output from the
+same component is reusable. Every accepted child artifact binding is new, as
+are the child source, generated, scratch, and seeded/writable private uppers.
+
+The remaining principal gaps are:
+
+1. Verified real-directory materialization caches participate in deterministic
+   cache eviction and reachability/accounting, but do not yet have a separate
+   per-artifact quota policy.
+2. Git-root lower-file reads still use a complete-file projection cache; CAS
+   artifact files use direct bounded blob/chunk ranges and materialize only the
+   selected file during copy-up.
+3. Checkpoint detection still relies partly on manifests or scans instead of an
    explicit per-view mutation set.
-7. Mount lifetime is tied mainly to a terminal agent process; editor workflows
+4. Mount lifetime is tied mainly to a terminal agent process; editor workflows
    need daemon-owned or foreground persistent mounts.
-8. The view has no Git compatibility metadata.
-9. There is no layer cache lifecycle, key model, quota, pinning, accounting, or
-   integrity verification.
+5. The view has no Git compatibility metadata.
+6. Layer cache lifecycle and accounting are implemented; finer per-component
+   quota policy remains incomplete.
 
 ## Architectural Principles
 
@@ -609,17 +629,21 @@ case-colliding paths are rejected. Layer files become read-only before publish.
 
 ### Build and publish protocol
 
-1. Acquire a lease for the cache key in one SQLite transaction.
+1. Acquire the cache-key file lock and reserve a durable, generation-fenced attempt.
 2. If a complete layer already exists, pin and use it.
 3. Build in `.trail/cache/staging/<build-id>`.
 4. Run guardrail and approval checks before network access or lifecycle scripts.
 5. Validate the resulting tree and build the manifest.
 6. Sync files and metadata according to durability policy.
 7. Atomically rename staging to the immutable layer location.
-8. Mark the layer complete and wake waiters.
+8. Mark the attempt complete and release durable waiters.
 
-Concurrent callers for the same key wait for one builder. A dead builder lease
-is recoverable; incomplete staging directories are never mounted.
+Concurrent callers for the same key record waiter evidence and reuse one builder's
+result. Attempts expose `reserved`, `building`, `validating`, `publishing`, and
+`completed` phases. Every mutation is fenced by attempt ID, owner generation, PID, and
+process-start token. Trail replaces an owner only when that exact process identity is
+proven dead or mismatched; unknown liveness remains owned. Incomplete staging
+directories are never mounted.
 
 ### Node adapter
 
@@ -661,6 +685,20 @@ deletion remains correct but is intentionally not the optimized control path.
 Trail must not infer that a lockfile update is valid merely because an agent
 mutated `node_modules`. The lockfile and adapter build remain authoritative.
 
+When a leaf package intentionally omits a lockfile, Trail may resolve one manager-specific
+snapshot selected by `packageManager` (defaulting to npm). npm, pnpm, Yarn, and Bun retain
+distinct lock names, formats, and frozen-install argv, but all use the common verified
+snapshot projection. The snapshot stays outside source and Git; the resulting
+`node_modules` seed, package download cache, COW upper, and invalidation behavior are the
+same as for a tracked lockfile. Until a narrower package input closure is certified, the
+managed snapshot is pinned to the complete source root.
+
+The repository-v2 framework fixture composes Next.js and Vite over that Node component.
+Next owns lane-private `.next`; Vite splits lane-private `.vite` optimizer state from a
+separately validated immutable `dist` component. Every framework component has a typed
+`build_requires` edge to Node, so dependency resolution and `node_modules` COW remain
+centralized while each generated path follows its own reuse and disposal policy.
+
 ### Cargo adapter
 
 Cargo needs a different strategy because `target` mixes reusable compiler
@@ -677,6 +715,14 @@ The safe default is:
 - Optionally attach an immutable Cargo target seed created for an identical
   base root, lockfile, toolchain, target triple, feature/profile set, Cargo
   config, and relevant flags.
+
+Library repositories that intentionally omit `Cargo.lock` use the same construction
+path after an explicit resolution operation records the lock bytes as Trail metadata.
+The verified snapshot is projected only into the attempt-owned source staging tree; it
+is never added to the lane source upper or Git. Until certified Cargo input-closure
+analysis exists, both its proposal and target seed remain keyed by the complete source
+root, so even an unrelated source change requires a new lock snapshot rather than
+silently reusing dependency selection from another root.
 
 `cargo clean` creates lane-local whiteouts over a seed; it never deletes the
 shared layer. Workspace-crate incremental state stays private. Trail may
@@ -1159,7 +1205,7 @@ Cache GC works from pins and policy:
 - Blob projections are independently reclaimable and rematerializable.
 - Generated uppers follow per-lane retention and archive policy.
 
-`trail lane space` and `trail cache list` should distinguish:
+`trail lane space` and structured cache-GC reports distinguish:
 
 ```text
 logical visible bytes
@@ -1168,15 +1214,33 @@ lane-exclusive physical bytes
 reflink/shared-extent bytes when the platform can report them
 reclaimable cache bytes
 uncheckpointed source bytes
+artifact logical bytes
+unique authoritative CAS bytes
+cross-artifact shared CAS bytes
+artifact materialized bytes
+lane-private bytes
+persisted prefetched bytes
+demand-loaded projection bytes
+artifact/cache reclaimable bytes
+unknown or unattributable bytes
 ```
 
 Ordinary `du` on mountpoints is insufficient and may report logical bytes
 multiple times. Trail reports should use layer manifests plus platform block or
-extent accounting where available and clearly label estimates.
+extent accounting where available and clearly label estimates. Logical,
+authoritative, physical, and reclaimable values are separate axes and must not
+be summed. Unique and cross-artifact shared bytes partition selected encoded
+CAS objects without double counting; reclaimable bytes can overlap a physical
+cache classification. Operating-system page-cache warming is not persisted and
+is explicitly excluded from prefetched bytes.
 
-`fsck` verifies layer manifests and references. Normal Trail object GC and
-workspace-cache GC remain separate commands because cache loss is recoverable
-while object-history loss is not.
+`fsck` verifies layer manifests and references, raw CAS object identities and
+edges, snapshots, envelopes, attempt state, and materialization ownership. It
+labels missing legacy layers as rebuild-required and missing CAS-backed layers
+as reconstructible. Orphan layer/restore directories are reported with review
+guidance rather than deleted without durable ownership evidence. Normal Trail
+object GC and workspace-cache GC remain separate commands because cache loss is
+recoverable while object-history loss is not.
 
 ## Performance Architecture and Targets
 
@@ -1451,8 +1515,11 @@ Existing lanes using the current mode vocabulary remain valid:
 - New materialized selections default to `auto`; mounted modes remain explicit.
 
 Backups from older schemas restore without views. New backups restore source
-uppers but rebuild caches. JSON reports add fields compatibly where possible;
-new report types are preferred over changing unrelated existing shapes.
+uppers and authenticated journals but rebuild generated/scratch state,
+materializations, and performance caches. Authoritative artifact objects and
+generation bindings survive even though copied active generations are retired
+until a fresh sync. JSON reports identify retained private bytes and omitted
+rebuildable state explicitly.
 
 ## Alternatives Considered
 

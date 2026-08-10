@@ -17,7 +17,12 @@ pub mod server;
 
 pub use db::{InitImportMode, Trail};
 pub use error::{Error, Result};
-pub use ids::{AnchorId, ChangeId, FileId, LineId, MessageId, ObjectId, WorkspaceId};
+pub use ids::{
+    AnchorId, ArtifactAttemptId, ArtifactAttestationId, ArtifactBlobId, ArtifactChunkId,
+    ArtifactChunkListId, ArtifactDesiredKeyV2, ArtifactEnvelopeId, ArtifactFileId,
+    ArtifactGenerationBindingId, ArtifactQuarantineId, ArtifactTreeId, ChangeId, FileId, LineId,
+    MessageId, ObjectId, WorkspaceId,
+};
 pub use model::*;
 
 #[cfg(debug_assertions)]

@@ -3,8 +3,46 @@
 Run `scripts/verify-layered-lane-scale.sh` with a unique external
 `CARGO_TARGET_DIR` and `TRAIL_SCALE_EVIDENCE_DIR` beneath `/Volumes/Workspace`.
 It executes deterministic 10k/1-lane, 100k/5-lane, and 1M/20-lane fixtures and
-writes one JSON evidence file per experiment. A platform whose native backend
-gate was not run remains unverified; a skipped result is never passing evidence.
+writes both a source-root and an artifact-CAS JSON evidence file per experiment.
+`scripts/check-layered-lane-scale-evidence.py` fails the run when any matrix row,
+measurement, or explicit skipped-backend disposition is absent.
+
+The artifact experiment constructs one immutable Merkle tree, binds the same
+tree to every lane, writes one distinct private delta per lane, and deliberately
+leaves the tree lazy. Its evidence records logical-to-authoritative content
+reuse, the naive per-lane copy baseline, actual copied/projected/prefetched and
+materialized bytes, private allocated bytes, phase latency, and CAS object
+counts. `backend=cas-lazy-unmounted` qualifies only the portable CAS/lazy lookup
+path. It sets `native_backend_qualified=false` and lists NFS, FUSE, and Dokan as
+skipped; native qualification belongs to the owning-host matrix and cannot be
+inferred from this experiment. A skipped result is never passing evidence.
+
+The million-entry cases are intentionally release-scale rather than pull-request
+smoke tests. Run them through the `Layered Workspace Native Gates` workflow's
+`run_scale` dispatch or on a machine where the external target and evidence
+directories have enough space and time. CI uploads the six checked JSON reports
+even when a later correctness gate fails.
+
+For native artifact qualification, run the owning-host matrix with the native
+backend gate enabled. For example, macOS uses:
+
+```sh
+TRAIL_RUN_NFS_COW_TESTS=1 \
+CARGO_TARGET_DIR=/Volumes/Workspace/crabbuild-target/trail-native-cow \
+python3 scripts/verify-artifact-native-cow-matrix.py \
+  --output /Volumes/Workspace/trail-native-cow-evidence/nfs-macos.json
+```
+
+The report is deliberately compositional. The platform adapter owns mounted
+immutable lookup, copy-up, and whiteout semantics; Trail's shared CAS lifecycle
+owns inheritance, verified materialization/repair, promotion, source export,
+retirement, recovery, and accounting. Every check runs on the same owning host,
+and the report labels these scopes separately. It passes only when exactly one
+test executes for every required check. The other platform backends are emitted
+as `unverified` with `reason=not_owning_platform`; reports from their owning-host
+jobs are required before claiming those backends. The layered-workspaces CI
+workflow uploads Linux FUSE and macOS NFS reports on pull requests and an
+explicitly dispatched Dokan report on Windows.
 
 Use the CLI scale benchmark to verify large-repo and agent orchestration behavior before treating a change as production ready.
 

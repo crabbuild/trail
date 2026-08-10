@@ -187,6 +187,41 @@ trail env sync component <COMPONENT> --lane <LANE>
 trail env promote <LANE> <COMPONENT> <OUTPUT>
 ```
 
+When discovery reports a component as `resolvable`, produce its immutable
+dependency snapshot before synchronization:
+
+```sh
+trail env resolve all [<LANE>] [--path <ROOT>] [--refresh]
+trail env resolve component <COMPONENT> [--lane <LANE>] [--path <ROOT>] [--refresh]
+```
+
+Resolution runs the exact host-validated argv against an isolated projection of
+the lane's pinned source. A current snapshot is reused without launching the
+tool; `--refresh` is the only way to rerun it. Discovery returns the exact
+`resolve component` recovery argv, including `--lane`. Reviewed built-in
+resolvers currently require an offline, credential-free plan. Repository and
+plugin resolver execution fails closed until its restricted native resolver
+sandbox is available.
+
+Inspect and verify shared artifacts or handle divergent-producer evidence with:
+
+```sh
+trail env artifact inspect <ARTIFACT_ID>
+trail env artifact verify <ARTIFACT_ID> --level attach|sample|full|reproduce
+trail env artifact quarantine list
+trail env artifact quarantine show <QUARANTINE_ID>
+trail env artifact quarantine resolve <QUARANTINE_ID> \
+  --resolution retain-private|accept-incumbent|accept-candidate|retire-all
+trail env source export <LANE> --component <ID> --export <NAME>
+```
+
+These lifecycle reports support `--format json` and one-record
+`--format ndjson` in addition to deterministic plain and human rendering.
+Artifact verification exits nonzero when its returned report has `valid=false`.
+Source export always replans and revalidates the pinned artifact, generation,
+gate, source root, destination, collision policy, and explicit authorization
+before making ordinary guarded source edits.
+
 Inside exactly one mounted or managed lane, the lane argument to `sync all`
 and `--lane` for `sync component` may be omitted. Trail never guesses from the
 most recently used lane. Managed execution performs the same convergence
@@ -533,6 +568,13 @@ trail backup restore <PATH> [--force]
 | `backup create` | Write a workspace backup |
 | `backup verify` | Check that a backup is readable |
 | `backup restore` | Restore from a backup |
+
+Backup output reports `retained_private_views`/`retained_private_bytes` and
+`rebuildable_materializations`/`rebuildable_materialization_bytes` plus
+`rebuildable_performance_caches`. Restore additionally reports
+`restored_private_views`. Rebuildable counts describe deliberately omitted
+host-local projections; authoritative artifact objects and bindings remain in
+the backup.
 
 ## Fsck
 

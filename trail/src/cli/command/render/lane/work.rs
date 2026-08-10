@@ -100,6 +100,42 @@ pub(crate) fn render_workspace_space(
                 "Lane-exclusive".to_string(),
                 byte_count(report.lane_exclusive_physical_bytes),
             ),
+            (
+                "Artifact logical".to_string(),
+                byte_count(report.artifact_storage.logical_bytes),
+            ),
+            (
+                "Artifact authoritative unique".to_string(),
+                byte_count(report.artifact_storage.unique_authoritative_bytes),
+            ),
+            (
+                "Artifact authoritative shared".to_string(),
+                byte_count(report.artifact_storage.cross_artifact_shared_bytes),
+            ),
+            (
+                "Artifact materialized".to_string(),
+                byte_count(report.artifact_storage.materialized_bytes),
+            ),
+            (
+                "Artifact lane-private".to_string(),
+                byte_count(report.artifact_storage.lane_private_bytes),
+            ),
+            (
+                "Artifact prefetched".to_string(),
+                byte_count(report.artifact_storage.prefetched_bytes),
+            ),
+            (
+                "Artifact demand-loaded".to_string(),
+                byte_count(report.artifact_storage.demand_loaded_bytes),
+            ),
+            (
+                "Artifact reclaimable".to_string(),
+                byte_count(report.artifact_storage.reclaimable_bytes),
+            ),
+            (
+                "Artifact unknown".to_string(),
+                byte_count(report.artifact_storage.unknown_bytes),
+            ),
             ("Backend".to_string(), report.backend.clone()),
             (
                 "Logical files".to_string(),

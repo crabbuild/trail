@@ -15,6 +15,87 @@ pub(crate) const ANCHOR_ID_PREFIX: &str = "anchor_";
 pub(crate) const CHECKPOINT_ALIAS_PREFIX: &str = "checkpoint_";
 pub(crate) const LINE_ALIAS_PREFIX: &str = "line_";
 
+macro_rules! artifact_id_type {
+    ($name:ident, $prefix:literal, $domain:literal) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new(seed: &[u8]) -> Self {
+                let mut hasher = Sha256::new();
+                hasher.update(b"TRAIL-ARTIFACT-ID-V1\0");
+                hasher.update($domain.as_bytes());
+                hasher.update((seed.len() as u64).to_le_bytes());
+                hasher.update(seed);
+                Self(format!("{}{}", $prefix, hex::encode(hasher.finalize())))
+            }
+
+            pub fn parse(value: impl Into<String>) -> std::result::Result<Self, String> {
+                let value = value.into();
+                let Some(digest) = value.strip_prefix($prefix) else {
+                    return Err(format!("expected an ID with prefix `{}`", $prefix));
+                };
+                if digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(format!(
+                        "expected `{}` followed by 64 lowercase hexadecimal characters",
+                        $prefix
+                    ));
+                }
+                Ok(Self(value))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+artifact_id_type!(ArtifactDesiredKeyV2, "artifact_desired_", "desired-v2");
+artifact_id_type!(ArtifactTreeId, "artifact_tree_", "tree");
+artifact_id_type!(ArtifactFileId, "artifact_file_", "file");
+artifact_id_type!(ArtifactBlobId, "artifact_blob_", "blob");
+artifact_id_type!(ArtifactChunkListId, "artifact_chunks_", "chunk-list");
+artifact_id_type!(ArtifactChunkId, "artifact_chunk_", "chunk");
+artifact_id_type!(ArtifactEnvelopeId, "artifact_envelope_", "envelope");
+artifact_id_type!(
+    ArtifactAttestationId,
+    "artifact_attestation_",
+    "attestation"
+);
+artifact_id_type!(ArtifactAttemptId, "artifact_attempt_", "attempt");
+artifact_id_type!(ArtifactQuarantineId, "artifact_quarantine_", "quarantine");
+artifact_id_type!(
+    ArtifactGenerationBindingId,
+    "artifact_binding_",
+    "generation-binding"
+);
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(pub String);
 
@@ -257,5 +338,19 @@ mod tests {
         assert!(is_object_id("object_current"));
         assert!(!is_change_id(&format!("ch_{digest}")));
         assert!(!is_object_id("obj_legacy"));
+    }
+
+    #[test]
+    fn artifact_ids_are_domain_separated_and_validate_deserialization() {
+        let desired = ArtifactDesiredKeyV2::new(b"same-seed");
+        let tree = ArtifactTreeId::new(b"same-seed");
+        assert_ne!(desired.0, tree.0);
+        assert_eq!(
+            serde_json::from_str::<ArtifactDesiredKeyV2>(&serde_json::to_string(&desired).unwrap())
+                .unwrap(),
+            desired
+        );
+        assert!(serde_json::from_str::<ArtifactDesiredKeyV2>("\"artifact_desired_BAD\"").is_err());
+        assert!(ArtifactTreeId::parse(desired.0).is_err());
     }
 }

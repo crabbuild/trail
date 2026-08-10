@@ -26,7 +26,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 The OpenAPI path builder groups routes as:
 
 - Core: health, OpenAPI, doctor, status, record, diff, timeline, why, history, code-from, config, ignore, guardrails.
-- Lanes: list/spawn/show/remove, status, review, contribution, gates, readiness, merge, handoff, workdir, diff, read-file, sync-workdir, record, rewind, tests, evals, patches.
+- Lanes: list/spawn/show/remove, status, review, contribution, gates, readiness, merge, handoff, workdir, diff, read-file, sync-workdir, record, rewind, tests, evals, patches, environment resolution, and source export.
+- Artifacts: workspace space, envelope inspection and reachability, verification, quarantine list/show/resolve, and the shared artifact report schemas.
 - Collaboration: sessions, approvals, leases, claims, anchors, merge queue, conflicts, and `POST /v1/lanes/{lane}/merge` (used by `trail lane merge`).
 - Turns and traces: turns, messages, events, spans, runs.
 

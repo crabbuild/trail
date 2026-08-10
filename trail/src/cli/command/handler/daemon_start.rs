@@ -92,6 +92,8 @@ struct SocketLeafIdentity {
     inode: u64,
     ctime_sec: i64,
     ctime_nsec: i64,
+    stable_creation_sec: i64,
+    stable_creation_nsec: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -1358,6 +1360,16 @@ fn socket_leaf_creation_timestamp(metadata: &libc::stat) -> (i64, i64) {
     (metadata.st_ctime, metadata.st_ctime_nsec)
 }
 
+#[cfg(target_os = "macos")]
+fn socket_leaf_stable_creation_timestamp(metadata: &libc::stat) -> (i64, i64) {
+    (metadata.st_birthtime, metadata.st_birthtime_nsec)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn socket_leaf_stable_creation_timestamp(_metadata: &libc::stat) -> (i64, i64) {
+    (0, 0)
+}
+
 fn socket_ctime_identity(
     socket_ctime_sec: Option<i64>,
     socket_ctime_nsec: Option<i64>,
@@ -1390,11 +1402,15 @@ fn verify_socket_leaf_owner(
         ));
     }
     let (ctime_sec, ctime_nsec) = socket_leaf_creation_timestamp(&metadata);
+    let (stable_creation_sec, stable_creation_nsec) =
+        socket_leaf_stable_creation_timestamp(&metadata);
     Ok(SocketLeafIdentity {
         device: metadata.st_dev as u64,
         inode: metadata.st_ino as u64,
         ctime_sec,
         ctime_nsec,
+        stable_creation_sec,
+        stable_creation_nsec,
     })
 }
 
@@ -1419,6 +1435,46 @@ fn verify_secure_socket_leaf_identity(
         ));
     }
     Ok(identity)
+}
+
+fn socket_leaf_identity_matches(
+    expected: SocketLeafIdentity,
+    captured: SocketLeafIdentity,
+) -> bool {
+    expected == captured
+}
+
+fn socket_leaf_identity_from_file(file: &File) -> Result<SocketLeafIdentity> {
+    let metadata = file.metadata()?;
+    if metadata.mode() & u32::from(libc::S_IFMT) != u32::from(libc::S_IFSOCK) {
+        return Err(Error::DaemonUnavailable(
+            "workspace daemon socket identity handle changed type".into(),
+        ));
+    }
+    Ok(SocketLeafIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        ctime_sec: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+        stable_creation_sec: 0,
+        stable_creation_nsec: 0,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_socket_leaf_identity_handle(parent: &File, leaf: &str) -> std::io::Result<Option<File>> {
+    openat_file(
+        parent,
+        leaf,
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_socket_leaf_identity_handle(_parent: &File, _leaf: &str) -> std::io::Result<Option<File>> {
+    Ok(None)
 }
 
 fn publish_owner_file(authority: &SecureAuthority, name: &str, bytes: &[u8]) -> Result<()> {
@@ -1548,6 +1604,11 @@ fn remove_socket_leaf_if_identity(
     missing_ok: bool,
     run_test_boundary: bool,
 ) -> Result<()> {
+    let identity_handle = match open_socket_leaf_identity_handle(&authority.trail_directory, leaf) {
+        Ok(handle) => handle,
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
     let expected = match socket_leaf_stat(&authority.trail_directory, leaf) {
         Ok(_) => verify_secure_socket_leaf_identity(
             &authority.trail_directory,
@@ -1559,6 +1620,13 @@ fn remove_socket_leaf_if_identity(
         Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Error::Io(error)),
     };
+    if let Some(handle) = identity_handle.as_ref()
+        && !socket_leaf_identity_matches(expected, socket_leaf_identity_from_file(handle)?)
+    {
+        return Err(Error::DaemonUnavailable(
+            "workspace daemon socket identity changed while acquiring cleanup authority".into(),
+        ));
+    }
 
     #[cfg(debug_assertions)]
     if run_test_boundary {
@@ -1582,7 +1650,19 @@ fn remove_socket_leaf_if_identity(
     authority.trail_directory.sync_all()?;
 
     let captured = verify_socket_leaf_owner(&authority.trail_directory, &quarantine, Some(0o600))?;
-    if captured.device != expected.device || captured.inode != expected.inode {
+    // Linux keeps the original inode alive through O_PATH so it cannot be
+    // recycled during the rename race. macOS socket handles are unavailable,
+    // so APFS birth time supplies the stable post-rename identity dimension.
+    let captured_matches = if let Some(handle) = identity_handle.as_ref() {
+        socket_leaf_identity_matches(socket_leaf_identity_from_file(handle)?, captured)
+    } else {
+        captured.device == expected.device
+            && captured.inode == expected.inode
+            && (!cfg!(target_os = "macos")
+                || (captured.stable_creation_sec, captured.stable_creation_nsec)
+                    == (expected.stable_creation_sec, expected.stable_creation_nsec))
+    };
+    if !captured_matches {
         let restore = renameat_noreplace(&authority.trail_directory, &quarantine, leaf);
         let _ = authority.trail_directory.sync_all();
         return match restore {
@@ -1833,4 +1913,32 @@ pub(super) fn workspace_from_context(ctx: &RuntimeContext) -> Result<PathBuf> {
         })
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| Error::InvalidInput("workspace path is unavailable".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{socket_leaf_identity_matches, SocketLeafIdentity};
+
+    #[test]
+    fn socket_leaf_identity_rejects_creation_time_reuse() {
+        let expected = SocketLeafIdentity {
+            device: 7,
+            inode: 11,
+            ctime_sec: 13,
+            ctime_nsec: 17,
+            stable_creation_sec: 23,
+            stable_creation_nsec: 29,
+        };
+        let substituted = SocketLeafIdentity {
+            ctime_nsec: 19,
+            ..expected
+        };
+        let recycled = SocketLeafIdentity {
+            stable_creation_nsec: 31,
+            ..expected
+        };
+
+        assert!(!socket_leaf_identity_matches(expected, substituted));
+        assert!(!socket_leaf_identity_matches(expected, recycled));
+    }
 }

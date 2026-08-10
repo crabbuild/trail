@@ -480,6 +480,9 @@ impl Trail {
     ) -> Result<()> {
         if let Some(view) = view {
             for statement in [
+                "DELETE FROM artifact_generation_bindings
+                 WHERE generation_id IN (
+                     SELECT generation_id FROM environment_generations WHERE view_id=?1)",
                 "DELETE FROM environment_secret_access_audit
                  WHERE generation_id IN (
                      SELECT generation_id FROM environment_generations WHERE view_id=?1)",

@@ -108,6 +108,169 @@ CREATE TABLE conflict_sets (
                 details_json TEXT,
                 created_at INTEGER NOT NULL
             );
+CREATE TABLE artifact_resolution_snapshots (
+                snapshot_id TEXT PRIMARY KEY REFERENCES objects(object_id),
+                proposal_key TEXT NOT NULL,
+                source_root TEXT NOT NULL REFERENCES objects(object_id),
+                component_id TEXT NOT NULL,
+                adapter_identity TEXT NOT NULL,
+                content_object_id TEXT NOT NULL REFERENCES objects(object_id),
+                predecessor_snapshot_id TEXT REFERENCES objects(object_id),
+                verification_state TEXT NOT NULL
+                    CHECK (verification_state IN ('verified','rejected')),
+                state TEXT NOT NULL CHECK (state IN ('current','superseded')),
+                created_at INTEGER NOT NULL,
+                superseded_at INTEGER
+            );
+CREATE UNIQUE INDEX artifact_resolution_snapshots_current_idx
+                ON artifact_resolution_snapshots(proposal_key)
+                WHERE state = 'current';
+CREATE INDEX artifact_resolution_snapshots_content_idx
+                ON artifact_resolution_snapshots(content_object_id);
+CREATE TABLE artifact_objects (
+                artifact_id TEXT PRIMARY KEY,
+                object_id TEXT NOT NULL REFERENCES objects(object_id),
+                kind TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                logical_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(object_id)
+            );
+CREATE INDEX artifact_objects_kind_idx ON artifact_objects(kind, artifact_id);
+CREATE TABLE artifact_envelopes (
+                envelope_id TEXT PRIMARY KEY,
+                desired_key TEXT NOT NULL,
+                trust_scope TEXT NOT NULL,
+                tree_root_id TEXT NOT NULL REFERENCES artifact_objects(artifact_id),
+                object_id TEXT NOT NULL UNIQUE REFERENCES objects(object_id),
+                state TEXT NOT NULL CHECK (state IN ('candidate','ready','quarantined','retired')),
+                verification_state TEXT NOT NULL
+                    CHECK (verification_state IN ('pending','verified','rejected')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+CREATE INDEX artifact_envelopes_desired_idx
+                ON artifact_envelopes(desired_key, state, envelope_id);
+CREATE TABLE artifact_construction_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                desired_key TEXT NOT NULL,
+                source_root TEXT NOT NULL REFERENCES objects(object_id),
+                owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+                owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+                owner_start_token TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN
+                    ('reserved','building','validating','publishing','completed')),
+                status TEXT NOT NULL CHECK (status IN
+                    ('running','succeeded','failed','cancelled','abandoned')),
+                candidate_journal_object_id TEXT REFERENCES objects(object_id),
+                envelope_id TEXT REFERENCES artifact_envelopes(envelope_id),
+                reason_code TEXT,
+                reason TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
+                started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL,
+                finished_at INTEGER
+            );
+CREATE UNIQUE INDEX artifact_construction_attempts_running_idx
+                ON artifact_construction_attempts(desired_key)
+                WHERE status = 'running';
+CREATE TABLE artifact_construction_waiters (
+                attempt_id TEXT NOT NULL REFERENCES artifact_construction_attempts(attempt_id),
+                waiter_id TEXT NOT NULL,
+                owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+                owner_start_token TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('waiting','released','cancelled','abandoned')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (attempt_id, waiter_id)
+            );
+CREATE TABLE artifact_resolution_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                proposal_key TEXT NOT NULL,
+                source_root TEXT NOT NULL REFERENCES objects(object_id),
+                plan_object_id TEXT NOT NULL REFERENCES objects(object_id),
+                owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+                owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+                owner_start_token TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN
+                    ('running','succeeded','failed','cancelled','abandoned')),
+                cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
+                authority_evidence_json BLOB NOT NULL,
+                stdout_object_id TEXT REFERENCES objects(object_id),
+                stderr_object_id TEXT REFERENCES objects(object_id),
+                snapshot_id TEXT REFERENCES artifact_resolution_snapshots(snapshot_id),
+                failure_receipt_object_id TEXT REFERENCES objects(object_id),
+                failure_code TEXT,
+                failure_message TEXT,
+                started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL,
+                finished_at INTEGER
+            );
+CREATE UNIQUE INDEX artifact_resolution_attempts_running_idx
+                ON artifact_resolution_attempts(proposal_key)
+                WHERE status = 'running';
+CREATE TABLE artifact_attestations (
+                attestation_id TEXT PRIMARY KEY,
+                envelope_id TEXT NOT NULL REFERENCES artifact_envelopes(envelope_id),
+                object_id TEXT NOT NULL UNIQUE REFERENCES objects(object_id),
+                producer_identity TEXT NOT NULL,
+                trust_scope TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('valid','revoked','invalid')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+CREATE TABLE artifact_quarantines (
+                quarantine_id TEXT PRIMARY KEY,
+                trust_scope TEXT NOT NULL,
+                desired_key TEXT NOT NULL,
+                incumbent_envelope_id TEXT REFERENCES artifact_envelopes(envelope_id),
+                candidate_envelope_id TEXT NOT NULL REFERENCES artifact_envelopes(envelope_id),
+                reason_code TEXT NOT NULL,
+                evidence_object_id TEXT NOT NULL REFERENCES objects(object_id),
+                state TEXT NOT NULL CHECK (state IN ('active','resolved')),
+                resolution TEXT,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER
+            );
+CREATE INDEX artifact_quarantines_desired_idx
+                ON artifact_quarantines(trust_scope, desired_key, state);
+CREATE TABLE artifact_holds (
+                hold_id TEXT PRIMARY KEY,
+                target_kind TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
+CREATE INDEX artifact_holds_target_idx
+                ON artifact_holds(target_kind, target_id, expires_at);
+CREATE TABLE artifact_generation_bindings (
+                binding_id TEXT PRIMARY KEY,
+                generation_id TEXT NOT NULL REFERENCES environment_generations(generation_id),
+                component_id TEXT NOT NULL,
+                output_name TEXT NOT NULL,
+                desired_key TEXT NOT NULL,
+                envelope_id TEXT NOT NULL REFERENCES artifact_envelopes(envelope_id),
+                tree_root_id TEXT NOT NULL REFERENCES artifact_objects(artifact_id),
+                binding_identity TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(generation_id, component_id, output_name)
+            );
+CREATE TABLE artifact_materializations (
+                materialization_id TEXT PRIMARY KEY,
+                tree_root_id TEXT NOT NULL REFERENCES artifact_objects(artifact_id),
+                backend_compatibility TEXT NOT NULL,
+                storage_path TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('building','verified','failed')),
+                logical_bytes INTEGER NOT NULL,
+                physical_bytes INTEGER,
+                entry_count INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(tree_root_id, backend_compatibility)
+            );
+CREATE INDEX artifact_materializations_lru_idx
+                ON artifact_materializations(state, last_used_at, materialization_id);
 CREATE TABLE environment_cache_namespaces (
                 namespace_id TEXT PRIMARY KEY,
                 adapter_identity TEXT NOT NULL,
@@ -946,6 +1109,13 @@ CREATE TABLE workspace_layers (
                 lease_expires_at INTEGER,
                 last_used_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
+            );
+CREATE TABLE workspace_layer_artifact_shadows (
+                layer_id TEXT PRIMARY KEY REFERENCES workspace_layers(layer_id),
+                tree_root_id TEXT NOT NULL REFERENCES artifact_objects(artifact_id),
+                envelope_id TEXT NOT NULL REFERENCES artifact_envelopes(envelope_id),
+                state TEXT NOT NULL CHECK (state IN ('verified','failed')),
+                verified_at INTEGER NOT NULL
             );
 CREATE TABLE workspace_layer_publications (
                 publication_id TEXT PRIMARY KEY,

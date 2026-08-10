@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::{LaneGateOptions, Result, Trail};
+use crate::{
+    ArtifactEnvelopeId, ArtifactQuarantineId, ArtifactSourceExportAuthorizationV1, LaneGateOptions,
+    Result, Trail,
+};
 
 use super::{super::response::tool_result, super::types::*, parse_args};
 
@@ -188,6 +191,68 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
                 args.path.as_deref(),
                 args.component.as_deref(),
             )?)
+        }
+        "trail.env_resolve" => {
+            let args: EnvironmentResolveArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.resolve_workspace_environment_component(
+                &lane,
+                &args.component,
+                args.path.as_deref(),
+                args.refresh,
+            )?)
+        }
+        "trail.env_resolve_all" => {
+            let args: EnvironmentResolveAllArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.resolve_all_workspace_environment_components(
+                &lane,
+                args.path.as_deref(),
+                args.refresh,
+            )?)
+        }
+        "trail.artifact_space" => tool_result(db.workspace_artifact_space()?),
+        "trail.artifact_inspect" => {
+            let args: ArtifactIdArgs = parse_args(arguments)?;
+            let artifact =
+                ArtifactEnvelopeId::parse(args.artifact).map_err(crate::Error::InvalidInput)?;
+            tool_result(db.inspect_artifact(&artifact)?)
+        }
+        "trail.artifact_reachability" => {
+            let args: ArtifactIdArgs = parse_args(arguments)?;
+            let artifact =
+                ArtifactEnvelopeId::parse(args.artifact).map_err(crate::Error::InvalidInput)?;
+            tool_result(db.artifact_content_reachability(&artifact)?)
+        }
+        "trail.artifact_verify" => {
+            let args: ArtifactVerifyArgs = parse_args(arguments)?;
+            let artifact =
+                ArtifactEnvelopeId::parse(args.artifact).map_err(crate::Error::InvalidInput)?;
+            tool_result(db.verify_artifact(&artifact, args.level)?)
+        }
+        "trail.artifact_quarantine_list" => tool_result(db.artifact_quarantine_list_report()?),
+        "trail.artifact_quarantine_show" => {
+            let args: ArtifactQuarantineArgs = parse_args(arguments)?;
+            let quarantine =
+                ArtifactQuarantineId::parse(args.quarantine).map_err(crate::Error::InvalidInput)?;
+            tool_result(db.artifact_quarantine(&quarantine)?)
+        }
+        "trail.artifact_quarantine_resolve" => {
+            let args: ArtifactQuarantineResolveArgs = parse_args(arguments)?;
+            let quarantine =
+                ArtifactQuarantineId::parse(args.quarantine).map_err(crate::Error::InvalidInput)?;
+            tool_result(db.resolve_artifact_quarantine_report(&quarantine, args.resolution)?)
+        }
+        "trail.env_source_export" => {
+            let args: ArtifactSourceExportArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            let plan = db.plan_artifact_source_export(
+                &lane,
+                &args.component,
+                &args.export,
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )?;
+            tool_result(db.execute_artifact_source_export(plan)?)
         }
         "trail.env_sync" => {
             let args: EnvironmentSyncArgs = parse_args(arguments)?;

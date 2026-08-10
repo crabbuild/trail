@@ -1,6 +1,8 @@
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::ArtifactDesiredKeyV2;
+
 use super::workspace_environment::{
     resolve_workspace_tool_executable, validate_environment_output_contract, ResolvedWorkspaceTool,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCommand,
@@ -9,15 +11,26 @@ use super::workspace_environment::{
 };
 use super::*;
 
-const RECIPE_SCHEMA: &str = "trail.environment/v1";
+const RECIPE_SCHEMA_V1: &str = "trail.environment/v1";
+const RECIPE_SCHEMA_V2: &str = "trail.environment/v2";
 const RECIPE_ADAPTER_IDENTITY: &str = "trail/command@1";
 const RECIPE_SPEC_PATHS: [&str; 2] = ["trail.environment.toml", ".trail/environment.toml"];
 const MAX_RECIPE_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_RECIPE_TOTAL_SPEC_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECIPE_INCLUDE_FILES: usize = 32;
 const MAX_RECIPE_INCLUDE_DEPTH: usize = 8;
+const MAX_RECIPE_INPUT_DECLARATIONS: usize = 4_096;
 const MAX_RECIPE_INPUT_FILES: usize = 100_000;
 const MAX_RECIPE_INPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_RECIPE_ACTIONS: usize = 64;
+const MAX_RECIPE_VALIDATIONS: usize = 64;
+const MAX_RECIPE_SOURCE_EXPORTS: usize = 32;
+const MAX_RECIPE_COMMAND_ARGUMENTS: usize = 1_024;
+const MAX_RECIPE_ARGUMENT_BYTES: usize = 128 * 1024;
+const MAX_RECIPE_NETWORK_AUTHORITIES: usize = 256;
+const MAX_RECIPE_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_RECIPE_VALIDATION_PARAMETERS: usize = 256;
+const MAX_RECIPE_CHILD_PROCESSES: u32 = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -44,11 +57,71 @@ pub(crate) static COMMAND_RECIPE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMe
 
 #[derive(Clone, Debug)]
 struct CommandRecipe {
+    schema: RecipeSchemaVersion,
     specification_digest: String,
     specification_sources: BTreeMap<String, String>,
     profile_versions: BTreeMap<String, String>,
     defaults: RecipeEnvironment,
     component: RecipeComponent,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledRepositoryArtifactPipelineV2 {
+    pub(crate) proposal: EnvironmentDiscoveredComponentReport,
+    pub(crate) resolution_plan: Option<ArtifactResolutionPlanV1>,
+    pub(crate) graph_plan: WorkspaceEnvironmentPlan,
+    pub(crate) desired_material: ArtifactDesiredKeyMaterialV2,
+    pub(crate) desired_key: ArtifactDesiredKeyV2,
+    pub(crate) outputs: Vec<ArtifactOutputContractV2>,
+    pub(crate) validations: Vec<ArtifactValidationV1>,
+    pub(crate) source_exports: Vec<ArtifactSourceExportContractV2>,
+}
+
+impl CompiledRepositoryArtifactPipelineV2 {
+    fn into_graph_plan(self) -> Result<WorkspaceEnvironmentPlan> {
+        if self.proposal.component_id != self.graph_plan.component_id
+            || self.desired_material.component_id != self.graph_plan.component_id
+            || self
+                .resolution_plan
+                .as_ref()
+                .is_some_and(|plan| plan.component_id != self.graph_plan.component_id)
+            || self.desired_material.outputs != self.outputs
+            || self.desired_material.validations != self.validations
+            || self.desired_material.source_exports != self.source_exports
+            || super::workspace_artifact::artifact_desired_key_v2(self.desired_material)?
+                != self.desired_key
+        {
+            return Err(Error::Corrupt(
+                "compiled repository artifact pipeline models disagree".into(),
+            ));
+        }
+        Ok(self.graph_plan)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecipeSchemaVersion {
+    V1,
+    V2,
+}
+
+impl RecipeSchemaVersion {
+    fn parse(value: &str, path: &str) -> Result<Self> {
+        match value {
+            RECIPE_SCHEMA_V1 => Ok(Self::V1),
+            RECIPE_SCHEMA_V2 => Ok(Self::V2),
+            other => Err(Error::InvalidInput(format!(
+                "unsupported environment schema `{other}` in `{path}`; expected `{RECIPE_SCHEMA_V1}` or `{RECIPE_SCHEMA_V2}`"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => RECIPE_SCHEMA_V1,
+            Self::V2 => RECIPE_SCHEMA_V2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,6 +144,8 @@ struct RecipeEnvironment {
     name: Option<String>,
     default_network: String,
     default_scripts: String,
+    #[serde(default)]
+    missing_resolution: Option<String>,
 }
 
 impl Default for RecipeEnvironment {
@@ -79,6 +154,7 @@ impl Default for RecipeEnvironment {
             name: None,
             default_network: "deny".to_string(),
             default_scripts: "deny".to_string(),
+            missing_resolution: None,
         }
     }
 }
@@ -105,6 +181,16 @@ struct RecipeComponentDefinition {
     outputs: Vec<RecipeOutput>,
     #[serde(default)]
     build: Option<RecipeBuild>,
+    #[serde(default, rename = "resolve")]
+    resolution: Option<RecipeResolution>,
+    #[serde(default, rename = "action")]
+    actions: Vec<RecipeAction>,
+    #[serde(default, rename = "validation")]
+    validations: Vec<RecipeValidation>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+    #[serde(default, rename = "source_export")]
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -127,6 +213,16 @@ struct RecipeProfile {
     outputs: Vec<RecipeOutput>,
     #[serde(default)]
     build: Option<RecipeBuild>,
+    #[serde(default, rename = "resolve")]
+    resolution: Option<RecipeResolution>,
+    #[serde(default, rename = "action")]
+    actions: Vec<RecipeAction>,
+    #[serde(default, rename = "validation")]
+    validations: Vec<RecipeValidation>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+    #[serde(default, rename = "source_export")]
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +234,11 @@ struct RecipeFragment {
     inputs: Vec<RecipeInput>,
     outputs: Vec<RecipeOutput>,
     build: Option<RecipeBuild>,
+    resolution: Option<RecipeResolution>,
+    actions: Vec<RecipeAction>,
+    validations: Vec<RecipeValidation>,
+    capabilities: Option<RecipeCapabilities>,
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +249,7 @@ struct ResolvedRecipeProfile {
 
 #[derive(Debug, Default)]
 struct RecipeDocuments {
+    schema: Option<RecipeSchemaVersion>,
     defaults: RecipeEnvironment,
     profiles: BTreeMap<String, RecipeProfile>,
     components: Vec<RecipeComponentDefinition>,
@@ -165,6 +267,11 @@ struct RecipeComponent {
     inputs: Vec<RecipeInput>,
     outputs: Vec<RecipeOutput>,
     build: RecipeBuild,
+    resolution: Option<RecipeResolution>,
+    actions: Vec<RecipeAction>,
+    validations: Vec<RecipeValidation>,
+    capabilities: Option<RecipeCapabilities>,
+    source_exports: Vec<RecipeSourceExport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -222,6 +329,117 @@ struct RecipeBuild {
     environment: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeResolution {
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    network: Option<RecipeNetwork>,
+    snapshot: String,
+    format: String,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RecipeNetwork {
+    Policy(String),
+    Authorities(RecipeNetworkAuthorities),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeNetworkAuthorities {
+    authorities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RecipeActionPhase {
+    Construct,
+    Validate,
+    MountedExecution,
+    SourceExport,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeAction {
+    #[serde(default)]
+    name: Option<String>,
+    phase: RecipeActionPhase,
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    network: Option<RecipeNetwork>,
+    #[serde(default)]
+    scripts: Option<String>,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default)]
+    capabilities: Option<RecipeCapabilities>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeValidation {
+    #[serde(default)]
+    name: Option<String>,
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeCapabilities {
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    filesystem_read: Option<String>,
+    #[serde(default)]
+    filesystem_write: Option<String>,
+    #[serde(default)]
+    process: Option<String>,
+    #[serde(default)]
+    child_processes: Option<u32>,
+    #[serde(default)]
+    secrets: Option<String>,
+    #[serde(default)]
+    publication: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeSourceExport {
+    #[serde(default)]
+    name: Option<String>,
+    from_output: String,
+    source: String,
+    target: String,
+    mode: String,
+    #[serde(default = "default_fail_collision")]
+    collision: String,
+    #[serde(default)]
+    validation: Option<String>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
 fn default_recipe_kind() -> String {
     "generated".to_string()
 }
@@ -236,6 +454,684 @@ fn default_bytes_format() -> String {
 
 fn default_host_portability() -> String {
     "host".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fail_collision() -> String {
+    "fail".to_string()
+}
+
+fn compile_recipe_validations(
+    validations: &[RecipeValidation],
+) -> Result<Vec<ArtifactValidationV1>> {
+    let mut compiled = validations
+        .iter()
+        .enumerate()
+        .map(|(index, validation)| {
+            let kind = match validation.kind.as_str() {
+                "structural" | "path_contract" => ArtifactValidationKindV1::Structural,
+                "loadability" => ArtifactValidationKindV1::Loadability,
+                "framework" => ArtifactValidationKindV1::Framework,
+                "policy" => ArtifactValidationKindV1::Policy,
+                "gate" => ArtifactValidationKindV1::Gate,
+                "reproducibility" => ArtifactValidationKindV1::Reproducibility,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "unsupported repository validation kind `{other}`"
+                    )))
+                }
+            };
+            let mut parameters = validation.parameters.clone();
+            if let Some(path) = &validation.path {
+                parameters.insert("path".into(), normalize_relative_path(path)?);
+            }
+            if !validation.command.is_empty() {
+                parameters.insert(
+                    "command".into(),
+                    serde_json::to_string(&validation.command)?,
+                );
+            }
+            if let Some(gate) = &validation.gate {
+                parameters.insert("gate".into(), gate.clone());
+            }
+            Ok(ArtifactValidationV1 {
+                name: validation
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("validation-{index}")),
+                kind,
+                required: validation.required,
+                parameters,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    compiled.sort();
+    if compiled.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(Error::InvalidInput(
+            "repository component declares duplicate validation names".into(),
+        ));
+    }
+    Ok(compiled)
+}
+
+fn compile_recipe_source_exports(
+    component: &RecipeComponent,
+) -> Vec<ArtifactSourceExportContractV2> {
+    component
+        .source_exports
+        .iter()
+        .map(|export| ArtifactSourceExportContractV2 {
+            name: export
+                .name
+                .clone()
+                .unwrap_or_else(|| export.from_output.clone()),
+            output_name: export.from_output.clone(),
+            artifact_subpath: export.source.clone(),
+            destination: export.target.clone(),
+            collision_policy: export.collision.clone(),
+            required_validation: export.validation.clone().unwrap_or_else(|| {
+                super::workspace_artifact::HOST_WORKSPACE_LAYER_STRUCTURAL_SEAL.into()
+            }),
+            required_gate: export.gate.clone(),
+            authorization_mode: export.mode.clone(),
+        })
+        .collect()
+}
+
+fn recipe_network_authorities(network: Option<&RecipeNetwork>) -> Result<Vec<String>> {
+    let mut authorities = match network {
+        None => Vec::new(),
+        Some(RecipeNetwork::Policy(policy)) if policy == "deny" => Vec::new(),
+        Some(RecipeNetwork::Policy(policy)) => Err(Error::InvalidInput(format!(
+            "repository resolver network policy `{policy}` must be `deny` or an exact authority list"
+        )))?,
+        Some(RecipeNetwork::Authorities(authorities)) => authorities.authorities.clone(),
+    };
+    if authorities.len() > MAX_RECIPE_NETWORK_AUTHORITIES {
+        return Err(Error::InvalidInput(format!(
+            "repository resolver declares more than {MAX_RECIPE_NETWORK_AUTHORITIES} network authorities"
+        )));
+    }
+    for authority in &authorities {
+        validate_recipe_network_authority(authority)?;
+    }
+    authorities.sort();
+    authorities.dedup();
+    Ok(authorities)
+}
+
+fn recipe_network_policy_identity(network: Option<&RecipeNetwork>) -> Result<String> {
+    let authorities = recipe_network_authorities(network)?;
+    if authorities.is_empty() {
+        Ok("deny".into())
+    } else {
+        Ok(format!("exact:{}", authorities.join(",")))
+    }
+}
+
+fn merge_recipe_identity_environment(
+    target: &mut BTreeMap<String, String>,
+    source: &BTreeMap<String, String>,
+    component_id: &str,
+) -> Result<()> {
+    for (name, value) in source {
+        validate_recipe_environment(name, value, component_id)?;
+        if let Some(previous) = target.insert(name.clone(), value.clone())
+            && previous != *value
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` declares conflicting identity environment values for `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RecipeCapabilityPhase {
+    Resolve,
+    Construct,
+    Validate,
+}
+
+impl RecipeCapabilityPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Construct => "construct",
+            Self::Validate => "validate",
+        }
+    }
+}
+
+fn validate_recipe_v2_component(
+    component: &RecipeComponent,
+    defaults: &RecipeEnvironment,
+) -> Result<()> {
+    if component.inputs.len() > MAX_RECIPE_INPUT_DECLARATIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_INPUT_DECLARATIONS} inputs",
+            component.id
+        )));
+    }
+    if component.actions.len() > MAX_RECIPE_ACTIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_ACTIONS} actions",
+            component.id
+        )));
+    }
+    if component.validations.len() > MAX_RECIPE_VALIDATIONS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_VALIDATIONS} validations",
+            component.id
+        )));
+    }
+    if component.source_exports.len() > MAX_RECIPE_SOURCE_EXPORTS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares more than {MAX_RECIPE_SOURCE_EXPORTS} source exports",
+            component.id
+        )));
+    }
+
+    validate_recipe_fixed_argv(
+        &component.build.command,
+        &component.id,
+        "build.command",
+        false,
+    )?;
+    validate_recipe_phase_cwd(
+        component.build.cwd.as_deref().unwrap_or(&component.root),
+        &component.root,
+        &component.id,
+        "build.cwd",
+    )?;
+    validate_recipe_environment_map(&component.build.environment, &component.id, "build")?;
+    if component
+        .build
+        .network
+        .as_deref()
+        .unwrap_or(&defaults.default_network)
+        != "deny"
+        || component
+            .build
+            .scripts
+            .as_deref()
+            .unwrap_or(&defaults.default_scripts)
+            != "deny"
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` build requires network = \"deny\" and scripts = \"deny\"",
+            component.id
+        )));
+    }
+    if let Some(capabilities) = &component.capabilities {
+        validate_recipe_capabilities(
+            capabilities,
+            RecipeCapabilityPhase::Construct,
+            &component.id,
+        )?;
+    }
+
+    if let Some(resolution) = &component.resolution {
+        validate_recipe_fixed_argv(&resolution.command, &component.id, "resolve.command", false)?;
+        validate_recipe_phase_cwd(
+            resolution.cwd.as_deref().unwrap_or(&component.root),
+            &component.root,
+            &component.id,
+            "resolve.cwd",
+        )?;
+        normalize_relative_path(&resolution.snapshot)?;
+        if resolution.format.is_empty()
+            || resolution.format.len() > 512
+            || resolution.format.contains(char::is_control)
+            || contains_sensitive_text(&resolution.format)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` has an invalid resolution snapshot format",
+                component.id
+            )));
+        }
+        recipe_network_authorities(resolution.network.as_ref())?;
+        validate_recipe_environment_map(&resolution.environment, &component.id, "resolver")?;
+        if let Some(capabilities) = &resolution.capabilities {
+            validate_recipe_capabilities(
+                capabilities,
+                RecipeCapabilityPhase::Resolve,
+                &component.id,
+            )?;
+        }
+    }
+
+    let mut action_names = BTreeSet::new();
+    for (index, action) in component.actions.iter().enumerate() {
+        if matches!(
+            action.phase,
+            RecipeActionPhase::MountedExecution | RecipeActionPhase::SourceExport
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action {} requests forbidden phase `{:?}`; mounted execution and source export cannot execute repository commands",
+                component.id, index, action.phase
+            )));
+        }
+        let action_name = action
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("action-{index}"));
+        validate_recipe_output_name(&action_name, &component.id)?;
+        if !action_names.insert(action_name.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` declares action name `{action_name}` more than once",
+                component.id
+            )));
+        }
+        validate_recipe_fixed_argv(
+            &action.command,
+            &component.id,
+            &format!("action `{action_name}` command"),
+            false,
+        )?;
+        validate_recipe_phase_cwd(
+            action.cwd.as_deref().unwrap_or(&component.root),
+            &component.root,
+            &component.id,
+            &format!("action `{action_name}` cwd"),
+        )?;
+        if !recipe_network_authorities(action.network.as_ref())?.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action `{action_name}` must be offline",
+                component.id
+            )));
+        }
+        if action
+            .scripts
+            .as_deref()
+            .is_some_and(|policy| policy != "deny")
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` action `{action_name}` must deny scripts",
+                component.id
+            )));
+        }
+        validate_recipe_environment_map(
+            &action.environment,
+            &component.id,
+            &format!("action `{action_name}`"),
+        )?;
+        if let Some(capabilities) = &action.capabilities {
+            let phase = if action.phase == RecipeActionPhase::Validate {
+                RecipeCapabilityPhase::Validate
+            } else {
+                RecipeCapabilityPhase::Construct
+            };
+            validate_recipe_capabilities(capabilities, phase, &component.id)?;
+        }
+    }
+
+    for (index, validation) in component.validations.iter().enumerate() {
+        if let Some(name) = &validation.name {
+            validate_recipe_output_name(name, &component.id)?;
+        }
+        if let Some(path) = &validation.path {
+            normalize_relative_path(path)?;
+        }
+        validate_recipe_fixed_argv(
+            &validation.command,
+            &component.id,
+            &format!("validation {index} command"),
+            true,
+        )?;
+        if validation.parameters.len() > MAX_RECIPE_VALIDATION_PARAMETERS {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` validation {index} declares too many parameters",
+                component.id
+            )));
+        }
+        for (name, value) in &validation.parameters {
+            if name.is_empty()
+                || name.len() > 128
+                || value.len() > MAX_RECIPE_ARGUMENT_BYTES
+                || name.contains(char::is_control)
+                || value.contains(char::is_control)
+                || contains_sensitive_text(name)
+                || contains_sensitive_text(value)
+                || contains_provider_socket_reference(value)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "repository component `{}` validation {index} has an unsafe parameter `{name}`",
+                    component.id
+                )));
+            }
+        }
+    }
+
+    for output in &component.outputs {
+        if output.reuse == Some(EnvironmentReuseMode::Compatible)
+            || output.scope == Some(EnvironmentSharingScope::Host)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` cannot request compatible or host-wide artifact reuse",
+                component.id
+            )));
+        }
+    }
+    let output_names = component
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            output
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("output-{index}"))
+        })
+        .collect::<BTreeSet<_>>();
+    for export in &component.source_exports {
+        let export_name = export.name.as_deref().unwrap_or(&export.from_output);
+        validate_recipe_output_name(export_name, &component.id)?;
+        validate_recipe_output_name(&export.from_output, &component.id)?;
+        if !output_names.contains(&export.from_output) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export references unknown output `{}`",
+                component.id, export.from_output
+            )));
+        }
+        normalize_relative_path(&export.source)?;
+        normalize_relative_path(&export.target)?;
+        if export.mode != "explicit" {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export mode must be `explicit`",
+                component.id
+            )));
+        }
+        if !matches!(export.collision.as_str(), "fail" | "replace") {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{}` source export `{export_name}` collision mode must be `fail` or `replace`",
+                component.id
+            )));
+        }
+        if let Some(validation) = &export.validation {
+            validate_recipe_output_name(validation, &component.id)?;
+        }
+        if let Some(gate) = &export.gate {
+            validate_recipe_output_name(gate, &component.id)?;
+        }
+    }
+    let mut export_names = component
+        .source_exports
+        .iter()
+        .map(|export| export.name.as_deref().unwrap_or(&export.from_output))
+        .collect::<Vec<_>>();
+    export_names.sort_unstable();
+    if export_names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{}` declares duplicate source export names",
+            component.id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_fixed_argv(
+    command: &[String],
+    component_id: &str,
+    field: &str,
+    allow_empty: bool,
+) -> Result<()> {
+    if command.is_empty() {
+        if allow_empty {
+            return Ok(());
+        }
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` has an empty {field}"
+        )));
+    }
+    if command.len() > MAX_RECIPE_COMMAND_ARGUMENTS {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} exceeds {MAX_RECIPE_COMMAND_ARGUMENTS} argv entries"
+        )));
+    }
+    let program = &command[0];
+    if program.contains('/')
+        || program.contains('\\')
+        || is_shell_program(program)
+        || is_indirect_process_launcher(program)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} must name one non-shell, non-launcher executable from PATH, not `{program}`"
+        )));
+    }
+    for argument in command {
+        if argument.is_empty()
+            || argument.len() > MAX_RECIPE_ARGUMENT_BYTES
+            || argument.contains('\0')
+            || argument.contains('\n')
+            || argument.contains('\r')
+            || contains_sensitive_text(argument)
+            || contains_shell_interpolation(argument)
+            || contains_provider_socket_reference(argument)
+            || is_absolute_host_path(argument)
+        {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` {field} contains an unsafe or excessive argv entry"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipe_phase_cwd(
+    cwd: &str,
+    component_root: &str,
+    component_id: &str,
+    field: &str,
+) -> Result<()> {
+    let cwd = normalize_recipe_path_allow_root(cwd)?;
+    if !component_root.is_empty()
+        && cwd != component_root
+        && !cwd.starts_with(&format!("{component_root}/"))
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {field} `{cwd}` escapes component root `{component_root}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_environment_map(
+    environment: &BTreeMap<String, String>,
+    component_id: &str,
+    phase: &str,
+) -> Result<()> {
+    if environment.len() > MAX_RECIPE_ENVIRONMENT_ENTRIES {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {phase} environment exceeds {MAX_RECIPE_ENVIRONMENT_ENTRIES} entries"
+        )));
+    }
+    for (name, value) in environment {
+        validate_recipe_environment(name, value, component_id)?;
+        if contains_provider_socket_reference(name) || contains_provider_socket_reference(value) {
+            return Err(Error::InvalidInput(format!(
+                "repository component `{component_id}` {phase} environment entry `{name}` requests a provider socket"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recipe_capabilities(
+    capabilities: &RecipeCapabilities,
+    phase: RecipeCapabilityPhase,
+    component_id: &str,
+) -> Result<()> {
+    let allowed_network = match phase {
+        RecipeCapabilityPhase::Resolve => &["deny", "exact_authorities"][..],
+        RecipeCapabilityPhase::Construct | RecipeCapabilityPhase::Validate => &["deny"][..],
+    };
+    let allowed_read = match phase {
+        RecipeCapabilityPhase::Resolve | RecipeCapabilityPhase::Construct => {
+            &["declared_inputs"][..]
+        }
+        RecipeCapabilityPhase::Validate => &["artifact_candidate"][..],
+    };
+    let allowed_write = match phase {
+        RecipeCapabilityPhase::Resolve | RecipeCapabilityPhase::Construct => {
+            &["isolated_candidate"][..]
+        }
+        RecipeCapabilityPhase::Validate => &["validation_receipt"][..],
+    };
+    validate_recipe_capability_value(
+        capabilities.network.as_deref(),
+        allowed_network,
+        component_id,
+        phase,
+        "network",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.filesystem_read.as_deref(),
+        allowed_read,
+        component_id,
+        phase,
+        "filesystem_read",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.filesystem_write.as_deref(),
+        allowed_write,
+        component_id,
+        phase,
+        "filesystem_write",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.process.as_deref(),
+        &["declared_executable"],
+        component_id,
+        phase,
+        "process",
+    )?;
+    let allowed_secrets = if matches!(phase, RecipeCapabilityPhase::Resolve) {
+        &["deny", "opaque_handles"][..]
+    } else {
+        &["deny"][..]
+    };
+    validate_recipe_capability_value(
+        capabilities.secrets.as_deref(),
+        allowed_secrets,
+        component_id,
+        phase,
+        "secrets",
+    )?;
+    validate_recipe_capability_value(
+        capabilities.publication.as_deref(),
+        &["deny"],
+        component_id,
+        phase,
+        "publication",
+    )?;
+    if capabilities
+        .child_processes
+        .is_some_and(|limit| limit == 0 || limit > MAX_RECIPE_CHILD_PROCESSES)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {} child-process limit must be between 1 and {MAX_RECIPE_CHILD_PROCESSES}",
+            phase.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_capability_value(
+    value: Option<&str>,
+    allowed: &[&str],
+    component_id: &str,
+    phase: RecipeCapabilityPhase,
+    field: &str,
+) -> Result<()> {
+    if let Some(value) = value
+        && !allowed.contains(&value)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository component `{component_id}` {} capability `{field} = {value}` exceeds the repository-declaration ceiling",
+            phase.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recipe_network_authority(authority: &str) -> Result<()> {
+    if authority.is_empty()
+        || authority.len() > 512
+        || authority.contains(char::is_whitespace)
+        || authority.contains(char::is_control)
+        || authority.contains('/')
+        || authority.contains('\\')
+        || authority.contains('@')
+        || authority.contains("//")
+        || contains_sensitive_text(authority)
+        || contains_shell_interpolation(authority)
+        || contains_provider_socket_reference(authority)
+    {
+        return Err(Error::InvalidInput(format!(
+            "repository resolver authority `{authority}` is not an exact non-secret network authority"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_shell_interpolation(argument: &str) -> bool {
+    argument.contains("$(")
+        || argument.contains("${")
+        || argument.contains('`')
+        || matches!(
+            argument,
+            "&&" | "||" | ";" | "|" | "&" | ">" | ">>" | "<" | "<<"
+        )
+}
+
+fn is_indirect_process_launcher(program: &str) -> bool {
+    matches!(
+        program.to_ascii_lowercase().as_str(),
+        "env"
+            | "xargs"
+            | "parallel"
+            | "nohup"
+            | "nice"
+            | "setsid"
+            | "sudo"
+            | "su"
+            | "doas"
+            | "command"
+            | "exec"
+    )
+}
+
+fn is_absolute_host_path(argument: &str) -> bool {
+    argument.starts_with('/')
+        || argument.starts_with("\\\\")
+        || argument.starts_with("file://")
+        || argument.as_bytes().get(1) == Some(&b':')
+            && argument
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            && argument
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+}
+
+fn contains_provider_socket_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("unix://")
+        || lower.contains("npipe://")
+        || lower.contains("/var/run/docker.sock")
+        || lower.contains("/run/docker.sock")
+        || lower.contains("/run/containerd/")
+        || lower.contains("ssh_auth_sock")
+        || lower.contains("docker_host")
+        || lower.contains("container_host")
+        || lower.contains("buildkit_host")
 }
 
 impl Trail {
@@ -255,11 +1151,45 @@ impl Trail {
                     .as_ref()
                     .is_none_or(|root| root == &recipe.component.root)
             })
-            .map(|recipe| EnvironmentDiscoveredComponentReport {
-                component_id: recipe.component.id,
-                component_root: recipe.component.root,
-                kind: recipe.component.kind,
-                adapter_identity: RECIPE_ADAPTER_IDENTITY.to_string(),
+            .map(|recipe| {
+                let resolvable = recipe.schema == RecipeSchemaVersion::V2
+                    && recipe.component.resolution.is_some();
+                EnvironmentDiscoveredComponentReport {
+                    component_id: recipe.component.id.clone(),
+                    component_root: recipe.component.root,
+                    kind: recipe.component.kind,
+                    adapter_identity: RECIPE_ADAPTER_IDENTITY.to_string(),
+                    status: if resolvable {
+                        EnvironmentComponentProposalStatus::Resolvable
+                    } else {
+                        EnvironmentComponentProposalStatus::Ready
+                    },
+                    reasons: if resolvable {
+                        vec![EnvironmentProposalReasonReport {
+                            code: "resolution_snapshot_required".into(),
+                            message:
+                                "repository component declares an explicit resolution snapshot"
+                                    .into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    recovery_actions: if resolvable {
+                        vec![EnvironmentRecoveryActionReport {
+                            code: "resolve_component".into(),
+                            description: "resolve and pin the declared component snapshot".into(),
+                            command: Some(vec![
+                                "trail".into(),
+                                "env".into(),
+                                "resolve".into(),
+                                "--component".into(),
+                                recipe.component.id,
+                            ]),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                }
             })
             .collect())
     }
@@ -278,7 +1208,351 @@ impl Trail {
                     "no `{RECIPE_ADAPTER_IDENTITY}` component named `{component_id}` exists in the pinned environment specification"
                 ))
             })?;
+        if recipe.schema == RecipeSchemaVersion::V2 {
+            return self
+                .compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                .into_graph_plan();
+        }
         self.plan_command_recipe(source_root, recipe)
+    }
+
+    pub(crate) fn command_recipe_resolution_plan(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<Option<ArtifactResolutionPlanV1>> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Ok(None);
+        }
+        Ok(self
+            .compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+            .resolution_plan)
+    }
+
+    #[cfg(test)]
+    fn compile_repository_artifact_pipeline_v2(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<CompiledRepositoryArtifactPipelineV2> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)
+    }
+
+    fn compile_repository_artifact_pipeline_v2_recipe(
+        &self,
+        source_root: &ObjectId,
+        recipe: CommandRecipe,
+    ) -> Result<CompiledRepositoryArtifactPipelineV2> {
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Err(Error::InvalidInput(format!(
+                "component `{}` requires `{RECIPE_SCHEMA_V2}` for artifact-pipeline compilation",
+                recipe.component.id
+            )));
+        }
+        let graph_plan = self.plan_command_recipe(source_root, recipe.clone())?;
+        let component = &recipe.component;
+        let validations = compile_recipe_validations(&component.validations)?;
+        let resolution_plan = component
+            .resolution
+            .as_ref()
+            .map(|resolution| {
+                self.compile_recipe_resolution_plan(
+                    source_root,
+                    &recipe,
+                    &graph_plan,
+                    resolution,
+                    &validations,
+                )
+            })
+            .transpose()?;
+        let outputs = graph_plan
+            .outputs
+            .iter()
+            .map(|output| ArtifactOutputContractV2 {
+                name: output.name.clone(),
+                output_path: output.output_path.clone(),
+                mount_path: output.mount_path.clone(),
+                policy: output.policy,
+                reuse: output.reuse,
+                scope: output.scope,
+                publish: output.publish,
+                gate: output.gate.clone(),
+            })
+            .collect::<Vec<_>>();
+        let source_exports = compile_recipe_source_exports(component);
+        let mut actions = Vec::new();
+        actions.push(self.compile_recipe_action_identity(
+            "build",
+            ArtifactActionPhaseV2::Construct,
+            &component.build.command,
+            component.build.cwd.as_deref().unwrap_or("."),
+            &component.build.environment,
+        )?);
+        if let Some(resolution) = &component.resolution {
+            actions.push(self.compile_recipe_action_identity(
+                "resolve",
+                ArtifactActionPhaseV2::Resolve,
+                &resolution.command,
+                resolution.cwd.as_deref().unwrap_or("."),
+                &resolution.environment,
+            )?);
+        }
+        for (index, action) in component.actions.iter().enumerate() {
+            let phase = match action.phase {
+                RecipeActionPhase::Construct => ArtifactActionPhaseV2::Construct,
+                RecipeActionPhase::Validate => ArtifactActionPhaseV2::Validate,
+                RecipeActionPhase::MountedExecution | RecipeActionPhase::SourceExport => {
+                    ArtifactActionPhaseV2::Finalize
+                }
+            };
+            let action_name = action
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("action-{index}"));
+            actions.push(self.compile_recipe_action_identity(
+                &action_name,
+                phase,
+                &action.command,
+                action.cwd.as_deref().unwrap_or(&component.root),
+                &action.environment,
+            )?);
+        }
+        actions.sort();
+
+        let mut build_environment = component.build.environment.clone();
+        if let Some(resolution) = &component.resolution {
+            merge_recipe_identity_environment(
+                &mut build_environment,
+                &resolution.environment,
+                &component.id,
+            )?;
+        }
+        for action in &component.actions {
+            merge_recipe_identity_environment(
+                &mut build_environment,
+                &action.environment,
+                &component.id,
+            )?;
+        }
+        let declared_inputs = graph_plan
+            .inputs
+            .iter()
+            .map(|input| ArtifactResolutionInputV1 {
+                source_path: input.source_path.clone(),
+                content_hash: input.entry.content_hash.clone(),
+                size_bytes: input.entry.size_bytes,
+            })
+            .collect::<Vec<_>>();
+        let desired_material = ArtifactDesiredKeyMaterialV2 {
+            version: 2,
+            component_id: component.id.clone(),
+            adapter_identity: component.adapter.clone(),
+            adapter_implementation_version: env!("CARGO_PKG_VERSION").into(),
+            adapter_distribution_digest: "builtin:repository-environment-v2".into(),
+            adapter_protocol: RECIPE_SCHEMA_V2.into(),
+            resolution_snapshot_id: None,
+            source_closure: ArtifactSourceClosureV2 {
+                normalizer_version: "repository-inputs/v1".into(),
+                certified_complete: false,
+                complete_source_root: Some(source_root.clone()),
+                declared_inputs,
+            },
+            upstream_identities: BTreeMap::new(),
+            actions,
+            outputs: outputs.clone(),
+            validations: validations.clone(),
+            source_exports: source_exports.clone(),
+            build_environment,
+            target: "repository-declared".into(),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            abi: "host-default".into(),
+            // The host has normalized every output through
+            // `validate_environment_output_contract`; repository text alone
+            // never sets this bit and compatible reuse remains unavailable.
+            portability_certified: true,
+            portability_scope: "workspace".into(),
+            trust_scope: "repository".into(),
+            network_policy: recipe_network_policy_identity(
+                component
+                    .resolution
+                    .as_ref()
+                    .and_then(|resolution| resolution.network.as_ref()),
+            )?,
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            sandbox_policy: "restricted-repository-pipeline-v2".into(),
+        };
+        let desired_key =
+            super::workspace_artifact::artifact_desired_key_v2(desired_material.clone())?;
+        let proposal = EnvironmentDiscoveredComponentReport {
+            component_id: component.id.clone(),
+            component_root: component.root.clone(),
+            kind: component.kind.clone(),
+            adapter_identity: component.adapter.clone(),
+            status: if resolution_plan.is_some() {
+                EnvironmentComponentProposalStatus::Resolvable
+            } else {
+                EnvironmentComponentProposalStatus::Ready
+            },
+            reasons: resolution_plan.as_ref().map_or_else(Vec::new, |_| {
+                vec![EnvironmentProposalReasonReport {
+                    code: "resolution_snapshot_required".into(),
+                    message: "repository component declares an explicit resolution snapshot".into(),
+                }]
+            }),
+            recovery_actions: resolution_plan.as_ref().map_or_else(Vec::new, |_| {
+                vec![EnvironmentRecoveryActionReport {
+                    code: "resolve_component".into(),
+                    description: "resolve and pin the declared component snapshot".into(),
+                    command: Some(vec![
+                        "trail".into(),
+                        "env".into(),
+                        "resolve".into(),
+                        "--component".into(),
+                        component.id.clone(),
+                    ]),
+                }]
+            }),
+        };
+        Ok(CompiledRepositoryArtifactPipelineV2 {
+            proposal,
+            resolution_plan,
+            graph_plan,
+            desired_material,
+            desired_key,
+            outputs,
+            validations,
+            source_exports,
+        })
+    }
+
+    fn compile_recipe_resolution_plan(
+        &self,
+        source_root: &ObjectId,
+        recipe: &CommandRecipe,
+        graph_plan: &WorkspaceEnvironmentPlan,
+        resolution: &RecipeResolution,
+        validations: &[ArtifactValidationV1],
+    ) -> Result<ArtifactResolutionPlanV1> {
+        let program = resolution.command.first().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "repository component `{}` resolver command is empty",
+                recipe.component.id
+            ))
+        })?;
+        let tool = resolve_workspace_tool_executable(program)?;
+        let working_directory = resolution
+            .cwd
+            .clone()
+            .unwrap_or_else(|| recipe.component.root.clone());
+        let mut plan = ArtifactResolutionPlanV1 {
+            version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+            proposal_key: format!("repository_v2_{}", recipe.specification_digest),
+            source_root: source_root.clone(),
+            component_id: recipe.component.id.clone(),
+            adapter_identity: recipe.component.adapter.clone(),
+            policy_identity: sha256_hex(&serde_json::to_vec(&(
+                &resolution.capabilities,
+                &recipe.component.capabilities,
+            ))?),
+            program: program.clone(),
+            resolved_program: tool.path.to_string_lossy().into_owned(),
+            executable_identity: tool.identity,
+            argv: resolution.command.clone(),
+            working_directory: working_directory.clone(),
+            readable_inputs: graph_plan
+                .inputs
+                .iter()
+                .map(|input| ArtifactResolutionInputV1 {
+                    source_path: input.source_path.clone(),
+                    content_hash: input.entry.content_hash.clone(),
+                    size_bytes: input.entry.size_bytes,
+                })
+                .collect(),
+            candidate_output: normalize_relative_path(&join_recipe_path(
+                &working_directory,
+                &resolution.snapshot,
+            ))?,
+            allowed_authorities: recipe_network_authorities(resolution.network.as_ref())?,
+            credential_handles: Vec::new(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            environment_roles: resolution
+                .environment
+                .keys()
+                .map(|name| (name.clone(), ArtifactEnvironmentRoleV1::Identity))
+                .collect(),
+            limits: ArtifactActionLimitsV1 {
+                timeout_ms: 5 * 60 * 1_000,
+                stdout_bytes: 1024 * 1024,
+                stderr_bytes: 1024 * 1024,
+                candidate_bytes: 256 * 1024 * 1024,
+                candidate_entries: 100_000,
+                child_processes: resolution
+                    .capabilities
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.child_processes)
+                    .unwrap_or(1)
+                    .max(1),
+            },
+            snapshot_format: resolution.format.clone(),
+            validations: if validations.is_empty() {
+                vec![ArtifactValidationV1 {
+                    name: "snapshot-structure".into(),
+                    kind: ArtifactValidationKindV1::Structural,
+                    required: true,
+                    parameters: BTreeMap::new(),
+                }]
+            } else {
+                validations.to_vec()
+            },
+        };
+        super::workspace_artifact::normalize_artifact_resolution_plan(&mut plan)?;
+        Ok(plan)
+    }
+
+    fn compile_recipe_action_identity(
+        &self,
+        name: &str,
+        phase: ArtifactActionPhaseV2,
+        command: &[String],
+        working_directory: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<ArtifactActionIdentityV2> {
+        let program = command.first().ok_or_else(|| {
+            Error::InvalidInput(format!("repository action `{name}` command is empty"))
+        })?;
+        let tool = resolve_workspace_tool_executable(program)?;
+        let normalized_working_directory = normalize_recipe_path_allow_root(working_directory)?;
+        Ok(ArtifactActionIdentityV2 {
+            name: name.into(),
+            phase,
+            executable_identity: tool.identity,
+            argv: command.to_vec(),
+            working_directory: if normalized_working_directory.is_empty() {
+                ".".into()
+            } else {
+                normalized_working_directory
+            },
+            environment_names: environment.keys().cloned().collect(),
+        })
     }
 
     pub(crate) fn command_recipe_plans(
@@ -292,6 +1566,14 @@ impl Trail {
         for recipe in recipes {
             if component_ids.contains(&recipe.component.id) {
                 let component_id = recipe.component.id.clone();
+                if recipe.schema == RecipeSchemaVersion::V2 {
+                    plans.insert(
+                        component_id,
+                        self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                            .into_graph_plan()?,
+                    );
+                    continue;
+                }
                 let program = recipe
                     .component
                     .build
@@ -330,6 +1612,28 @@ impl Trail {
         Ok(plans)
     }
 
+    pub(crate) fn command_recipe_source_exports(
+        &self,
+        source_root: &ObjectId,
+        component_id: &str,
+    ) -> Result<Vec<ArtifactSourceExportContractV2>> {
+        let recipe = self
+            .load_command_recipes(source_root)?
+            .into_iter()
+            .find(|recipe| recipe.component.id == component_id)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no repository environment component named `{component_id}` exists"
+                ))
+            })?;
+        if recipe.schema != RecipeSchemaVersion::V2 {
+            return Err(Error::InvalidInput(format!(
+                "component `{component_id}` requires `{RECIPE_SCHEMA_V2}` for source export"
+            )));
+        }
+        Ok(compile_recipe_source_exports(&recipe.component))
+    }
+
     pub(crate) fn command_recipe_plan_for_root(
         &self,
         source_root: &ObjectId,
@@ -342,7 +1646,15 @@ impl Trail {
             .filter(|recipe| recipe.component.root == component_root)
             .collect::<Vec<_>>();
         match matching.len() {
-            1 => self.plan_command_recipe(source_root, matching.remove(0)),
+            1 => {
+                let recipe = matching.remove(0);
+                if recipe.schema == RecipeSchemaVersion::V2 {
+                    self.compile_repository_artifact_pipeline_v2_recipe(source_root, recipe)?
+                        .into_graph_plan()
+                } else {
+                    self.plan_command_recipe(source_root, recipe)
+                }
+            }
             0 => Err(Error::InvalidInput(format!(
                 "no `{RECIPE_ADAPTER_IDENTITY}` component is declared at `{}`",
                 display_recipe_root(&component_root)
@@ -442,8 +1754,15 @@ impl Trail {
                 }
                 targets.insert(target, format!("{}:{name}", component.id));
             }
-            let canonical = serde_json::to_vec(&(RECIPE_SCHEMA, &component, &profile_versions))?;
+            let schema = documents.schema.ok_or_else(|| {
+                Error::Corrupt("environment specification graph lost its schema version".into())
+            })?;
+            if schema == RecipeSchemaVersion::V2 {
+                validate_recipe_v2_component(&component, &documents.defaults)?;
+            }
+            let canonical = serde_json::to_vec(&(schema.as_str(), &component, &profile_versions))?;
             recipes.push(CommandRecipe {
+                schema,
                 specification_digest: sha256_hex(&canonical),
                 specification_sources: documents.specification_sources.clone(),
                 profile_versions,
@@ -518,7 +1837,18 @@ impl Trail {
         let specification: RecipeSpecification = toml::from_str(&text).map_err(|err| {
             Error::InvalidInput(format!("invalid environment specification `{path}`: {err}"))
         })?;
-        validate_recipe_specification_header(&specification, path)?;
+        let schema = validate_recipe_specification_header(&specification, path)?;
+        if let Some(expected) = documents.schema {
+            if schema != expected {
+                return Err(Error::InvalidInput(format!(
+                    "environment specification `{path}` uses schema `{}` but the root document uses `{}`",
+                    schema.as_str(),
+                    expected.as_str()
+                )));
+            }
+        } else {
+            documents.schema = Some(schema);
+        }
 
         stack.push(path.to_string());
         for include in &specification.include {
@@ -822,6 +2152,7 @@ impl Trail {
                 strategy: "restricted-command-recipe-v1".to_string(),
             },
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {
@@ -961,11 +2292,18 @@ impl Trail {
 fn validate_recipe_specification_header(
     specification: &RecipeSpecification,
     path: &str,
-) -> Result<()> {
-    if specification.schema != RECIPE_SCHEMA {
+) -> Result<RecipeSchemaVersion> {
+    let schema = RecipeSchemaVersion::parse(&specification.schema, path)?;
+    if schema == RecipeSchemaVersion::V1
+        && (specification.environment.missing_resolution.is_some()
+            || specification.profile.values().any(recipe_profile_uses_v2)
+            || specification
+                .components
+                .iter()
+                .any(recipe_component_definition_uses_v2))
+    {
         return Err(Error::InvalidInput(format!(
-            "unsupported environment schema `{}` in `{path}`; expected `{RECIPE_SCHEMA}`",
-            specification.schema
+            "environment specification `{path}` uses fields that require `{RECIPE_SCHEMA_V2}`"
         )));
     }
     if specification.environment.default_network != "deny"
@@ -975,8 +2313,34 @@ fn validate_recipe_specification_header(
             "environment specification `{path}` must set default_network and default_scripts to `deny`"
         )));
     }
+    if specification
+        .environment
+        .missing_resolution
+        .as_deref()
+        .is_some_and(|policy| policy != "explicit")
+    {
+        return Err(Error::InvalidInput(format!(
+            "environment specification `{path}` missing_resolution must be `explicit`"
+        )));
+    }
     let _environment_name = specification.environment.name.as_deref();
-    Ok(())
+    Ok(schema)
+}
+
+fn recipe_profile_uses_v2(profile: &RecipeProfile) -> bool {
+    profile.resolution.is_some()
+        || !profile.actions.is_empty()
+        || !profile.validations.is_empty()
+        || profile.capabilities.is_some()
+        || !profile.source_exports.is_empty()
+}
+
+fn recipe_component_definition_uses_v2(component: &RecipeComponentDefinition) -> bool {
+    component.resolution.is_some()
+        || !component.actions.is_empty()
+        || !component.validations.is_empty()
+        || component.capabilities.is_some()
+        || !component.source_exports.is_empty()
 }
 
 fn resolve_recipe_include_path(including_path: &str, include: &str) -> Result<String> {
@@ -1032,6 +2396,11 @@ fn recipe_profile_fragment(profile: &RecipeProfile) -> RecipeFragment {
         inputs: profile.inputs.clone(),
         outputs: profile.outputs.clone(),
         build: profile.build.clone(),
+        resolution: profile.resolution.clone(),
+        actions: profile.actions.clone(),
+        validations: profile.validations.clone(),
+        capabilities: profile.capabilities.clone(),
+        source_exports: profile.source_exports.clone(),
     }
 }
 
@@ -1051,6 +2420,15 @@ fn apply_recipe_fragment(target: &mut RecipeFragment, source: &RecipeFragment) {
     if source.build.is_some() {
         target.build.clone_from(&source.build);
     }
+    if source.resolution.is_some() {
+        target.resolution.clone_from(&source.resolution);
+    }
+    target.actions.extend(source.actions.clone());
+    target.validations.extend(source.validations.clone());
+    if source.capabilities.is_some() {
+        target.capabilities.clone_from(&source.capabilities);
+    }
+    target.source_exports.extend(source.source_exports.clone());
 }
 
 fn resolve_recipe_profile(
@@ -1128,6 +2506,11 @@ fn resolve_recipe_component(
             inputs: definition.inputs,
             outputs: definition.outputs,
             build: definition.build,
+            resolution: definition.resolution,
+            actions: definition.actions,
+            validations: definition.validations,
+            capabilities: definition.capabilities,
+            source_exports: definition.source_exports,
         },
     );
     let adapter = fragment.adapter.ok_or_else(|| {
@@ -1144,6 +2527,11 @@ fn resolve_recipe_component(
     })?;
     let mut inputs = fragment.inputs;
     let mut outputs = fragment.outputs;
+    let mut resolution = fragment.resolution;
+    let mut actions = fragment.actions;
+    let mut validations = fragment.validations;
+    let capabilities = fragment.capabilities;
+    let mut source_exports = fragment.source_exports;
     let mut dependencies = fragment.dependencies;
     let edges = fragment.edges;
     let mut seen_dependencies = BTreeSet::new();
@@ -1208,6 +2596,41 @@ fn resolve_recipe_component(
     for value in build.environment.values_mut() {
         *value = expand_recipe_root_template(value, &root);
     }
+    if let Some(resolution) = &mut resolution {
+        for argument in &mut resolution.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+        if let Some(cwd) = &mut resolution.cwd {
+            *cwd = expand_recipe_root_template(cwd, &root);
+        }
+        resolution.snapshot = expand_recipe_root_template(&resolution.snapshot, &root);
+        for value in resolution.environment.values_mut() {
+            *value = expand_recipe_root_template(value, &root);
+        }
+    }
+    for action in &mut actions {
+        for argument in &mut action.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+        if let Some(cwd) = &mut action.cwd {
+            *cwd = expand_recipe_root_template(cwd, &root);
+        }
+        for value in action.environment.values_mut() {
+            *value = expand_recipe_root_template(value, &root);
+        }
+    }
+    for validation in &mut validations {
+        if let Some(path) = &mut validation.path {
+            *path = expand_recipe_root_template(path, &root);
+        }
+        for argument in &mut validation.command {
+            *argument = expand_recipe_root_template(argument, &root);
+        }
+    }
+    for export in &mut source_exports {
+        export.source = expand_recipe_root_template(&export.source, &root);
+        export.target = expand_recipe_root_template(&export.target, &root);
+    }
     let mut seen_inputs = BTreeSet::new();
     inputs.retain(|input| {
         seen_inputs.insert((
@@ -1228,6 +2651,11 @@ fn resolve_recipe_component(
             inputs,
             outputs,
             build,
+            resolution,
+            actions,
+            validations,
+            capabilities,
+            source_exports,
         },
         versions,
     ))
@@ -1566,6 +2994,15 @@ portability = "host"
         assert_eq!(plan.outputs[0].mount_path, ".trail-generated/copy");
         assert_eq!(plan.inputs.len(), 1);
         assert_eq!(plan.inputs[0].source_path, "input.txt");
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &plan,
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&plan)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert_eq!(identity.trust_scope, "repository");
         let report = db
             .plan_workspace_environment("recipe-a", RECIPE_ADAPTER_IDENTITY, None)
             .unwrap();
@@ -1580,6 +3017,816 @@ portability = "host"
             vec!["project/generated"]
         );
         assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_v2_schema_preserves_v1_command_recipe_planning() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_recipe_workspace(
+            workspace.path(),
+            &["cp", "input.txt", "generated/copied.txt"],
+        );
+        let path = workspace.path().join("trail.environment.toml");
+        let v1 = fs::read_to_string(&path).unwrap();
+        fs::write(&path, v1.replace(RECIPE_SCHEMA_V1, RECIPE_SCHEMA_V2)).unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].component.adapter, RECIPE_ADAPTER_IDENTITY);
+        let plan = db
+            .command_recipe_plan(&source_root, "generated.copy")
+            .unwrap();
+        assert_eq!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+        );
+        assert_eq!(plan.outputs[0].mount_path, ".trail-generated/copy");
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn v2_schema_parses_typed_pipeline_sections_and_heterogeneous_outputs() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+missing_resolution = "explicit"
+
+[[component]]
+id = "custom.pipeline"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+cwd = "."
+
+[component.resolve]
+command = ["cp", "input.txt", "generated.lock"]
+cwd = "."
+network = { authorities = ["registry.example:443"] }
+snapshot = "generated.lock"
+format = "application/vnd.example.lock+json"
+
+[component.resolve.capabilities]
+network = "exact_authorities"
+filesystem_write = "isolated_candidate"
+process = "declared_executable"
+child_processes = 4
+secrets = "opaque_handles"
+publication = "deny"
+
+[[component.action]]
+name = "construct"
+phase = "construct"
+command = ["cp", "input.txt", "generated/result.txt"]
+cwd = "."
+network = "deny"
+
+[[component.action]]
+name = "load-check"
+phase = "validate"
+command = ["cp", "generated/result.txt", "generated/checked.txt"]
+
+[[component.validation]]
+name = "path-contract"
+kind = "path_contract"
+path = "generated"
+required = true
+parameters = { maximum_entries = "1000" }
+
+[component.capabilities]
+network = "deny"
+filesystem_read = "declared_inputs"
+filesystem_write = "isolated_candidate"
+process = "declared_executable"
+child_processes = 1
+secrets = "deny"
+publication = "deny"
+
+[[component.output]]
+name = "seed"
+source = "generated"
+target = ".trail-generated/seed"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+
+[[component.output]]
+name = "scratch"
+source = "scratch"
+target = ".trail-generated/scratch"
+policy = "disposable"
+reuse = "none"
+scope = "lane"
+publish = "never"
+
+[[component.source_export]]
+from_output = "seed"
+source = "generated-client"
+target = "src/generated-client"
+mode = "explicit"
+collision = "fail"
+validation = "path-contract"
+"#;
+        let (_workspace, db) = open_recipe_graph(specification);
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        let component = &recipes[0].component;
+
+        assert_eq!(
+            component.resolution.as_ref().unwrap().snapshot,
+            "generated.lock"
+        );
+        assert_eq!(component.actions.len(), 2);
+        assert_eq!(component.actions[0].phase, RecipeActionPhase::Construct);
+        assert_eq!(component.actions[1].phase, RecipeActionPhase::Validate);
+        assert_eq!(component.validations.len(), 1);
+        assert_eq!(component.outputs.len(), 2);
+        assert_eq!(
+            component.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableSeedPrivate
+        );
+        assert_eq!(
+            component.outputs[1].policy,
+            EnvironmentOutputPolicy::Disposable
+        );
+        assert_eq!(
+            component.capabilities.as_ref().unwrap().child_processes,
+            Some(1)
+        );
+        assert_eq!(component.source_exports.len(), 1);
+        assert_eq!(component.source_exports[0].target, "src/generated-client");
+
+        let compiled = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "custom.pipeline")
+            .unwrap();
+        assert_eq!(
+            compiled.proposal.status,
+            EnvironmentComponentProposalStatus::Resolvable
+        );
+        assert_eq!(compiled.graph_plan.component_id, "custom.pipeline");
+        assert_eq!(
+            compiled
+                .resolution_plan
+                .as_ref()
+                .unwrap()
+                .allowed_authorities,
+            vec!["registry.example:443"]
+        );
+        assert_eq!(compiled.desired_material.actions.len(), 4);
+        assert_eq!(compiled.outputs.len(), 2);
+        assert_eq!(compiled.validations.len(), 1);
+        assert_eq!(compiled.source_exports.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&compiled.source_exports[0]).unwrap(),
+            serde_json::json!({
+                "name": "seed",
+                "output_name": "seed",
+                "artifact_subpath": "generated-client",
+                "destination": "src/generated-client",
+                "collision_policy": "fail",
+                "required_validation": "path-contract",
+                "authorization_mode": "explicit"
+            })
+        );
+        assert_eq!(
+            compiled.desired_key,
+            super::super::workspace_artifact::artifact_desired_key_v2(
+                compiled.desired_material.clone()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            compiled.desired_material.adapter_protocol,
+            RECIPE_SCHEMA_V2,
+            "repository v2 retains its explicit desired-key protocol instead of being relabeled as plugin v3"
+        );
+    }
+
+    #[test]
+    fn v2_schema_rejects_non_explicit_missing_resolution_policy() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+missing_resolution = "automatic"
+
+[[component]]
+id = "custom.pipeline"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+cwd = "."
+
+[[component.output]]
+name = "seed"
+source = "generated"
+target = ".trail-generated/seed"
+policy = "immutable_shared"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#;
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), "input\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            specification,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid input: environment specification `trail.environment.toml` missing_resolution must be `explicit`"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn next_and_vite_v2_components_compose_over_node_with_private_framework_state() {
+        if !Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"framework-composition","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("package-lock.json"),
+            r#"{"name":"framework-composition","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"framework-composition","version":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        fs::write(workspace.path().join("next-source.js"), "next fixture\n").unwrap();
+        fs::write(workspace.path().join("vite-source.js"), "vite fixture\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "web.next-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "next-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "next-state", source = "next-output", target = ".next", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "next-source.js", "next-output/server.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "web.vite-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [
+  { name = "dist", source = "dist", target = "dist", policy = "immutable_shared", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }
+]
+[component.build]
+command = ["cp", "vite-source.js", "dist/app.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dist-path-contract"
+kind = "path_contract"
+path = "dist"
+required = true
+parameters = { maximum_entries = "1000" }
+
+[[component]]
+id = "web.vite-cache"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "vite-cache", source = "vite-cache", target = ".vite", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "vite-source.js", "vite-cache/metadata.json"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+"#,
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        for lane in ["framework-one", "framework-two"] {
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                lane,
+                Some("main"),
+                mode.clone(),
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        }
+
+        let graph = db
+            .workspace_environment_graph("framework-one", None)
+            .unwrap();
+        assert_eq!(graph.nodes.len(), 4);
+        assert_eq!(graph.edges.len(), 3);
+        assert!(graph.edges.iter().all(|edge| {
+            edge.source_component_id == "node" && edge.edge_type == "build_requires"
+        }));
+
+        let first = db
+            .sync_all_workspace_environments("framework-one", None)
+            .unwrap();
+        let second = db
+            .sync_all_workspace_environments("framework-two", None)
+            .unwrap();
+        assert_eq!(first.generation.components.len(), 4);
+        assert_eq!(second.generation.components.len(), 4);
+        let next = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.next-build")
+            .unwrap();
+        assert_eq!(
+            next.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert!(next.outputs[0].layer_id.is_none());
+        let vite = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.vite-build")
+            .unwrap();
+        assert_eq!(vite.outputs.len(), 1);
+        assert_eq!(
+            vite.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableShared
+        );
+        assert!(vite.outputs[0].layer_id.is_some());
+        let vite_cache = first
+            .generation
+            .components
+            .iter()
+            .find(|component| component.component_id == "web.vite-cache")
+            .unwrap();
+        assert_eq!(
+            vite_cache.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert!(vite_cache.outputs[0].layer_id.is_none());
+
+        let first_view = db.lane_workspace_view("framework-one").unwrap().unwrap();
+        let second_view = db.lane_workspace_view("framework-two").unwrap().unwrap();
+        let first_generated = Path::new(&first_view.generated_upper);
+        let second_generated = Path::new(&second_view.generated_upper);
+        fs::write(first_generated.join(".next/lane.txt"), "one\n").unwrap();
+        fs::write(second_generated.join(".next/lane.txt"), "two\n").unwrap();
+        fs::write(first_generated.join(".vite/cache.txt"), "one\n").unwrap();
+        fs::write(second_generated.join(".vite/cache.txt"), "two\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(first_generated.join(".next/lane.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second_generated.join(".next/lane.txt")).unwrap(),
+            "two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(first_generated.join(".vite/cache.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second_generated.join(".vite/cache.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[test]
+    fn v2_pipeline_sections_reject_unknown_fields_and_v1_cannot_opt_in_implicitly() {
+        for (schema, extra, expected) in [
+            (
+                RECIPE_SCHEMA_V2,
+                "[[component.action]]\nphase = \"construct\"\ncommand = [\"tool\"]\nshell = true\n",
+                "unknown field",
+            ),
+            (
+                RECIPE_SCHEMA_V1,
+                "[[component.action]]\nphase = \"construct\"\ncommand = [\"tool\"]\n",
+                RECIPE_SCHEMA_V2,
+            ),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("input.txt"), "strict\n").unwrap();
+            fs::write(
+                workspace.path().join("trail.environment.toml"),
+                format!(
+                    "schema = {schema:?}\n[[component]]\nid = \"strict\"\nadapter = \"trail/command@1\"\ninputs = [{{ path = \"input.txt\" }}]\noutputs = [{{ source = \"generated\", target = \"generated\" }}]\n[component.build]\ncommand = [\"tool\"]\n{extra}"
+                ),
+            )
+            .unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+            let error = db.load_command_recipes(&source_root).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected strict-v2 parser error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_repository_pipeline_rejects_unsafe_authority_and_reuse_requests() {
+        struct Case {
+            name: &'static str,
+            command: &'static [&'static str],
+            before_output: &'static str,
+            reuse: &'static str,
+            scope: &'static str,
+            after_output: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "shell interpolation",
+                command: &["cp", "$(read-secret)", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "shell control flow",
+                command: &["cp", "input.txt", "&&", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "absolute host path",
+                command: &["cp", "/etc/passwd", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "unsafe or excessive argv",
+            },
+            Case {
+                name: "indirect child launcher",
+                command: &["env", "cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "non-shell, non-launcher executable",
+            },
+            Case {
+                name: "raw secret environment",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.build.environment]\nAPI_TOKEN = \"sk-live-secret\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "forbidden environment entry",
+            },
+            Case {
+                name: "provider socket",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.build.environment]\nDOCKER_HOST = \"unix:///var/run/docker.sock\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "requests a provider socket",
+            },
+            Case {
+                name: "forbidden process graph",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nprocess = \"reviewed_builtin_graph\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "exceeds the repository-declaration ceiling",
+            },
+            Case {
+                name: "secret-tainted constructor",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nsecrets = \"opaque_handles\"\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "exceeds the repository-declaration ceiling",
+            },
+            Case {
+                name: "excessive child processes",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "[component.capabilities]\nchild_processes = 257\n",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "",
+                expected: "child-process limit",
+            },
+            Case {
+                name: "host-wide reuse",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "host",
+                after_output: "",
+                expected: "host-wide artifact reuse",
+            },
+            Case {
+                name: "compatible reuse",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "compatible",
+                scope: "workspace",
+                after_output: "",
+                expected: "compatible or host-wide artifact reuse",
+            },
+            Case {
+                name: "mounted repository action",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "[[component.action]]\nphase = \"mounted_execution\"\ncommand = [\"cp\", \"input.txt\", \"generated/mounted.txt\"]\n",
+                expected: "requests forbidden phase",
+            },
+            Case {
+                name: "online constructor",
+                command: &["cp", "input.txt", "generated/result.txt"],
+                before_output: "",
+                reuse: "exact",
+                scope: "workspace",
+                after_output: "[[component.action]]\nphase = \"construct\"\ncommand = [\"cp\", \"input.txt\", \"generated/online.txt\"]\nnetwork = { authorities = [\"registry.example:443\"] }\n",
+                expected: "must be offline",
+            },
+        ];
+
+        for case in cases {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("input.txt"), "strict\n").unwrap();
+            let command = serde_json::to_string(case.command).unwrap();
+            fs::write(
+                workspace.path().join("trail.environment.toml"),
+                format!(
+                    r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "unsafe.pipeline"
+adapter = "trail/command@1"
+inputs = [{{ path = "input.txt" }}]
+
+[component.build]
+command = {command}
+cwd = "."
+{before_output}
+[[component.output]]
+name = "generated"
+source = "generated"
+target = ".trail-generated/unsafe"
+policy = "immutable_seed_private"
+reuse = "{reuse}"
+scope = "{scope}"
+publish = "on_sync"
+{after_output}"#,
+                    before_output = case.before_output,
+                    reuse = case.reuse,
+                    scope = case.scope,
+                    after_output = case.after_output,
+                ),
+            )
+            .unwrap();
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+            let error = db.load_command_recipes(&source_root).unwrap_err();
+            assert!(
+                error.to_string().contains(case.expected),
+                "{} produced unexpected error: {error}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn v2_repository_authorities_are_bounded_sorted_and_deduplicated() {
+        let network = RecipeNetwork::Authorities(RecipeNetworkAuthorities {
+            authorities: vec![
+                "registry.z.example:443".into(),
+                "registry.a.example:443".into(),
+                "registry.z.example:443".into(),
+            ],
+        });
+        assert_eq!(
+            recipe_network_authorities(Some(&network)).unwrap(),
+            vec!["registry.a.example:443", "registry.z.example:443"]
+        );
+
+        let excessive = RecipeNetwork::Authorities(RecipeNetworkAuthorities {
+            authorities: (0..=MAX_RECIPE_NETWORK_AUTHORITIES)
+                .map(|index| format!("registry-{index}.example:443"))
+                .collect(),
+        });
+        let error = recipe_network_authorities(Some(&excessive)).unwrap_err();
+        assert!(error.to_string().contains("more than"));
+    }
+
+    #[test]
+    fn v2_repository_input_declarations_are_bounded_and_expansion_is_sorted() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("z.txt"), "z\n").unwrap();
+        fs::write(workspace.path().join("a.txt"), "a\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[[component]]
+id = "sorted.inputs"
+adapter = "trail/command@1"
+inputs = [{ path = "*.txt" }]
+
+[component.build]
+command = ["cp", "a.txt", "generated/result.txt"]
+
+[[component.output]]
+name = "generated"
+source = "generated"
+target = ".trail-generated/sorted"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+        let recipes = db.load_command_recipes(&source_root).unwrap();
+        let selected = db
+            .expand_recipe_inputs(&source_root, &recipes[0].component)
+            .unwrap();
+        assert_eq!(
+            selected.keys().cloned().collect::<Vec<_>>(),
+            vec!["a.txt", "z.txt"]
+        );
+
+        let excessive_workspace = tempfile::tempdir().unwrap();
+        let inputs = (0..=MAX_RECIPE_INPUT_DECLARATIONS)
+            .map(|index| format!("{{ path = \"missing/{index}.txt\", optional = true }}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            excessive_workspace.path().join("trail.environment.toml"),
+            format!(
+                r#"schema = "trail.environment/v2"
+[[component]]
+id = "excessive.inputs"
+adapter = "trail/command@1"
+inputs = [{inputs}]
+[component.build]
+command = ["cp", "input.txt", "generated/result.txt"]
+[[component.output]]
+source = "generated"
+target = ".trail-generated/excessive"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+"#
+            ),
+        )
+        .unwrap();
+        Trail::init(
+            excessive_workspace.path(),
+            "main",
+            InitImportMode::WorkingTree,
+            false,
+        )
+        .unwrap();
+        let excessive_db = Trail::open(excessive_workspace.path()).unwrap();
+        let excessive_root = excessive_db.resolve_branch_ref("main").unwrap().root_id;
+        let error = excessive_db
+            .load_command_recipes(&excessive_root)
+            .unwrap_err();
+        assert!(error.to_string().contains("declares more than"));
+    }
+
+    #[test]
+    fn repository_document_graph_rejects_mixed_schema_versions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("config")).unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            format!("schema = {RECIPE_SCHEMA_V2:?}\ninclude = [\"config/profile.toml\"]\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("config/profile.toml"),
+            format!("schema = {RECIPE_SCHEMA_V1:?}\n"),
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert!(error.to_string().contains("config/profile.toml"));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V1));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V2));
+    }
+
+    #[test]
+    fn repository_document_rejects_unsupported_schema_with_supported_versions() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            "schema = \"trail.environment/v3\"\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let error = db.load_command_recipes(&source_root).unwrap_err();
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V1));
+        assert!(error.to_string().contains(RECIPE_SCHEMA_V2));
+    }
+
+    #[test]
+    fn command_recipe_discovery_does_not_require_or_execute_declared_tool() {
+        let (_workspace, db) = open_recipe_lane(&[
+            "trail-fixture-tool-that-does-not-exist",
+            "input.txt",
+            "generated/copied.txt",
+        ]);
+
+        let discovery = db.discover_workspace_environment("recipe-a", None).unwrap();
+        assert_eq!(discovery.components.len(), 1);
+        assert_eq!(discovery.components[0].component_id, "generated.copy");
+        assert_eq!(
+            discovery.components[0].status,
+            EnvironmentComponentProposalStatus::Ready
+        );
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+
+        let error = db
+            .command_recipe_plan(&discovery.source_root, "generated.copy")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("trail-fixture-tool-that-does-not-exist"));
     }
 
     #[test]
@@ -1654,6 +3901,121 @@ scripts = "deny"
             .layer_key
             .inputs
             .contains_key("specification_source:config/copy.toml"));
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn maven_gradle_like_and_unknown_custom_shapes_use_repository_v2_components() {
+        let specification = r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "jvm.dependencies"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "dependencies", source = "dependencies", target = ".trail-generated/jvm-dependencies", policy = "immutable_seed_private", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "dependencies/checksums.lock"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dependency-checksum-graph"
+kind = "path_contract"
+path = "dependencies"
+required = true
+parameters = { maximum_entries = "10000" }
+
+[[component]]
+id = "jvm.private-build-state"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["jvm.dependencies"]
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "build-state", source = "build-state", target = ".trail-generated/jvm-build", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "build-state/task-state.bin"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "custom.codegen"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt", role = "identity", format = "bytes" }]
+outputs = [{ name = "generated-api", source = "generated-api", target = ".trail-generated/custom-api", policy = "immutable_seed_private", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "input.txt", "generated-api/client.txt"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "generated-api-contract"
+kind = "path_contract"
+path = "generated-api"
+required = true
+
+[[component.source_export]]
+from_output = "generated-api"
+source = "client.txt"
+target = "src/generated/client.txt"
+mode = "explicit"
+collision = "fail"
+validation = "generated-api-contract"
+"#;
+        let (_workspace, db) = open_recipe_graph(specification);
+        let source_root = db.resolve_branch_ref("main").unwrap().root_id;
+
+        let dependencies = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "jvm.dependencies")
+            .unwrap();
+        let build_state = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "jvm.private-build-state")
+            .unwrap();
+        let custom = db
+            .compile_repository_artifact_pipeline_v2(&source_root, "custom.codegen")
+            .unwrap();
+
+        for compiled in [&dependencies, &build_state, &custom] {
+            assert_eq!(
+                compiled.graph_plan.adapter_identity,
+                RECIPE_ADAPTER_IDENTITY
+            );
+            assert_eq!(compiled.desired_material.adapter_protocol, RECIPE_SCHEMA_V2);
+            assert_eq!(compiled.desired_material.trust_scope, "repository");
+            assert_eq!(compiled.desired_material.network_policy, "deny");
+        }
+        assert_eq!(
+            dependencies.outputs[0].policy,
+            EnvironmentOutputPolicy::ImmutableSeedPrivate
+        );
+        assert_eq!(
+            dependencies.validations[0].name,
+            "dependency-checksum-graph"
+        );
+        assert_eq!(
+            build_state.outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+        assert_eq!(build_state.outputs[0].reuse, EnvironmentReuseMode::None);
+        assert_eq!(
+            build_state.graph_plan.dependencies,
+            [WorkspaceEnvironmentDependency::build_requires(
+                "jvm.dependencies"
+            )]
+        );
+        assert_eq!(custom.source_exports.len(), 1);
+        assert_eq!(
+            custom.source_exports[0].destination,
+            "src/generated/client.txt"
+        );
         assert!(db.list_workspace_layers().unwrap().is_empty());
     }
 
@@ -2744,6 +5106,22 @@ portability = "host"
             "sandboxed netcat reached a host socket"
         );
         assert!(db.list_workspace_layers().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restricted_command_recipe_denies_child_process_execution() {
+        let (_workspace, db) =
+            open_recipe_lane(&["env", "cp", "input.txt", "generated/copied-by-child.txt"]);
+        let error = db
+            .sync_workspace_environment("recipe-a", RECIPE_ADAPTER_IDENTITY, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("failed with"));
+        assert!(db.list_workspace_layers().unwrap().is_empty());
+        assert!(db
+            .active_environment_generation("recipe-a")
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(target_os = "macos")]

@@ -2150,7 +2150,8 @@ impl CaptureCoordinator {
                 "stop_reason": stop_reason(message),
                 "error": message.get("error").cloned(),
                 "checkpoint_error": checkpoint_error,
-                "managed_execution_id": lifecycle.as_ref().map(|receipt| &receipt.execution_id)
+                "managed_execution_id": lifecycle.as_ref().map(|receipt| &receipt.execution_id),
+                "managed_execution": lifecycle.as_ref()
             }))),
             None,
             None,
@@ -2923,9 +2924,10 @@ impl CaptureCoordinator {
                     "acp_managed_execution_interrupted",
                     Some(serde_json::json!({
                         "finish_reason": format!("{reason:?}"),
-                        "execution_id": lifecycle.execution_id,
-                        "checkpoint_error": lifecycle.checkpoint_error,
-                        "disposal_error": lifecycle.disposal_error
+                        "execution_id": &lifecycle.execution_id,
+                        "checkpoint_error": &lifecycle.checkpoint_error,
+                        "disposal_error": &lifecycle.disposal_error,
+                        "managed_execution": &lifecycle
                     })),
                     None,
                     None,
@@ -5172,6 +5174,18 @@ mod tests {
                 payload["surface"] == "acp_prompt" && payload["phase"] == "checkpoint"
             })
         }));
+        let finished = turn
+            .events
+            .iter()
+            .find(|event| event.event_type == "acp_prompt_finished")
+            .expect("managed ACP completion must retain its lifecycle receipt");
+        let managed = &finished.payload.as_ref().unwrap()["managed_execution"];
+        assert_eq!(
+            managed["preparation"]["missing_resolution_policy"],
+            "explicit"
+        );
+        assert_eq!(managed["finalization"]["checkpoint_status"], "failed");
+        assert_eq!(managed["finalization"]["complete"], false);
     }
 
     #[test]
@@ -5259,7 +5273,20 @@ mod tests {
             .flat_map(|turn| turn.events)
             .find(|event| event.event_type == "acp_managed_execution_interrupted")
             .expect("ACP interruption must be durable");
-        assert_eq!(interruption.payload.unwrap()["finish_reason"], "EditorEof");
+        let payload = interruption.payload.unwrap();
+        assert_eq!(payload["finish_reason"], "EditorEof");
+        assert_eq!(
+            payload["managed_execution"]["preparation"]["missing_resolution_policy"],
+            "explicit"
+        );
+        assert_eq!(
+            payload["managed_execution"]["finalization"]["checkpoint_status"],
+            "succeeded"
+        );
+        assert_eq!(
+            payload["managed_execution"]["finalization"]["complete"],
+            true
+        );
         let branch = db.lane_branch(lane).unwrap();
         assert_ne!(branch.head_change, branch.base_change);
     }

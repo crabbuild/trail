@@ -132,6 +132,56 @@ wire types. Select it in `trail-adapter.toml`:
 protocols = ["trail.environment-adapter/v2"]
 ```
 
+Protocol v3 is a separate, strictly bounded wire surface so existing v1/v2 request,
+response, and plan layouts remain unchanged. `AdapterRequestV3` carries exact host
+ceilings and either pinned proposal inputs or typed planning inputs plus an optional
+verified resolution snapshot. `AdapterResponseV3` returns an incomplete/ready proposal
+or an `AdapterPipelineV3` containing resolution, typed phases, validations, capability
+profiles, identity declarations, outputs, explicit source exports, attestation
+requirements, secret taint, and quarantine policy.
+
+Call `validate_bounds()` before writing a v3 frame. It enforces hard limits for input
+bytes/files, actions, validations, outputs, authorities, exports, maps, strings, resolver
+captures, output trees, and child processes. Trail repeats this validation and the full
+semantic/trust validation at the host boundary. Host evidence in a v3 request is tagged
+and object-referenced; an adapter cannot mint an attestation, resolve a quarantine,
+publish an artifact, mount a lane, or write exported source.
+
+Protocol-v3 negotiation and host normalization are explicit. Merely adding v3 types to
+an adapter does not cause a v1/v2 package to receive resolution, export, attestation, or
+compatibility authority.
+
+Start v3 authoring from
+[`examples/artifact-pipeline-adapter.rs`](examples/artifact-pipeline-adapter.rs). Use
+`AdapterPipelineV3::builder(...)` rather than constructing an unvalidated response. The
+builder canonicalizes set-like dependencies, inputs, authorities, validations, outputs,
+and exports; rejects duplicates, unsafe paths and shell-style commands; verifies export
+references; and prevents secret-tainted output from becoming reusable or exportable.
+It returns `AdapterPipelineV3BuildError` for local authoring errors. The host still
+repeats complete validation because serialized plugin output is untrusted.
+
+A v3 package declares its maximum semantics explicitly; omitted capability metadata is
+the deny-all legacy value and is not serialized into v1/v2 packages:
+
+```toml
+[adapter]
+protocols = ["trail.environment-adapter/v3", "trail.environment-adapter/v2"]
+
+[adapter.capabilities]
+resolution = true
+source_exports = true
+host_attestation_evidence = false
+host_quarantine_evidence = false
+certification_ceiling = "local_artifact"
+```
+
+`negotiate_highest_mutual_protocol` compares exact protocol identities and selects v3,
+then v2, then v1 only when both peers list that exact value. Unknown future strings,
+aliases, prefixes, and package list order cannot change the result. The canonical legacy
+projection retains v1/v2 data while `v3_only` remains entirely absent, so conversion
+cannot infer resolution, validation, certification, export, attestation, or quarantine
+authority from missing fields.
+
 A mounted-only plan is authored as:
 
 ```rust
@@ -227,6 +277,33 @@ outputs. Trail validates the digest/reference/platform tuple, includes the sorte
 contract in the component key, persists it with each generation, and treats cleanup as
 provider-owned. Registry access, tag resolution, credentials, and runtime allocation
 are deliberately outside the planner.
+
+The same metadata-only contract represents an already verified provider store without
+copying it into a Trail layer. This is suitable for content-addressed build stores,
+remote action caches, and other immutable provider objects; it is not a request for
+Trail to fetch or execute against the reference:
+
+```rust
+use trail_environment_adapter_sdk::{AdapterExternalArtifact, AdapterPlanV2};
+
+let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+let plan = AdapterPlanV2::builder("external-stores", "external")
+    .identity_input("stores.lock")
+    .external_artifact(AdapterExternalArtifact::verified_external(
+        "dependency-store",
+        "local-store",
+        "store://objects/example-package",
+        digest,
+        "linux/x86_64",
+    ))
+    .stale_reason("verified provider identity changed")
+    .build()?;
+# Ok::<(), trail_environment_adapter_sdk::AdapterPlanBuildError>(())
+```
+
+`verified_external` accepts a bounded provider token, opaque safe reference, SHA-256
+digest, and exact platform identity (or `any`). It cannot back an OCI runtime resource;
+container declarations still require a digest-pinned `oci_image` in the same plan.
 
 An external plan may bind a pinned image to a lane-private service declaration. The
 adapter still performs no provider calls and receives no Docker socket, network, port,

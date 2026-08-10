@@ -122,6 +122,13 @@ fn lane_test_uses_managed_lifecycle_and_checkpoints_after_command_failure() {
     assert!(!report.success);
     assert_eq!(report.exit_code, Some(9));
     assert_eq!(report.lifecycle.surface, "lane_test");
+    let preparation = report.lifecycle.preparation.as_ref().unwrap();
+    assert_eq!(
+        serde_json::to_value(preparation.missing_resolution_policy).unwrap(),
+        "explicit"
+    );
+    assert!(preparation.resolution_pins.is_empty());
+    assert!(preparation.output_pins.is_empty());
     assert!(report
         .lifecycle
         .checkpoint
@@ -150,6 +157,12 @@ fn lane_test_uses_managed_lifecycle_and_checkpoints_after_command_failure() {
             "unmount",
         ]
     );
+    let finalization = report.lifecycle.finalization.as_ref().unwrap();
+    assert!(finalization.complete);
+    assert!(finalization.source_changed);
+    assert_eq!(finalization.checkpoint_status, "succeeded");
+    assert_eq!(finalization.disposal_status, "skipped");
+    assert_eq!(finalization.unmount_status, "skipped");
 }
 
 #[test]
@@ -315,6 +328,19 @@ fn terminal_agent_uses_managed_lifecycle_and_returns_its_receipt() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "completed");
     assert_eq!(report["lifecycle"]["surface"], "terminal_agent");
+    assert_eq!(
+        report["lifecycle"]["preparation"]["missing_resolution_policy"],
+        "explicit"
+    );
+    assert!(report["lifecycle"]["preparation"]["resolution_pins"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        report["lifecycle"]["finalization"]["checkpoint_status"],
+        "succeeded"
+    );
+    assert_eq!(report["lifecycle"]["finalization"]["complete"], true);
     assert!(report["lifecycle"]["checkpoint"]["source_paths"]
         .as_array()
         .unwrap()

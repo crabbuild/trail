@@ -836,6 +836,58 @@ mod mounted_conformance {
     }
 
     #[test]
+    fn dokan_mount_reads_artifact_manifest_without_layer_materialization() {
+        if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "dokan-lazy-artifact",
+            Some("main"),
+            LaneWorkdirMode::DokanCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let (binding, tree_id, missing_cache) =
+            lazy_artifact_conformance_binding(&db, temp.path()).unwrap();
+        let branch = db.lane_branch("dokan-lazy-artifact").unwrap();
+        let source_root = db.get_ref(&branch.ref_name).unwrap().root_id;
+        let source_upper = PathBuf::from(
+            db.lane_workspace_view("dokan-lazy-artifact")
+                .unwrap()
+                .unwrap()
+                .source_upper,
+        );
+        let mount = db
+            .mount_dokan_cow_workdir_for_lane_with_ephemeral_bindings(
+                "dokan-lazy-artifact",
+                source_upper,
+                source_root,
+                vec![binding],
+            )
+            .unwrap();
+        let workdir = PathBuf::from(
+            db.lane_workdir("dokan-lazy-artifact")
+                .unwrap()
+                .workdir
+                .unwrap(),
+        );
+        run_mounted_lazy_artifact_conformance(&workdir, &missing_cache).unwrap();
+        assert!(db
+            .artifact_tree_lazy_entry(&tree_id, "payload/pkg/tool.js")
+            .unwrap()
+            .is_some());
+        drop(mount);
+    }
+
+    #[test]
     fn foreground_dokan_mount_stops_through_a_separate_trail_handle() {
         if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").is_none() {
             return;

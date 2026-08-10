@@ -103,9 +103,25 @@ is quiescent.
 | Review readiness | `review`, `contribution`, `readiness`, `refresh-preview`, `handoff` |
 | Coordinate work | `claim`, `message` |
 | Workdir editing | `record`, `watch`, `read`, `hydrate`, `workdir`, `sync-workdir`, `checkout` |
+| Storage accounting | `space` |
 | Patches and history | `apply-patch`, `diff`, `timeline`, `rewind` |
 | Validation | `test`, `eval`, `gates` |
 | Advanced records | `turn`, `run`, `events`, `trace` |
+
+### Inspect lane storage
+
+```sh
+trail lane space <NAME>
+trail --format json lane space <NAME>
+```
+
+The structured report's `artifact_storage` object separates logical artifact
+bytes, unique and cross-artifact-shared authoritative CAS bytes, physical
+materializations, lane-private state, persisted prefetch, demand-loaded
+projections, reclaimable data, and unknown allocation. Do not sum those fields:
+logical, authoritative, physical, and reclaimable values are separate axes.
+The human report presents the same counters. Native COW extents remain unknown
+unless Trail has platform evidence proving their ownership.
 
 ## Create and Inspect Lanes
 

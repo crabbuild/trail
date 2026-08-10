@@ -1,10 +1,46 @@
 use super::workdir::{classify_view_path, PreparedLayerMountReset, ViewCore, ViewPathClass};
 use super::*;
+use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 
 const LAYER_BUILD_LEASE_SECS: i64 = 300;
+const CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS: u64 = 10;
+
+#[derive(Clone, Debug)]
+struct ArtifactConstructionAttemptFence {
+    attempt_id: String,
+    owner_generation: u64,
+    owner_pid: u32,
+    owner_start_token: String,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactConstructionWaiterFence {
+    attempt_id: String,
+    waiter_id: String,
+    owner_pid: u32,
+    owner_start_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InheritedArtifactBinding {
+    output_name: String,
+    desired_key: String,
+    envelope_id: String,
+    tree_root_id: String,
+}
+
+struct ArtifactInheritanceRequest<'a> {
+    component_id: &'a str,
+    component_key: &'a str,
+    output_name: &'a str,
+    output_policy: EnvironmentOutputPolicy,
+    child_backend: &'a str,
+    child_desired_key_was_planned: bool,
+}
+
 const WORKSPACE_LAYER_VERIFICATION_STAMP_VERSION: u16 = 1;
 const WORKSPACE_LAYER_SIDECAR_MAX_BYTES: u64 = 64 * 1024;
 
@@ -25,6 +61,10 @@ fn inheritable_workspace_layer_scope(scope: &str) -> bool {
     )
 }
 
+fn artifact_inheritance_backend_supported(backend: &str) -> bool {
+    matches!(backend, "fuse" | "nfs" | "dokan")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceLayerBinding {
     /// Durable identity used by filesystem-side activation recovery. For an
@@ -35,6 +75,12 @@ pub(crate) struct WorkspaceLayerBinding {
     pub(crate) layer_id: Option<String>,
     pub(crate) mount_path: String,
     pub(crate) storage_path: Option<PathBuf>,
+    /// Verified artifact tree backing this immutable layer. Native workspace
+    /// backends prefer this manifest-backed view and retain `storage_path` as
+    /// a compatibility/materialization-cache fallback.
+    pub(crate) artifact_tree_id: Option<ArtifactTreeId>,
+    /// Path inside `artifact_tree_id` mounted at `mount_path`.
+    pub(crate) artifact_subpath: String,
     pub(crate) kind: String,
     #[allow(dead_code)]
     pub(crate) priority: i64,
@@ -119,7 +165,7 @@ fn workspace_layer_manifest_entry_count(manifest: &WorkspaceLayerManifest) -> u6
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkspaceLayerEntry {
+pub(crate) struct WorkspaceLayerEntry {
     kind: String,
     mode: u32,
     size_bytes: u64,
@@ -240,6 +286,16 @@ impl Trail {
             .ok_or_else(|| {
                 Error::InvalidInput("lane has no active environment generation".to_string())
             })?;
+        let generation_secret_tainted = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM environment_secret_access_audit
+                 WHERE generation_id=?1 AND status='available'
+             )",
+            params![&predecessor],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let producer_receipt_json =
+            validate_private_output_promotion_taint(generation_secret_tainted, producer_receipt)?;
         let (policy, reuse, scope, trigger, gate, binding_identity, mount_path, component_key) =
             self.conn
                 .query_row(
@@ -341,7 +397,7 @@ impl Trail {
                 &output_identity,
                 trigger.as_str(),
                 &gate,
-                producer_receipt.map(serde_json::to_vec).transpose()?,
+                producer_receipt_json,
                 std::process::id(),
                 current_process_start_token(),
                 staging_relative,
@@ -577,6 +633,160 @@ impl Trail {
         Ok(())
     }
 
+    /// Rebuild missing verified layer cache directories from authoritative CAS
+    /// envelopes during workspace-open recovery. This runs under the existing
+    /// workspace write lock, stages into an attempt-owned directory, validates
+    /// against the legacy manifest, and only then publishes by atomic rename.
+    pub(crate) fn recover_workspace_layer_materializations(&self) -> Result<()> {
+        let private_stage = self.db_dir != self.workspace_root.join(".trail");
+        let mut statement = self.conn.prepare(
+            "SELECT l.layer_id,l.storage_path,l.manifest_object_id,
+                    s.tree_root_id,s.envelope_id
+             FROM workspace_layers l
+             JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+             JOIN artifact_envelopes e ON e.envelope_id=s.envelope_id
+             WHERE l.state='ready' AND s.state='verified'
+               AND e.state='ready' AND e.verification_state='verified'
+             ORDER BY l.layer_id",
+        )?;
+        let candidates = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for (layer_id, stored_path, manifest_id, tree_id, envelope_id) in candidates {
+            if !valid_workspace_layer_id(&layer_id) {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer ID `{layer_id}` is invalid; restore from backup or reinitialize the workspace"
+                )));
+            }
+            let final_path = self.db_dir.join("cache/layers").join(&layer_id);
+            if private_stage {
+                if !workspace_layer_storage_path_matches_id(&stored_path, &layer_id) {
+                    return Err(Error::Corrupt(format!(
+                        "workspace layer `{layer_id}` has a non-canonical materialization path"
+                    )));
+                }
+                let restored_path = self
+                    .workspace_root
+                    .join(".trail/cache/layers")
+                    .join(&layer_id);
+                if Path::new(&stored_path) != restored_path {
+                    self.conn.execute(
+                        "UPDATE workspace_layers SET storage_path=?1 WHERE layer_id=?2",
+                        params![restored_path.to_string_lossy(), &layer_id],
+                    )?;
+                }
+            } else if Path::new(&stored_path) != final_path {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` has a non-canonical materialization path"
+                )));
+            }
+            let staging = self
+                .db_dir
+                .join("cache/staging")
+                .join(format!("restore_{layer_id}"));
+            if final_path.exists() {
+                remove_exact_recovery_directory(
+                    &staging,
+                    "completed artifact materialization staging",
+                )?;
+                continue;
+            }
+            let tree_id = crate::ids::ArtifactTreeId::parse(tree_id)
+                .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+            let envelope_id =
+                crate::ids::ArtifactEnvelopeId::parse(envelope_id).map_err(|error| {
+                    Error::Corrupt(format!("invalid artifact envelope ID: {error}"))
+                })?;
+            let envelope = self
+                .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` cannot be reconstructed because envelope `{envelope_id}` failed verification: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            if !matches!(
+                envelope.desired_identity,
+                ArtifactDesiredIdentityV1::WorkspaceLayerV1 { .. }
+            ) {
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` references a non-legacy artifact envelope"
+                )));
+            }
+            let mut manifest: WorkspaceLayerManifest = self
+                .get_object(
+                    WORKSPACE_LAYER_MANIFEST_KIND,
+                    &ObjectId(manifest_id.clone()),
+                )
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` has no valid layer manifest: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            self.hydrate_workspace_layer_manifest(&mut manifest)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` has an invalid paged manifest: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            remove_exact_recovery_directory(&staging, "artifact materialization staging")?;
+            fs::create_dir_all(staging.parent().unwrap())?;
+            let shared_materialization = self
+                .ensure_artifact_tree_materialization_under_write_lock(&tree_id)
+                .map_err(|error| {
+                    Error::Corrupt(format!(
+                        "CAS-backed workspace layer `{layer_id}` could not materialize tree `{tree_id}` through its shared cache: {error}; restore the workspace from backup or reinitialize it and run environment synchronization"
+                    ))
+                })?;
+            copy_layer_tree(&shared_materialization.storage_path, &staging)?;
+            test_crash_point("layer_after_cas_materialization");
+            // The legacy manifest records the immutable attachment modes
+            // (0555/0444), so seal the reconstructed children before the
+            // byte-for-byte manifest comparison.
+            let actual = scan_layer_entries(&staging, true)?;
+            if manifest.layer_id != layer_id || manifest.entries != actual {
+                make_tree_writable(&staging);
+                fs::remove_dir_all(&staging)?;
+                return Err(Error::Corrupt(format!(
+                    "workspace layer `{layer_id}` CAS materialization disagrees with its manifest"
+                )));
+            }
+            fs::create_dir_all(final_path.parent().unwrap())?;
+            fs::rename(&staging, &final_path)?;
+            set_layer_read_only(
+                &final_path,
+                true,
+                layer_mode(&fs::symlink_metadata(&final_path)?),
+            )?;
+            sync_directory(final_path.parent().unwrap());
+            let physical_bytes = layer_physical_bytes(&final_path)?;
+            self.conn.execute(
+                "UPDATE workspace_layers SET physical_bytes=?1,last_used_at=?2
+                 WHERE layer_id=?3 AND state='ready'",
+                params![physical_bytes as i64, now_ts(), layer_id],
+            )?;
+            let report = self
+                .workspace_layer_by_cache_key(&manifest.cache_key)?
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "workspace layer `{layer_id}` disappeared after CAS materialization"
+                    ))
+                })?;
+            write_workspace_layer_publish_marker_from_report(&report, &manifest_id)?;
+            write_workspace_layer_verification_stamp(&report, &manifest_id)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_workspace_layer_publications_integrity(&self) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT p.publication_id,p.view_id,p.predecessor_generation_id,
@@ -726,6 +936,324 @@ impl Trail {
         Ok(errors)
     }
 
+    pub(crate) fn validate_workspace_artifact_layout_integrity(&self) -> Result<Vec<String>> {
+        const MAX_MATERIALIZATION_DIRECTORIES: usize = 100_000;
+        let mut errors = Vec::new();
+        // Backup verification and restore validation open a private SQLite
+        // stage whose disposable cache tree is intentionally absent. Validate
+        // durable path identity there, but reserve physical materialization
+        // checks for an active `.trail` database directory.
+        let private_stage = self.db_dir != self.workspace_root.join(".trail");
+        let layers = {
+            let mut statement = self.conn.prepare(
+                "SELECT l.layer_id,l.storage_path,l.state,
+                        CASE WHEN s.layer_id IS NULL THEN 0 ELSE 1 END
+                 FROM workspace_layers l
+                 LEFT JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+                 ORDER BY l.layer_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let known_layers = layers
+            .iter()
+            .filter(|(layer_id, _, _, _)| valid_workspace_layer_id(layer_id))
+            .map(|(layer_id, _, _, _)| layer_id.clone())
+            .collect::<BTreeSet<_>>();
+        for (layer_id, stored_path, state, cas_backed) in &layers {
+            if !valid_workspace_layer_id(layer_id) {
+                errors.push(format!(
+                    "workspace layer ID `{layer_id}` is invalid; restore from backup or reinitialize the workspace"
+                ));
+                continue;
+            }
+            let expected = self.db_dir.join("cache/layers").join(layer_id);
+            if private_stage {
+                if !workspace_layer_storage_path_matches_id(stored_path, layer_id) {
+                    errors.push(format!(
+                        "workspace layer {layer_id} has a non-canonical storage path; restore from backup or reinitialize the workspace"
+                    ));
+                }
+                continue;
+            }
+            if Path::new(stored_path) != expected {
+                errors.push(format!(
+                    "workspace layer {layer_id} has a non-canonical storage path; restore from backup or reinitialize the workspace"
+                ));
+                continue;
+            }
+            if state != "ready" {
+                continue;
+            }
+            if !expected.is_dir() {
+                errors.push(if *cas_backed {
+                    format!(
+                        "CAS-backed workspace layer {layer_id} has no materialization; reopen Trail to reconstruct it from its verified envelope"
+                    )
+                } else {
+                    format!(
+                        "legacy workspace layer {layer_id} is missing and has no CAS authority; run environment synchronization to rebuild it"
+                    )
+                });
+                continue;
+            }
+            if let Err(error) = self.verify_workspace_layer(layer_id) {
+                errors.push(if *cas_backed {
+                    format!(
+                        "CAS-backed workspace layer {layer_id} failed materialization verification: {error}; move the materialization outside `.trail/cache/layers` and reopen Trail"
+                    )
+                } else {
+                    format!(
+                        "legacy workspace layer {layer_id} failed verification: {error}; run environment synchronization to rebuild it"
+                    )
+                });
+            }
+        }
+
+        let layer_root = self.db_dir.join("cache/layers");
+        if layer_root.is_dir() {
+            for (index, entry) in fs::read_dir(&layer_root)?.enumerate() {
+                if index >= MAX_MATERIALIZATION_DIRECTORIES {
+                    errors.push(format!(
+                        "workspace layer materialization directory exceeds the {MAX_MATERIALIZATION_DIRECTORIES}-entry diagnostic bound; inspect `.trail/cache/layers` manually"
+                    ));
+                    break;
+                }
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if workspace_layer_sidecar_owner(&name)
+                    .is_some_and(|layer_id| known_layers.contains(layer_id))
+                {
+                    continue;
+                }
+                if !known_layers.contains(&name) {
+                    errors.push(format!(
+                        "orphan workspace layer materialization `{name}` has no database owner; move it outside `.trail/cache/layers`, rerun `trail fsck`, then delete it after review"
+                    ));
+                }
+            }
+        }
+
+        let staging_root = self.db_dir.join("cache/staging");
+        if staging_root.is_dir() {
+            for (index, entry) in fs::read_dir(&staging_root)?.enumerate() {
+                if index >= MAX_MATERIALIZATION_DIRECTORIES {
+                    errors.push(format!(
+                        "workspace layer staging directory exceeds the {MAX_MATERIALIZATION_DIRECTORIES}-entry diagnostic bound; inspect `.trail/cache/staging` manually"
+                    ));
+                    break;
+                }
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(layer_id) = name.strip_prefix("restore_") else {
+                    continue;
+                };
+                errors.push(if known_layers.contains(layer_id) {
+                    format!(
+                        "workspace layer {layer_id} retains incomplete materialization staging; reopen Trail to recover the exact staged path"
+                    )
+                } else {
+                    format!(
+                        "orphan artifact materialization staging `{name}` has no database owner; move it outside `.trail/cache/staging` and rerun `trail fsck`"
+                    )
+                });
+            }
+        }
+        Ok(errors)
+    }
+
+    fn inheritance_adapter_compatibility(
+        &self,
+        parent_view_id: &str,
+        component_id: &str,
+        component_key: &str,
+        adapter_identity: &str,
+        layer_adapter: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let (canonical_identity, contract_major, implementation_version, distribution_digest) =
+            if let Some(metadata) =
+                super::workspace_environment::registered_environment_adapter_metadata()
+                    .into_iter()
+                    .find(|metadata| {
+                        metadata.canonical_identity == adapter_identity
+                            || metadata.selectors.contains(&adapter_identity)
+                    })
+            {
+                if metadata.layer_adapter_name != layer_adapter {
+                    return Err("adapter_package_identity_mismatch");
+                }
+                if !metadata
+                    .supported_operating_systems
+                    .contains(&std::env::consts::OS)
+                    || !metadata
+                        .supported_architectures
+                        .contains(&std::env::consts::ARCH)
+                {
+                    return Err("adapter_host_unsupported");
+                }
+                (
+                    metadata.canonical_identity.to_string(),
+                    metadata.contract_major,
+                    metadata.implementation_version.to_string(),
+                    metadata.distribution_digest.to_string(),
+                )
+            } else {
+                let plugin = match self.environment_plugin_for_selector(adapter_identity) {
+                    Ok(Some(plugin)) => plugin,
+                    Ok(None) => return Err("adapter_package_unavailable"),
+                    Err(_) => return Err("adapter_package_trust_failed"),
+                };
+                if plugin.manifest.adapter.layer_adapter_name != layer_adapter {
+                    return Err("adapter_package_identity_mismatch");
+                }
+                if !super::workspace_plugin::environment_plugin_supports_current_host(&plugin) {
+                    return Err("adapter_host_unsupported");
+                }
+                let (_, _, contract_major) = super::workspace_plugin::validate_plugin_identity(
+                    &plugin.manifest.adapter.canonical_identity,
+                )
+                .map_err(|_| "adapter_package_identity_mismatch")?;
+                (
+                    plugin.manifest.adapter.canonical_identity,
+                    contract_major,
+                    plugin.manifest.adapter.implementation_version,
+                    plugin.distribution_digest,
+                )
+            };
+        let recorded = self
+            .conn
+            .query_row(
+                "SELECT adapter_identity,adapter_version,implementation_version,
+                        COALESCE(distribution_digest,''),attached_key,status
+                 FROM environment_component_states
+                 WHERE view_id=?1 AND component_id=?2",
+                params![parent_view_id, component_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| "adapter_package_evidence_invalid")?
+            .ok_or("adapter_package_identity_unproven")?;
+        if recorded.0 != canonical_identity
+            || recorded.1 != contract_major
+            || recorded.2 != implementation_version
+            || recorded.3 != distribution_digest
+            || recorded.4.as_deref() != Some(component_key)
+            || recorded.5 != "ready"
+        {
+            return Err("adapter_package_identity_mismatch");
+        }
+        Ok(())
+    }
+
+    fn verify_artifact_inheritance_binding(
+        &self,
+        layer: &WorkspaceLayerReport,
+        request: ArtifactInheritanceRequest<'_>,
+    ) -> std::result::Result<InheritedArtifactBinding, &'static str> {
+        if !artifact_inheritance_backend_supported(request.child_backend) {
+            return Err("artifact_backend_unsupported");
+        }
+        let shadow = self
+            .conn
+            .query_row(
+                "SELECT tree_root_id,envelope_id,state
+                 FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![&layer.layer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| "artifact_binding_query_failed")?
+            .ok_or("artifact_binding_missing")?;
+        if shadow.2 != "verified" {
+            return Err("artifact_binding_unverified");
+        }
+        let tree_id = ArtifactTreeId::parse(shadow.0.clone())
+            .map_err(|_| "artifact_tree_identity_invalid")?;
+        let envelope_id = crate::ids::ArtifactEnvelopeId::parse(shadow.1.clone())
+            .map_err(|_| "artifact_envelope_identity_invalid")?;
+        let envelope = self
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .map_err(|_| "artifact_envelope_verification_failed")?;
+        self.artifact_tree_flat_entries(&tree_id)
+            .map_err(|_| "artifact_tree_verification_failed")?;
+        if envelope.portability_scope != layer.portability_scope
+            || !inheritable_workspace_layer_scope(&envelope.portability_scope)
+        {
+            return Err("artifact_portability_mismatch");
+        }
+        let desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 {
+                cache_key,
+                canonical_key,
+            } => {
+                if envelope.component_id != format!("legacy:{}", layer.adapter)
+                    || envelope.output_name != "legacy-layer"
+                    || !envelope.output_policy.has_immutable_layer()
+                    || !request.output_policy.has_immutable_layer()
+                    || envelope.trust_scope != "workspace-layer-v1"
+                    || cache_key != request.component_key
+                    || canonical_key.adapter != layer.adapter
+                    || canonical_key.portability_scope != layer.portability_scope
+                    || canonical_key.portability_scope != "portable"
+                        && (canonical_key.platform != std::env::consts::OS
+                            || canonical_key.architecture != std::env::consts::ARCH)
+                    || self
+                        .workspace_layer_cache_key(canonical_key)
+                        .ok()
+                        .as_deref()
+                        != Some(request.component_key)
+                {
+                    return Err("artifact_desired_identity_mismatch");
+                }
+                cache_key.clone()
+            }
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => {
+                if !request.child_desired_key_was_planned {
+                    return Err("artifact_desired_identity_unproven");
+                }
+                if envelope.component_id != request.component_id
+                    || envelope.output_name != request.output_name
+                    || envelope.output_policy != request.output_policy
+                {
+                    return Err("artifact_output_contract_mismatch");
+                }
+                if desired_key.0 != request.component_key {
+                    return Err("artifact_desired_identity_mismatch");
+                }
+                desired_key.0.clone()
+            }
+        };
+        Ok(InheritedArtifactBinding {
+            output_name: request.output_name.to_string(),
+            desired_key,
+            envelope_id: envelope_id.0,
+            tree_root_id: tree_id.0,
+        })
+    }
+
     pub(crate) fn inherit_workspace_environment_generation(
         &self,
         parent_lane_id: &str,
@@ -801,6 +1329,7 @@ impl Trail {
             mount_path: Option<String>,
             source_path: String,
             priority: i64,
+            artifact_bindings: Vec<InheritedArtifactBinding>,
         }
 
         let candidates = {
@@ -829,6 +1358,7 @@ impl Trail {
                             mount_path: row.get(5)?,
                             source_path: row.get(6)?,
                             priority: row.get(7)?,
+                            artifact_bindings: Vec::new(),
                         })
                     },
                 )?
@@ -836,7 +1366,7 @@ impl Trail {
         };
         let mut inherited = Vec::new();
         let mut decisions = Vec::<EnvironmentOutputInheritanceDecisionReport>::new();
-        for component in candidates {
+        for mut component in candidates {
             let mut component_rejection = None;
             if let Some(planned) = desired.get(&component.component_id) {
                 if planned.adapter_identity != component.adapter_identity {
@@ -852,7 +1382,7 @@ impl Trail {
 
             let outputs = {
                 let mut statement = self.conn.prepare(
-                    "SELECT output_name,policy,storage_identity,layer_id
+                    "SELECT output_name,policy,reuse_mode,sharing_scope,storage_identity,layer_id
                      FROM environment_generation_outputs
                      WHERE generation_id=?1 AND component_id=?2 ORDER BY output_name",
                 )?;
@@ -863,19 +1393,26 @@ impl Trail {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, EnvironmentOutputPolicy>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, EnvironmentReuseMode>(2)?,
+                                row.get::<_, EnvironmentSharingScope>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<String>>(5)?,
                             ))
                         },
                     )?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
             let mut reusable_output = false;
-            for (output_name, policy, storage_identity, layer_id) in outputs {
+            for (output_name, policy, reuse, scope, storage_identity, layer_id) in outputs {
                 let mut rejection = component_rejection;
                 let decision = if !policy.has_immutable_layer() {
                     rejection = Some("fresh_lane_private_upper");
                     EnvironmentComponentDecision::Private
+                } else if reuse == EnvironmentReuseMode::None
+                    || scope == EnvironmentSharingScope::Lane
+                {
+                    rejection = Some("artifact_sharing_policy_rejected");
+                    EnvironmentComponentDecision::Rejected
                 } else if rejection.is_some() {
                     EnvironmentComponentDecision::Rejected
                 } else if let Some(layer_id) = layer_id.as_deref() {
@@ -883,8 +1420,39 @@ impl Trail {
                         Ok(layer)
                             if inheritable_workspace_layer_scope(&layer.portability_scope) =>
                         {
-                            reusable_output = true;
-                            EnvironmentComponentDecision::Reused
+                            if let Err(reason) = self.inheritance_adapter_compatibility(
+                                &parent_view.view_id,
+                                &component.component_id,
+                                &component.component_key,
+                                &component.adapter_identity,
+                                &layer.adapter,
+                            ) {
+                                rejection = Some(reason);
+                                EnvironmentComponentDecision::Rejected
+                            } else {
+                                match self.verify_artifact_inheritance_binding(
+                                    &layer,
+                                    ArtifactInheritanceRequest {
+                                        component_id: &component.component_id,
+                                        component_key: &component.component_key,
+                                        output_name: &output_name,
+                                        output_policy: policy,
+                                        child_backend: &child_view.backend,
+                                        child_desired_key_was_planned: desired
+                                            .contains_key(&component.component_id),
+                                    },
+                                ) {
+                                    Ok(binding) => {
+                                        component.artifact_bindings.push(binding);
+                                        reusable_output = true;
+                                        EnvironmentComponentDecision::Reused
+                                    }
+                                    Err(reason) => {
+                                        rejection = Some(reason);
+                                        EnvironmentComponentDecision::Rejected
+                                    }
+                                }
+                            }
                         }
                         Ok(_) => {
                             rejection = Some("unsupported_portability_scope");
@@ -1010,23 +1578,67 @@ impl Trail {
                         &component.component_id
                     ],
                 )?;
-                self.conn.execute(
-                    "INSERT INTO environment_generation_outputs(
-                         generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
-                         publication_trigger,publication_gate,storage_identity,layer_id,
-                         manifest_object_id,publication_id,mount_path,layer_subpath)
-                     SELECT ?1,component_id,output_name,policy,reuse_mode,sharing_scope,
-                            publication_trigger,publication_gate,storage_identity,layer_id,
-                            manifest_object_id,publication_id,mount_path,layer_subpath
-                     FROM environment_generation_outputs
-                     WHERE generation_id=?2 AND component_id=?3
-                       AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
-                    params![
-                        &generation_id,
-                        &parent_generation_id,
-                        &component.component_id
-                    ],
-                )?;
+                for binding in &component.artifact_bindings {
+                    let inserted = self.conn.execute(
+                        "INSERT INTO environment_generation_outputs(
+                             generation_id,component_id,output_name,policy,reuse_mode,sharing_scope,
+                             publication_trigger,publication_gate,storage_identity,layer_id,
+                             manifest_object_id,publication_id,mount_path,layer_subpath)
+                         SELECT ?1,component_id,output_name,policy,reuse_mode,sharing_scope,
+                                publication_trigger,publication_gate,storage_identity,layer_id,
+                                manifest_object_id,publication_id,mount_path,layer_subpath
+                         FROM environment_generation_outputs
+                         WHERE generation_id=?2 AND component_id=?3 AND output_name=?4
+                           AND policy LIKE 'immutable%' AND layer_id IS NOT NULL",
+                        params![
+                            &generation_id,
+                            &parent_generation_id,
+                            &component.component_id,
+                            &binding.output_name
+                        ],
+                    )?;
+                    if inserted != 1 {
+                        return Err(Error::Corrupt(format!(
+                            "inherited artifact output `{}/{}` changed after compatibility verification",
+                            component.component_id, binding.output_name
+                        )));
+                    }
+                    let binding_identity = format!(
+                        "artifact_binding_{}",
+                        crate::ids::short_hash(
+                            format!(
+                                "{}\0{}\0{}\0{}",
+                                generation_id,
+                                component.component_id,
+                                binding.output_name,
+                                binding.envelope_id
+                            )
+                            .as_bytes(),
+                            32,
+                        )
+                    );
+                    let binding_id = format!(
+                        "binding_{}",
+                        crate::ids::short_hash(binding_identity.as_bytes(), 32)
+                    );
+                    self.conn.execute(
+                        "INSERT INTO artifact_generation_bindings(
+                             binding_id,generation_id,component_id,output_name,desired_key,
+                             envelope_id,tree_root_id,binding_identity,created_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![
+                            binding_id,
+                            &generation_id,
+                            &component.component_id,
+                            &binding.output_name,
+                            &binding.desired_key,
+                            &binding.envelope_id,
+                            &binding.tree_root_id,
+                            binding_identity,
+                            now
+                        ],
+                    )?;
+                }
             }
             self.conn.execute(
                 "INSERT INTO environment_view_generations(view_id,generation_id,updated_at)
@@ -1065,20 +1677,529 @@ impl Trail {
         Ok(sha256_hex(&serde_json::to_vec(key)?))
     }
 
+    fn begin_artifact_construction_attempt(
+        &self,
+        desired_key: &str,
+        source_root: &ObjectId,
+    ) -> Result<ArtifactConstructionAttemptFence> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let _: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, source_root)?;
+        if let Some((attempt_id, generation, owner_pid, owner_start_token)) = self
+            .conn
+            .query_row(
+                "SELECT attempt_id,owner_generation,owner_pid,owner_start_token
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 AND status='running'",
+                params![desired_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            let owner_pid = u32::try_from(owner_pid).map_err(|_| {
+                Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has invalid owner PID"
+                ))
+            })?;
+            if process_start_token_match(owner_pid, &owner_start_token)
+                != ProcessIdentityMatch::DeadOrMismatch
+            {
+                return Err(Error::InvalidInput(format!(
+                    "artifact desired key `{desired_key}` is still owned by live or indeterminate construction attempt `{attempt_id}`"
+                )));
+            }
+            let updated = self.conn.execute(
+                "UPDATE artifact_construction_attempts
+                 SET phase='completed',status='abandoned',reason_code='owner_lost',
+                     reason='construction owner process exited',heartbeat_at=?1,finished_at=?1
+                 WHERE attempt_id=?2 AND owner_generation=?3 AND owner_pid=?4
+                   AND owner_start_token=?5 AND status='running'",
+                params![
+                    now_ts(),
+                    attempt_id,
+                    generation,
+                    i64::from(owner_pid),
+                    owner_start_token
+                ],
+            )?;
+            if updated != 1 {
+                return Err(Error::InvalidInput(format!(
+                    "artifact construction attempt `{attempt_id}` changed during dead-owner fencing"
+                )));
+            }
+            self.conn.execute(
+                "UPDATE artifact_construction_waiters
+                 SET status='abandoned',updated_at=?1
+                 WHERE attempt_id=?2 AND status='waiting'",
+                params![now_ts(), attempt_id],
+            )?;
+        }
+        let owner_generation = self.conn.query_row(
+            "SELECT COALESCE(MAX(owner_generation),0)+1
+             FROM artifact_construction_attempts WHERE desired_key=?1",
+            params![desired_key],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let owner_generation = u64::try_from(owner_generation).map_err(|_| {
+            Error::Corrupt("artifact construction generation exceeds supported range".into())
+        })?;
+        let owner_pid = std::process::id();
+        let owner_start_token = current_process_start_token();
+        let attempt_id = format!(
+            "construct_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{desired_key}\0{}\0{owner_generation}\0{owner_pid}\0{owner_start_token}\0{}",
+                    source_root.0,
+                    now_nanos()
+                )
+                .as_bytes(),
+                32
+            )
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_construction_attempts(
+                attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+             VALUES(?1,?2,?3,?4,?5,?6,'reserved','running',NULL,NULL,NULL,NULL,0,?7,?7,NULL)",
+            params![
+                attempt_id,
+                desired_key,
+                source_root.0,
+                i64::try_from(owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(owner_pid),
+                owner_start_token,
+                now_ts(),
+            ],
+        )?;
+        Ok(ArtifactConstructionAttemptFence {
+            attempt_id,
+            owner_generation,
+            owner_pid,
+            owner_start_token,
+        })
+    }
+
+    fn register_artifact_construction_waiter(
+        &self,
+        desired_key: &str,
+    ) -> Result<Option<ArtifactConstructionWaiterFence>> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let Some((attempt_id, owner_pid, owner_start_token)) = self
+            .conn
+            .query_row(
+                "SELECT attempt_id,owner_pid,owner_start_token
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 AND status='running'",
+                params![desired_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let construction_owner_pid = u32::try_from(owner_pid).map_err(|_| {
+            Error::Corrupt(format!(
+                "artifact construction attempt `{attempt_id}` has invalid owner PID"
+            ))
+        })?;
+        if process_start_token_match(construction_owner_pid, &owner_start_token)
+            == ProcessIdentityMatch::DeadOrMismatch
+        {
+            return Ok(None);
+        }
+        let owner_pid = std::process::id();
+        let owner_start_token = current_process_start_token();
+        let waiter_id = format!(
+            "waiter_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{attempt_id}\0{owner_pid}\0{owner_start_token}\0{}",
+                    now_nanos()
+                )
+                .as_bytes(),
+                32
+            )
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_construction_waiters(
+                attempt_id,waiter_id,owner_pid,owner_start_token,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'waiting',?5,?5)",
+            params![
+                attempt_id,
+                waiter_id,
+                i64::from(owner_pid),
+                owner_start_token,
+                now_ts()
+            ],
+        )?;
+        Ok(Some(ArtifactConstructionWaiterFence {
+            attempt_id,
+            waiter_id,
+            owner_pid,
+            owner_start_token,
+        }))
+    }
+
+    fn finish_artifact_construction_waiter(
+        &self,
+        waiter: &ArtifactConstructionWaiterFence,
+        status: &str,
+    ) -> Result<()> {
+        if !matches!(status, "released" | "cancelled" | "abandoned") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction waiter status `{status}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_waiters SET status=?1,updated_at=?2
+             WHERE attempt_id=?3 AND waiter_id=?4 AND owner_pid=?5
+               AND owner_start_token=?6 AND status='waiting'",
+            params![
+                status,
+                now_ts(),
+                waiter.attempt_id,
+                waiter.waiter_id,
+                i64::from(waiter.owner_pid),
+                waiter.owner_start_token,
+            ],
+        )?;
+        if updated == 0 {
+            let existing_status = self
+                .conn
+                .query_row(
+                    "SELECT status FROM artifact_construction_waiters
+                     WHERE attempt_id=?1 AND waiter_id=?2 AND owner_pid=?3
+                       AND owner_start_token=?4",
+                    params![
+                        waiter.attempt_id,
+                        waiter.waiter_id,
+                        i64::from(waiter.owner_pid),
+                        waiter.owner_start_token,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "released" | "cancelled" | "abandoned"))
+            {
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(format!(
+                "artifact construction waiter `{}` lost its exact owner fence",
+                waiter.waiter_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn advance_artifact_construction_attempt(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        phase: &str,
+    ) -> Result<()> {
+        if !matches!(phase, "building" | "validating" | "publishing") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction phase `{phase}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_attempts SET phase=?1,heartbeat_at=?2
+             WHERE attempt_id=?3 AND owner_generation=?4 AND owner_pid=?5
+               AND owner_start_token=?6 AND status='running' AND cancel_requested=0",
+            params![
+                phase,
+                now_ts(),
+                attempt.attempt_id,
+                i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(attempt.owner_pid),
+                attempt.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` lost its exact owner fence or was cancelled",
+                attempt.attempt_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_artifact_construction_attempt(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        status: &str,
+        reason_code: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(status, "succeeded" | "failed" | "cancelled" | "abandoned") {
+            return Err(Error::InvalidInput(format!(
+                "invalid artifact construction attempt status `{status}`"
+            )));
+        }
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let updated = self.conn.execute(
+            "UPDATE artifact_construction_attempts
+             SET phase='completed',status=?1,reason_code=?2,reason=?3,
+                 heartbeat_at=?4,finished_at=?4
+             WHERE attempt_id=?5 AND owner_generation=?6 AND owner_pid=?7
+               AND owner_start_token=?8 AND status='running'",
+            params![
+                status,
+                reason_code,
+                reason,
+                now_ts(),
+                attempt.attempt_id,
+                i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                    "artifact construction generation exceeds SQLite range".into()
+                ))?,
+                i64::from(attempt.owner_pid),
+                attempt.owner_start_token,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` lost its exact owner fence",
+                attempt.attempt_id
+            )));
+        }
+        self.conn.execute(
+            "UPDATE artifact_construction_waiters SET status='released',updated_at=?1
+             WHERE attempt_id=?2 AND status='waiting'",
+            params![now_ts(), attempt.attempt_id],
+        )?;
+        Ok(())
+    }
+
+    fn verify_artifact_construction_seal_fence(
+        &self,
+        attempt: &ArtifactConstructionAttemptFence,
+        desired_key: &str,
+        source_root: &ObjectId,
+    ) -> Result<()> {
+        let _lock = Self::with_write_lock_wait(
+            Duration::from_secs(CONSTRUCTION_EVIDENCE_LOCK_WAIT_SECS),
+            || self.acquire_write_lock(),
+        )?;
+        let matched = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM artifact_construction_attempts
+                 WHERE attempt_id=?1 AND desired_key=?2 AND source_root=?3
+                   AND owner_generation=?4 AND owner_pid=?5 AND owner_start_token=?6
+                   AND phase='validating' AND status='running' AND cancel_requested=0",
+                params![
+                    attempt.attempt_id,
+                    desired_key,
+                    source_root.0,
+                    i64::try_from(attempt.owner_generation).map_err(|_| Error::InvalidInput(
+                        "artifact construction generation exceeds SQLite range".into()
+                    ))?,
+                    i64::from(attempt.owner_pid),
+                    attempt.owner_start_token,
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !matched {
+            return Err(Error::InvalidInput(format!(
+                "artifact construction attempt `{}` changed its source, desired key, owner, phase, or cancellation pin before sealing",
+                attempt.attempt_id
+            )));
+        }
+        let _: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, source_root)?;
+        Ok(())
+    }
+
+    /// Terminalize construction attempts whose exact process owner is proven
+    /// dead and remove only staging/lock paths derived from that fenced owner.
+    /// This is called by workspace-open recovery while the workspace write
+    /// lock is already held.
+    pub(crate) fn recover_artifact_construction_attempts_under_write_lock(&self) -> Result<()> {
+        let attempts = {
+            let mut statement = self.conn.prepare(
+                "SELECT attempt_id,desired_key,owner_generation,owner_pid,
+                        owner_start_token,cancel_requested
+                 FROM artifact_construction_attempts
+                 WHERE status='running' ORDER BY started_at,attempt_id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            attempt_id,
+            desired_key,
+            owner_generation,
+            owner_pid,
+            owner_start_token,
+            cancel_requested,
+        ) in attempts
+        {
+            if !valid_workspace_cache_key(&desired_key) {
+                return Err(Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has an invalid desired key; restore from backup or reinitialize the workspace"
+                )));
+            }
+            let owner_pid = u32::try_from(owner_pid).map_err(|_| {
+                Error::Corrupt(format!(
+                    "artifact construction attempt `{attempt_id}` has invalid owner PID"
+                ))
+            })?;
+            if process_start_token_match(owner_pid, &owner_start_token)
+                != ProcessIdentityMatch::DeadOrMismatch
+            {
+                continue;
+            }
+            let owner_token = format!("{owner_pid}:{owner_start_token}");
+            let staging = self.db_dir.join("cache/staging").join(format!(
+                "input_{}",
+                crate::ids::short_hash(format!("{desired_key}:{owner_token}").as_bytes(), 12)
+            ));
+            remove_exact_recovery_directory(&staging, "artifact construction staging")?;
+
+            let lock_path = self
+                .db_dir
+                .join("cache/staging/locks")
+                .join(format!("{desired_key}.lock"));
+            if fs::read_to_string(&lock_path)
+                .ok()
+                .is_some_and(|value| value == owner_token)
+            {
+                fs::remove_file(&lock_path)?;
+            }
+
+            self.conn
+                .execute_batch("SAVEPOINT trail_construction_recovery")?;
+            let recovery = (|| -> Result<()> {
+                let status = if cancel_requested {
+                    "cancelled"
+                } else {
+                    "abandoned"
+                };
+                let reason_code = if cancel_requested {
+                    "construction_cancelled"
+                } else {
+                    "owner_lost"
+                };
+                let reason = if cancel_requested {
+                    "construction cancellation was recovered after its owner exited"
+                } else {
+                    "construction owner exited before artifact publication"
+                };
+                let updated = self.conn.execute(
+                    "UPDATE artifact_construction_attempts
+                     SET phase='completed',status=?1,reason_code=?2,reason=?3,
+                         heartbeat_at=?4,finished_at=?4
+                     WHERE attempt_id=?5 AND desired_key=?6 AND owner_generation=?7
+                       AND owner_pid=?8 AND owner_start_token=?9 AND status='running'",
+                    params![
+                        status,
+                        reason_code,
+                        reason,
+                        now_ts(),
+                        attempt_id,
+                        desired_key,
+                        owner_generation,
+                        i64::from(owner_pid),
+                        owner_start_token,
+                    ],
+                )?;
+                if updated != 1 {
+                    return Err(Error::Corrupt(format!(
+                        "artifact construction attempt `{attempt_id}` changed during exact-owner recovery"
+                    )));
+                }
+                self.conn.execute(
+                    "UPDATE artifact_construction_waiters
+                     SET status='abandoned',updated_at=?1
+                     WHERE attempt_id=?2 AND status='waiting'",
+                    params![now_ts(), attempt_id],
+                )?;
+                Ok(())
+            })();
+            match recovery {
+                Ok(()) => self
+                    .conn
+                    .execute_batch("RELEASE SAVEPOINT trail_construction_recovery")?,
+                Err(error) => {
+                    let _ = self.conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT trail_construction_recovery;
+                         RELEASE SAVEPOINT trail_construction_recovery",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn build_workspace_layer_singleflight<F>(
         &self,
         key: &WorkspaceLayerKeyV1,
+        source_root: &ObjectId,
         builder: F,
     ) -> Result<WorkspaceLayerReport>
     where
         F: FnOnce(&Path) -> Result<PathBuf>,
     {
-        self.build_workspace_layer_singleflight_with_cancel(key, &AtomicBool::new(false), builder)
+        self.build_workspace_layer_singleflight_with_cancel(
+            key,
+            source_root,
+            &AtomicBool::new(false),
+            builder,
+        )
     }
 
     pub(crate) fn build_workspace_layer_singleflight_with_cancel<F>(
         &self,
         key: &WorkspaceLayerKeyV1,
+        source_root: &ObjectId,
         cancelled: &AtomicBool,
         builder: F,
     ) -> Result<WorkspaceLayerReport>
@@ -1098,8 +2219,12 @@ impl Trail {
         fs::create_dir_all(lock_path.parent().unwrap())?;
         let token = format!("{}:{}", std::process::id(), current_process_start_token());
         let deadline = Instant::now() + Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64);
+        let mut waiter = None;
         let guard = loop {
             if cancelled.load(AtomicOrdering::Acquire) {
+                if let Some(waiter) = waiter.as_ref() {
+                    self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                }
                 return Err(Error::InvalidInput(format!(
                     "cancelled while waiting for workspace layer key {cache_key}"
                 )));
@@ -1121,6 +2246,9 @@ impl Trail {
                     if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
                         && layer.state == "ready"
                     {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "released")?;
+                        }
                         return self.verify_workspace_layer_for_attach(&layer.layer_id);
                     }
                     if build_lock_is_stale(&lock_path)? {
@@ -1128,12 +2256,21 @@ impl Trail {
                         let _ = fs::rename(&lock_path, stale);
                         continue;
                     }
+                    if waiter.is_none() {
+                        waiter = self.register_artifact_construction_waiter(&cache_key)?;
+                    }
                     if Instant::now() >= deadline {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                        }
                         return Err(Error::InvalidInput(format!(
                             "timed out waiting for workspace layer key {cache_key}"
                         )));
                     }
                     if cancelled.load(AtomicOrdering::Acquire) {
+                        if let Some(waiter) = waiter.as_ref() {
+                            self.finish_artifact_construction_waiter(waiter, "cancelled")?;
+                        }
                         return Err(Error::InvalidInput(format!(
                             "cancelled while waiting for workspace layer key {cache_key}"
                         )));
@@ -1143,10 +2280,20 @@ impl Trail {
                 Err(err) => return Err(Error::Io(err)),
             }
         };
+        if let Some(waiter) = waiter.as_ref() {
+            self.finish_artifact_construction_waiter(waiter, "abandoned")?;
+        }
+        let attempt = self.begin_artifact_construction_attempt(&cache_key, source_root)?;
         let builder_limit = self.config().workspace_views.concurrent_cache_builders;
         if builder_limit > 0
             && active_cache_builder_count(lock_path.parent().unwrap())? > builder_limit
         {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("builder_quota_exceeded"),
+                Some("workspace cache builder quota exceeded"),
+            )?;
             drop(guard);
             return Err(Error::InvalidInput(format!(
                 "workspace cache builder quota exceeded (limit {builder_limit})"
@@ -1155,6 +2302,7 @@ impl Trail {
         if let Some(layer) = self.workspace_layer_by_cache_key(&cache_key)?
             && layer.state == "ready"
         {
+            self.finish_artifact_construction_attempt(&attempt, "succeeded", None, None)?;
             drop(guard);
             return self.verify_workspace_layer_for_attach(&layer.layer_id);
         }
@@ -1163,40 +2311,96 @@ impl Trail {
             crate::ids::short_hash(format!("{cache_key}:{token}").as_bytes(), 12)
         ));
         if build_dir.exists() {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("staging_path_collision"),
+                Some("workspace layer build directory already exists"),
+            )?;
             return Err(Error::InvalidInput(format!(
                 "workspace layer build directory `{}` already exists",
                 build_dir.display()
             )));
         }
-        fs::create_dir_all(&build_dir)?;
+        if let Err(error) = fs::create_dir_all(&build_dir) {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("staging_create_failed"),
+                Some("workspace layer staging directory could not be created"),
+            )?;
+            return Err(Error::Io(error));
+        }
+        self.advance_artifact_construction_attempt(&attempt, "building")?;
         let output = match builder(&build_dir) {
             Ok(output) => output,
             Err(err) => {
                 make_tree_writable(&build_dir);
                 let failed = build_dir.with_extension(format!("failed.{}", now_ts()));
                 let _ = fs::rename(&build_dir, failed);
+                self.finish_artifact_construction_attempt(
+                    &attempt,
+                    "failed",
+                    Some("builder_failed"),
+                    Some("workspace layer builder failed"),
+                )?;
                 return Err(err);
             }
         };
-        self.enforce_workspace_cache_build_quota(&output)?;
+        self.advance_artifact_construction_attempt(&attempt, "validating")?;
+        if let Err(error) = self.enforce_workspace_cache_build_quota(&output) {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("output_quota_exceeded"),
+                Some("workspace layer output failed quota validation"),
+            )?;
+            return Err(error);
+        }
+        if let Err(error) =
+            self.verify_artifact_construction_seal_fence(&attempt, &cache_key, source_root)
+        {
+            self.finish_artifact_construction_attempt(
+                &attempt,
+                "failed",
+                Some("seal_pin_changed"),
+                Some("artifact construction pins changed before sealing"),
+            )?;
+            return Err(error);
+        }
         // Different ready DAG nodes may finish their external builds at the
         // same time.  Publication is intentionally serialized by the
         // workspace lock, so a builder waits for that short commit boundary
         // instead of treating another independent builder as a command
         // conflict.
+        self.advance_artifact_construction_attempt(&attempt, "publishing")?;
         let report =
             Self::with_write_lock_wait(Duration::from_secs(LAYER_BUILD_LEASE_SECS as u64), || {
                 self.publish_workspace_layer_from_directory(key, &output)
-            })?;
+            });
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.finish_artifact_construction_attempt(
+                    &attempt,
+                    "failed",
+                    Some("publication_failed"),
+                    Some("workspace layer publication failed"),
+                )?;
+                return Err(error);
+            }
+        };
+        self.finish_artifact_construction_attempt(&attempt, "succeeded", None, None)?;
         make_tree_writable(&build_dir);
         let _ = fs::remove_dir_all(&build_dir);
         drop(guard);
         Ok(report)
     }
 
-    /// Publish a prebuilt directory as an immutable cache layer. The
-    /// workspace write lock is the singleflight boundary: concurrent callers
-    /// for the same canonical key observe one completed publish and reuse it.
+    /// Publish a prebuilt directory as an immutable cache layer. Callers that
+    /// need construction singleflight use `build_workspace_layer_singleflight`;
+    /// this operation serializes the short publication transaction and reuses
+    /// an already-ready canonical key.
     pub fn publish_workspace_layer_from_directory(
         &self,
         key: &WorkspaceLayerKeyV1,
@@ -1273,13 +2477,35 @@ impl Trail {
                 now,
             ],
         )?;
+        test_crash_point("layer_after_reservation");
 
         let publish = (|| -> Result<WorkspaceLayerReport> {
             copy_layer_tree(source, &staging)?;
-            let _validated_entries = scan_layer_entries(&staging, false)?;
+            let validated_entries = scan_layer_entries(&staging, false)?;
             sync_layer_tree(&staging)?;
             test_crash_point("layer_after_staging_sync");
+            let (artifact_tree_id, artifact_tree) =
+                self.ingest_artifact_tree_under_write_lock(&staging)?;
+            test_crash_point("layer_after_cas_tree");
+            let stable_entries = scan_layer_entries(&staging, false)?;
+            if stable_entries != validated_entries {
+                return Err(Error::InvalidInput(
+                    "workspace layer candidate changed while Trail was sealing its content".into(),
+                ));
+            }
+            verify_artifact_shadow_matches_layer_entries(
+                &artifact_tree,
+                &self.artifact_tree_flat_entries(&artifact_tree_id)?,
+                &stable_entries,
+            )?;
             let entries = scan_layer_entries(&staging, true)?;
+            sync_layer_tree(&staging)?;
+            let artifact_envelope_id = self.put_legacy_artifact_envelope_under_write_lock(
+                key,
+                &cache_key,
+                artifact_tree_id.clone(),
+            )?;
+            test_crash_point("layer_after_envelope_ready");
             let logical_bytes = entries.values().map(|entry| entry.size_bytes).sum();
             let entry_count = entries.len() as u64;
             let mut entry_pages = Vec::new();
@@ -1353,6 +2579,17 @@ impl Trail {
             )?;
             sync_directory(final_path.parent().unwrap());
             test_crash_point("layer_after_atomic_rename");
+            self.conn.execute(
+                "INSERT OR REPLACE INTO workspace_layer_artifact_shadows(
+                    layer_id, tree_root_id, envelope_id, state, verified_at
+                 ) VALUES(?1, ?2, ?3, 'verified', ?4)",
+                params![
+                    layer_id,
+                    artifact_tree_id.0,
+                    artifact_envelope_id.0,
+                    now_ts()
+                ],
+            )?;
             self.conn.execute(
                 "UPDATE workspace_layers SET manifest_object_id = ?1, storage_path = ?2, state = 'ready', logical_bytes = ?3, physical_bytes = ?4, entry_count = ?5, builder_id = NULL, lease_expires_at = NULL, last_used_at = ?6 WHERE cache_key = ?7",
                 params![
@@ -1461,6 +2698,18 @@ impl Trail {
                 "workspace layer `{layer_id}` cannot recover because its published tree is corrupt"
             )));
         }
+        let (artifact_tree_id, artifact_tree) =
+            self.ingest_artifact_tree_under_write_lock(final_path)?;
+        verify_artifact_shadow_matches_layer_entries(
+            &artifact_tree,
+            &self.artifact_tree_flat_entries(&artifact_tree_id)?,
+            &actual,
+        )?;
+        let artifact_envelope_id = self.put_legacy_artifact_envelope_under_write_lock(
+            key,
+            cache_key,
+            artifact_tree_id.clone(),
+        )?;
         self.conn.execute(
             "INSERT INTO workspace_layers (layer_id, kind, cache_key, adapter, adapter_version, manifest_object_id, storage_path, state, logical_bytes, physical_bytes, entry_count, portability_scope, builder_id, lease_expires_at, last_used_at, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9, ?10, ?11, NULL, NULL, ?12, ?12) \
@@ -1478,6 +2727,17 @@ impl Trail {
                 marker.entry_count as i64,
                 key.portability_scope,
                 now_ts(),
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workspace_layer_artifact_shadows(
+                layer_id, tree_root_id, envelope_id, state, verified_at
+             ) VALUES(?1, ?2, ?3, 'verified', ?4)",
+            params![
+                layer_id,
+                artifact_tree_id.0,
+                artifact_envelope_id.0,
+                now_ts()
             ],
         )?;
         let report = self
@@ -1560,7 +2820,11 @@ impl Trail {
     pub(crate) fn workspace_layer_object_roots(&self) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT manifest_object_id FROM workspace_layers
-             WHERE manifest_object_id IS NOT NULL ORDER BY layer_id",
+             WHERE manifest_object_id IS NOT NULL
+             UNION
+             SELECT manifest_object_id FROM workspace_layer_publications
+             WHERE manifest_object_id IS NOT NULL
+             ORDER BY manifest_object_id",
         )?;
         let manifests = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1640,9 +2904,41 @@ impl Trail {
         )?;
         let blobs = cache_tree_usage(&self.db_dir.join("cache/blobs"))?;
         let environment_caches = cache_tree_usage(&self.db_dir.join("cache/namespaces"))?;
+        let artifact_materializations = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(physical_bytes, 0)), 0)
+             FROM artifact_materializations WHERE state != 'building'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok((layer_bytes.max(0) as u64)
             .saturating_add(blobs)
-            .saturating_add(environment_caches))
+            .saturating_add(environment_caches)
+            .saturating_add(artifact_materializations.max(0) as u64))
+    }
+
+    pub(crate) fn workspace_view_reclaimable_artifact_bytes(&self, view_id: &str) -> Result<u64> {
+        let bytes = self.conn.query_row(
+            "WITH selected_trees(tree_root_id) AS (
+                 SELECT b.tree_root_id
+                 FROM environment_view_generations v
+                 JOIN artifact_generation_bindings b ON b.generation_id=v.generation_id
+                 WHERE v.view_id=?1
+                 UNION
+                 SELECT s.tree_root_id
+                 FROM workspace_view_layers l
+                 JOIN workspace_layer_artifact_shadows s ON s.layer_id=l.layer_id
+                 WHERE l.view_id=?1
+             )
+             SELECT COALESCE(SUM(COALESCE(m.physical_bytes,0)),0)
+             FROM artifact_materializations m
+             JOIN selected_trees t ON t.tree_root_id=m.tree_root_id
+             WHERE m.state != 'building'",
+            params![view_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u64::try_from(bytes).map_err(|_| {
+            Error::Corrupt("artifact materialization has negative physical bytes".into())
+        })
     }
 
     pub fn workspace_cache_gc(
@@ -1655,6 +2951,12 @@ impl Trail {
         let cutoff = now_ts().saturating_sub(retention_secs.min(i64::MAX as u64) as i64);
         let cache_root = self.db_dir.join("cache");
         let cache_physical_bytes_before = cache_tree_usage(&cache_root)?;
+        let demand_loaded_bytes = cache_tree_usage(&cache_root.join("blobs"))?;
+        let mut artifact_storage =
+            self.artifact_storage_accounting(None, 0, demand_loaded_bytes, 0, 0)?;
+        artifact_storage.unknown_bytes = cache_physical_bytes_before
+            .saturating_sub(demand_loaded_bytes)
+            .saturating_sub(artifact_storage.materialized_bytes);
         let mut found = Vec::<CacheGcCandidate>::new();
         {
             let mut stmt = self.conn.prepare(
@@ -1745,6 +3047,53 @@ impl Trail {
                 });
             }
         }
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT materialization_id,storage_path,COALESCE(physical_bytes,0),
+                        last_used_at,state
+                 FROM artifact_materializations
+                 ORDER BY last_used_at ASC,materialization_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (materialization_id, storage_path, physical_bytes, last_used_at, state) = row?;
+                if state == "building" {
+                    continue;
+                }
+                let expected = cache_root
+                    .join("artifact-materializations")
+                    .join(&materialization_id);
+                if Path::new(&storage_path) != expected {
+                    return Err(Error::Corrupt(format!(
+                        "artifact materialization `{materialization_id}` has invalid storage path `{storage_path}`"
+                    )));
+                }
+                found.push(CacheGcCandidate {
+                    entry: WorkspaceCacheGcEntry {
+                        kind: "artifact_materialization".to_string(),
+                        id: materialization_id,
+                        path: storage_path,
+                        physical_bytes,
+                        pinned: false,
+                        reason: if last_used_at <= cutoff {
+                            "artifact_materialization_retention_expired".to_string()
+                        } else {
+                            "artifact_materialization_lru".to_string()
+                        },
+                    },
+                    last_used_at,
+                    retention_expired: last_used_at <= cutoff,
+                });
+            }
+        }
         let blob_root = cache_root.join("blobs");
         if blob_root.exists() {
             for entry in walkdir::WalkDir::new(&blob_root).follow_links(false) {
@@ -1815,6 +3164,7 @@ impl Trail {
         let reclaimable_bytes = selected
             .iter()
             .fold(0_u64, |sum, item| sum.saturating_add(item.physical_bytes));
+        artifact_storage.reclaimable_bytes = reclaimable_bytes;
         if dry_run {
             return Ok(WorkspaceCacheGcReport {
                 dry_run,
@@ -1824,6 +3174,7 @@ impl Trail {
                 reclaimed_bytes: 0,
                 candidates: selected,
                 deleted: Vec::new(),
+                artifact_storage,
             });
         }
 
@@ -1897,16 +3248,16 @@ impl Trail {
                             path.display()
                         )));
                     }
-                    if let Err(err) = self.conn.execute(
-                        "DELETE FROM workspace_layers WHERE layer_id = ?1
-                         AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
-                        params![candidate.id],
-                    ) {
-                        let _ = fs::rename(&trash_path, &path);
-                        return Err(Error::from(err));
+                    match self.delete_workspace_layer_row_and_shadow(&candidate.id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = fs::rename(&trash_path, &path);
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = fs::rename(&trash_path, &path);
+                            return Err(error);
+                        }
                     }
                     make_tree_writable(&trash_path);
                     fs::remove_dir_all(&trash_path).map_err(|err| {
@@ -1916,14 +3267,9 @@ impl Trail {
                         ))
                     })?;
                 } else {
-                    self.conn.execute(
-                        "DELETE FROM workspace_layers WHERE layer_id = ?1
-                         AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id = ?1)
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id = ?1 AND phase IN ('published','activated'))
-                         AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id = ?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
-                        params![candidate.id],
-                    )?;
+                    if !self.delete_workspace_layer_row_and_shadow(&candidate.id)? {
+                        continue;
+                    }
                     remove_workspace_layer_trash_entries(&trash, &candidate.id)?;
                 }
                 let _ = fs::remove_file(workspace_layer_marker_path(&path));
@@ -1993,6 +3339,85 @@ impl Trail {
                         .join("cache/namespace-leases")
                         .join(&candidate.id),
                 );
+            } else if candidate.kind == "artifact_materialization" {
+                let expected = cache_root
+                    .join("artifact-materializations")
+                    .join(&candidate.id);
+                if path != expected {
+                    return Err(Error::Corrupt(format!(
+                        "artifact materialization `{}` escaped cache storage",
+                        candidate.id
+                    )));
+                }
+                let state = self
+                    .conn
+                    .query_row(
+                        "SELECT state FROM artifact_materializations
+                         WHERE materialization_id=?1",
+                        params![candidate.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if state.as_deref() == Some("building") {
+                    continue;
+                }
+                let trash_path = trash.join(format!(
+                    "artifact-materialization.{}.{}",
+                    candidate.id,
+                    crate::ids::short_hash(
+                        format!("{}:{}", candidate.id, now_nanos()).as_bytes(),
+                        12
+                    )
+                ));
+                if path.exists() {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(Error::Corrupt(format!(
+                            "artifact materialization `{}` is not a real directory",
+                            candidate.id
+                        )));
+                    }
+                    let root_mode = layer_mode(&metadata);
+                    make_tree_writable(&path);
+                    if let Err(error) = fs::rename(&path, &trash_path) {
+                        let _ = set_layer_read_only(&path, true, root_mode);
+                        return Err(Error::InvalidInput(format!(
+                            "failed to quarantine artifact materialization `{}`: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+                let removed = self.conn.execute(
+                    "DELETE FROM artifact_materializations
+                     WHERE materialization_id=?1 AND state!='building'",
+                    params![candidate.id],
+                );
+                match removed {
+                    Ok(1) => {}
+                    Ok(_) => {
+                        if trash_path.exists() {
+                            let _ = fs::rename(&trash_path, &path);
+                            let _ = set_layer_read_only(&path, true, 0o755);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        if trash_path.exists() {
+                            let _ = fs::rename(&trash_path, &path);
+                            let _ = set_layer_read_only(&path, true, 0o755);
+                        }
+                        return Err(Error::from(error));
+                    }
+                }
+                if trash_path.exists() {
+                    make_tree_writable(&trash_path);
+                    fs::remove_dir_all(&trash_path).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "failed to remove quarantined artifact materialization `{}`: {error}",
+                            trash_path.display()
+                        ))
+                    })?;
+                }
             } else {
                 if !path.is_file() {
                     continue;
@@ -2029,7 +3454,59 @@ impl Trail {
             reclaimed_bytes,
             candidates: selected,
             deleted,
+            artifact_storage,
         })
+    }
+
+    fn delete_workspace_layer_row_and_shadow(&self, layer_id: &str) -> Result<bool> {
+        self.conn
+            .execute_batch("SAVEPOINT trail_workspace_layer_gc")?;
+        let deletion = (|| -> Result<bool> {
+            let pinned = self.conn.query_row(
+                "SELECT (EXISTS(SELECT 1 FROM workspace_view_layers WHERE layer_id=?1)
+                         OR EXISTS(SELECT 1 FROM environment_generation_components WHERE layer_id=?1)
+                         OR EXISTS(SELECT 1 FROM workspace_layer_publications WHERE layer_id=?1 AND phase IN ('published','activated'))
+                         OR EXISTS(SELECT 1 FROM workspace_layer_pins WHERE layer_id=?1 AND (expires_at IS NULL OR expires_at > unixepoch())))",
+                params![layer_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if pinned {
+                return Ok(false);
+            }
+            self.conn.execute(
+                "DELETE FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer_id],
+            )?;
+            Ok(self.conn.execute(
+                "DELETE FROM workspace_layers WHERE layer_id=?1
+                 AND NOT EXISTS (SELECT 1 FROM workspace_view_layers WHERE layer_id=?1)
+                 AND NOT EXISTS (SELECT 1 FROM environment_generation_components WHERE layer_id=?1)
+                 AND NOT EXISTS (SELECT 1 FROM workspace_layer_publications WHERE layer_id=?1 AND phase IN ('published','activated'))
+                 AND NOT EXISTS (SELECT 1 FROM workspace_layer_pins WHERE layer_id=?1 AND (expires_at IS NULL OR expires_at > unixepoch()))",
+                params![layer_id],
+            )? != 0)
+        })();
+        match deletion {
+            Ok(true) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT trail_workspace_layer_gc")?;
+                Ok(true)
+            }
+            Ok(false) => {
+                self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_workspace_layer_gc;
+                     RELEASE SAVEPOINT trail_workspace_layer_gc",
+                )?;
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT trail_workspace_layer_gc;
+                     RELEASE SAVEPOINT trail_workspace_layer_gc",
+                );
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn workspace_view_layer_reports(
@@ -2360,6 +3837,61 @@ impl Trail {
         )
     }
 
+    fn validate_artifact_v2_activation(
+        &self,
+        layer: &WorkspaceLayerReport,
+        activation: &EnvironmentLayerActivation,
+    ) -> Result<bool> {
+        let (tree_root_id, envelope_id, state) = self.conn.query_row(
+            "SELECT tree_root_id,envelope_id,state
+             FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+            params![&layer.layer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if state != "verified" {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{}` has an unverified artifact binding",
+                layer.layer_id
+            )));
+        }
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?;
+        let envelope =
+            self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_root_id)?;
+        let ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } =
+            &envelope.desired_identity
+        else {
+            return Ok(false);
+        };
+        let matching_outputs = activation
+            .outputs
+            .iter()
+            .filter(|output| {
+                output.name == envelope.output_name && output.policy == envelope.output_policy
+            })
+            .count();
+        if desired_key.0 != activation.expected_key
+            || envelope.component_id != activation.component_id
+            || envelope.portability_scope != layer.portability_scope
+            || activation.outputs.len() != 1
+            || matching_outputs != 1
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment component `{}` does not match its artifact-v2 desired/output contract",
+                activation.component_id
+            )));
+        }
+        Ok(true)
+    }
+
     fn replace_declared_workspace_layers_with_removals_internal(
         &self,
         lane: &str,
@@ -2453,13 +3985,6 @@ impl Trail {
         let mut resolved = Vec::with_capacity(requested.len());
         let mut mount_paths = Vec::<(String, String)>::new();
         for activation in requested {
-            if self.workspace_layer_cache_key(&activation.canonical_key)? != activation.expected_key
-            {
-                return Err(Error::Corrupt(format!(
-                    "environment component `{}` canonical key does not match its expected key",
-                    activation.component_id
-                )));
-            }
             let mut dependency_ids = BTreeSet::new();
             for (dependency, component_key, edge_type) in &activation.dependencies {
                 super::workspace_environment::validate_environment_component_identity(dependency)?;
@@ -2574,6 +4099,28 @@ impl Trail {
                 .as_deref()
                 .map(|layer_id| self.verify_workspace_layer_for_attach(layer_id))
                 .transpose()?;
+            let canonical_storage_key =
+                self.workspace_layer_cache_key(&activation.canonical_key)?;
+            if layer
+                .as_ref()
+                .is_some_and(|layer| layer.cache_key != canonical_storage_key)
+            {
+                return Err(Error::Corrupt(format!(
+                    "environment component `{}` canonical storage key does not match its layer",
+                    activation.component_id
+                )));
+            }
+            let artifact_v2 = layer
+                .as_ref()
+                .map(|layer| self.validate_artifact_v2_activation(layer, activation))
+                .transpose()?
+                .unwrap_or(false);
+            if !artifact_v2 && canonical_storage_key != activation.expected_key {
+                return Err(Error::Corrupt(format!(
+                    "environment component `{}` canonical key does not match its expected key",
+                    activation.component_id
+                )));
+            }
             if let Some(layer) = &layer
                 && layer.kind != activation.kind
             {
@@ -2709,7 +4256,13 @@ impl Trail {
                     private_seed: output.private_seed.clone(),
                 });
             }
-            resolved.push((activation.clone(), layer, outputs, previous_bindings));
+            resolved.push((
+                activation.clone(),
+                layer,
+                outputs,
+                previous_bindings,
+                artifact_v2,
+            ));
         }
         self.validate_environment_batch_mount_ownership(
             &view.view_id,
@@ -2741,7 +4294,7 @@ impl Trail {
                 }
             }
         }
-        for (component, layer, outputs, previous_bindings) in &resolved {
+        for (component, layer, outputs, previous_bindings, _) in &resolved {
             for output in outputs {
                 if matches!(
                     output.policy,
@@ -2885,34 +4438,36 @@ impl Trail {
                     params![&view.view_id, component_id],
                 )?;
             }
-            for (component, layer, outputs, previous_bindings) in &resolved {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO environment_component_key_provenance
-                     (component_key, canonical_key_json, created_at) VALUES (?1, ?2, ?3)",
-                    params![
-                        &component.expected_key,
-                        serde_json::to_vec(&component.canonical_key)?,
-                        now_ts()
-                    ],
-                )?;
-                let stored_key = self.conn.query_row(
-                    "SELECT canonical_key_json FROM environment_component_key_provenance
-                     WHERE component_key = ?1",
-                    params![&component.expected_key],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )?;
-                let stored_key: WorkspaceLayerKeyV1 =
-                    serde_json::from_slice(&stored_key).map_err(|error| {
-                        Error::Corrupt(format!(
-                            "environment key provenance `{}` is malformed: {error}",
+            for (component, layer, outputs, previous_bindings, artifact_v2) in &resolved {
+                if !artifact_v2 {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO environment_component_key_provenance
+                         (component_key, canonical_key_json, created_at) VALUES (?1, ?2, ?3)",
+                        params![
+                            &component.expected_key,
+                            serde_json::to_vec(&component.canonical_key)?,
+                            now_ts()
+                        ],
+                    )?;
+                    let stored_key = self.conn.query_row(
+                        "SELECT canonical_key_json FROM environment_component_key_provenance
+                         WHERE component_key = ?1",
+                        params![&component.expected_key],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?;
+                    let stored_key: WorkspaceLayerKeyV1 = serde_json::from_slice(&stored_key)
+                        .map_err(|error| {
+                            Error::Corrupt(format!(
+                                "environment key provenance `{}` is malformed: {error}",
+                                component.expected_key
+                            ))
+                        })?;
+                    if stored_key != component.canonical_key {
+                        return Err(Error::Corrupt(format!(
+                            "environment key provenance `{}` does not match its content identity",
                             component.expected_key
-                        ))
-                    })?;
-                if stored_key != component.canonical_key {
-                    return Err(Error::Corrupt(format!(
-                        "environment key provenance `{}` does not match its content identity",
-                        component.expected_key
-                    )));
+                        )));
+                    }
                 }
                 for (previous_mount, _, _, _) in previous_bindings {
                     self.conn.execute(
@@ -3543,6 +5098,102 @@ impl Trail {
         Ok(())
     }
 
+    fn record_artifact_generation_binding(
+        &self,
+        generation_id: &str,
+        component: &EnvironmentGenerationComponentReport,
+        output: &EnvironmentGenerationOutputReport,
+        created_at: i64,
+    ) -> Result<()> {
+        if !output.policy.has_immutable_layer() {
+            return Ok(());
+        }
+        let layer_id = output.layer_id.as_deref().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "immutable generation output `{}/{}` has no workspace layer",
+                component.component_id, output.name
+            ))
+        })?;
+        let (tree_root_id, envelope_id, state) = self.conn.query_row(
+            "SELECT tree_root_id,envelope_id,state
+             FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+            params![layer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if state != "verified" {
+            return Err(Error::Corrupt(format!(
+                "workspace layer `{layer_id}` has an unverified artifact binding"
+            )));
+        }
+        let tree_root_id = ArtifactTreeId::parse(tree_root_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact tree ID: {error}")))?;
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id)
+            .map_err(|error| Error::Corrupt(format!("invalid artifact envelope ID: {error}")))?;
+        let envelope =
+            self.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_root_id)?;
+        let desired_key = match &envelope.desired_identity {
+            ArtifactDesiredIdentityV1::WorkspaceLayerV1 { cache_key, .. } => cache_key.clone(),
+            ArtifactDesiredIdentityV1::ArtifactDesiredV2 { desired_key } => {
+                if desired_key.0 != component.component_key
+                    || envelope.component_id != component.component_id
+                    || envelope.output_name != output.name
+                    || envelope.output_policy != output.policy
+                {
+                    return Err(Error::Corrupt(format!(
+                        "artifact-v2 envelope does not match generation output `{}/{}`",
+                        component.component_id, output.name
+                    )));
+                }
+                desired_key.0.clone()
+            }
+        };
+        if desired_key != component.component_key {
+            return Err(Error::Corrupt(format!(
+                "artifact desired key does not match generation component `{}`",
+                component.component_id
+            )));
+        }
+        let binding_identity = format!(
+            "artifact_binding_{}",
+            crate::ids::short_hash(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    generation_id, component.component_id, output.name, envelope_id.0
+                )
+                .as_bytes(),
+                32,
+            )
+        );
+        let binding_id = format!(
+            "binding_{}",
+            crate::ids::short_hash(binding_identity.as_bytes(), 32)
+        );
+        self.conn.execute(
+            "INSERT INTO artifact_generation_bindings(
+                 binding_id,generation_id,component_id,output_name,desired_key,
+                 envelope_id,tree_root_id,binding_identity,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                binding_id,
+                generation_id,
+                &component.component_id,
+                &output.name,
+                desired_key,
+                envelope_id.0,
+                tree_root_id.0,
+                binding_identity,
+                created_at
+            ],
+        )?;
+        Ok(())
+    }
+
     fn record_environment_generation(&self, lane: &str, view_id: &str) -> Result<String> {
         let branch = self.lane_branch(lane)?;
         let head = self.get_ref(&branch.ref_name)?;
@@ -3750,6 +5401,7 @@ impl Trail {
                         &output.layer_subpath
                     ],
                 )?;
+                self.record_artifact_generation_binding(&generation_id, component, output, now)?;
             }
             for dependency in &component.dependencies {
                 self.conn.execute(
@@ -3974,9 +5626,12 @@ impl Trail {
         source_upper: &Path,
     ) -> Result<Vec<WorkspaceLayerBinding>> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.layer_id, b.mount_path, l.storage_path, b.source_path, l.kind, b.priority \
+            "SELECT l.layer_id, b.mount_path, l.storage_path, b.source_path, l.kind, b.priority, \
+                    s.tree_root_id \
              FROM workspace_views v JOIN workspace_view_layers b ON b.view_id = v.view_id \
              JOIN workspace_layers l ON l.layer_id = b.layer_id \
+             LEFT JOIN workspace_layer_artifact_shadows s \
+               ON s.layer_id = l.layer_id AND s.state = 'verified' \
              WHERE v.source_upper = ?1 AND b.read_only = 1 AND l.state = 'ready' \
              ORDER BY length(b.mount_path) DESC, b.priority DESC",
         )?;
@@ -3989,6 +5644,7 @@ impl Trail {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(Error::from)?
@@ -3996,7 +5652,23 @@ impl Trail {
         let mut bindings = rows
             .into_iter()
             .map(
-                |(layer_id, mount_path, storage_path, source_path, kind, priority)| {
+                |(
+                    layer_id,
+                    mount_path,
+                    storage_path,
+                    source_path,
+                    kind,
+                    priority,
+                    artifact_tree_id,
+                )| {
+                    let artifact_tree_id = artifact_tree_id
+                        .map(ArtifactTreeId::parse)
+                        .transpose()
+                        .map_err(|reason| {
+                            Error::Corrupt(format!(
+                                "workspace layer `{layer_id}` has invalid artifact tree identity: {reason}"
+                            ))
+                        })?;
                     let storage_path = if source_path.is_empty() {
                         PathBuf::from(storage_path)
                     } else {
@@ -4007,6 +5679,8 @@ impl Trail {
                         layer_id: Some(layer_id),
                         mount_path,
                         storage_path: Some(storage_path),
+                        artifact_tree_id,
+                        artifact_subpath: source_path,
                         kind,
                         priority,
                     })
@@ -4027,6 +5701,8 @@ impl Trail {
                     layer_id: None,
                     mount_path: row.get(1)?,
                     storage_path: None,
+                    artifact_tree_id: None,
+                    artifact_subpath: String::new(),
                     kind: row.get(2)?,
                     priority: 100,
                 })
@@ -4043,6 +5719,48 @@ impl Trail {
         });
         Ok(bindings)
     }
+}
+
+fn validate_private_output_promotion_taint(
+    generation_secret_tainted: bool,
+    producer_receipt: Option<&serde_json::Value>,
+) -> Result<Option<Vec<u8>>> {
+    if generation_secret_tainted {
+        return Err(Error::InvalidInput(
+            "secret-tainted private output is non-promotable and must remain lane-private"
+                .to_string(),
+        ));
+    }
+    let Some(producer_receipt) = producer_receipt else {
+        return Ok(None);
+    };
+    let secret_taint = match producer_receipt.get("secret_taint") {
+        Some(value) => {
+            serde_json::from_value::<ArtifactSecretTaintV1>(value.clone()).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "producer receipt has malformed secret-taint evidence: {error}"
+                ))
+            })?
+        }
+        None => ArtifactSecretTaintV1::Clear,
+    };
+    super::workspace_artifact::validate_artifact_secret_taint(&secret_taint)?;
+    if !secret_taint.is_clear() {
+        return Err(Error::InvalidInput(
+            "secret-tainted private output is non-promotable and must remain lane-private"
+                .to_string(),
+        ));
+    }
+    let mut non_taint_evidence = producer_receipt.clone();
+    if let Some(object) = non_taint_evidence.as_object_mut() {
+        object.remove("secret_taint");
+    }
+    if contains_sensitive_json(&non_taint_evidence) {
+        return Err(Error::InvalidInput(
+            "producer receipt may contain secret material and cannot be stored".to_string(),
+        ));
+    }
+    Ok(Some(serde_json::to_vec(producer_receipt)?))
 }
 
 struct EnvironmentRuntimeAllocationNames {
@@ -4175,6 +5893,63 @@ struct CacheBuildKeyGuard {
     token: String,
 }
 
+fn remove_exact_recovery_directory(path: &Path, purpose: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Corrupt(format!(
+            "{purpose} path `{}` is not a real directory; move it outside `.trail` and reopen Trail",
+            path.display()
+        )));
+    }
+    make_tree_writable(path);
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn valid_workspace_layer_id(value: &str) -> bool {
+    value.strip_prefix("layer_").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_workspace_cache_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn workspace_layer_storage_path_matches_id(value: &str, layer_id: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        && path.ends_with(
+            Path::new(".trail")
+                .join("cache")
+                .join("layers")
+                .join(layer_id),
+        )
+}
+
+fn workspace_layer_sidecar_owner(value: &str) -> Option<&str> {
+    let value = value.strip_prefix('.')?;
+    value
+        .strip_suffix(".publish.json")
+        .or_else(|| value.strip_suffix(".verified.json"))
+}
+
 impl Drop for CacheBuildKeyGuard {
     fn drop(&mut self) {
         if fs::read_to_string(&self.path)
@@ -4201,7 +5976,7 @@ fn build_lock_is_stale(path: &Path) -> Result<bool> {
     let Ok(pid) = pid.parse::<u32>() else {
         return malformed_build_lock_is_stale(path);
     };
-    Ok(!process_matches_start_token(pid, token))
+    Ok(process_start_token_match(pid, token) == ProcessIdentityMatch::DeadOrMismatch)
 }
 
 fn acquire_environment_cache_maintenance(
@@ -4536,7 +6311,7 @@ fn layer_builder_is_alive(layer_id: &str, conn: &Connection) -> Result<bool> {
     Ok(process_matches_start_token(pid, token))
 }
 
-fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_layer_tree(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     let mut folded = HashMap::<String, String>::new();
     for entry in walkdir::WalkDir::new(source).follow_links(false) {
@@ -4671,7 +6446,7 @@ fn publication_staging_path(db_dir: &Path, publication_id: &str, stored: &str) -
     safe_join(db_dir, stored)
 }
 
-fn scan_layer_entries(
+pub(crate) fn scan_layer_entries(
     root: &Path,
     make_read_only: bool,
 ) -> Result<BTreeMap<String, WorkspaceLayerEntry>> {
@@ -4754,6 +6529,49 @@ fn scan_layer_entries(
         }
     }
     Ok(entries)
+}
+
+pub(crate) fn verify_artifact_shadow_matches_layer_entries(
+    tree: &ArtifactTreeRootV1,
+    artifact_entries: &BTreeMap<String, super::workspace_artifact::ArtifactFlatEntry>,
+    layer_entries: &BTreeMap<String, WorkspaceLayerEntry>,
+) -> Result<()> {
+    let layer_logical_bytes = layer_entries
+        .values()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes));
+    if tree.entry_count != layer_entries.len() as u64
+        || Some(tree.logical_bytes) != layer_logical_bytes
+        || artifact_entries.len() != layer_entries.len()
+    {
+        return Err(Error::Corrupt(
+            "CAS shadow count or logical bytes disagree with the workspace layer scan".into(),
+        ));
+    }
+    for (path, layer) in layer_entries {
+        let artifact = artifact_entries.get(path).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "CAS shadow is missing workspace layer path `{path}`"
+            ))
+        })?;
+        let normalized_mode = match layer.kind.as_str() {
+            "directory" => 0o755,
+            "file" if layer.mode & 0o111 != 0 => 0o755,
+            "file" => 0o644,
+            "symlink" => 0o777,
+            _ => layer.mode,
+        };
+        if artifact.kind != layer.kind
+            || artifact.mode != normalized_mode
+            || artifact.size_bytes != layer.size_bytes
+            || artifact.content_hash != layer.content_hash
+            || artifact.symlink_target != layer.symlink_target
+        {
+            return Err(Error::Corrupt(format!(
+                "CAS shadow disagrees with workspace layer path `{path}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn sha256_layer_file(path: &Path) -> Result<String> {
@@ -4857,7 +6675,7 @@ fn layer_mode(metadata: &fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-fn set_layer_read_only(path: &Path, directory: bool, original_mode: u32) -> Result<()> {
+pub(crate) fn set_layer_read_only(path: &Path, directory: bool, original_mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let executable = directory || original_mode & 0o111 != 0;
     fs::set_permissions(
@@ -4877,7 +6695,11 @@ fn immutable_layer_mode(directory: bool, original_mode: u32) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn set_layer_read_only(path: &Path, _directory: bool, _original_mode: u32) -> Result<()> {
+pub(crate) fn set_layer_read_only(
+    path: &Path,
+    _directory: bool,
+    _original_mode: u32,
+) -> Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)?;
@@ -4893,7 +6715,7 @@ fn immutable_layer_mode(directory: bool, _original_mode: u32) -> u32 {
     }
 }
 
-fn sync_layer_tree(root: &Path) -> Result<()> {
+pub(crate) fn sync_layer_tree(root: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
         if entry.file_type().is_file() {
@@ -4904,7 +6726,7 @@ fn sync_layer_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn layer_physical_bytes(root: &Path) -> Result<u64> {
+pub(crate) fn layer_physical_bytes(root: &Path) -> Result<u64> {
     let mut bytes = 0_u64;
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -4930,6 +6752,7 @@ fn layer_file_physical_bytes(metadata: &fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::workdir::{ViewCore, VIEW_ROOT_INO};
+    use super::super::workspace_environment::WorkspaceEnvironmentAdapterProposal;
     use super::*;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4946,6 +6769,610 @@ mod tests {
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ArtifactConformanceProfile {
+        producer_family: &'static str,
+        adapter_identity: &'static str,
+        distribution_digest: &'static str,
+        adapter_protocol: &'static str,
+        trust_scope: &'static str,
+        trust_tier: ArtifactProducerTrustTierV1,
+    }
+
+    fn run_artifact_pipeline_conformance_fixture(
+        profile: ArtifactConformanceProfile,
+    ) -> ArtifactAdapterCertificationReportV1 {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("fixture.input"), "fixture input\n").unwrap();
+        fs::write(
+            workspace.path().join("trail.environment.toml"),
+            r#"schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "fixture.pipeline"
+adapter = "trail/command@1"
+inputs = [{ path = "fixture.input" }]
+
+[component.build]
+command = ["fixture-builder", "build"]
+
+[[component.validation]]
+name = "path-contract"
+kind = "structural"
+required = true
+
+[[component.output]]
+name = "generated"
+source = "artifact"
+target = ".trail-generated/fixture"
+policy = "immutable_seed_private"
+reuse = "exact"
+scope = "workspace"
+publish = "on_sync"
+
+[[component.source_export]]
+name = "client"
+from_output = "generated"
+source = "generated-client"
+target = "src/generated-client"
+mode = "explicit"
+collision = "fail"
+validation = "path-contract"
+"#,
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "fixture",
+            Some("main"),
+            if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            },
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let source_root = db.lane_branch("fixture").unwrap().head_root;
+        let input = db
+            .root_file_entry(&source_root, "fixture.input")
+            .unwrap()
+            .unwrap();
+        let proposal = WorkspaceEnvironmentAdapterProposal {
+            status: EnvironmentComponentProposalStatus::Resolvable,
+            reasons: vec![EnvironmentProposalReasonReport {
+                code: "resolution_snapshot_missing".into(),
+                message: "fixture adapter requires an immutable resolution snapshot".into(),
+            }],
+            recovery_actions: vec![EnvironmentRecoveryActionReport {
+                code: "resolve_fixture".into(),
+                description: "resolve the fixture component".into(),
+                command: None,
+            }],
+        };
+        assert_eq!(
+            proposal.status,
+            EnvironmentComponentProposalStatus::Resolvable
+        );
+
+        let resolver = std::env::current_exe().unwrap();
+        let resolver_identity =
+            super::super::workspace_environment::workspace_tool_identity_for_path(&resolver)
+                .unwrap();
+        let resolution = db
+            .resolve_artifact_component(
+                ArtifactResolutionRequestV1 {
+                    plan: ArtifactResolutionPlanV1 {
+                        version: ARTIFACT_RESOLUTION_PLAN_VERSION,
+                        proposal_key: "fixture.pipeline:proposal-v1".into(),
+                        source_root: source_root.clone(),
+                        component_id: "fixture.pipeline".into(),
+                        adapter_identity: profile.adapter_identity.into(),
+                        policy_identity: "fixture-policy-v1".into(),
+                        program: "fixture-resolver".into(),
+                        resolved_program: resolver.to_string_lossy().into_owned(),
+                        executable_identity: resolver_identity.clone(),
+                        argv: vec!["fixture-resolver".into(), "resolve".into()],
+                        working_directory: ".".into(),
+                        readable_inputs: vec![ArtifactResolutionInputV1 {
+                            source_path: "fixture.input".into(),
+                            content_hash: input.content_hash.clone(),
+                            size_bytes: input.size_bytes,
+                        }],
+                        candidate_output: "fixture.lock".into(),
+                        allowed_authorities: Vec::new(),
+                        credential_handles: Vec::new(),
+                        script_policy: ArtifactScriptPolicyV1::Deny,
+                        environment_roles: BTreeMap::new(),
+                        limits: ArtifactActionLimitsV1 {
+                            timeout_ms: 30_000,
+                            stdout_bytes: 1024,
+                            stderr_bytes: 1024,
+                            candidate_bytes: 1024,
+                            candidate_entries: 1,
+                            child_processes: 1,
+                        },
+                        snapshot_format: "fixture-lock/v1".into(),
+                        validations: vec![ArtifactValidationV1 {
+                            name: "fixture-lock-structure".into(),
+                            kind: ArtifactValidationKindV1::Structural,
+                            required: true,
+                            parameters: BTreeMap::new(),
+                        }],
+                    },
+                    candidate: ArtifactResolutionCandidateV1 {
+                        snapshot_bytes: b"fixture = 1\n".to_vec(),
+                        resolved_identities: BTreeMap::from([("fixture".into(), "1".into())]),
+                        checksums: BTreeMap::from([(
+                            "fixture".into(),
+                            sha256_hex(b"fixture = 1\n"),
+                        )]),
+                        contacted_authorities: Vec::new(),
+                        stdout: b"resolved\n".to_vec(),
+                        stderr: Vec::new(),
+                        redactions: Vec::new(),
+                    },
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(resolution.decision, ArtifactResolutionDecisionV1::Resolved);
+
+        let desired_material = ArtifactDesiredKeyMaterialV2 {
+            version: 2,
+            component_id: "fixture.pipeline".into(),
+            adapter_identity: profile.adapter_identity.into(),
+            adapter_implementation_version: "1".into(),
+            adapter_distribution_digest: profile.distribution_digest.into(),
+            adapter_protocol: profile.adapter_protocol.into(),
+            resolution_snapshot_id: Some(resolution.snapshot_id.clone()),
+            source_closure: ArtifactSourceClosureV2 {
+                normalizer_version: "source-paths/v1".into(),
+                certified_complete: false,
+                complete_source_root: Some(source_root.clone()),
+                declared_inputs: vec![ArtifactResolutionInputV1 {
+                    source_path: "fixture.input".into(),
+                    content_hash: input.content_hash,
+                    size_bytes: input.size_bytes,
+                }],
+            },
+            upstream_identities: BTreeMap::new(),
+            actions: vec![ArtifactActionIdentityV2 {
+                name: "construct".into(),
+                phase: ArtifactActionPhaseV2::Construct,
+                executable_identity: resolver_identity,
+                argv: vec!["fixture-builder".into(), "build".into()],
+                working_directory: ".".into(),
+                environment_names: Vec::new(),
+            }],
+            outputs: vec![ArtifactOutputContractV2 {
+                name: "generated".into(),
+                output_path: "artifact".into(),
+                mount_path: ".trail-generated/fixture".into(),
+                policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
+            }],
+            validations: vec![ArtifactValidationV1 {
+                name: "path-contract".into(),
+                kind: ArtifactValidationKindV1::Structural,
+                required: true,
+                parameters: BTreeMap::new(),
+            }],
+            source_exports: vec![ArtifactSourceExportContractV2 {
+                name: "client".into(),
+                output_name: "generated".into(),
+                artifact_subpath: "generated-client".into(),
+                destination: "src/generated-client".into(),
+                collision_policy: "fail".into(),
+                required_validation: "path-contract".into(),
+                required_gate: None,
+                authorization_mode: "explicit".into(),
+            }],
+            build_environment: BTreeMap::new(),
+            target: "fixture".into(),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            abi: "host".into(),
+            portability_certified: true,
+            portability_scope: "workspace".into(),
+            trust_scope: profile.trust_scope.into(),
+            network_policy: "deny".into(),
+            script_policy: ArtifactScriptPolicyV1::Deny,
+            sandbox_policy: "native-deny-by-default".into(),
+        };
+        let desired_key =
+            super::super::workspace_artifact::artifact_desired_key_v2(desired_material.clone())
+                .unwrap();
+        let mut invalidated_material = desired_material;
+        invalidated_material.target = "fixture-invalidated".into();
+        let invalidated_key =
+            super::super::workspace_artifact::artifact_desired_key_v2(invalidated_material)
+                .unwrap();
+        assert_ne!(desired_key, invalidated_key);
+
+        let candidate = tempfile::tempdir().unwrap();
+        fs::create_dir_all(candidate.path().join("artifact/generated-client")).unwrap();
+        fs::write(
+            candidate.path().join("artifact/generated-client/new.rs"),
+            "generated\n",
+        )
+        .unwrap();
+        let storage_key = WorkspaceLayerKeyV1 {
+            kind: "generated".into(),
+            adapter: "fixture-common-artifact".into(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([
+                ("source_root".into(), source_root.0.clone()),
+                (
+                    "resolution_snapshot".into(),
+                    resolution.snapshot_id.0.clone(),
+                ),
+            ]),
+            tool_versions: BTreeMap::from([("fixture-builder".into(), "1".into())]),
+            platform: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            portability_scope: "workspace".into(),
+            strategy: "fixture-common-artifact-v2".into(),
+        };
+        let layer = db
+            .publish_workspace_layer_from_directory(&storage_key, candidate.path())
+            .unwrap();
+        let tree_root_id = ArtifactTreeId::parse(
+            db.conn
+                .query_row(
+                    "SELECT tree_root_id FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                    params![&layer.layer_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let desired_identity = ArtifactDesiredIdentityV1::ArtifactDesiredV2 {
+            desired_key: desired_key.clone(),
+        };
+        let validation_receipt_id = db
+            .put_artifact_validation_receipt(ArtifactValidationReceiptV1 {
+                version: ARTIFACT_VALIDATION_RECEIPT_VERSION,
+                declaration: ArtifactValidationV1 {
+                    name: "path-contract".into(),
+                    kind: ArtifactValidationKindV1::Structural,
+                    required: true,
+                    parameters: BTreeMap::new(),
+                },
+                desired_identity: desired_identity.clone(),
+                tree_root_id: tree_root_id.clone(),
+                validator_identity: "trail.fixture/structural-validator@1".into(),
+                validated_input_digest: sha256_hex(b"fixture desired+tree+validator"),
+                outcome: ArtifactValidationOutcomeV1::Passed,
+                evidence: BTreeMap::from([("structure".into(), "passed".into())]),
+            })
+            .unwrap();
+        let envelope_id = db
+            .bind_workspace_layer_artifact_v2(
+                &layer.layer_id,
+                ArtifactEnvelopeV1 {
+                    version: ARTIFACT_ENVELOPE_VERSION,
+                    desired_identity,
+                    tree_root_id: tree_root_id.clone(),
+                    component_id: "fixture.pipeline".into(),
+                    output_name: "generated".into(),
+                    output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    portability_scope: "workspace".into(),
+                    trust_scope: profile.trust_scope.into(),
+                    secret_taint: ArtifactSecretTaintV1::Clear,
+                    resolution_snapshot_id: Some(resolution.snapshot_id.clone()),
+                    validation_receipt_ids: vec![validation_receipt_id.clone()],
+                },
+            )
+            .unwrap();
+        let reopened = Trail::open(workspace.path()).unwrap();
+        let reopened_artifact = reopened.inspect_artifact(&envelope_id).unwrap();
+        assert_eq!(reopened_artifact.tree_root_id, tree_root_id);
+        drop(reopened);
+        db.replace_declared_workspace_layers_at_source(
+            "fixture",
+            &[EnvironmentLayerActivation {
+                layer_id: Some(layer.layer_id.clone()),
+                outputs: vec![EnvironmentLayerOutputActivation {
+                    name: "generated".into(),
+                    mount_path: ".trail-generated/fixture".into(),
+                    policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+                    reuse: EnvironmentReuseMode::Exact,
+                    scope: EnvironmentSharingScope::Workspace,
+                    publish: EnvironmentPublicationTrigger::OnSync,
+                    gate: None,
+                    binding_identity: layer.layer_id.clone(),
+                    manifest_object_id: None,
+                    publication_id: None,
+                    private_seed: None,
+                    layer_subpath: "artifact".into(),
+                }],
+                component_id: "fixture.pipeline".into(),
+                adapter_identity: profile.adapter_identity.into(),
+                adapter_version: 1,
+                implementation_version: "1".into(),
+                distribution_digest: profile.distribution_digest.into(),
+                kind: "generated".into(),
+                dependencies: Vec::new(),
+                caches: Vec::new(),
+                external_artifacts: Vec::new(),
+                runtime_resources: Vec::new(),
+                expected_key: desired_key.0.clone(),
+                canonical_key: storage_key,
+            }],
+            &source_root,
+        )
+        .unwrap();
+        let generation = db
+            .active_environment_generation("fixture")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT desired_key FROM artifact_generation_bindings
+                     WHERE generation_id=?1 AND component_id='fixture.pipeline'",
+                    params![&generation.generation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            desired_key.0
+        );
+
+        let branch = db.lane_branch("fixture").unwrap();
+        let paths = db.workspace_view_paths_for_lane("fixture").unwrap();
+        let mut view = ViewCore::new_lazy(
+            Trail::open(workspace.path()).unwrap(),
+            paths.source_upper.clone(),
+            branch.head_root,
+        )
+        .unwrap();
+        let generated = view.lookup(VIEW_ROOT_INO, ".trail-generated").unwrap();
+        let fixture = view.lookup(generated, "fixture").unwrap();
+        let client = view.lookup(fixture, "generated-client").unwrap();
+        let file = view.lookup(client, "new.rs").unwrap();
+        assert_eq!(view.read(file, 0, 64).unwrap().0, b"generated\n");
+        view.write(file, 0, b"private!!\n").unwrap();
+        assert_eq!(view.read(file, 0, 64).unwrap().0, b"private!!\n");
+        assert_eq!(
+            fs::read(Path::new(&layer.storage_path).join("artifact/generated-client/new.rs"))
+                .unwrap(),
+            b"generated\n"
+        );
+        drop(view);
+
+        let export = db
+            .plan_artifact_source_export(
+                "fixture",
+                "fixture.pipeline",
+                "client",
+                ArtifactSourceExportAuthorizationV1::ExplicitUser,
+            )
+            .unwrap();
+        assert_eq!(export.envelope_id, envelope_id);
+        let exported = db.execute_artifact_source_export(export).unwrap();
+        assert!(exported.checkpointed);
+        let branch = db.lane_branch("fixture").unwrap();
+        let exported_entry = db
+            .root_file_entry(&branch.head_root, "src/generated-client/new.rs")
+            .unwrap()
+            .unwrap();
+        let exported_bytes = db
+            .materialize_entries_bytes(&BTreeMap::from([(
+                "src/generated-client/new.rs".into(),
+                exported_entry,
+            )]))
+            .unwrap();
+        assert_eq!(
+            exported_bytes["src/generated-client/new.rs"],
+            b"generated\n"
+        );
+
+        db.remove_lane("fixture", true).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_generation_bindings",
+                    [],
+                    |row| { row.get::<_, u64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        let cache_gc = db.workspace_cache_gc(false, Some(0)).unwrap();
+        assert!(cache_gc
+            .deleted
+            .iter()
+            .any(|candidate| candidate.id == layer.layer_id));
+        db.gc(false).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![envelope_id.0],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let evidence = [
+            ("discovery", format!("producer:{}", profile.producer_family)),
+            ("resolution", "exact_snapshot:published".to_string()),
+            ("identity", "desired_key:canonical_v2".to_string()),
+            ("validation", "required_receipt:passed".to_string()),
+            ("sealing", "envelope_tree:bound_and_reopened".to_string()),
+            ("cow", "private_upper:lower_unchanged".to_string()),
+            ("recovery", "reopen:artifact_authority_valid".to_string()),
+            ("invalidation", "changed_target:changes_key".to_string()),
+            ("export", "source_export:checkpointed".to_string()),
+            ("retirement", "generation_bindings:released".to_string()),
+            ("collection", "artifact_envelope:collected".to_string()),
+        ];
+        let report = ArtifactAdapterCertificationReportV1 {
+            schema: "trail.artifact-adapter-certification/v1".into(),
+            producer_family: profile.producer_family.into(),
+            adapter_identity: profile.adapter_identity.into(),
+            trust_tier: profile.trust_tier,
+            status: ArtifactAdapterConformanceStatusV1::Passed,
+            authority_effect: "evidence_only".into(),
+            checks: evidence
+                .into_iter()
+                .map(|(stage, evidence)| ArtifactAdapterConformanceCheckV1 {
+                    stage: stage.into(),
+                    applicable: true,
+                    status: ArtifactAdapterConformanceStatusV1::Passed,
+                    evidence: vec![evidence],
+                })
+                .collect(),
+        };
+        report.validate().unwrap();
+        report
+    }
+
+    #[test]
+    fn builtins_plugins_and_repository_v2_share_artifact_pipeline_conformance() {
+        let reports = [
+            ArtifactConformanceProfile {
+                producer_family: "builtin",
+                adapter_identity: "trail.fixture/builtin@1",
+                distribution_digest: "builtin:fixture-v1",
+                adapter_protocol: "trail.environment-adapter/v3",
+                trust_scope: "builtin",
+                trust_tier: ArtifactProducerTrustTierV1::ReviewedBuiltin,
+            },
+            ArtifactConformanceProfile {
+                producer_family: "plugin_v3",
+                adapter_identity: "example/fixture-plugin@1",
+                distribution_digest: "sha256:fixture-plugin-v1",
+                adapter_protocol: "trail.environment-adapter/v3",
+                trust_scope: "plugin-local",
+                trust_tier: ArtifactProducerTrustTierV1::LocallyTrustedPlugin,
+            },
+            ArtifactConformanceProfile {
+                producer_family: "repository_v2",
+                adapter_identity: "trail/command@1",
+                distribution_digest: "repository:trail.environment/v2",
+                adapter_protocol: "trail.environment/v2",
+                trust_scope: "repository",
+                trust_tier: ArtifactProducerTrustTierV1::RepositoryDeclaration,
+            },
+        ]
+        .map(run_artifact_pipeline_conformance_fixture);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.producer_family.as_str())
+                .collect::<Vec<_>>(),
+            ["builtin", "plugin_v3", "repository_v2"]
+        );
+        let encoded = serde_json::to_string(&reports).unwrap();
+        assert!(!encoded.contains(workspace_secret_probe()));
+        if let Some(path) = std::env::var_os("TRAIL_ARTIFACT_CERTIFICATION_OUTPUT") {
+            fs::write(path, format!("{encoded}\n")).unwrap();
+        }
+    }
+
+    fn workspace_secret_probe() -> &'static str {
+        "credential-value-never-store"
+    }
+
+    #[test]
+    fn private_output_promotion_rejects_secret_taint_and_sensitive_receipts() {
+        let clear = serde_json::json!({
+            "gate": "integration",
+            "secret_taint": { "state": "clear" }
+        });
+        assert!(validate_private_output_promotion_taint(false, Some(&clear))
+            .unwrap()
+            .is_some());
+
+        let tainted = serde_json::json!({
+            "gate": "integration",
+            "secret_taint": {
+                "state": "tainted",
+                "channels": ["runtime_credential"]
+            }
+        });
+        assert!(
+            validate_private_output_promotion_taint(false, Some(&tainted))
+                .unwrap_err()
+                .to_string()
+                .contains("non-promotable")
+        );
+        assert!(validate_private_output_promotion_taint(true, None)
+            .unwrap_err()
+            .to_string()
+            .contains("non-promotable"));
+
+        let sensitive = serde_json::json!({
+            "gate": "integration",
+            "authorization": "Bearer credential-value-never-store"
+        });
+        assert!(
+            validate_private_output_promotion_taint(false, Some(&sensitive))
+                .unwrap_err()
+                .to_string()
+                .contains("secret material")
+        );
+    }
+
+    fn artifact_inheritance_request<'a>(
+        component_key: &'a str,
+        child_backend: &'a str,
+    ) -> ArtifactInheritanceRequest<'a> {
+        ArtifactInheritanceRequest {
+            component_id: "node",
+            component_key,
+            output_name: "dependencies",
+            output_policy: EnvironmentOutputPolicy::ImmutableSeedPrivate,
+            child_backend,
+            child_desired_key_was_planned: false,
+        }
+    }
+
+    #[test]
+    fn workspace_layer_storage_identity_requires_lowercase_canonical_absolute_paths() {
+        let layer_id = "layer_0123456789abcdef0123456789abcdef";
+        let canonical = std::env::temp_dir()
+            .join(".trail/cache/layers")
+            .join(layer_id);
+        assert!(valid_workspace_layer_id(layer_id));
+        assert!(workspace_layer_storage_path_matches_id(
+            &canonical.to_string_lossy(),
+            layer_id
+        ));
+        assert!(!valid_workspace_layer_id(
+            "layer_0123456789ABCDEF0123456789ABCDEF"
+        ));
+        assert!(!workspace_layer_storage_path_matches_id(
+            &Path::new("relative/.trail/cache/layers")
+                .join(layer_id)
+                .to_string_lossy(),
+            layer_id
+        ));
+        assert!(!workspace_layer_storage_path_matches_id(
+            &std::env::temp_dir()
+                .join("ignored/../.trail/cache/layers")
+                .join(layer_id)
+                .to_string_lossy(),
+            layer_id
+        ));
     }
 
     #[test]
@@ -5058,6 +7485,139 @@ mod tests {
         ] {
             assert!(!inheritable_workspace_layer_scope(scope), "{scope}");
         }
+    }
+
+    #[test]
+    fn artifact_inheritance_checks_backend_adapter_identity_envelope_tree_and_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), b"shared\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO environment_component_states(
+                     view_id,component_id,adapter_identity,adapter_version,implementation_version,
+                     distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
+                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v1',
+                        'dependency',?2,?2,'ready',NULL,1)",
+                params![env!("CARGO_PKG_VERSION"), &layer.cache_key],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "node"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "cargo"
+            ),
+            Err("adapter_package_identity_mismatch")
+        );
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "missing/adapter@1",
+                "node"
+            ),
+            Err("adapter_package_unavailable")
+        );
+        db.conn
+            .execute(
+                "UPDATE environment_component_states SET distribution_digest='changed-package'
+                 WHERE view_id='parent-view' AND component_id='node'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.inheritance_adapter_compatibility(
+                "parent-view",
+                "node",
+                &layer.cache_key,
+                "trail/node@1",
+                "node"
+            ),
+            Err("adapter_package_identity_mismatch")
+        );
+        db.conn
+            .execute(
+                "UPDATE environment_component_states
+                 SET distribution_digest='builtin:node-plan-v1'
+                 WHERE view_id='parent-view' AND component_id='node'",
+                [],
+            )
+            .unwrap();
+
+        let native_backend = if cfg!(target_os = "macos") {
+            "nfs"
+        } else if cfg!(target_os = "windows") {
+            "dokan"
+        } else {
+            "fuse"
+        };
+        let binding = db
+            .verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            )
+            .unwrap();
+        assert_eq!(binding.desired_key, layer.cache_key);
+        assert!(binding.envelope_id.starts_with("artifact_envelope_"));
+        assert!(binding.tree_root_id.starts_with("artifact_tree_"));
+
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request("wrong-key", "virtual"),
+            ),
+            Err("artifact_backend_unsupported")
+        );
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request("wrong-key", native_backend),
+            ),
+            Err("artifact_desired_identity_mismatch")
+        );
+        let mut wrong_scope = layer.clone();
+        wrong_scope.portability_scope = "host".to_string();
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &wrong_scope,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            ),
+            Err("artifact_portability_mismatch")
+        );
+
+        db.conn
+            .execute(
+                "UPDATE artifact_envelopes SET state='quarantined' WHERE envelope_id=?1",
+                params![&binding.envelope_id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.verify_artifact_inheritance_binding(
+                &layer,
+                artifact_inheritance_request(&layer.cache_key, native_backend),
+            ),
+            Err("artifact_envelope_verification_failed")
+        );
     }
 
     #[test]
@@ -5514,9 +8074,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_materialization_crash_helper() {
+        let Some(workspace) = std::env::var_os("TRAIL_TEST_CRASH_WORKSPACE") else {
+            return;
+        };
+        let _ = Trail::open(PathBuf::from(workspace));
+        panic!("cache materialization crash helper passed its requested crash point");
+    }
+
+    #[test]
     fn killing_cache_publish_at_each_durable_phase_preserves_source_and_recovers() {
         for phase in [
+            "layer_after_reservation",
             "layer_after_staging_sync",
+            "layer_after_cas_tree",
+            "layer_after_envelope_ready",
             "layer_after_publish_marker",
             "layer_after_atomic_rename",
             "layer_after_ready_state",
@@ -5590,6 +8162,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn killing_cas_rematerialization_before_activation_retries_without_private_data_loss() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "restore-source",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let source_upper = db
+            .workspace_view_paths_for_lane("restore-source")
+            .unwrap()
+            .source_upper;
+        fs::write(source_upper.join("uncheckpointed.rs"), "keep me\n").unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(built.path().join("pkg/index.js"), "cached\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let storage_path = PathBuf::from(&layer.storage_path);
+        make_tree_writable(&storage_path);
+        fs::remove_dir_all(&storage_path).unwrap();
+        drop(db);
+
+        let phase = "layer_after_cas_materialization";
+        let ready = workspace.path().join(format!("{phase}.ready"));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::lane::workspace_layer::tests::cache_materialization_crash_helper",
+                "--nocapture",
+            ])
+            .env("RUST_TEST_THREADS", "1")
+            .env("TRAIL_TEST_CRASH_AT", phase)
+            .env("TRAIL_TEST_CRASH_READY", &ready)
+            .env("TRAIL_TEST_CRASH_WORKSPACE", workspace.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_crash_handshake(&mut child, &ready, phase);
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(source_upper.join("uncheckpointed.rs")).unwrap(),
+            "keep me\n"
+        );
+        let reopened = Trail::open(workspace.path()).unwrap();
+        reopened.verify_workspace_layer(&layer.layer_id).unwrap();
+        assert_eq!(
+            fs::read_to_string(storage_path.join("pkg/index.js")).unwrap(),
+            "cached\n"
+        );
+        assert_eq!(
+            fs::read_to_string(source_upper.join("uncheckpointed.rs")).unwrap(),
+            "keep me\n"
+        );
+    }
+
     fn wait_for_crash_handshake(child: &mut std::process::Child, ready: &Path, phase: &str) {
         for _ in 0..1_000 {
             if ready.is_file() {
@@ -5622,6 +8270,34 @@ mod tests {
             .unwrap();
         assert_eq!(first.layer_id, second.layer_id);
         assert_eq!(db.list_workspace_layers().unwrap().len(), 1);
+        let shadow = db
+            .conn
+            .query_row(
+                "SELECT tree_root_id, envelope_id, state FROM workspace_layer_artifact_shadows
+                 WHERE layer_id=?1",
+                params![first.layer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(shadow.0.starts_with("artifact_tree_"));
+        assert!(shadow.1.starts_with("artifact_envelope_"));
+        assert_eq!(shadow.2, "verified");
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT state FROM artifact_envelopes WHERE envelope_id=?1",
+                    params![shadow.1],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ready"
+        );
         assert!(
             fs::metadata(Path::new(&first.storage_path).join("pkg/index.js"))
                 .unwrap()
@@ -5629,6 +8305,208 @@ mod tests {
                 .readonly()
         );
         db.verify_workspace_layer(&first.layer_id).unwrap();
+    }
+
+    #[test]
+    fn workspace_open_reconstructs_missing_layer_materialization_from_verified_cas() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(
+            built.path().join("pkg/index.js"),
+            "module.exports = 'cas';\n",
+        )
+        .unwrap();
+        let published = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let storage_path = PathBuf::from(&published.storage_path);
+        let object_count = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        make_tree_writable(&storage_path);
+        fs::remove_dir_all(&storage_path).unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(storage_path.join("pkg/index.js")).unwrap(),
+            "module.exports = 'cas';\n"
+        );
+        assert!(fs::metadata(storage_path.join("pkg/index.js"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        reopened
+            .verify_workspace_layer(&published.layer_id)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .conn
+                .query_row("SELECT COUNT(*) FROM artifact_objects", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            object_count
+        );
+    }
+
+    #[test]
+    fn workspace_open_removes_completed_materialization_staging() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "ready\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let staging = db
+            .db_dir
+            .join("cache/staging")
+            .join(format!("restore_{}", layer.layer_id));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), "stale\n").unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert!(!staging.exists());
+        reopened.verify_workspace_layer(&layer.layer_id).unwrap();
+    }
+
+    #[test]
+    fn workspace_open_reports_exact_guidance_for_corrupt_cas_reconstruction() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "ready\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let corrupt_object = db
+            .conn
+            .query_row(
+                "SELECT object_id FROM artifact_objects WHERE kind=?1 ORDER BY artifact_id LIMIT 1",
+                params![ARTIFACT_BLOB_KIND],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![corrupt_object],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+        drop(db);
+
+        let error = match Trail::open(workspace.path()) {
+            Ok(_) => panic!("corrupt CAS reconstruction unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("could not materialize tree"), "{message}");
+        assert!(
+            message.contains("restore the workspace from backup"),
+            "{message}"
+        );
+        assert!(
+            message.contains("run environment synchronization"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn cas_shadow_comparison_rejects_path_metadata_and_digest_disagreement() {
+        let tree = ArtifactTreeRootV1 {
+            version: ARTIFACT_TREE_ROOT_VERSION,
+            root_directory_id: crate::ids::ArtifactTreeId::new(b"root"),
+            logical_bytes: 4,
+            entry_count: 1,
+            path_normalizer: "trail-paths/v1".into(),
+        };
+        let artifact = BTreeMap::from([(
+            "artifact".into(),
+            super::workspace_artifact::ArtifactFlatEntry {
+                kind: "file",
+                mode: 0o644,
+                size_bytes: 4,
+                content_hash: Some(sha256_hex(b"good")),
+                symlink_target: None,
+            },
+        )]);
+        let mut layer = BTreeMap::from([(
+            "artifact".into(),
+            WorkspaceLayerEntry {
+                kind: "file".into(),
+                mode: 0o644,
+                size_bytes: 4,
+                content_hash: Some(sha256_hex(b"good")),
+                symlink_target: None,
+            },
+        )]);
+        verify_artifact_shadow_matches_layer_entries(&tree, &artifact, &layer).unwrap();
+        layer.get_mut("artifact").unwrap().content_hash = Some(sha256_hex(b"evil"));
+        assert!(verify_artifact_shadow_matches_layer_entries(&tree, &artifact, &layer).is_err());
+    }
+
+    #[test]
+    #[ignore = "known pre-CAS failure: distinct desired keys duplicate equal authoritative trees"]
+    fn equal_content_under_distinct_keys_reuses_authoritative_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::write(built.path().join("artifact"), "identical bytes\n").unwrap();
+        let first_key = key();
+        let mut second_key = key();
+        second_key
+            .inputs
+            .insert("feature".into(), "different-desired-key".into());
+
+        let first = db
+            .publish_workspace_layer_from_directory(&first_key, built.path())
+            .unwrap();
+        let second = db
+            .publish_workspace_layer_from_directory(&second_key, built.path())
+            .unwrap();
+
+        assert_eq!(
+            first.storage_path, second.storage_path,
+            "equal content should have one authoritative CAS tree"
+        );
+    }
+
+    #[test]
+    #[ignore = "known pre-CAS failure: one desired key silently reuses a divergent content tree"]
+    fn one_desired_key_rejects_a_divergent_content_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let divergent = tempfile::tempdir().unwrap();
+        fs::write(first.path().join("artifact"), "producer A\n").unwrap();
+        fs::write(divergent.path().join("artifact"), "producer B\n").unwrap();
+        db.publish_workspace_layer_from_directory(&key(), first.path())
+            .unwrap();
+
+        let error = db
+            .publish_workspace_layer_from_directory(&key(), divergent.path())
+            .expect_err("a divergent content root for one desired key must be quarantined");
+        assert!(error.to_string().contains("divergent"));
     }
 
     #[test]
@@ -5737,6 +8615,83 @@ mod tests {
                 .publish_workspace_layer_from_directory(&key(), built.path())
                 .is_err());
         }
+    }
+
+    #[test]
+    fn host_sealing_precedes_ready_workspace_layer_envelopes() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(built.path().join("pkg/index.js"), "sealed\n").unwrap();
+
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        let (tree_id, envelope_id) = db
+            .conn
+            .query_row(
+                "SELECT tree_root_id,envelope_id
+                 FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer.layer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let tree_id = ArtifactTreeId::parse(tree_id).unwrap();
+        let envelope_id = crate::ids::ArtifactEnvelopeId::parse(envelope_id).unwrap();
+        let envelope = db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
+        assert_eq!(envelope.validation_receipt_ids.len(), 2);
+        let receipts = envelope
+            .validation_receipt_ids
+            .iter()
+            .map(|receipt_id| db.artifact_validation_receipt(receipt_id).unwrap())
+            .collect::<Vec<_>>();
+        assert!(receipts.iter().any(|receipt| {
+            receipt.declaration.name == "trail.host.workspace-layer.structural-seal/v1"
+                && receipt.declaration.kind == ArtifactValidationKindV1::Structural
+                && receipt
+                    .evidence
+                    .get("complete_tree_identity")
+                    .map(String::as_str)
+                    == Some("passed")
+        }));
+        assert!(receipts.iter().any(|receipt| {
+            receipt.declaration.name == "trail.host.workspace-layer.policy-seal/v1"
+                && receipt.declaration.kind == ArtifactValidationKindV1::Policy
+                && receipt
+                    .evidence
+                    .get("producer_termination")
+                    .map(String::as_str)
+                    == Some("terminated_or_disconnected")
+                && receipt.evidence.get("desired_pins").map(String::as_str) == Some("unchanged")
+                && receipt.evidence.get("producer_trust").map(String::as_str)
+                    == Some("local_host_authorized")
+        }));
+
+        let mut missing_required_seals = envelope.clone();
+        missing_required_seals.validation_receipt_ids.clear();
+        assert!(db
+            .put_artifact_envelope_under_write_lock(missing_required_seals)
+            .unwrap_err()
+            .to_string()
+            .contains("missing required host"));
+
+        let mut stale_receipt = receipts
+            .into_iter()
+            .find(|receipt| receipt.declaration.name == "trail.host.workspace-layer.policy-seal/v1")
+            .unwrap();
+        stale_receipt
+            .evidence
+            .insert("producer_trust".into(), "untrusted".into());
+        assert!(db
+            .put_artifact_validation_receipt(stale_receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("stale input digest"));
     }
 
     #[test]
@@ -6169,31 +9124,111 @@ mod tests {
         fs::write(workspace.path().join("README.md"), "root\n").unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let workspace_path = workspace.path().to_path_buf();
+        let observer = Trail::open(workspace.path()).unwrap();
+        let source_root = observer.resolve_refish("main").unwrap().root_id;
+        let key = key();
+        let cache_key = observer.workspace_layer_cache_key(&key).unwrap();
         let builds = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let workspace_path = workspace_path.clone();
-            let builds = Arc::clone(&builds);
-            let key = key();
-            workers.push(std::thread::spawn(move || {
-                let db = Trail::open(&workspace_path).unwrap();
-                db.build_workspace_layer_singleflight(&key, |build_dir| {
-                    builds.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(150));
-                    let output = build_dir.join("output");
-                    fs::create_dir_all(&output).unwrap();
-                    fs::write(output.join("index.js"), "shared\n").unwrap();
-                    Ok(output)
-                })
-                .unwrap()
-            }));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let owner_workspace = workspace_path.clone();
+        let owner_builds = Arc::clone(&builds);
+        let owner_key = key.clone();
+        let owner_root = source_root.clone();
+        let owner = std::thread::spawn(move || {
+            let db = Trail::open(&owner_workspace).unwrap();
+            db.build_workspace_layer_singleflight(&owner_key, &owner_root, |build_dir| {
+                owner_builds.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let output = build_dir.join("output");
+                fs::create_dir_all(&output).unwrap();
+                fs::write(output.join("index.js"), "shared\n").unwrap();
+                Ok(output)
+            })
+            .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let waiter_workspace = workspace_path.clone();
+        let waiter_key = key.clone();
+        let waiter_root = source_root.clone();
+        let waiter = std::thread::spawn(move || {
+            let db = Trail::open(&waiter_workspace).unwrap();
+            db.build_workspace_layer_singleflight(&waiter_key, &waiter_root, |_| {
+                panic!("a singleflight waiter must not invoke a second builder")
+            })
+            .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiting = observer
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM artifact_construction_waiters w
+                     JOIN artifact_construction_attempts a ON a.attempt_id=w.attempt_id
+                     WHERE a.desired_key=?1 AND w.status='waiting'",
+                    params![cache_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not publish durable waiting evidence"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let reports = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect::<Vec<_>>();
+        let running = observer
+            .conn
+            .query_row(
+                "SELECT phase,status,owner_generation
+                 FROM artifact_construction_attempts WHERE desired_key=?1",
+                params![cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(running, ("building".into(), "running".into(), 1));
+
+        release_tx.send(()).unwrap();
+        let owner_report = owner.join().unwrap();
+        let waiter_report = waiter.join().unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        assert_eq!(reports[0].layer_id, reports[1].layer_id);
+        assert_eq!(owner_report.layer_id, waiter_report.layer_id);
+        let completed = observer
+            .conn
+            .query_row(
+                "SELECT phase,status,owner_generation
+                 FROM artifact_construction_attempts WHERE desired_key=?1",
+                params![cache_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), "succeeded".into(), 1));
+        let waiter_status = observer
+            .conn
+            .query_row(
+                "SELECT status FROM artifact_construction_waiters",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(waiter_status, "released");
     }
 
     #[test]
@@ -6203,6 +9238,7 @@ mod tests {
         Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let db = Trail::open(workspace.path()).unwrap();
         let key = key();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
         let cache_key = db.workspace_layer_cache_key(&key).unwrap();
         let lock_dir = db.db_dir.join("cache/staging/locks");
         fs::create_dir_all(&lock_dir).unwrap();
@@ -6214,15 +9250,26 @@ mod tests {
         .unwrap();
         let cancelled = AtomicBool::new(true);
         let error = db
-            .build_workspace_layer_singleflight_with_cancel(&key, &cancelled, |_| {
+            .build_workspace_layer_singleflight_with_cancel(&key, &source_root, &cancelled, |_| {
                 panic!("a cancelled waiter must not invoke the builder")
             })
             .unwrap_err();
         assert!(error.to_string().contains("cancelled while waiting"));
 
         fs::write(&lock, "4294967295:dead-owner").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_attempts(
+                    attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                    owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                    reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+                 VALUES('construct_dead',?1,?2,1,4294967295,'dead-owner','building',
+                        'running',NULL,NULL,NULL,NULL,0,?3,?3,NULL)",
+                params![cache_key, source_root.0, now_ts()],
+            )
+            .unwrap();
         let report = db
-            .build_workspace_layer_singleflight(&key, |build_dir| {
+            .build_workspace_layer_singleflight(&key, &source_root, |build_dir| {
                 let output = build_dir.join("output");
                 fs::create_dir_all(&output).unwrap();
                 fs::write(output.join("artifact"), "recovered\n").unwrap();
@@ -6234,6 +9281,254 @@ mod tests {
             fs::read_to_string(Path::new(&report.storage_path).join("artifact")).unwrap(),
             "recovered\n"
         );
+        let attempts = db
+            .conn
+            .prepare(
+                "SELECT owner_generation,phase,status,reason_code
+                 FROM artifact_construction_attempts
+                 WHERE desired_key=?1 ORDER BY owner_generation",
+            )
+            .unwrap()
+            .query_map(params![cache_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            attempts,
+            vec![
+                (
+                    1,
+                    "completed".into(),
+                    "abandoned".into(),
+                    Some("owner_lost".into())
+                ),
+                (2, "completed".into(), "succeeded".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn construction_phase_updates_require_the_exact_owner_generation() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let attempt = db
+            .begin_artifact_construction_attempt("exact-fence-test", &source_root)
+            .unwrap();
+        let mut stale_fence = attempt.clone();
+        stale_fence.owner_generation += 1;
+
+        let error = db
+            .advance_artifact_construction_attempt(&stale_fence, "building")
+            .unwrap_err();
+        assert!(error.to_string().contains("lost its exact owner fence"));
+        db.advance_artifact_construction_attempt(&attempt, "building")
+            .unwrap();
+        db.advance_artifact_construction_attempt(&attempt, "validating")
+            .unwrap();
+        db.verify_artifact_construction_seal_fence(&attempt, "exact-fence-test", &source_root)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE artifact_construction_attempts SET desired_key='changed-pin'
+                 WHERE attempt_id=?1",
+                params![attempt.attempt_id],
+            )
+            .unwrap();
+        assert!(db
+            .verify_artifact_construction_seal_fence(&attempt, "exact-fence-test", &source_root,)
+            .unwrap_err()
+            .to_string()
+            .contains("changed its source, desired key"));
+        db.finish_artifact_construction_attempt(
+            &attempt,
+            "abandoned",
+            Some("test_complete"),
+            Some("test completed"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn workspace_open_recovers_dead_construction_owner_and_exact_staging() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.resolve_refish("main").unwrap().root_id;
+        let desired_key = db.workspace_layer_cache_key(&key()).unwrap();
+        let owner_pid = u32::MAX;
+        let owner_start_token = "dead-open-owner";
+        let owner_token = format!("{owner_pid}:{owner_start_token}");
+        let staging = db.db_dir.join("cache/staging").join(format!(
+            "input_{}",
+            crate::ids::short_hash(format!("{desired_key}:{owner_token}").as_bytes(), 12)
+        ));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("partial"), "incomplete\n").unwrap();
+        let lock = db
+            .db_dir
+            .join("cache/staging/locks")
+            .join(format!("{desired_key}.lock"));
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, &owner_token).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_attempts(
+                    attempt_id,desired_key,source_root,owner_generation,owner_pid,
+                    owner_start_token,phase,status,candidate_journal_object_id,envelope_id,
+                    reason_code,reason,cancel_requested,started_at,heartbeat_at,finished_at)
+                 VALUES('construct_open_dead',?1,?2,1,?3,?4,'building','running',
+                        NULL,NULL,NULL,NULL,0,?5,?5,NULL)",
+                params![
+                    desired_key,
+                    source_root.0,
+                    i64::from(owner_pid),
+                    owner_start_token,
+                    now_ts()
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO artifact_construction_waiters(
+                    attempt_id,waiter_id,owner_pid,owner_start_token,status,created_at,updated_at)
+                 VALUES('construct_open_dead','waiter_open_dead',?1,?2,'waiting',?3,?3)",
+                params![i64::from(owner_pid), owner_start_token, now_ts()],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = Trail::open(workspace.path()).unwrap();
+        assert!(!staging.exists());
+        assert!(!lock.exists());
+        let attempt = reopened
+            .conn
+            .query_row(
+                "SELECT phase,status,reason_code FROM artifact_construction_attempts
+                 WHERE attempt_id='construct_open_dead'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            attempt,
+            ("completed".into(), "abandoned".into(), "owner_lost".into())
+        );
+        let waiter = reopened
+            .conn
+            .query_row(
+                "SELECT status FROM artifact_construction_waiters
+                 WHERE waiter_id='waiter_open_dead'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(waiter, "abandoned");
+    }
+
+    #[test]
+    fn fsck_and_doctor_report_cas_corruption_and_orphan_materializations() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), "verified\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), source.path())
+            .unwrap();
+        drop(db);
+        let db = Trail::open(workspace.path()).unwrap();
+        let corrupt_object = db
+            .conn
+            .query_row(
+                "SELECT object_id FROM artifact_objects WHERE kind=?1 ORDER BY artifact_id LIMIT 1",
+                params![ARTIFACT_BLOB_KIND],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE objects SET bytes=X'00' WHERE object_id=?1",
+                params![corrupt_object],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+        let orphan_id = format!("layer_{}", "a".repeat(32));
+        fs::create_dir_all(db.db_dir.join("cache/layers").join(&orphan_id)).unwrap();
+
+        let fsck = db.fsck().unwrap();
+        assert!(
+            fsck.errors.iter().any(|error| {
+                error.contains("artifact object") && error.contains("rebuild the owning")
+            }),
+            "fsck errors: {:?}",
+            fsck.errors
+        );
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("CAS-backed workspace layer")
+                && error.contains("reopen Trail to reconstruct")
+        }));
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("orphan workspace layer materialization")
+                && error.contains("rerun `trail fsck`")
+        }));
+
+        let doctor = db.doctor().unwrap();
+        assert_eq!(doctor.status, "error");
+        let doctor_json = serde_json::to_string(&doctor).unwrap();
+        assert!(doctor_json.contains("CAS-backed workspace layer"));
+        assert!(doctor_json.contains("orphan workspace layer materialization"));
+    }
+
+    #[test]
+    fn fsck_distinguishes_missing_legacy_layer_without_cas_authority() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("artifact"), "legacy\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), source.path())
+            .unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM workspace_layer_artifact_shadows WHERE layer_id=?1",
+                params![layer.layer_id],
+            )
+            .unwrap();
+        let layer_path = Path::new(&layer.storage_path);
+        make_tree_writable(layer_path);
+        fs::remove_dir_all(layer_path).unwrap();
+
+        let fsck = db.fsck().unwrap();
+        assert!(fsck.errors.iter().any(|error| {
+            error.contains("legacy workspace layer")
+                && error.contains("run environment synchronization to rebuild it")
+        }));
+        assert!(!fsck
+            .errors
+            .iter()
+            .any(|error| error.contains("reconstruct it from its verified envelope")));
     }
 
     #[test]

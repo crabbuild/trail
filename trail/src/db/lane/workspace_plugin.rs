@@ -7,14 +7,16 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use trail_environment_adapter_sdk::{
-    read_frame, write_frame, AdapterAction, AdapterCache, AdapterCacheAccess, AdapterCacheProtocol,
-    AdapterCommand, AdapterDependencyType, AdapterExternalArtifact, AdapterHost, AdapterOperation,
-    AdapterOutput, AdapterOutputPolicy, AdapterPackageManifest, AdapterPackageSignature,
-    AdapterPermissions, AdapterPlan, AdapterPlanV2, AdapterPortability, AdapterPublicationTrigger,
-    AdapterPublisherKey, AdapterRequest, AdapterResponse, AdapterResult, AdapterReuseMode,
-    AdapterRuntimeResource, AdapterSharingScope, DiscoveredComponent, PinnedFile, MAX_FRAME_BYTES,
-    PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1, PROTOCOL_V2,
-    TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
+    negotiate_highest_mutual_protocol, read_frame, write_frame, AdapterAction, AdapterCache,
+    AdapterCacheAccess, AdapterCacheProtocol, AdapterCommand, AdapterDependencyType,
+    AdapterExternalArtifact, AdapterHost, AdapterOperation, AdapterOutput, AdapterOutputPolicy,
+    AdapterPackageManifest, AdapterPackageSignature, AdapterPermissions, AdapterPlan,
+    AdapterPlanV2, AdapterPortability, AdapterProposalStatusV3, AdapterPublicationTrigger,
+    AdapterPublisherKey, AdapterRequest, AdapterRequestV3, AdapterResponse, AdapterResponseV3,
+    AdapterResult, AdapterResultV3, AdapterReuseMode, AdapterRuntimeResource,
+    AdapterSecretCapabilityV3, AdapterSecretTaintV3, AdapterSharingScope, DiscoveredComponent,
+    PinnedFile, MAX_FRAME_BYTES, PACKAGE_SCHEMA_V1, PACKAGE_SIGNATURE_SCHEMA_V1, PROTOCOL_V1,
+    PROTOCOL_V2, PROTOCOL_V3, TRUSTED_PUBLISHER_KEY_SCHEMA_V1,
 };
 
 use super::workspace_environment::{
@@ -349,6 +351,8 @@ impl Trail {
         package_directory: impl AsRef<Path>,
     ) -> Result<EnvironmentPluginPackageInspectionReport> {
         let prepared = prepare_environment_plugin_package(package_directory)?;
+        let protocol_capabilities =
+            environment_plugin_protocol_capabilities(&prepared.package.adapter);
         let distribution_material = adapter_package_distribution_material(
             &prepared.payload_material,
             prepared.signature.as_ref(),
@@ -364,6 +368,7 @@ impl Trail {
                 .as_ref()
                 .map(|signature| signature.publisher.clone()),
             publisher_key_id: prepared.signature.map(|signature| signature.key_id),
+            protocol_capabilities,
         })
     }
 
@@ -401,6 +406,7 @@ impl Trail {
             adapter_package_distribution_material(&payload_material, signature.as_ref())?;
         let distribution_hex = sha256_hex(&distribution_material);
         let distribution_digest = format!("sha256:{distribution_hex}");
+        let protocol_capabilities = environment_plugin_protocol_capabilities(&package.adapter);
         let executable_file = package.executable.path.clone();
         let installed = InstalledPluginManifest {
             package: package.clone(),
@@ -526,6 +532,7 @@ impl Trail {
             publisher_key_id,
             trust,
             certification_tier,
+            protocol_capabilities,
         })
     }
 
@@ -534,6 +541,12 @@ impl Trail {
         canonical_identity: &str,
     ) -> Result<EnvironmentPluginRemoveReport> {
         validate_plugin_identity(canonical_identity)?;
+        let protocol_capabilities = self
+            .environment_plugin_for_selector(canonical_identity)
+            .ok()
+            .flatten()
+            .map(|plugin| environment_plugin_protocol_capabilities(&plugin.manifest.adapter))
+            .unwrap_or_default();
         let existing = self
             .latest_environment_plugin_registry_record(canonical_identity)?
             .filter(|record| record.action == "install")
@@ -548,6 +561,7 @@ impl Trail {
         Ok(EnvironmentPluginRemoveReport {
             canonical_identity: canonical_identity.to_string(),
             removed_distribution_digest: existing,
+            protocol_capabilities,
         })
     }
 
@@ -981,6 +995,9 @@ impl Trail {
                     component_root: component_root.to_string(),
                     kind: component.kind,
                     adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+                    status: EnvironmentComponentProposalStatus::Ready,
+                    reasons: Vec::new(),
+                    recovery_actions: Vec::new(),
                 }))
             }
             _ => Err(Error::InvalidInput(format!(
@@ -1981,6 +1998,7 @@ impl Trail {
                 .to_string(),
             },
             inputs,
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command,
@@ -2276,6 +2294,240 @@ fn validate_discovered_plugin_component(
     validate_plugin_component_id(&component.component_id)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "v3 exchange validation is staged before v3 invocation/normalization is enabled"
+    )
+)]
+pub(super) fn validate_environment_plugin_v3_exchange(
+    plugin: &InstalledEnvironmentPlugin,
+    request: &AdapterRequestV3,
+    response: AdapterResponseV3,
+) -> Result<AdapterResultV3> {
+    if !plugin
+        .manifest
+        .adapter
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3)
+        || request.protocol != PROTOCOL_V3
+        || response.protocol != PROTOCOL_V3
+        || response.request_id != request.request_id
+        || request.adapter_identity != plugin.manifest.adapter.canonical_identity
+        || request.distribution_digest != plugin.distribution_digest
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned a protocol/package/request mismatch for protocol v3",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    request.validate_bounds().map_err(|error| {
+        Error::InvalidInput(format!("invalid protocol-v3 adapter request: {error}"))
+    })?;
+    response.validate_bounds(&request.limits).map_err(|error| {
+        Error::InvalidInput(format!("invalid protocol-v3 adapter response: {error}"))
+    })?;
+
+    let capabilities = &plugin.manifest.adapter.capabilities;
+    let host_evidence = match &request.operation {
+        trail_environment_adapter_sdk::AdapterOperationV3::Plan { host_evidence, .. } => {
+            host_evidence.as_deref()
+        }
+        trail_environment_adapter_sdk::AdapterOperationV3::Propose { .. } => None,
+    };
+    if host_evidence.is_some_and(|evidence| {
+        (!evidence.attestations.is_empty() && !capabilities.host_attestation_evidence)
+            || (!evidence.quarantines.is_empty() && !capabilities.host_quarantine_evidence)
+    }) {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` received host evidence beyond its package declaration",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+
+    match response.result {
+        AdapterResultV3::Error {
+            code,
+            message,
+            recovery_actions: _,
+        } => Err(Error::InvalidInput(format!(
+            "adapter `{}` rejected protocol-v3 request with {}: {}",
+            plugin.manifest.adapter.canonical_identity,
+            redact_sensitive_text(&code),
+            redact_sensitive_text(&message)
+        ))),
+        AdapterResultV3::Proposed { component } => {
+            let trail_environment_adapter_sdk::AdapterOperationV3::Propose {
+                component_root, ..
+            } = &request.operation
+            else {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned a proposal to a non-proposal request",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            };
+            if let Some(proposal) = &component {
+                validate_environment_plugin_v3_proposal(plugin, component_root, proposal)?;
+            }
+            Ok(AdapterResultV3::Proposed { component })
+        }
+        AdapterResultV3::Planned { pipeline } => {
+            let trail_environment_adapter_sdk::AdapterOperationV3::Plan {
+                proposal, files, ..
+            } = &request.operation
+            else {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned a plan to a non-plan request",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            };
+            if pipeline.proposal != **proposal {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` changed the pinned proposal while planning",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            validate_environment_plugin_v3_proposal(
+                plugin,
+                &proposal.component_root,
+                &pipeline.proposal,
+            )?;
+            pipeline.validate_canonical().map_err(|error| {
+                Error::InvalidInput(format!(
+                    "adapter `{}` returned a noncanonical or invalid protocol-v3 pipeline: {error}",
+                    plugin.manifest.adapter.canonical_identity
+                ))
+            })?;
+
+            let mut expected_inputs = files
+                .iter()
+                .map(|pinned| pinned.input.clone())
+                .collect::<Vec<_>>();
+            expected_inputs.sort();
+            if pipeline.inputs != expected_inputs {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` protocol-v3 plan omitted, added, or changed pinned inputs",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            for input in &pipeline.inputs {
+                if normalize_relative_path(&input.path)? != input.path {
+                    return Err(Error::InvalidInput(format!(
+                        "adapter `{}` returned non-normalized input `{}`",
+                        plugin.manifest.adapter.canonical_identity, input.path
+                    )));
+                }
+            }
+            if pipeline.identity.platform != request.host.operating_system
+                || pipeline.identity.architecture != request.host.architecture
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` changed the pinned host identity",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.resolution.is_some() && !capabilities.resolution {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned resolution without package capability",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if !pipeline.source_exports.is_empty() && !capabilities.source_exports {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` returned source exports without package capability",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.identity.portability_certified
+                && capabilities.certification_ceiling
+                    != trail_environment_adapter_sdk::AdapterCertificationCeiling::PortableArtifact
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` exceeded its package certification ceiling",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            if pipeline.secret_taint == AdapterSecretTaintV3::Clear
+                && (pipeline.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    || pipeline.actions.iter().any(|action| {
+                        action.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    })
+                    || pipeline.resolution.as_ref().is_some_and(|resolution| {
+                        resolution.capabilities.secrets != AdapterSecretCapabilityV3::Deny
+                    }))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` must conservatively taint a secret-capable protocol-v3 pipeline",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
+            Ok(AdapterResultV3::Planned { pipeline })
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the staged v3 exchange validator before v3 invocation is enabled"
+    )
+)]
+fn validate_environment_plugin_v3_proposal(
+    plugin: &InstalledEnvironmentPlugin,
+    expected_root: &str,
+    proposal: &trail_environment_adapter_sdk::AdapterComponentProposalV3,
+) -> Result<()> {
+    validate_discovered_plugin_component(
+        plugin,
+        &DiscoveredComponent {
+            component_id: proposal.component_id.clone(),
+            kind: proposal.kind.clone(),
+        },
+    )?;
+    if normalize_plugin_component_root(&proposal.component_root)?
+        != normalize_plugin_component_root(expected_root)?
+        || proposal.proposal_key.trim().is_empty()
+        || contains_sensitive_text(&proposal.proposal_key)
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned an invalid protocol-v3 proposal root or key",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    if proposal.status == AdapterProposalStatusV3::Ready
+        && !proposal.missing_requirements.is_empty()
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned a ready proposal with missing requirements",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    if !strictly_increasing_by(&proposal.missing_requirements, |requirement| {
+        requirement.code.as_str()
+    }) || !strictly_increasing_by(&proposal.recovery_actions, |action| action.code.as_str())
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` returned duplicate or noncanonical proposal evidence",
+            plugin.manifest.adapter.canonical_identity
+        )));
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the staged v3 proposal validator before v3 invocation is enabled"
+    )
+)]
+fn strictly_increasing_by<'a, T>(values: &'a [T], key: impl Fn(&'a T) -> &'a str) -> bool {
+    values.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
+}
+
 fn validate_plugin_component_id(component_id: &str) -> Result<()> {
     if component_id.is_empty()
         || component_id.len() > 256
@@ -2308,30 +2560,101 @@ pub(super) fn environment_plugin_supports_current_host(
             .any(|value| value == std::env::consts::ARCH)
 }
 
+pub(super) fn unsupported_environment_plugin_proposal(
+    plugin: &InstalledEnvironmentPlugin,
+    component_root: &str,
+) -> Result<EnvironmentDiscoveredComponentReport> {
+    let component_root = normalize_plugin_component_root(component_root)?;
+    let component_id = if component_root.is_empty() {
+        format!("plugin:{}", plugin.manifest.adapter.layer_adapter_name)
+    } else {
+        format!(
+            "plugin:{}:{component_root}",
+            plugin.manifest.adapter.layer_adapter_name
+        )
+    };
+    validate_plugin_component_id(&component_id)?;
+    Ok(EnvironmentDiscoveredComponentReport {
+        component_id,
+        component_root,
+        kind: plugin.manifest.adapter.kind.clone(),
+        adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+        status: EnvironmentComponentProposalStatus::Unsupported,
+        reasons: vec![EnvironmentProposalReasonReport {
+            code: "unsupported_host_platform".to_string(),
+            message: format!(
+                "adapter `{}` recognizes this marker but does not support {}/{}",
+                plugin.manifest.adapter.canonical_identity,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        }],
+        recovery_actions: vec![EnvironmentRecoveryActionReport {
+            code: "use_supported_host".to_string(),
+            description: format!(
+                "Use a host matching the adapter's supported operating systems ({}) and architectures ({})",
+                plugin
+                    .manifest
+                    .adapter
+                    .supported_operating_systems
+                    .join(", "),
+                plugin
+                    .manifest
+                    .adapter
+                    .supported_architectures
+                    .join(", ")
+            ),
+            command: None,
+        }],
+    })
+}
+
 pub(super) fn selected_environment_plugin_protocol(
     plugin: &InstalledEnvironmentPlugin,
 ) -> Result<&'static str> {
-    if plugin
-        .manifest
-        .adapter
-        .protocols
-        .iter()
-        .any(|protocol| protocol == PROTOCOL_V2)
-    {
-        Ok(PROTOCOL_V2)
-    } else if plugin
-        .manifest
-        .adapter
-        .protocols
-        .iter()
-        .any(|protocol| protocol == PROTOCOL_V1)
-    {
-        Ok(PROTOCOL_V1)
-    } else {
-        Err(Error::InvalidInput(format!(
+    negotiate_highest_mutual_protocol(
+        &[PROTOCOL_V2, PROTOCOL_V1],
+        &plugin.manifest.adapter.protocols,
+    )
+    .ok_or_else(|| {
+        Error::InvalidInput(format!(
             "adapter `{}` shares no supported protocol with this Trail host",
             plugin.manifest.adapter.canonical_identity
-        )))
+        ))
+    })
+}
+
+pub(super) fn environment_plugin_protocol_capabilities(
+    metadata: &trail_environment_adapter_sdk::AdapterMetadata,
+) -> EnvironmentPluginProtocolCapabilitiesReport {
+    let declares_v3 = metadata
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3);
+    let capabilities = &metadata.capabilities;
+    EnvironmentPluginProtocolCapabilitiesReport {
+        selected_protocol: negotiate_highest_mutual_protocol(
+            &[PROTOCOL_V2, PROTOCOL_V1],
+            &metadata.protocols,
+        )
+        .map(str::to_string),
+        resolution_capable: declares_v3 && capabilities.resolution,
+        source_export_capable: declares_v3 && capabilities.source_exports,
+        host_attestation_evidence_capable: declares_v3 && capabilities.host_attestation_evidence,
+        host_quarantine_evidence_capable: declares_v3 && capabilities.host_quarantine_evidence,
+        certification_ceiling: capabilities.certification_ceiling.as_str().into(),
+        content_policy: if declares_v3 {
+            "host_verified_local_cas"
+        } else {
+            "legacy_exact_layer"
+        }
+        .into(),
+        attestation_policy: if declares_v3 {
+            "host_authored_required"
+        } else {
+            "legacy_host_evidence"
+        }
+        .into(),
     }
 }
 
@@ -2736,10 +3059,22 @@ fn canonicalize_and_validate_package(package: &mut AdapterPackageManifest) -> Re
             .adapter
             .protocols
             .iter()
-            .any(|protocol| !matches!(protocol.as_str(), PROTOCOL_V1 | PROTOCOL_V2))
+            .any(|protocol| !matches!(protocol.as_str(), PROTOCOL_V1 | PROTOCOL_V2 | PROTOCOL_V3))
     {
         return Err(Error::InvalidInput(format!(
             "adapter `{}` must declare one or more host-supported protocols",
+            package.adapter.canonical_identity
+        )));
+    }
+    if !package
+        .adapter
+        .protocols
+        .iter()
+        .any(|protocol| protocol == PROTOCOL_V3)
+        && !package.adapter.capabilities.is_denied()
+    {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{}` declares protocol-v3 capabilities without protocol v3",
             package.adapter.canonical_identity
         )));
     }
@@ -2997,7 +3332,386 @@ fn validate_plugin_catalog(plugins: &[InstalledEnvironmentPlugin]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
     use ed25519_dalek::{Signer, SigningKey};
+
+    fn plugin_with_protocols(protocols: &[&str]) -> InstalledEnvironmentPlugin {
+        InstalledEnvironmentPlugin {
+            manifest: AdapterPackageManifest {
+                schema: PACKAGE_SCHEMA_V1.into(),
+                adapter: trail_environment_adapter_sdk::AdapterMetadata {
+                    canonical_identity: "example/test@1".into(),
+                    implementation_version: "1".into(),
+                    selectors: vec!["example/test@1".into()],
+                    kind: "generated".into(),
+                    layer_adapter_name: "test".into(),
+                    discovery_markers: vec!["test.adapter".into()],
+                    protocols: protocols
+                        .iter()
+                        .map(|protocol| (*protocol).into())
+                        .collect(),
+                    capabilities:
+                        trail_environment_adapter_sdk::AdapterPackageCapabilities::default(),
+                    supported_operating_systems: vec![std::env::consts::OS.into()],
+                    supported_architectures: vec![std::env::consts::ARCH.into()],
+                    stability: "experimental".into(),
+                    description: "test".into(),
+                },
+                executable: trail_environment_adapter_sdk::AdapterExecutable {
+                    path: "adapter".into(),
+                    sha256: format!("sha256:{}", "0".repeat(64)),
+                },
+                permissions: AdapterPermissions::default(),
+            },
+            distribution_digest: format!("sha256:{}", "1".repeat(64)),
+            executable_digest: format!("sha256:{}", "2".repeat(64)),
+            executable_path: PathBuf::from("adapter"),
+            publisher: None,
+            publisher_key_id: None,
+            trust: "local".into(),
+            certification_tier: "uncertified".into(),
+        }
+    }
+
+    fn valid_v3_exchange() -> (
+        InstalledEnvironmentPlugin,
+        AdapterRequestV3,
+        AdapterResponseV3,
+    ) {
+        use trail_environment_adapter_sdk::{
+            denied_capabilities_v3, AdapterActionLimitsV3, AdapterActionPhaseV3, AdapterActionV3,
+            AdapterCertificationCeiling, AdapterComponentProposalV3, AdapterIdentityContractV3,
+            AdapterInputRoleV3, AdapterInputV3, AdapterOperationV3, AdapterPinnedInputV3,
+            AdapterPipelineV3, AdapterProcessCapabilityV3, AdapterProtocolLimitsV3,
+            AdapterQuarantinePolicyV3, AdapterSourceExportAuthorizationV3,
+            AdapterSourceExportCollisionV3, AdapterSourceExportV3, AdapterValidationKindV3,
+            AdapterValidationV3,
+        };
+
+        let mut plugin = plugin_with_protocols(&[PROTOCOL_V3, PROTOCOL_V2]);
+        plugin.manifest.adapter.capabilities.source_exports = true;
+        plugin.manifest.adapter.capabilities.certification_ceiling =
+            AdapterCertificationCeiling::LocalArtifact;
+        let proposal = AdapterComponentProposalV3 {
+            component_id: "example.generated".into(),
+            component_root: ".".into(),
+            kind: "generated".into(),
+            status: AdapterProposalStatusV3::Ready,
+            proposal_key: "sha256:proposal".into(),
+            missing_requirements: Vec::new(),
+            recovery_actions: Vec::new(),
+        };
+        let inputs = [
+            AdapterPinnedInputV3 {
+                input: AdapterInputV3 {
+                    path: "z.json".into(),
+                    content_hash: "sha256:z".into(),
+                    size_bytes: 2,
+                    executable: false,
+                    role: AdapterInputRoleV3::Identity,
+                    format: "application/json".into(),
+                    required: true,
+                },
+                content: b"{}".to_vec(),
+            },
+            AdapterPinnedInputV3 {
+                input: AdapterInputV3 {
+                    path: "a.json".into(),
+                    content_hash: "sha256:a".into(),
+                    size_bytes: 2,
+                    executable: false,
+                    role: AdapterInputRoleV3::Identity,
+                    format: "application/json".into(),
+                    required: true,
+                },
+                content: b"{}".to_vec(),
+            },
+        ];
+        let request = AdapterRequestV3 {
+            protocol: PROTOCOL_V3.into(),
+            request_id: "request-v3".into(),
+            adapter_identity: plugin.manifest.adapter.canonical_identity.clone(),
+            distribution_digest: plugin.distribution_digest.clone(),
+            host: AdapterHost {
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+            },
+            source_root: "root:v3".into(),
+            limits: AdapterProtocolLimitsV3::default(),
+            operation: AdapterOperationV3::Plan {
+                proposal: Box::new(proposal.clone()),
+                files: inputs.to_vec(),
+                resolution_snapshot: None,
+                host_evidence: None,
+            },
+        };
+        let mut action_capabilities = denied_capabilities_v3();
+        action_capabilities.process = AdapterProcessCapabilityV3::DeclaredExecutable;
+        let pipeline = AdapterPipelineV3::builder(
+            proposal,
+            AdapterIdentityContractV3 {
+                normalizer_version: "trail-path-v1".into(),
+                source_closure_complete: true,
+                semantic_identities: BTreeMap::new(),
+                target: "host".into(),
+                platform: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                abi: "host".into(),
+                portability: AdapterPortability::Host,
+                portability_certified: false,
+                portability_scope: "workspace".into(),
+                trust_scope: "local_plugin".into(),
+            },
+        )
+        .input(inputs[0].input.clone())
+        .input(inputs[1].input.clone())
+        .action(AdapterActionV3 {
+            name: "construct".into(),
+            phase: AdapterActionPhaseV3::Construct,
+            program: "generator".into(),
+            argv: vec!["build".into()],
+            working_directory: ".".into(),
+            environment: BTreeMap::new(),
+            capabilities: action_capabilities.clone(),
+            limits: AdapterActionLimitsV3 {
+                timeout_ms: 30_000,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                output_entries: 100,
+                output_bytes: 1024 * 1024,
+                child_processes: 0,
+            },
+        })
+        .action(AdapterActionV3 {
+            name: "finalize".into(),
+            phase: AdapterActionPhaseV3::Finalize,
+            program: "generator".into(),
+            argv: vec!["finalize".into()],
+            working_directory: ".".into(),
+            environment: BTreeMap::new(),
+            capabilities: action_capabilities,
+            limits: AdapterActionLimitsV3 {
+                timeout_ms: 30_000,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                output_entries: 100,
+                output_bytes: 1024 * 1024,
+                child_processes: 0,
+            },
+        })
+        .validation(AdapterValidationV3 {
+            name: "path-contract".into(),
+            kind: AdapterValidationKindV3::PathContract,
+            path: "generated".into(),
+            required: true,
+            parameters: BTreeMap::new(),
+        })
+        .output(AdapterOutput::immutable_seed_private(
+            "generated",
+            "generated",
+            ".trail-generated/generated",
+        ))
+        .source_export(AdapterSourceExportV3 {
+            name: "client".into(),
+            output_name: "generated".into(),
+            artifact_subpath: "client".into(),
+            destination: "src/generated".into(),
+            collision: AdapterSourceExportCollisionV3::Fail,
+            required_validation: "path-contract".into(),
+            required_gate: None,
+            authorization: AdapterSourceExportAuthorizationV3::ExplicitUser,
+        })
+        .quarantine_policy(AdapterQuarantinePolicyV3::FailClosed)
+        .stale_reason("source or tool changed")
+        .build()
+        .unwrap();
+        let response = AdapterResponseV3 {
+            protocol: PROTOCOL_V3.into(),
+            request_id: request.request_id.clone(),
+            result: AdapterResultV3::Planned {
+                pipeline: Box::new(pipeline),
+            },
+        };
+        (plugin, request, response)
+    }
+
+    #[test]
+    fn host_negotiation_falls_back_exactly_until_v3_normalization_is_enabled() {
+        assert_eq!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[
+                PROTOCOL_V1,
+                PROTOCOL_V3,
+                PROTOCOL_V2,
+            ]))
+            .unwrap(),
+            PROTOCOL_V2
+        );
+        assert_eq!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[
+                PROTOCOL_V3,
+                PROTOCOL_V1,
+            ]))
+            .unwrap(),
+            PROTOCOL_V1
+        );
+        assert!(
+            selected_environment_plugin_protocol(&plugin_with_protocols(&[PROTOCOL_V3]))
+                .unwrap_err()
+                .to_string()
+                .contains("shares no supported protocol")
+        );
+
+        let mut plugin = plugin_with_protocols(&[PROTOCOL_V3, PROTOCOL_V2]);
+        plugin.manifest.adapter.capabilities.resolution = true;
+        plugin.manifest.adapter.capabilities.source_exports = true;
+        plugin.manifest.adapter.capabilities.certification_ceiling =
+            trail_environment_adapter_sdk::AdapterCertificationCeiling::LocalArtifact;
+        let report = environment_plugin_protocol_capabilities(&plugin.manifest.adapter);
+        assert_eq!(report.selected_protocol.as_deref(), Some(PROTOCOL_V2));
+        assert!(report.resolution_capable);
+        assert!(report.source_export_capable);
+        assert_eq!(report.certification_ceiling, "local_artifact");
+        assert_eq!(report.content_policy, "host_verified_local_cas");
+        assert_eq!(report.attestation_policy, "host_authored_required");
+    }
+
+    #[test]
+    fn protocol_v3_host_validation_repeats_bounds_canonical_and_package_checks() {
+        let (plugin, request, response) = valid_v3_exchange();
+        assert!(matches!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, response.clone()).unwrap(),
+            AdapterResultV3::Planned { .. }
+        ));
+
+        let mut noncanonical = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut noncanonical.result else {
+            unreachable!();
+        };
+        pipeline.inputs.reverse();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, noncanonical)
+                .unwrap_err()
+                .to_string()
+                .contains("noncanonical")
+        );
+
+        let mut too_small = request.clone();
+        too_small.limits.max_actions = 1;
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &too_small, response.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("pipeline.actions")
+        );
+
+        let mut underdeclared = plugin.clone();
+        underdeclared.manifest.adapter.capabilities.source_exports = false;
+        assert!(validate_environment_plugin_v3_exchange(
+            &underdeclared,
+            &request,
+            response.clone()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("without package capability"));
+
+        let mut duplicate = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut duplicate.result else {
+            unreachable!();
+        };
+        pipeline.actions.push(pipeline.actions[0].clone());
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("repeats")
+        );
+
+        let mut invalid_request = request.clone();
+        let trail_environment_adapter_sdk::AdapterOperationV3::Plan { files, .. } =
+            &mut invalid_request.operation
+        else {
+            unreachable!();
+        };
+        files[0].input.path = "src/../escape".into();
+        let mut invalid_path = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut invalid_path.result else {
+            unreachable!();
+        };
+        pipeline.inputs[1].path = "src/../escape".into();
+        pipeline.inputs.sort();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &invalid_request, invalid_path)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid relative path")
+        );
+
+        let mut invalid_phase = response.clone();
+        let AdapterResultV3::Planned { pipeline } = &mut invalid_phase.result else {
+            unreachable!();
+        };
+        pipeline.actions[0].phase =
+            trail_environment_adapter_sdk::AdapterActionPhaseV3::MountedInitialization;
+        pipeline.actions.sort_by(|left, right| {
+            left.phase
+                .cmp(&right.phase)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &request, invalid_phase)
+                .unwrap_err()
+                .to_string()
+                .contains("mounted initialization")
+        );
+
+        let mut mismatched = request;
+        mismatched.distribution_digest = "sha256:wrong".into();
+        assert!(
+            validate_environment_plugin_v3_exchange(&plugin, &mismatched, response)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol/package/request mismatch")
+        );
+    }
+
+    #[test]
+    fn protocol_v3_host_identity_is_enforced_for_every_supported_platform() {
+        for (operating_system, architecture) in [
+            ("linux", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            let (mut plugin, mut request, mut response) = valid_v3_exchange();
+            plugin.manifest.adapter.supported_operating_systems =
+                vec![operating_system.to_string()];
+            plugin.manifest.adapter.supported_architectures = vec![architecture.to_string()];
+            request.host.operating_system = operating_system.into();
+            request.host.architecture = architecture.into();
+            if let AdapterResultV3::Planned { pipeline } = &mut response.result {
+                pipeline.identity.platform = operating_system.into();
+                pipeline.identity.architecture = architecture.into();
+            } else {
+                unreachable!();
+            }
+            assert!(
+                validate_environment_plugin_v3_exchange(&plugin, &request, response.clone())
+                    .is_ok(),
+                "matching {operating_system}/{architecture} identity must pass"
+            );
+
+            let AdapterResultV3::Planned { pipeline } = &mut response.result else {
+                unreachable!();
+            };
+            pipeline.identity.architecture = "mismatched".into();
+            assert!(
+                validate_environment_plugin_v3_exchange(&plugin, &request, response)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed the pinned host identity")
+            );
+        }
+    }
 
     #[test]
     fn protocol_v2_typed_dependencies_normalize_to_host_edge_semantics() {
@@ -3056,6 +3770,70 @@ mod tests {
         assert_eq!(
             normalized.runtime_resources[0].volume_target.as_deref(),
             Some("/var/lib/postgresql/data")
+        );
+    }
+
+    #[test]
+    fn protocol_v2_bazel_nix_like_stores_remain_metadata_only_after_host_normalization() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plan = AdapterPlanV2::builder("verified-stores", "external")
+            .identity_input("stores.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "content-addressed-store",
+                "local-store",
+                "store://objects/example-package",
+                digest,
+                "linux/x86_64",
+            ))
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "remote-action-cache",
+                "remote-cas",
+                "cas://objects/example-action",
+                digest,
+                "any",
+            ))
+            .stale_reason("verified external store identities changed")
+            .build()
+            .unwrap();
+
+        let normalized = ProposedPluginPlan::from_v2(plan).unwrap();
+        assert_eq!(normalized.component_id, "verified-stores");
+        assert!(normalized.outputs.is_empty());
+        assert!(normalized.caches.is_empty());
+        assert!(normalized.runtime_resources.is_empty());
+        assert_eq!(normalized.external_artifacts.len(), 2);
+        assert!(normalized.external_artifacts.iter().all(|artifact| {
+            artifact.artifact_type == "verified_external" && artifact.cleanup_owner == "external"
+        }));
+        for artifact in &normalized.external_artifacts {
+            super::workspace_environment::validate_environment_external_artifact_report(
+                &EnvironmentExternalArtifactReport {
+                    name: artifact.name.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
+                    provider: artifact.provider.clone(),
+                    reference: artifact.reference.clone(),
+                    digest: artifact.digest.clone(),
+                    platform: artifact.platform.clone(),
+                    cleanup_owner: artifact.cleanup_owner.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let mut secret_like = normalized.external_artifacts[0].clone();
+        secret_like.reference = "store://objects/token=credential".to_string();
+        assert!(
+            super::workspace_environment::validate_environment_external_artifact_report(
+                &EnvironmentExternalArtifactReport {
+                    name: secret_like.name,
+                    artifact_type: secret_like.artifact_type,
+                    provider: secret_like.provider,
+                    reference: secret_like.reference,
+                    digest: secret_like.digest,
+                    platform: secret_like.platform,
+                    cleanup_owner: secret_like.cleanup_owner,
+                },
+            )
+            .is_err()
         );
     }
 
@@ -3158,6 +3936,26 @@ max_response_bytes = 1048576
         .unwrap();
     }
 
+    fn make_test_package_unsupported_on_current_host(root: &Path) {
+        let manifest_path = root.join(PLUGIN_PACKAGE_MANIFEST);
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        let unsupported_os = if cfg!(target_os = "windows") {
+            "linux"
+        } else {
+            "windows"
+        };
+        fs::write(
+            manifest_path,
+            manifest.replace(
+                "stability = \"experimental\"",
+                &format!(
+                    "supported_operating_systems = [\"{unsupported_os}\"]\nstability = \"experimental\""
+                ),
+            ),
+        )
+        .unwrap();
+    }
+
     fn sign_test_package(root: &Path, signing_key: &SigningKey, publisher: &str) -> PathBuf {
         let mut package: AdapterPackageManifest =
             toml::from_str(&fs::read_to_string(root.join(PLUGIN_PACKAGE_MANIFEST)).unwrap())
@@ -3209,6 +4007,10 @@ max_response_bytes = 1048576
             .unwrap();
         assert_eq!(inspected.canonical_identity, "example/test@1");
         assert!(!inspected.signature_present);
+        assert_eq!(
+            inspected.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
 
         let installed = db
             .install_environment_adapter_plugin(package.path())
@@ -3219,6 +4021,10 @@ max_response_bytes = 1048576
         assert_eq!(installed.trust, "local_unsigned");
         assert_eq!(installed.certification_tier, "local-experimental");
         assert!(installed.publisher.is_none());
+        assert_eq!(
+            installed.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
         assert!(Path::new(&installed.package_path).is_dir());
         let catalog = db.workspace_environment_adapters().unwrap();
         let entry = catalog
@@ -3229,6 +4035,10 @@ max_response_bytes = 1048576
         assert_eq!(entry.source, "plugin");
         assert_eq!(entry.trust, "local_unsigned");
         assert_eq!(entry.certification_tier, "local-experimental");
+        assert_eq!(
+            entry.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
         assert_eq!(
             entry.identity.distribution_digest.as_deref(),
             Some(installed.distribution_digest.as_str())
@@ -3248,12 +4058,62 @@ max_response_bytes = 1048576
             removed.removed_distribution_digest.as_deref(),
             Some(installed.distribution_digest.as_str())
         );
+        assert_eq!(
+            removed.protocol_capabilities.selected_protocol.as_deref(),
+            Some(PROTOCOL_V1)
+        );
         assert!(db
             .workspace_environment_adapters()
             .unwrap()
             .adapters
             .iter()
             .all(|entry| entry.canonical_identity != "example/test@1"));
+    }
+
+    #[test]
+    fn unsupported_plugin_marker_returns_proposal_without_invoking_plugin() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("test.plugin"), "recognized marker\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let package = tempfile::tempdir().unwrap();
+        write_test_package(package.path(), "example/unsupported@1");
+        make_test_package_unsupported_on_current_host(package.path());
+        db.install_environment_adapter_plugin(package.path())
+            .unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "unsupported-plugin",
+            Some("main"),
+            if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            },
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        // The fixture executable is not a protocol peer. Discovery can only
+        // succeed if the host reports the pinned marker without launching it.
+        let discovery = db
+            .discover_workspace_environment("unsupported-plugin", None)
+            .unwrap();
+        assert_eq!(discovery.components.len(), 1);
+        let proposal = &discovery.components[0];
+        assert_eq!(proposal.component_id, "plugin:test-plugin");
+        assert_eq!(proposal.adapter_identity, "example/unsupported@1");
+        assert_eq!(
+            proposal.status,
+            EnvironmentComponentProposalStatus::Unsupported
+        );
+        assert_eq!(proposal.reasons[0].code, "unsupported_host_platform");
+        assert_eq!(proposal.recovery_actions[0].code, "use_supported_host");
     }
 
     #[test]
@@ -3310,6 +4170,40 @@ max_response_bytes = 1048576
         let trust = db.environment_adapter_publisher_trust().unwrap();
         assert_eq!(trust.keys.len(), 1);
         assert_eq!(trust.keys[0].key_id, trusted.key_id);
+        let artifact = tempfile::tempdir().unwrap();
+        fs::write(artifact.path().join("plugin-output"), "signed output\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(
+                &WorkspaceLayerKeyV1 {
+                    kind: "generated".into(),
+                    adapter: "example/signed@1".into(),
+                    adapter_version: 1,
+                    inputs: BTreeMap::from([("source_root".into(), "fixture-source".into())]),
+                    tool_versions: BTreeMap::from([(
+                        "adapter".into(),
+                        installed.executable_digest.clone(),
+                    )]),
+                    platform: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    portability_scope: "host".into(),
+                    strategy: "signed-plugin-test".into(),
+                },
+                artifact.path(),
+            )
+            .unwrap();
+        let (envelope_id, tree_id) = db
+            .conn
+            .query_row(
+                "SELECT envelope_id,tree_root_id FROM workspace_layer_artifact_shadows
+                 WHERE layer_id=?1",
+                params![layer.layer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let envelope_id = ArtifactEnvelopeId::parse(envelope_id).unwrap();
+        let tree_id = ArtifactTreeId::parse(tree_id).unwrap();
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
         db.remove_environment_adapter_publisher_key(&trusted.key_id)
             .unwrap();
         assert!(db
@@ -3317,6 +4211,11 @@ max_response_bytes = 1048576
             .unwrap_err()
             .to_string()
             .contains("no longer has a valid trusted publisher"));
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err()
+            .to_string()
+            .contains("publisher trust cannot be verified"));
         assert!(db
             .environment_adapter_publisher_trust()
             .unwrap()
@@ -3326,6 +4225,8 @@ max_response_bytes = 1048576
         db.trust_environment_adapter_publisher_key(&key_document)
             .unwrap();
         assert!(db.workspace_environment_adapters().is_ok());
+        db.verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap();
         let signature_path = package.path().join(PLUGIN_PACKAGE_SIGNATURE);
         let mut signature: AdapterPackageSignature =
             toml::from_str(&fs::read_to_string(&signature_path).unwrap()).unwrap();
@@ -3342,6 +4243,11 @@ max_response_bytes = 1048576
             .remove_environment_adapter_plugin("example/signed@1")
             .unwrap();
         assert!(removed.removed_distribution_digest.is_some());
+        assert!(db
+            .verify_ready_artifact_envelope_under_write_lock(&envelope_id, &tree_id)
+            .unwrap_err()
+            .to_string()
+            .contains("producer package is removed or revoked"));
     }
 
     #[test]

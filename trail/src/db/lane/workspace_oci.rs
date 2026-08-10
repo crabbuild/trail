@@ -313,6 +313,7 @@ impl WorkspaceEnvironmentAdapter for OciImageAdapter {
                 strategy: "pinned-oci-images-v1".to_string(),
             },
             inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,
@@ -401,6 +402,21 @@ mod tests {
         assert_eq!(plan.external_artifacts.len(), 1);
         assert_eq!(plan.external_artifacts[0].digest, DIGEST);
         assert_eq!(plan.external_artifacts[0].platform, "linux/amd64");
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &plan,
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&plan)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!identity.source_closure_complete);
+        assert!(!identity.portability_certified);
+        assert!(identity
+            .semantic_identities
+            .contains_key("external_artifacts"));
+        assert!(!identity
+            .semantic_identities
+            .contains_key("runtime_resources"));
+        assert_eq!(identity.trust_scope, "builtin");
 
         let after = fs::read_dir(&cache_root)
             .ok()
@@ -529,6 +545,23 @@ mod tests {
             Some("POSTGRES_PASSWORD_FILE")
         );
         assert!(plan.outputs.is_empty());
+        let raw_plan = OCI_IMAGE_ADAPTER
+            .plan(&db, &db.resolve_branch_ref("main").unwrap().root_id, "")
+            .unwrap();
+        let identity = super::workspace_environment::workspace_environment_identity_contract_v3(
+            &raw_plan,
+            super::workspace_environment::workspace_environment_artifact_contract_digest(&raw_plan)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(identity
+            .semantic_identities
+            .contains_key("external_artifacts"));
+        assert!(identity
+            .semantic_identities
+            .contains_key("runtime_resources"));
+        assert!(raw_plan.outputs.is_empty());
+        assert!(raw_plan.caches.is_empty());
 
         let first = db
             .sync_workspace_environment_component(

@@ -1193,6 +1193,25 @@ impl Trail {
             .physical_bytes
             .saturating_add(generated.physical_bytes)
             .saturating_add(scratch.physical_bytes);
+        let reclaimable_cache_bytes = self.workspace_reclaimable_cache_bytes()?;
+        let unknown_layer_bytes = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(w.physical_bytes,0)),0)
+             FROM workspace_view_layers l
+             JOIN workspace_layers w ON w.layer_id=l.layer_id
+             LEFT JOIN workspace_layer_artifact_shadows s ON s.layer_id=w.layer_id
+             WHERE l.view_id=?1 AND s.layer_id IS NULL",
+            params![&view.view_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let unknown_layer_bytes = u64::try_from(unknown_layer_bytes)
+            .map_err(|_| Error::Corrupt("workspace layer has negative physical bytes".into()))?;
+        let artifact_storage = self.artifact_storage_accounting(
+            Some(&view.view_id),
+            lane_exclusive_physical_bytes,
+            0,
+            self.workspace_view_reclaimable_artifact_bytes(&view.view_id)?,
+            unknown_layer_bytes,
+        )?;
         Ok(WorkspaceSpaceReport {
             view_id: view.view_id,
             logical_visible_bytes: root
@@ -1203,7 +1222,7 @@ impl Trail {
             shared_physical_bytes: blobs.physical_bytes.saturating_add(layers.physical_bytes),
             lane_exclusive_physical_bytes,
             shared_extent_bytes: None,
-            reclaimable_cache_bytes: self.workspace_reclaimable_cache_bytes()?,
+            reclaimable_cache_bytes,
             uncheckpointed_source_bytes: source.logical_bytes,
             generated_upper_bytes: generated.logical_bytes,
             scratch_upper_bytes: scratch.logical_bytes,
@@ -1224,6 +1243,7 @@ impl Trail {
             physical_sharing: PhysicalSharing::Unknown,
             physical_sharing_evidence:
                 "layered_workspace_uses_separate_shared_and_exclusive_accounting".to_string(),
+            artifact_storage,
         })
     }
 
@@ -1233,6 +1253,7 @@ impl Trail {
         let usage = materialized_workdir_usage(&context.workdir)?;
         let changed_since_baseline_bytes =
             self.native_cow_changed_since_baseline_bytes(&branch, &context.workdir)?;
+        let reclaimable_cache_bytes = self.workspace_reclaimable_cache_bytes()?;
         Ok(WorkspaceSpaceReport {
             view_id: context.initialization_id,
             logical_visible_bytes: usage.logical_bytes,
@@ -1242,7 +1263,7 @@ impl Trail {
             // from both ownership projections.
             lane_exclusive_physical_bytes: 0,
             shared_extent_bytes: None,
-            reclaimable_cache_bytes: self.workspace_reclaimable_cache_bytes()?,
+            reclaimable_cache_bytes,
             uncheckpointed_source_bytes: changed_since_baseline_bytes,
             generated_upper_bytes: 0,
             scratch_upper_bytes: 0,
@@ -1259,6 +1280,15 @@ impl Trail {
             physical_sharing: PhysicalSharing::Unknown,
             physical_sharing_evidence: "allocated_blocks_do_not_prove_apfs_extent_sharing"
                 .to_string(),
+            artifact_storage: ArtifactStorageAccountingReport {
+                lane_private_bytes: 0,
+                reclaimable_bytes: 0,
+                unknown_bytes: usage.physical_bytes,
+                accounting:
+                    "scope=lane;native-clone-extents=unattributed;artifact-bindings=unavailable;workspace-reclaimable-excluded"
+                        .into(),
+                ..ArtifactStorageAccountingReport::default()
+            },
         })
     }
 
@@ -2079,6 +2109,14 @@ mod tests {
         );
         assert_eq!(space.changed_since_baseline_bytes, None);
         assert_eq!(space.physical_sharing, PhysicalSharing::Unknown);
+        assert_eq!(
+            space.artifact_storage.lane_private_bytes,
+            space.lane_exclusive_physical_bytes
+        );
+        assert_eq!(space.artifact_storage.logical_bytes, 0);
+        assert_eq!(space.artifact_storage.materialized_bytes, 0);
+        assert_eq!(space.artifact_storage.reclaimable_bytes, 0);
+        assert_eq!(space.artifact_storage.prefetched_bytes, 0);
 
         drop(db);
         let reopened = Trail::open(temp.path()).unwrap();

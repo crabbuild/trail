@@ -1,8 +1,69 @@
 use super::*;
+use crate::ids::ArtifactTreeId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ViewConformanceResult {
     pub(crate) changed_paths: BTreeSet<String>,
+}
+
+pub(crate) fn lazy_artifact_conformance_binding(
+    db: &Trail,
+    fixture_root: &Path,
+) -> Result<(WorkspaceLayerBinding, ArtifactTreeId, PathBuf)> {
+    let source = fixture_root.join("lazy-artifact-input");
+    fs::create_dir_all(source.join("payload/pkg"))?;
+    fs::write(source.join("payload/pkg/index.js"), b"shared artifact\n")?;
+    fs::write(source.join("payload/pkg/tool.js"), b"tool artifact\n")?;
+    let tree_id = {
+        let _lock = db.acquire_write_lock()?;
+        db.ingest_artifact_tree_under_write_lock(&source)?.0
+    };
+    let missing_cache = fixture_root.join("never-materialized-artifact-layer");
+    Ok((
+        WorkspaceLayerBinding {
+            binding_identity: "lazy-artifact-conformance".into(),
+            layer_id: Some("lazy-artifact-conformance".into()),
+            mount_path: "node_modules".into(),
+            storage_path: Some(missing_cache.clone()),
+            artifact_tree_id: Some(tree_id.clone()),
+            artifact_subpath: "payload".into(),
+            kind: "dependency".into(),
+            priority: 100,
+        },
+        tree_id,
+        missing_cache,
+    ))
+}
+
+pub(crate) fn run_mounted_lazy_artifact_conformance(
+    root: &Path,
+    missing_cache: &Path,
+) -> Result<()> {
+    let index = root.join("node_modules/pkg/index.js");
+    let tool = root.join("node_modules/pkg/tool.js");
+    if fs::read(&index)? != b"shared artifact\n" || fs::read(&tool)? != b"tool artifact\n" {
+        return Err(Error::InvalidInput(
+            "mounted lazy artifact baseline is invalid".into(),
+        ));
+    }
+    if missing_cache.exists() {
+        return Err(Error::InvalidInput(
+            "lazy artifact backend unexpectedly materialized the complete layer".into(),
+        ));
+    }
+    let file = OpenOptions::new().write(true).open(&index)?;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(b"private")?;
+    file.sync_all()?;
+    fs::remove_file(&tool)?;
+    if fs::read(&index)? != b"privateartifact\n" || tool.exists() || missing_cache.exists() {
+        return Err(Error::InvalidInput(
+            "mounted lazy artifact copy-up or whiteout behavior failed".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// One protocol-independent operation trace used by mounted FUSE, NFS, and

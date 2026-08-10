@@ -153,6 +153,12 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.env_runtime_status"
         | "trail.env_explain"
         | "trail.env_plan"
+        | "trail.artifact_space"
+        | "trail.artifact_inspect"
+        | "trail.artifact_reachability"
+        | "trail.artifact_verify"
+        | "trail.artifact_quarantine_list"
+        | "trail.artifact_quarantine_show"
         | "trail.cache_list"
         | "trail.cache_inspect"
         | "trail.cache_verify"
@@ -231,6 +237,9 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.read_file"
         | "trail.lane_hydrate"
         | "trail.sync_workdir" => Some(ToolRiskClass::DestructiveWrite),
+        "trail.artifact_quarantine_resolve" | "trail.env_source_export" => {
+            Some(ToolRiskClass::DestructiveWrite)
+        }
         "trail.cache_gc" => Some(ToolRiskClass::DestructiveWrite),
         "trail.agent_test"
         | "trail.agent_eval"
@@ -240,6 +249,8 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.deps_sync"
         | "trail.env_sync"
         | "trail.env_sync_all"
+        | "trail.env_resolve"
+        | "trail.env_resolve_all"
         | "trail.env_promote"
         | "trail.env_runtime_reconcile" => Some(ToolRiskClass::OpenWorldWrite),
         "trail.env_runtime_stop" => Some(ToolRiskClass::OpenWorldDestructiveWrite),

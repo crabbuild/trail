@@ -77,6 +77,41 @@ trail agent start codex --workdir-mode nfs-cow
 See [Spawn and materialize workdirs](../lanes/spawn-and-materialize-workdirs.md)
 for platform requirements and mount behavior.
 
+## Environment Sync Says Resolution Is Missing
+
+Inspect side-effect-free discovery and use its exact recovery command:
+
+```sh
+trail env discover <LANE>
+trail --format json env status <LANE>
+trail env resolve all <LANE>
+trail env sync all <LANE>
+```
+
+Managed execution never resolves implicitly. A missing lockfile may produce a
+Trail-managed immutable snapshot rather than a source edit. `--refresh` is an
+explicit request to rerun resolution; omit it to reuse the current pinned
+snapshot. Repository/plugin resolution fails closed when the host cannot enforce
+its declared sandbox or authority profile.
+
+## An Artifact Is Quarantined or Fails Verification
+
+Do not remove CAS files or edit `.trail/index` manually. Preserve and inspect
+the evidence:
+
+```sh
+trail env artifact inspect <ARTIFACT_ID>
+trail env artifact verify <ARTIFACT_ID> --level full
+trail env artifact quarantine list
+trail env artifact quarantine show <QUARANTINE_ID>
+```
+
+Quarantine means two producers claimed different content for the same desired
+key/trust scope, or retained evidence is otherwise unresolved. Use
+`trail env artifact quarantine resolve` only after choosing the explicit policy
+shown by `--help`. If the envelope is valid but a projection is missing, rerun
+`trail env sync all <LANE>` to rebuild the materialization.
+
 ## Changes Are Missing
 
 First verify which task workdir the agent used:

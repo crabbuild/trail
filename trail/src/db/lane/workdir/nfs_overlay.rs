@@ -1002,6 +1002,58 @@ mod macos {
         }
 
         #[test]
+        fn nfs_mount_reads_artifact_manifest_without_layer_materialization() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "nfs-lazy-artifact",
+                Some("main"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let (binding, tree_id, missing_cache) =
+                lazy_artifact_conformance_binding(&db, temp.path()).unwrap();
+            let branch = db.lane_branch("nfs-lazy-artifact").unwrap();
+            let source_root = db.get_ref(&branch.ref_name).unwrap().root_id;
+            let source_upper = PathBuf::from(
+                db.lane_workspace_view("nfs-lazy-artifact")
+                    .unwrap()
+                    .unwrap()
+                    .source_upper,
+            );
+            let mount = db
+                .mount_nfs_cow_workdir_for_lane_with_ephemeral_bindings(
+                    "nfs-lazy-artifact",
+                    source_upper,
+                    source_root,
+                    vec![binding],
+                )
+                .unwrap();
+            let workdir = PathBuf::from(
+                db.lane_workdir("nfs-lazy-artifact")
+                    .unwrap()
+                    .workdir
+                    .unwrap(),
+            );
+            run_mounted_lazy_artifact_conformance(&workdir, &missing_cache).unwrap();
+            assert!(db
+                .artifact_tree_lazy_entry(&tree_id, "payload/pkg/tool.js")
+                .unwrap()
+                .is_some());
+            drop(mount);
+        }
+
+        #[test]
         fn foreground_nfs_mount_stops_through_a_separate_trail_handle() {
             if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
                 return;
@@ -1212,6 +1264,7 @@ mod macos {
             let temp = tempfile::tempdir().unwrap();
             fs::create_dir_all(temp.path().join("src")).unwrap();
             fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            fs::write(temp.path().join("delete-after-mount.txt"), "delete me\n").unwrap();
             fs::write(temp.path().join("src/old.txt"), "old\n").unwrap();
             Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
             let mut db = Trail::open(temp.path()).unwrap();
@@ -1239,6 +1292,7 @@ mod macos {
                 .collect::<BTreeSet<_>>();
             assert!(root_names.contains(OsStr::new("docs")));
             fs::rename(workdir.join("src/old.txt"), workdir.join("src/renamed.txt")).unwrap();
+            fs::remove_file(workdir.join("delete-after-mount.txt")).unwrap();
             assert!(db.mount_nfs_cow_workdir_for_lane("nfs-test").is_err());
             let report = db
                 .record_lane_workdir("nfs-test", Some("NFS checkpoint".to_string()))
@@ -1250,7 +1304,12 @@ mod macos {
                 .collect::<BTreeSet<_>>();
             assert_eq!(
                 paths,
-                BTreeSet::from(["README.md", "docs/new.txt", "src/renamed.txt"])
+                BTreeSet::from([
+                    "README.md",
+                    "delete-after-mount.txt",
+                    "docs/new.txt",
+                    "src/renamed.txt",
+                ])
             );
             drop(mount);
             assert!(!is_nfs_mount(&workdir));
@@ -1259,6 +1318,7 @@ mod macos {
             let remount = db.mount_nfs_cow_workdir_for_lane("nfs-test").unwrap();
             assert_eq!(fs::read(workdir.join("README.md")).unwrap(), b"changed\n");
             assert_eq!(fs::read(workdir.join("docs/new.txt")).unwrap(), b"new\n");
+            assert!(!workdir.join("delete-after-mount.txt").exists());
             drop(remount);
             assert!(!is_nfs_mount(&workdir));
         }
@@ -2030,6 +2090,16 @@ mod macos {
                 lock.status.success(),
                 "cargo generate-lockfile failed: {}",
                 String::from_utf8_lossy(&lock.stderr)
+            );
+            let nested_lock = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(temp.path().join("shared-dep"))
+                .output()
+                .unwrap();
+            assert!(
+                nested_lock.status.success(),
+                "nested cargo generate-lockfile failed: {}",
+                String::from_utf8_lossy(&nested_lock.stderr)
             );
 
             Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();

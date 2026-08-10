@@ -4,10 +4,41 @@ Environment layer manifests and their sorted page objects are authoritative
 content-addressed objects rooted by `workspace_layers`. Object GC preserves the
 root and every page. `workspace_layer_publications` records private-output
 promotion phases and producer evidence; doctor, fsck, backup, restore, and
-schema validation treat those rows as authoritative schema-v1 state. Because
-backup archives exclude workspace cache bytes and mounted views, restore keeps
-publication history but closes attachable attempts as `recovered` and clears
-their layer/generation links.
+schema validation treat those rows as authoritative schema-v1 state. Backup
+archives exclude mountpoints, generated/scratch uppers, and workspace cache
+bytes while retaining source uppers and their authenticated recovery journals.
+Restore keeps publication history, closes attachable attempts as `recovered`,
+and clears only machine-local layer/runtime links.
+
+Artifact CAS rows are verified against the raw `objects` bytes rather than the
+process-local object cache. `fsck` checks object metadata/content identity,
+directory/file/chunk edges, complete tree roots, resolution snapshots, ready
+envelopes, construction-attempt coherence, and layer materialization ownership.
+It distinguishes a legacy layer whose directory is authoritative from a
+CAS-backed layer whose directory can be reconstructed, and reports different
+repair guidance for each.
+
+Workspace-open recovery terminalizes only construction attempts whose exact
+PID/start identity is proven dead or mismatched. It removes only the lock and
+staging directory derived from that owner fence. Missing CAS-backed layer
+materializations are reconstructed through a private staging directory;
+completed restore staging is removed idempotently. Unknown layer directories or
+restore staging are never deleted implicitly and remain visible to doctor and
+fsck as bounded orphan diagnostics.
+
+Private backup-verification stages validate durable CAS without requiring the
+intentionally omitted materialization cache. Resolution snapshots, artifact
+objects, envelopes, attestations, historical generations, and exact generation
+bindings remain in the portable SQLite snapshot. Host-local materialization
+rows, performance-cache namespaces, active runtime resources, and generation
+activation pointers do not. Restore first recovers retained source uppers from
+private staged paths, then rebases them to the destination `.trail` directory
+immediately before atomic publication. Reports distinguish retained private
+bytes from omitted rebuildable materializations and caches. Verification checks
+a deterministic retained-private tree digest before opening the staged
+database. Legacy cache absence remains rebuildable through environment
+synchronization rather than making an otherwise valid database-only backup
+unverifiable.
 
 This design section is advanced/internal. It describes the current storage architecture and index maintenance paths.
 
@@ -213,8 +244,65 @@ Garbage collection works from reachability:
 - Operations reference roots, parents, messages, conflict sets, and event payload objects.
 - Roots reference file entries and text/blob content.
 - Lane events and coordination records can reference object IDs.
+- Artifact generation bindings and workspace-layer shadows root their exact
+  envelope and tree identities. Construction/resolution attempts, resolution
+  snapshots, attestations, quarantines, active holds, and in-progress layer
+  publications root their durable object evidence.
+- Artifact envelopes traverse to tree roots, resolution snapshots, and
+  typed deterministic validation receipts. Tree roots traverse directory nodes;
+  directory nodes
+  traverse directories/files; file nodes traverse blobs or chunk lists; and
+  chunk lists traverse chunks. Shared nodes remain live while any rooted graph
+  reaches them.
+- Ready compatibility workspace-layer envelopes require exact structural and policy
+  host-seal receipts. Their deterministic input digests bind the declaration, desired
+  identity, tree root, validator identity, outcome, and bounded evidence; object or
+  reference tampering therefore fails attachment and fsck instead of weakening the
+  publication boundary.
+- A recorded real-directory artifact materialization acts as a conservative
+  local cache lease. Cache eviction removes that row independently; a later
+  object GC may collect the CAS graph if no durable authority remains.
+- Portable backups do not add roots to the source database: backup creation is
+  serialized by the workspace write lock, and the completed archive contains
+  its own authoritative object graph.
 
-`gc --dry-run` reports without pruning. Normal GC deletes unreachable known objects while preserving reachable roots and references.
+An unbound artifact envelope row is an index, not an independent retention
+root. GC may therefore collect a ready envelope left between publication and
+generation activation when no generation, attempt, attestation, quarantine,
+shadow, or hold retains it.
+
+`gc --dry-run` reports without pruning. Normal GC validates artifact identities
+and edges before deleting anything, orders unreachable artifact DAGs
+parent-before-child with object-ID tie breaking, and commits batches of at most
+256 objects. Each committed batch leaves the remaining artifact graph valid:
+interruption preserves earlier batches and rolls back the current batch, while
+a later invocation recomputes reachability and resumes. Missing roots,
+invalid edges, corrupt identities, unsupported active hold targets, or foreign
+key disagreement fail closed rather than risking reachable content.
+
+Artifact storage reports use distinct accounting axes rather than one total:
+
+- `logical_bytes` sums file sizes once per distinct artifact tree in scope.
+- `unique_authoritative_bytes` and `cross_artifact_shared_bytes` partition the
+  encoded content-addressed object bytes in scope. An object is counted once;
+  it is shared when more than one artifact envelope references it.
+- `materialized_bytes`, `lane_private_bytes`, `demand_loaded_bytes`, and
+  `unknown_bytes` classify measured filesystem allocation. CAS-backed artifact
+  directories and layers are materialized; source/generated/scratch uppers are
+  lane-private; Git-root blob projections are demand-loaded; legacy layers,
+  tool namespaces, and unattributable native-clone extents remain unknown.
+- `prefetched_bytes` counts persisted storage created only for prefetch. The
+  current hot-set implementation warms the operating-system page cache, so it
+  reports zero and excludes that volatile cache explicitly.
+- `reclaimable_bytes` is an independent policy/disposition axis and can overlap
+  materialized or cache classifications. A lane-scoped report includes only
+  its rebuildable artifact materializations; the legacy top-level workspace
+  reclaimable field remains workspace-wide.
+
+Callers must not add logical, authoritative, physical, and reclaimable axes
+together. Workspace-cache GC captures these values before deletion and sets
+its reclaimable field from the exact ordered candidates selected by retention,
+quota, and free-space policy.
 
 ## Backup and Restore
 

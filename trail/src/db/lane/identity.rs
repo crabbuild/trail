@@ -25,6 +25,23 @@ impl Trail {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        let views = {
+            let mut stmt = self.conn.prepare(
+                "SELECT v.view_id,v.lane_id,a.name,v.checkpoint_seq,v.generation
+                 FROM workspace_views v JOIN lanes a ON a.lane_id=v.lane_id
+                 ORDER BY v.view_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
 
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let rewrite = (|| -> Result<u64> {
@@ -38,17 +55,14 @@ impl Trail {
                 rewritten += 1;
             }
 
-            // Backups do not contain `.trail/views`. Invalidate every view and
-            // its derived environment state before normal open recovery can
-            // inspect source-workspace absolute paths from the copied SQLite
-            // store. Backups also exclude performance cache bytes, so retain
-            // publication attempts as non-attachable recovery provenance and
-            // discard layer/cache authorities. A lane can create a fresh view
-            // and generation in the restored workspace.
+            // Cache and runtime projections are host-local. Preserve durable
+            // artifact objects, snapshots, envelopes, attestations, historical
+            // generations, and exact generation bindings, but retire active
+            // pointers and remove every omitted projection before recovery.
             self.conn.execute_batch(
                 "UPDATE workspace_layer_publications
                    SET phase='recovered', successor_generation_id=NULL,
-                       manifest_object_id=NULL, layer_id=NULL,
+                       layer_id=NULL,
                        error_code='backup_restore_cache_invalidated',
                        error_message='backup restore excluded workspace cache bytes',
                        updated_at=unixepoch(), finished_at=unixepoch()
@@ -66,14 +80,12 @@ impl Trail {
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
                  DELETE FROM environment_generation_caches
                    WHERE generation_id IN (SELECT generation_id FROM environment_generations);
-                 DELETE FROM environment_generation_edges
-                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
-                 DELETE FROM environment_generation_outputs
-                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
-                 DELETE FROM environment_generation_components
-                   WHERE generation_id IN (SELECT generation_id FROM environment_generations);
+                 UPDATE environment_generation_outputs SET layer_id=NULL;
+                 UPDATE environment_generation_components SET layer_id=NULL;
                  DELETE FROM environment_view_generations;
-                 DELETE FROM environment_generations;
+                 UPDATE environment_generations
+                    SET state='retired', retired_at=COALESCE(retired_at,unixepoch())
+                    WHERE state='active';
                  DELETE FROM environment_sync_attempts;
                  DELETE FROM environment_component_runtime_secrets;
                  DELETE FROM environment_component_runtime_resources;
@@ -85,10 +97,62 @@ impl Trail {
                  DELETE FROM environment_component_states;
                  DELETE FROM workspace_environment_states;
                  DELETE FROM workspace_view_layers;
+                 DELETE FROM workspace_layer_artifact_shadows;
+                 DELETE FROM artifact_materializations;
+                 DELETE FROM environment_cache_namespaces;
                  DELETE FROM workspace_layers;
-                 DELETE FROM workspace_git_shadows;
-                 DELETE FROM workspace_views;",
+                 DELETE FROM workspace_git_shadows;",
             )?;
+
+            for (view_id, lane_id, lane_name, checkpoint_seq, generation) in views {
+                let mut components = Path::new(&view_id).components();
+                let confined = matches!(components.next(), Some(Component::Normal(_)))
+                    && components.next().is_none();
+                let staged_view = self.db_dir.join("views").join(&view_id);
+                let staged_source = staged_view.join("source-upper");
+                let staged_meta = staged_view.join("meta");
+                if !confined || !staged_source.is_dir() || !staged_meta.is_dir() {
+                    self.conn.execute(
+                        "DELETE FROM workspace_views WHERE view_id=?1",
+                        params![view_id],
+                    )?;
+                    continue;
+                }
+
+                let staged_generated = staged_view.join("generated-upper");
+                let staged_scratch = staged_view.join("scratch-upper");
+                fs::create_dir_all(&staged_generated)?;
+                fs::create_dir_all(&staged_scratch)?;
+                scrub_restored_view_metadata(&staged_meta)?;
+                let mut barrier = ViewMutationBarrier::exclusive(&staged_meta)?;
+                barrier.record_checkpoint_cut(checkpoint_seq, generation)?;
+
+                let staged_database_view = self.db_dir.join("views").join(&view_id);
+                let mountpoint = self.default_lane_workdir_path(&lane_name)?;
+                self.conn.execute(
+                    "UPDATE workspace_views
+                     SET mountpoint=?1,source_upper=?2,generated_upper=?3,scratch_upper=?4,
+                         meta_dir=?5,journal_path=?6,status='recovered',owner_pid=NULL,
+                         owner_start_token=NULL,heartbeat_at=NULL,updated_at=?7
+                     WHERE view_id=?8 AND lane_id=?9",
+                    params![
+                        mountpoint.to_string_lossy(),
+                        staged_database_view.join("source-upper").to_string_lossy(),
+                        staged_database_view
+                            .join("generated-upper")
+                            .to_string_lossy(),
+                        staged_database_view.join("scratch-upper").to_string_lossy(),
+                        staged_database_view.join("meta").to_string_lossy(),
+                        staged_database_view
+                            .join("meta")
+                            .join("mutation-journal.jsonl")
+                            .to_string_lossy(),
+                        now_ts(),
+                        view_id,
+                        lane_id,
+                    ],
+                )?;
+            }
             Ok(rewritten)
         })();
         match rewrite {
@@ -102,6 +166,50 @@ impl Trail {
             Err(err) => {
                 let _ = self.conn.execute_batch("ROLLBACK;");
                 Err(err)
+            }
+        }
+    }
+
+    pub(crate) fn finalize_restored_workspace_view_paths(&mut self) -> Result<()> {
+        let view_ids = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT view_id FROM workspace_views ORDER BY view_id")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let final_db_dir = self.workspace_root.join(".trail");
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let update = (|| -> Result<()> {
+            for view_id in view_ids {
+                let final_view = final_db_dir.join("views").join(&view_id);
+                self.conn.execute(
+                    "UPDATE workspace_views
+                     SET source_upper=?1,generated_upper=?2,scratch_upper=?3,
+                         meta_dir=?4,journal_path=?5,updated_at=?6
+                     WHERE view_id=?7",
+                    params![
+                        final_view.join("source-upper").to_string_lossy(),
+                        final_view.join("generated-upper").to_string_lossy(),
+                        final_view.join("scratch-upper").to_string_lossy(),
+                        final_view.join("meta").to_string_lossy(),
+                        final_view
+                            .join("meta")
+                            .join("mutation-journal.jsonl")
+                            .to_string_lossy(),
+                        now_ts(),
+                        view_id,
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match update {
+            Ok(()) => self.conn.execute_batch("COMMIT;").map_err(Error::from),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
             }
         }
     }
@@ -243,4 +351,27 @@ impl Trail {
             gates,
         })
     }
+}
+
+fn scrub_restored_view_metadata(meta_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(meta_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("checkpoint-barrier.")
+            || matches!(
+                name.as_ref(),
+                "mount.json" | "unmount-request.json" | "view.json"
+            )
+        {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
 }

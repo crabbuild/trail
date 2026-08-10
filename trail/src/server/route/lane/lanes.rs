@@ -2,16 +2,21 @@ use std::path::PathBuf;
 
 use crate::model::{LaneGateOptions, LaneInitializationPhase};
 use crate::server::request_types::{
-    DependencySyncRequest, EnvironmentPromoteRequest, EnvironmentSyncRequest, LaneClaimRequest,
-    LaneReadFileRequest, LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest,
-    SpawnLaneRequest, SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
+    ArtifactQuarantineResolveRequest, ArtifactSourceExportRequest, ArtifactVerifyRequest,
+    DependencySyncRequest, EnvironmentPromoteRequest, EnvironmentResolveAllRequest,
+    EnvironmentResolveRequest, EnvironmentSyncRequest, LaneClaimRequest, LaneReadFileRequest,
+    LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest,
+    SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
     reject_unexpected_body,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
-use crate::{Error, Result, Trail};
+use crate::{
+    ArtifactEnvelopeId, ArtifactQuarantineId, ArtifactSourceExportAuthorizationV1, Error, Result,
+    Trail,
+};
 
 pub(super) fn handle_lane_resources(
     db: &mut Trail,
@@ -23,6 +28,98 @@ pub(super) fn handle_lane_resources(
     if request.method == "GET" && path == "/v1/environment/adapters" {
         let report = db.workspace_environment_adapters()?;
         return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "GET" && path == "/v1/artifacts/space" {
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.workspace_artifact_space()?,
+        )?));
+    }
+
+    if request.method == "GET" && path == "/v1/artifact-quarantines" {
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.artifact_quarantine_list_report()?,
+        )?));
+    }
+
+    if parts.len() == 3 && parts[0] == "v1" && parts[1] == "artifacts" {
+        let artifact = ArtifactEnvelopeId::parse(parts[2]).map_err(|error| {
+            Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+        })?;
+        if request.method == "GET" {
+            return Ok(Some(json_response(
+                200,
+                "OK",
+                &db.inspect_artifact(&artifact)?,
+            )?));
+        }
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "artifacts"
+        && parts[3] == "reachability"
+        && request.method == "GET"
+    {
+        let artifact = ArtifactEnvelopeId::parse(parts[2]).map_err(|error| {
+            Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+        })?;
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.artifact_content_reachability(&artifact)?,
+        )?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "artifacts"
+        && parts[3] == "verify"
+        && request.method == "POST"
+    {
+        let artifact = ArtifactEnvelopeId::parse(parts[2]).map_err(|error| {
+            Error::InvalidInput(format!("invalid artifact envelope ID: {error}"))
+        })?;
+        let body: ArtifactVerifyRequest = serde_json::from_slice(&request.body)?;
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.verify_artifact(&artifact, body.level)?,
+        )?));
+    }
+
+    if parts.len() == 3
+        && parts[0] == "v1"
+        && parts[1] == "artifact-quarantines"
+        && request.method == "GET"
+    {
+        let quarantine = ArtifactQuarantineId::parse(parts[2])
+            .map_err(|error| Error::InvalidInput(format!("invalid quarantine ID: {error}")))?;
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.artifact_quarantine(&quarantine)?,
+        )?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "artifact-quarantines"
+        && parts[3] == "resolve"
+        && request.method == "POST"
+    {
+        let quarantine = ArtifactQuarantineId::parse(parts[2])
+            .map_err(|error| Error::InvalidInput(format!("invalid quarantine ID: {error}")))?;
+        let body: ArtifactQuarantineResolveRequest = serde_json::from_slice(&request.body)?;
+        return Ok(Some(json_response(
+            200,
+            "OK",
+            &db.resolve_artifact_quarantine_report(&quarantine, body.resolution)?,
+        )?));
     }
 
     if request.method == "GET" && path == "/v1/lanes" {
@@ -231,6 +328,64 @@ pub(super) fn handle_lane_resources(
             query_usize(query, "offset", 0)? as u64,
             query_usize(query, "limit", 256)? as u64,
         )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "resolve"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: EnvironmentResolveRequest = serde_json::from_slice(&request.body)?;
+        let report = db.resolve_workspace_environment_component(
+            &lane,
+            &body.component,
+            body.path.as_deref(),
+            body.refresh,
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "resolve-all"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: EnvironmentResolveAllRequest = if request.body.is_empty() {
+            EnvironmentResolveAllRequest::default()
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.resolve_all_workspace_environment_components(
+            &lane,
+            body.path.as_deref(),
+            body.refresh,
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "environment"
+        && parts[4] == "source-export"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: ArtifactSourceExportRequest = serde_json::from_slice(&request.body)?;
+        let plan = db.plan_artifact_source_export(
+            &lane,
+            &body.component,
+            &body.export,
+            ArtifactSourceExportAuthorizationV1::ExplicitUser,
+        )?;
+        let report = db.execute_artifact_source_export(plan)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

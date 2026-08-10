@@ -127,6 +127,19 @@ Each phase emits a `managed_execution_phase` lane event. Command failure does
 not skip source checkpointing or cleanup. Dependency, generated, scratch,
 secret, and Trail-internal paths stay outside the recorded source change.
 
+The structured lifecycle report also retains two exact receipts. `preparation`
+pins the source root, layered view and generation, explicit missing-resolution
+policy, each component proposal/snapshot, and each active output binding. A
+component that is `resolvable`, `blocked`, `unsupported`, or `ambiguous` stops
+before synchronization and returns its exact `trail env resolve ...` recovery
+argv; managed execution never resolves implicitly. `finalization` reports the
+checkpoint, runtime disposal, and unmount outcomes plus one sealing decision per
+output. If execution changes identity-bearing source, a pending publication
+decision becomes `replan_required` instead of sealing bytes against stale pins.
+The same receipt shape is used by exec, test, eval, terminal-agent, and
+materialized ACP execution; older serialized lifecycle reports remain valid
+with both receipts absent.
+
 Omitting `--workdir-mode` creates a lazy `auto` layered lane on a qualified
 native transparent backend. Spawn does not copy source or execute ecosystem
 tools. The first managed command converges the desired environment; exact

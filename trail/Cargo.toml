@@ -23,6 +23,7 @@ bzip2.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 flate2.workspace = true
+fastcdc.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 ignore.workspace = true
@@ -36,6 +37,7 @@ reqwest.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_cbor.workspace = true
 serde_json.workspace = true
 globset.workspace = true
@@ -71,6 +73,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["errhandlingapi", "fileapi", "handleapi", "jobapi2", "minwinbase", "ntdef", "ntstatus", "processthreadsapi", "sddl", "securitybaseapi", "synchapi", "userenv", "winbase", "winerror", "winnt"] }
+
+[target.'cfg(unix)'.dependencies]
+xattr.workspace = true
 
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 dokan = "0.3.1"

@@ -101,6 +101,74 @@ Use a separate component for each ownership policy. A shared immutable SDK, a
 seeded consumer-mutable dependency tree, a persistent private build tree, and
 disposable test scratch must not be collapsed into one live mutable directory.
 
+## Next.js and Vite composition with repository v2
+
+Frameworks compose over dependency components; framework names do not receive
+special sharing authority. This tested `trail.environment/v2` shape keeps
+Next.js state private while allowing a validated Vite distribution to be
+shared. Built-in Node discovery supplies the `node` dependency component.
+
+```toml
+schema = "trail.environment/v2"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "web.next-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "next-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "next-state", source = "next-output", target = ".next", policy = "writable_private", reuse = "none", scope = "lane", publish = "manual", portability = "host" }]
+[component.build]
+command = ["cp", "next-source.js", "next-output/server.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component]]
+id = "web.vite-build"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["node"]
+inputs = [{ path = "vite-source.js", role = "identity", format = "bytes" }]
+outputs = [{ name = "dist", source = "dist", target = "dist", policy = "immutable_shared", reuse = "exact", scope = "workspace", publish = "on_sync", portability = "host" }]
+[component.build]
+command = ["cp", "vite-source.js", "dist/app.js"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.validation]]
+name = "dist-path-contract"
+kind = "path_contract"
+path = "dist"
+required = true
+parameters = { maximum_entries = "1000" }
+```
+
+Create the two declared input files, record them, then verify the graph and
+execute the exact component closure:
+
+```sh
+trail lane spawn web-a --from main
+trail env discover web-a
+trail env graph web-a
+trail env plan web-a --component web.vite-build
+trail env sync component web.vite-build --lane web-a
+trail lane exec web-a -- test -f dist/app.js
+trail lane spawn web-b --from web-a
+trail lane exec web-b -- test -f dist/app.js
+```
+
+Both lanes can attach the Vite content root. Their `.next`, `.vite`, incremental
+compiler, and daemon state remains in fresh lane-private uppers. If generated
+client code must become source, add a `[[component.source_export]]` declaration
+and invoke `trail env source export`; do not point a shared output directly into
+the repository tree.
+
 Every key includes adapter provenance, declared byte/Merkle identities (or the
 complete source root when closure is not certified), identity-bearing upstream
 keys, argv/cwd, tools, identity environment, output policy, platform,
@@ -133,8 +201,16 @@ pinned; callers can also use the Rust `pin_workspace_layer` API for an explicit
 time-bounded or indefinite evidence pin. Private uppers, source, runtime, and
 secrets are never cache candidates.
 
+Use `trail --format json lane space <lane>` and
+`trail --format json cache gc --dry-run` for artifact-aware accounting. The
+`artifact_storage` fields keep logical, authoritative CAS, physical, and
+reclaimable axes separate. Cache-GC accounting describes the pre-deletion
+snapshot and its `reclaimable_bytes` is the exact selected candidate set.
+
 Successful managed commands record only bounded immutable-layer path accesses.
 A later execution with the exact command fingerprint, component keys,
 generation, and manifest identities may prefetch that authenticated hot set.
 Prefetch is advisory and cancellable; lifecycle receipts report its entry and
-byte limits, match state, cancellation, and bytes actually read.
+byte limits, match state, cancellation, and bytes actually read. Those reads
+warm the operating-system page cache without creating a persisted prefetch
+store, so storage accounting reports `prefetched_bytes: 0`.

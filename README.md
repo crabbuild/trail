@@ -173,6 +173,43 @@ trail lane readiness fix-login
 trail lane merge fix-login --into main --dry-run
 ```
 
+### Source changes and disposable framework artifacts
+
+A layered lane keeps two kinds of state separate:
+
+- Source changes are normal repository-relative edits. `lane record`, review,
+  readiness, merge, and Git export can preserve them.
+- Framework artifacts are dependency installs, compiler targets, bundles,
+  generated caches, and other tool output. Trail discovers them through Cargo,
+  Node, Next.js, Vite, repository v2, or adapter-v3 contracts; they do not enter
+  source history unless an explicit declared source export is authorized.
+
+The reusable artifact path is content addressed. Discovery reads source markers
+without running tools. An incomplete proposal can be resolved to an immutable
+resolution snapshot. Trail combines the pinned source closure, snapshot, tool
+and action identities, platform, output policy, and validation contract into a
+desired key. Successful construction produces a content root and verified
+artifact envelope. Lanes attach that immutable lower by identity and receive
+fresh writable private uppers, so sibling lanes share unchanged bytes while
+copy-up writes and whiteouts remain isolated. Materializations are reconstructible
+CAS projections, not a second source of truth.
+
+```sh
+trail env discover fix-login
+trail env plan fix-login
+# Run only when discovery reports a resolvable component.
+trail env resolve all fix-login
+trail env sync all fix-login
+trail env generation fix-login
+```
+
+`immutable_shared` and `immutable_seed_private` outputs can be reused under
+their declared scope. `writable_private` and `disposable` output stays lane
+private and is removed with the lane unless a declared, validated promotion is
+authorized. A source export is different from promotion: it writes an exact
+artifact subtree through ordinary source guardrails, checkpoints the resulting
+source change, and makes it eligible for review and merge.
+
 ## Why This Matters for AI Agents
 
 AI coding agents produce more than final diffs. They create attempts,
