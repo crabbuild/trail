@@ -8148,11 +8148,15 @@ mod tests {
         fs::write(plan.caches[0].storage_path.join("entry"), "cached\n").unwrap();
 
         let (sender, receiver) = std::sync::mpsc::channel();
-        let workspace_path = workspace.path().to_path_buf();
+        // Open the competing handle before measuring cache-lock contention.
+        // Under parallel test load, open recovery may legitimately hold the
+        // workspace mutation lock for longer than the short cache timeout;
+        // that is a different serialization boundary from the host-exclusive
+        // namespace lease this test is intended to exercise.
+        let concurrent = Trail::open(workspace.path()).unwrap();
         let concurrent_plan = plan.clone();
         let concurrent_command = command.clone();
         let worker = thread::spawn(move || {
-            let concurrent = Trail::open(workspace_path).unwrap();
             let guard = concurrent
                 .acquire_workspace_environment_cache_uses(&concurrent_plan, &concurrent_command)
                 .unwrap();
