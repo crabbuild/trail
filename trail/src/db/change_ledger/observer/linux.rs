@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use super::{ObserverFence, ObserverLease, QualifiedObserver};
 use crate::db::change_ledger::reconcile::{ObserverEvent, ObserverQualification};
+use crate::db::change_ledger::secure_fs::SecureDirectory;
 #[cfg(debug_assertions)]
 use crate::db::change_ledger::ScopeId;
 #[cfg(debug_assertions)]
@@ -49,6 +50,7 @@ const COOKIE_EXPIRY: Duration = Duration::from_millis(75);
 // worker enough time to deliver a sentinel while unrelated observers drain.
 const FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOP_PAUSE: Duration = Duration::from_millis(2);
+const INTERNAL_FENCE_DIRECTORY: &str = ".trail/observer-fences";
 
 const WATCH_MASK: WatchMask = WatchMask::CREATE
     .union(WatchMask::DELETE)
@@ -228,6 +230,8 @@ pub(crate) struct LinuxInotifyObserver {
     root_path: PathBuf,
     root: File,
     root_identity: Vec<u8>,
+    fence_directory: SecureDirectory,
+    fence_directory_identity: (u64, u64),
     provider_identity: Vec<u8>,
     provider_id: String,
     owner_token: String,
@@ -474,6 +478,22 @@ impl LinuxInotifyObserver {
         ensure_supported_linux_filesystem(root_path)?;
         let root = open_root_no_follow(root_path)?;
         let root_identity = root_identity(&root)?;
+        let secure_root = SecureDirectory::open_absolute(root_path)?;
+        let trail_directory = match secure_root.open_dir(".trail") {
+            Ok(directory) => directory,
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                secure_root.create_private_dir(".trail")?
+            }
+            Err(error) => return Err(error),
+        };
+        let fence_directory = match trail_directory.open_private_dir("observer-fences") {
+            Ok(directory) => directory,
+            Err(Error::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                trail_directory.create_private_dir("observer-fences")?
+            }
+            Err(error) => return Err(error),
+        };
+        let fence_directory_identity = fence_directory.identity()?;
         let lease_policy_dependencies = policy_dependencies.to_vec();
         let binding = durability.binding();
         if binding.owner_token.is_empty()
@@ -489,6 +509,8 @@ impl LinuxInotifyObserver {
         let mut inotify = Inotify::init()?;
         let mut watches = HashMap::new();
         add_tree(&mut inotify, root_path, Path::new(""), &mut watches, false)?;
+        add_internal_fence_watch(&mut inotify, root_path, &mut watches)?;
+        fence_directory.verify_identity(fence_directory_identity)?;
         let (policy_watches, policy_directories) =
             build_policy_coverage(&mut inotify, root_path, policy_dependencies, &mut watches)?;
         let observer_policy_directories = policy_directories
@@ -544,6 +566,8 @@ impl LinuxInotifyObserver {
             root_path: root_path.to_path_buf(),
             root,
             root_identity,
+            fence_directory,
+            fence_directory_identity,
             provider_identity,
             provider_id,
             owner_token,
@@ -630,31 +654,42 @@ impl LinuxInotifyObserver {
         getrandom::getrandom(&mut nonce).map_err(|error| {
             Error::InvalidInput(format!("observer fence nonce failed: {error}"))
         })?;
-        let nonce_hex = hex::encode(nonce);
-        let name = format!(".trail-observer-fence-{nonce_hex}");
-        let path = LedgerPath::parse(&name)?;
-        // Registration, not a filename pattern, authenticates observer-owned
-        // sentinel events. A user path that merely resembles a sentinel must
-        // remain an ordinary changed-path candidate.
+        let name = hex::encode(nonce);
+        let path = LedgerPath::parse(&format!("{INTERNAL_FENCE_DIRECTORY}/{name}"))?;
+        // The hard-private parent excludes these paths from source scans.
+        // Registration still authenticates the exact nonce for this observer;
+        // another process's fence and a user path that merely resembles one
+        // must not enter this observer's interval.
         let _internal_fence =
             InternalFenceRegistration::new(Arc::clone(&self.shared), path.clone())?;
 
+        self.fence_directory
+            .verify_identity(self.fence_directory_identity)
+            .map_err(|_| {
+                self.shared.revoke("inotify_fence_directory_replaced");
+                reconcile_error("inotify_fence_directory_replaced")
+            })?;
+
         let fd = openat(
-            &self.root,
+            self.fence_directory.file(),
             Path::new(&name),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(|error| Error::Io(error.into()))?;
         let mut sentinel = File::from(fd);
-        sentinel.write_all(nonce_hex.as_bytes())?;
+        sentinel.write_all(name.as_bytes())?;
         sentinel.sync_all()?;
-        fsync(&self.root).map_err(|error| Error::Io(error.into()))?;
+        fsync(self.fence_directory.file()).map_err(|error| Error::Io(error.into()))?;
         let create = self.wait_for(&path, EvidenceFlags::CREATE, 0)?;
 
-        unlinkat(&self.root, Path::new(&name), AtFlags::empty())
-            .map_err(|error| Error::Io(error.into()))?;
-        fsync(&self.root).map_err(|error| Error::Io(error.into()))?;
+        unlinkat(
+            self.fence_directory.file(),
+            Path::new(&name),
+            AtFlags::empty(),
+        )
+        .map_err(|error| Error::Io(error.into()))?;
+        fsync(self.fence_directory.file()).map_err(|error| Error::Io(error.into()))?;
         let delete = self.wait_for(&path, EvidenceFlags::DELETE, create.event.sequence)?;
         let public = ObserverFence {
             sequence: delete.event.sequence,
@@ -742,7 +777,7 @@ impl LinuxInotifyObserver {
                 mismatches.push("sentinel_order");
             }
             if issued.sentinel_path.as_str()
-                != format!(".trail-observer-fence-{}", hex::encode(&fence.nonce))
+                != format!("{INTERNAL_FENCE_DIRECTORY}/{}", hex::encode(&fence.nonce))
             {
                 mismatches.push("sentinel_path");
             }
@@ -1141,12 +1176,21 @@ fn run_worker(
                 break;
             }
             let ledger_parent = watches.get(&wd).cloned();
+            let internal_fence_watch = ledger_parent
+                .as_deref()
+                .is_some_and(|parent| parent == Path::new(INTERNAL_FENCE_DIRECTORY));
             if ledger_parent
                 .as_ref()
                 .is_some_and(|parent| parent.as_os_str().is_empty())
                 && (mask.contains(EventMask::DELETE_SELF) || mask.contains(EventMask::MOVE_SELF))
             {
                 shared.revoke("inotify_root_deleted_or_moved");
+                break;
+            }
+            if internal_fence_watch
+                && (mask.contains(EventMask::DELETE_SELF) || mask.contains(EventMask::MOVE_SELF))
+            {
+                shared.revoke("inotify_fence_directory_replaced");
                 break;
             }
             let Some(name) = name else {
@@ -1192,7 +1236,18 @@ fn run_worker(
             };
             let relative = parent.join(name);
             let is_dir = mask.contains(EventMask::ISDIR);
-            if observer_internal_path(&relative)
+            if internal_fence_watch {
+                let Some(relative_text) = relative.to_str() else {
+                    shared.revoke("inotify_path_decode_ambiguity");
+                    break;
+                };
+                let registered = LedgerPath::parse(relative_text)
+                    .ok()
+                    .is_some_and(|path| shared.lock().internal_fence_paths.contains(&path));
+                if !registered {
+                    continue;
+                }
+            } else if observer_internal_path(&relative)
                 && !policy_watches.iter().any(|watch| {
                     watch
                         .observed_path
@@ -1651,6 +1706,23 @@ fn add_tree(
             }
         }
     }
+    Ok(())
+}
+
+fn add_internal_fence_watch(
+    inotify: &mut Inotify,
+    root: &Path,
+    watches: &mut HashMap<WatchDescriptor, PathBuf>,
+) -> Result<()> {
+    let relative = PathBuf::from(INTERNAL_FENCE_DIRECTORY);
+    let absolute = root.join(&relative);
+    let metadata = fs::symlink_metadata(&absolute)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(reconcile_error("inotify_fence_directory_unsafe"));
+    }
+    #[allow(deprecated)]
+    let descriptor = inotify.add_watch(&absolute, WATCH_MASK)?;
+    watches.insert(descriptor, relative);
     Ok(())
 }
 
@@ -2564,7 +2636,7 @@ pub(crate) fn run_fence_ordering() -> std::result::Result<(), String> {
             item.event
                 .path
                 .as_str()
-                .starts_with(".trail-observer-fence-")
+                .starts_with(".trail/observer-fences/")
         })
         .collect::<Vec<_>>();
     let create = sentinel
@@ -2582,17 +2654,68 @@ pub(crate) fn run_fence_ordering() -> std::result::Result<(), String> {
         return Err("sentinel durable create/delete ordering is invalid".into());
     }
     drop(state);
-    if fs::read_dir(temp.path())
+    if fs::read_dir(temp.path().join(INTERNAL_FENCE_DIRECTORY))
         .map_err(|error| error.to_string())?
-        .any(|entry| {
-            entry
-                .ok()
-                .and_then(|entry| entry.file_name().to_str().map(str::to_owned))
-                .is_some_and(|name| name.starts_with(".trail-observer-fence-"))
-        })
+        .next()
+        .is_some()
     {
         return Err("sentinel remained after the delete fence".into());
     }
+
+    let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let first = LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(None)), &[])
+        .map_err(|error| error.to_string())?;
+    let second = LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(None)), &[])
+        .map_err(|error| error.to_string())?;
+    let first_fence = first
+        .begin_observation(&expected_for(&first, 4))
+        .map_err(|error| error.to_string())?;
+    let second_fence = second
+        .begin_observation(&expected_for(&second, 5))
+        .map_err(|error| error.to_string())?;
+    first
+        .begin_observation(&expected_for(&first, 4))
+        .map_err(|error| error.to_string())?;
+    let first_path = format!(
+        "{INTERNAL_FENCE_DIRECTORY}/{}",
+        hex::encode(first_fence.nonce)
+    );
+    let second_path = format!(
+        "{INTERNAL_FENCE_DIRECTORY}/{}",
+        hex::encode(second_fence.nonce)
+    );
+    let first_state = first.shared.lock();
+    let second_state = second.shared.lock();
+    if first_state
+        .events
+        .iter()
+        .any(|item| item.event.path.as_str() == second_path)
+        || second_state
+            .events
+            .iter()
+            .any(|item| item.event.path.as_str() == first_path)
+    {
+        return Err("one observer retained another observer's private fence".into());
+    }
+    drop(second_state);
+    drop(first_state);
+
+    let (temp, observer) = fixture()?;
+    let lookalike = ".trail-observer-fence-user-owned";
+    fs::write(temp.path().join(lookalike), b"ordinary source")
+        .map_err(|error| error.to_string())?;
+    observer
+        .begin_observation(&expected_for(&observer, 4))
+        .map_err(|error| error.to_string())?;
+    let state = observer.shared.lock();
+    if !state.events.iter().any(|item| {
+        item.event.path.as_str() == lookalike
+            && item.event.flags.0 & EvidenceFlags::CREATE.0 != 0
+            && !item.internal_fence
+    }) {
+        return Err("user fence lookalike was hidden as observer-internal".into());
+    }
+    drop(state);
 
     // A controlled fence is a single synthetic durability record. Retaining
     // it as the next continuous tail must preserve that provenance instead of

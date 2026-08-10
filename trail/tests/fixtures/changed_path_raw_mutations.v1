@@ -25,7 +25,7 @@ reviewed|db/change_ledger/observer/linux.rs|run_delayed_backlog|fs::write|1
 reviewed|db/change_ledger/observer/linux.rs|run_fault_revocation_matrix|fs::create_dir|2
 reviewed|db/change_ledger/observer/linux.rs|run_fault_revocation_matrix|fs::remove_dir|1
 reviewed|db/change_ledger/observer/linux.rs|run_fault_revocation_matrix|fs::write|3
-reviewed|db/change_ledger/observer/linux.rs|run_fence_ordering|fs::write|1
+reviewed|db/change_ledger/observer/linux.rs|run_fence_ordering|fs::write|2
 reviewed|db/change_ledger/observer/linux.rs|run_owner_death_and_root_replacement|fs::create_dir|1
 reviewed|db/change_ledger/observer/linux.rs|run_owner_death_and_root_replacement|fs::remove_dir_all|1
 reviewed|db/change_ledger/observer/linux.rs|run_owner_death_and_root_replacement|fs::rename|2

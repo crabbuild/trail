@@ -186,6 +186,9 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Linux observer fences now live under the authenticated private
+  `.trail/observer-fences/` directory and ignore foreign fence nonces, preventing
+  overlapping observer recovery from reporting internal sentinels as untracked source.
 - Concurrent materialized-lane initialization now retries short SQLite WAL
   checkpoint contention and allows native Linux observer fences enough delivery
   time under high startup fan-out.
