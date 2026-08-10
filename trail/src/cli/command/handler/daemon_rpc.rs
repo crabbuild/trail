@@ -70,6 +70,13 @@ pub(super) fn try_handle_auto_daemon_command(
         if !workspace.join(".trail").is_dir() {
             return Err(Error::WorkspaceNotFound(workspace));
         }
+        if let Some(url) = discover_daemon_url(ctx)? {
+            match try_handle_daemon_command(ctx, Some(url), daemon_token.clone(), command) {
+                Ok(handled) => return Ok(handled),
+                Err(error) if auto_daemon_should_fallback(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let ready =
             daemon_start::ensure_workspace_daemon_ready(&workspace, daemon_token.as_deref())?;
         let result = try_handle_daemon_command(
@@ -1302,6 +1309,7 @@ struct LedgerFenceRequest<'a> {
     executable_identity: &'a str,
     scope_id: &'a str,
     expected_epoch: u64,
+    daemon_launch_nonce: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1332,8 +1340,26 @@ pub(super) fn authenticated_ledger_fence(
         executable_identity: &endpoint.executable_identity,
         scope_id: &endpoint.scope_id,
         expected_epoch: endpoint.epoch,
+        daemon_launch_nonce: &endpoint.daemon_launch_nonce,
     })?;
     client.request_json("POST", "/v1/ledger/challenge", Some(&body))
+}
+
+#[cfg(unix)]
+pub(super) fn authenticated_ledger_retire(
+    endpoint: &daemon_start::WorkspaceDaemonEndpoint,
+) -> Result<LedgerFenceProof> {
+    let client = DaemonClient::new(&endpoint.url, Some(endpoint.auth_token.clone()))?;
+    let body = serde_json::to_value(LedgerFenceRequest {
+        protocol_version: endpoint.protocol_version,
+        owner_nonce: &endpoint.owner_nonce,
+        workspace_identity: &endpoint.workspace_identity,
+        executable_identity: &endpoint.executable_identity,
+        scope_id: &endpoint.scope_id,
+        expected_epoch: endpoint.epoch,
+        daemon_launch_nonce: &endpoint.daemon_launch_nonce,
+    })?;
+    client.request_json("POST", "/v1/ledger/retire", Some(&body))
 }
 
 enum DaemonTransport {

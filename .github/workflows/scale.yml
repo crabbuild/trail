@@ -163,9 +163,9 @@ jobs:
               daemon_wait_for_health=60
               daemon_wait_for_hot_cache=120
               daemon_status=5
-              daemon_persisted_snapshot_status=5
-              daemon_persisted_snapshot_record_clean=5
-              daemon_persisted_snapshot_diff_dirty=10
+              daemon_authoritative_status=5
+              daemon_authoritative_record_clean=5
+              daemon_authoritative_diff_dirty=10
               daemon_cli_status=5
               daemon_cli_record_dirty=10
               daemon_cli_agent_readiness=5

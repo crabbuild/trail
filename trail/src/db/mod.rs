@@ -4761,6 +4761,7 @@ pub(crate) use change_ledger::run_tracked_ignored_candidate_flow;
 pub(crate) use change_ledger::set_command_authority_override;
 pub(crate) use change_ledger::{
     command_authority_enabled, persisted_workspace_daemon_owner, prepare_workspace_daemon_launch,
+    prepare_workspace_daemon_launch_after_revoked_owner, retire_workspace_daemon,
     verified_stale_workspace_owner_for_launch, workspace_daemon_fence,
     workspace_daemon_ready_proof, workspace_daemon_reconcile, PersistedWorkspaceDaemonOwner,
     VerifiedStaleWorkspaceOwner, WorkspaceDaemonLaunchIdentity, WorkspaceDaemonProof,

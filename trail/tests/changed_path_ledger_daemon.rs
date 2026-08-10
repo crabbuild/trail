@@ -456,6 +456,47 @@ fn first_status_publishes_a_ready_workspace_daemon() {
     assert!(!command_line.contains(&endpoint.owner_nonce));
 }
 
+#[test]
+fn authenticated_retirement_revokes_the_owner_before_process_shutdown() {
+    let fixture = Fixture::new();
+    let status = fixture.status();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let endpoint = fixture.endpoint();
+    let connection =
+        rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+    let scope_id: String = connection
+        .query_row("SELECT scope_id FROM changed_path_scopes", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let response = authenticated_post(
+        &endpoint,
+        "/v1/ledger/retire",
+        serde_json::json!({
+            "protocol_version": endpoint.protocol_version,
+            "owner_nonce": &endpoint.owner_nonce,
+            "workspace_identity": &endpoint.workspace_identity,
+            "executable_identity": &endpoint.executable_identity,
+            "scope_id": scope_id,
+            "expected_epoch": endpoint.epoch,
+            "daemon_launch_nonce": &endpoint.daemon_launch_nonce,
+        }),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let active: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM changed_path_observer_owners WHERE lease_state='active'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+}
+
 #[cfg(target_os = "macos")]
 fn external_volume_candidate_is_compatible(
     is_directory: bool,

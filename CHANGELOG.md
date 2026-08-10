@@ -5,6 +5,14 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Changed-path daemon authority now follows workspace generation changes and
+  hands off atomically between automatic and explicit daemons. Sparse lane
+  hydration also narrows native directory events to authenticated selections
+  and visible files instead of treating intentionally absent siblings as
+  deletions.
+
 ### Added
 
 - Added deterministic 10k/100k/1M artifact and source scale matrices for

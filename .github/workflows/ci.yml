@@ -141,9 +141,9 @@ jobs:
           git_status_after_dirty_record=15
           daemon_wait_for_health=60
           daemon_wait_for_hot_cache=60
-          daemon_persisted_snapshot_status=10
-          daemon_persisted_snapshot_record_clean=10
-          daemon_persisted_snapshot_diff_dirty=10
+          daemon_authoritative_status=10
+          daemon_authoritative_record_clean=10
+          daemon_authoritative_diff_dirty=10
           daemon_cli_session_start=10
           daemon_cli_approval_request=10
           daemon_cli_lease_acquire=10

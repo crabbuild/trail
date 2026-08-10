@@ -97,11 +97,11 @@ reviewed|db/change_ledger/recovery.rs|subprocess_kill_preserves_old_or_new_backu
 reviewed|db/change_ledger/recovery.rs|subprocess_kill_preserves_old_or_new_backup_and_restore_tree|fs::write|7
 reviewed|db/change_ledger/snapshot.rs|run_command_flow_inner|fs::create_dir|1
 reviewed|db/change_ledger/snapshot.rs|run_command_flow_inner|fs::write|5
-reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::create_dir|2
+reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::create_dir|3
 reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::remove_file|1
 reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::rename|1
 reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::set_permissions|1
-reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::write|4
+reviewed|db/change_ledger/snapshot.rs|run_materialized_lane_snapshot_flow|fs::write|6
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|fs::create_dir|1
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|fs::create_dir_all|1
 reviewed|db/change_ledger/snapshot.rs|run_materialized_candidate_lifecycle_flow|fs::remove_file|1

@@ -91,6 +91,40 @@ pub fn prepare_workspace_changed_path_daemon(
     .and_then(public_workspace_proof)
 }
 
+#[doc(hidden)]
+pub fn retire_workspace_changed_path_daemon(
+    db: &crate::Trail,
+) -> crate::Result<WorkspaceLedgerProof> {
+    public_workspace_proof(crate::db::retire_workspace_daemon(db)?)
+}
+
+#[doc(hidden)]
+pub fn prepare_explicit_workspace_changed_path_daemon(
+    db: &crate::Trail,
+) -> crate::Result<WorkspaceLedgerProof> {
+    let mut nonce = [0_u8; 32];
+    getrandom::getrandom(&mut nonce).map_err(|error| {
+        crate::Error::DaemonUnavailable(format!(
+            "explicit daemon launch nonce generation failed: {error}"
+        ))
+    })?;
+    let pid = std::process::id();
+    let process_start_identity = workspace_daemon_process_start_identity(pid).ok_or_else(|| {
+        crate::Error::DaemonUnavailable(
+            "explicit daemon process start identity is unavailable".into(),
+        )
+    })?;
+    crate::db::prepare_workspace_daemon_launch_after_revoked_owner(
+        db,
+        crate::db::WorkspaceDaemonLaunchIdentity {
+            nonce: hex::encode(nonce),
+            pid,
+            process_start_identity,
+        },
+    )
+    .and_then(public_workspace_proof)
+}
+
 fn verify_persisted_workspace_owner(
     db: &crate::Trail,
 ) -> crate::Result<Option<crate::db::VerifiedStaleWorkspaceOwner>> {
