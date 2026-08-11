@@ -58,6 +58,7 @@ jobs:
         run: |
           python3 -m unittest scripts/test_verify_real_repo_lane_scale.py -v
           python3 -m unittest scripts/test_check_real_repo_lane_scale.py -v
+          python3 -m unittest scripts/test_check_real_framework_handoff.py -v
       - name: Check real-repository harness syntax
         run: bash -n scripts/verify-real-repo-lane-scale.sh
 
