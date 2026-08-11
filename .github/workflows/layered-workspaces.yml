@@ -13,6 +13,9 @@ on:
       - "scripts/verify-linux-command-recipe-sandbox.sh"
       - "scripts/verify-windows-command-recipe-sandbox.ps1"
       - "scripts/verify-macos-nfs-framework-layers.sh"
+      - "scripts/verify-real-framework-handoff.sh"
+      - "scripts/check-real-framework-handoff.py"
+      - "scripts/test_check_real_framework_handoff.py"
       - "scripts/verify-environment-adapter-plugin.sh"
       - "scripts/verify-artifact-adapter-conformance.sh"
       - "scripts/verify-artifact-real-tool-gates.sh"
@@ -34,6 +37,11 @@ on:
         type: boolean
       run_macos_framework_bench:
         description: "Run real Next.js and Vite dependency/build benchmarks through macOS NFS"
+        required: false
+        default: false
+        type: boolean
+      run_real_framework_handoffs:
+        description: "Qualify pinned Go, pnpm, npm, Python, and CMake repositories through A -> B -> C macOS NFS lanes"
         required: false
         default: false
         type: boolean
@@ -231,6 +239,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: scripts/verify-macos-nfs-framework-layers.sh
+
+  real-framework-handoffs:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_real_framework_handoffs }}
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [go, pnpm, npm, python, cmake]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: real-framework-${{ matrix.framework }}
+      - if: ${{ matrix.framework == 'pnpm' || matrix.framework == 'npm' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - if: ${{ matrix.framework == 'pnpm' }}
+        run: corepack enable && corepack prepare pnpm@10.14.0 --activate
+      - name: Build candidate Trail
+        run: cargo build -p trail --release --locked
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-real-framework-target-${{ matrix.framework }}
+      - name: Qualify ${{ matrix.framework }} A -> B -> C handoff
+        run: scripts/verify-real-framework-handoff.sh "${{ matrix.framework }}"
+        env:
+          TRAIL_BIN: ${{ runner.temp }}/trail-real-framework-target-${{ matrix.framework }}/release/trail
+          TRAIL_FRAMEWORK_EVIDENCE_DIR: ${{ runner.temp }}/trail-real-framework-${{ matrix.framework }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: trail-real-framework-${{ matrix.framework }}
+          path: ${{ runner.temp }}/trail-real-framework-${{ matrix.framework }}
+          if-no-files-found: error
 
   dokan-conformance:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_dokan_conformance }}

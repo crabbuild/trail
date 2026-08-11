@@ -7502,7 +7502,7 @@ validation = "path-contract"
                 "INSERT INTO environment_component_states(
                      view_id,component_id,adapter_identity,adapter_version,implementation_version,
                      distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
-                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v1',
+                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v2',
                         'dependency',?2,?2,'ready',NULL,1)",
                 params![env!("CARGO_PKG_VERSION"), &layer.cache_key],
             )
@@ -7558,7 +7558,7 @@ validation = "path-contract"
         db.conn
             .execute(
                 "UPDATE environment_component_states
-                 SET distribution_digest='builtin:node-plan-v1'
+                 SET distribution_digest='builtin:node-plan-v2'
                  WHERE view_id='parent-view' AND component_id='node'",
                 [],
             )

@@ -118,6 +118,35 @@ TRAIL_SCALE_LABEL=manual-scale \
 scripts/cli-scale-bench.sh
 ```
 
+## Real-Framework A → B → C Gate
+
+Framework adapters have a separate opt-in macOS qualification matrix. Each row
+fetches an exact upstream revision, uses the candidate Trail binary, and moves
+three native NFS lanes through a source edit, environment synchronization, and
+real framework check. The gate covers bbolt/Go, date-fns/pnpm, lodash/npm,
+httpx/Python virtual environments, and LevelDB/CMake:
+
+```sh
+TRAIL_BIN=/absolute/path/to/trail \
+TRAIL_FRAMEWORK_EVIDENCE_DIR=/absolute/new/evidence/go \
+scripts/verify-real-framework-handoff.sh go
+```
+
+Valid selectors are `go`, `pnpm`, `npm`, `python`, and `cmake`. The output
+directory must not exist. `evidence.json` pins the repository/revision, three
+distinct source roots, active component keys, layer identities, cache
+namespaces, lane-private output identities, and SHA-256 digests of every raw
+Trail report. The checker requires each edit to checkpoint only `README.md`,
+each child to inherit its parent's active generation before editing, and every
+framework command to pass. Go additionally requires compatible-predecessor
+seeding with nonzero avoided bytes; npm/pnpm require one exact immutable layer;
+Python and CMake require three distinct writable-private outputs.
+
+Dispatch `layered-workspaces.yml` with
+`run_real_framework_handoffs=true` to run all five rows on clean macOS hosts
+and upload their complete evidence directories. Synthetic tests or a skipped
+matrix row are not production-readiness evidence for that framework.
+
 ## Real-Repository Concurrent Lane Gate
 
 Use the blocking real-repository harness for release qualification of native-COW

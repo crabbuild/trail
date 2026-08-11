@@ -59,6 +59,10 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added an opt-in macOS real-framework qualification matrix for pinned bbolt,
+  date-fns, lodash, httpx, and LevelDB revisions. Each row produces checksummed
+  Agent A → B → C evidence for source-only handoff, parent-generation
+  inheritance, framework checks, cache/layer reuse, and lane-private outputs.
 - Added deterministic 10k/100k/1M artifact and source scale matrices for
   1/5/20 lanes, fail-closed JSON evidence validation, and compositional
   owning-host NFS/FUSE/Dokan qualification that distinguishes mounted backend

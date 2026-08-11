@@ -102,7 +102,7 @@ const NODE_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] = &[
 
 const NODE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] = &[
     WorkspaceEnvironmentOutputCommandBinding {
-        output_name: "node_modules",
+        output_name: "modules",
         environment: Some("TRAIL_NODE_MODULES"),
         relative_path: "",
         direct: true,
@@ -110,7 +110,7 @@ const NODE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] 
         required: true,
     },
     WorkspaceEnvironmentOutputCommandBinding {
-        output_name: "node_modules",
+        output_name: "modules",
         environment: Some("NODE_PATH"),
         relative_path: "",
         direct: true,
@@ -118,7 +118,7 @@ const NODE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] 
         required: true,
     },
     WorkspaceEnvironmentOutputCommandBinding {
-        output_name: "node_modules",
+        output_name: "modules",
         environment: None,
         relative_path: ".bin",
         direct: true,
