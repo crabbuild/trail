@@ -1072,7 +1072,8 @@ impl Trail {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut bindings = BTreeMap::<String, String>::new();
-        let mut path_prefixes = Vec::<PathBuf>::new();
+        let mut output_path_prefixes = Vec::<PathBuf>::new();
+        let mut tool_path_prefixes = Vec::<PathBuf>::new();
         for (component_id, adapter_identity) in components {
             let Some(adapter) =
                 super::workspace_environment::builtin_environment_adapter_for_selector(
@@ -1120,7 +1121,7 @@ impl Trail {
                             "resolved tool for component `{component_id}` has no parent directory"
                         ))
                     })?;
-                    path_prefixes.push(parent.to_path_buf());
+                    tool_path_prefixes.push(parent.to_path_buf());
                 }
                 insert_workspace_command_binding(
                     &mut bindings,
@@ -1192,7 +1193,7 @@ impl Trail {
                     safe_join(&root, binding.relative_path)?
                 };
                 if binding.prepend_path {
-                    path_prefixes.push(path.clone());
+                    output_path_prefixes.push(path.clone());
                 }
                 if let Some(environment) = binding.environment {
                     insert_workspace_command_binding(
@@ -1204,8 +1205,13 @@ impl Trail {
                 }
             }
         }
-        if !path_prefixes.is_empty() {
-            let mut paths = path_prefixes;
+        if !output_path_prefixes.is_empty() || !tool_path_prefixes.is_empty() {
+            // Project-local output executables (for example node_modules/.bin
+            // or a virtual environment's bin directory) must win over global
+            // tool directories while the resolved tools still win over the
+            // ambient PATH.
+            let mut paths = output_path_prefixes;
+            paths.extend(tool_path_prefixes);
             if let Some(existing) = std::env::var_os("PATH") {
                 paths.extend(std::env::split_paths(&existing));
             }

@@ -474,7 +474,7 @@ impl Trail {
         );
         key_inputs.insert(
             "command_environment".to_string(),
-            "npm_config_cache=cache:package-manager/npm;PNPM_HOME=cache:package-manager/pnpm-home;PNPM_STORE_DIR=cache:package-manager/pnpm-store;YARN_CACHE_FOLDER=cache:package-manager/yarn;BUN_INSTALL_CACHE_DIR=cache:package-manager/bun;TRAIL_NODE=tool:node;TRAIL_NPM=tool?:npm;TRAIL_PNPM=tool?:pnpm;TRAIL_YARN=tool?:yarn;TRAIL_BUN=tool?:bun;TRAIL_NODE_MODULES=direct:node_modules;NODE_PATH=direct:node_modules;PATH+=tool-dirs+direct:node_modules/.bin".to_string(),
+            "npm_config_cache=cache:package-manager/npm;PNPM_HOME=cache:package-manager/pnpm-home;PNPM_STORE_DIR=cache:package-manager/pnpm-store;YARN_CACHE_FOLDER=cache:package-manager/yarn;BUN_INSTALL_CACHE_DIR=cache:package-manager/bun;TRAIL_NODE=tool:node;TRAIL_NPM=tool?:npm;TRAIL_PNPM=tool?:pnpm;TRAIL_YARN=tool?:yarn;TRAIL_BUN=tool?:bun;TRAIL_NODE_MODULES=direct:node_modules;NODE_PATH=direct:node_modules;PATH+=direct:node_modules/.bin+tool-dirs".to_string(),
         );
         let key = WorkspaceLayerKeyV1 {
             kind: "dependency".to_string(),
