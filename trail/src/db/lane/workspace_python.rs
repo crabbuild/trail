@@ -2,9 +2,11 @@ use super::workspace_environment::{
     resolve_workspace_tool_executable, workspace_mounted_commands_identity,
     WorkspaceEnvironmentAdapter, WorkspaceEnvironmentAdapterMetadata,
     WorkspaceEnvironmentAdapterProposal, WorkspaceEnvironmentCacheAccess,
-    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
-    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
-    WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentCacheCommandBinding, WorkspaceEnvironmentCacheProtocol,
+    WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentOutputCommandBinding, WorkspaceEnvironmentOutputPolicy,
+    WorkspaceEnvironmentPlan, WorkspaceEnvironmentResolutionInput,
+    WorkspaceEnvironmentSandboxPolicy, WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 use crate::ids::sha256_hex;
@@ -39,7 +41,7 @@ static PYTHON_VENV_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "python-venv",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:python-venv-plan-v2",
+        distribution_digest: "builtin:python-venv-plan-v3",
         selectors: &["trail/python-venv@1", "python-venv", "python"],
         kind: "dependency",
         layer_adapter_name: "python-venv",
@@ -49,6 +51,65 @@ static PYTHON_VENV_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         stability: "experimental",
         description: "Automatically initialized lane-private Python virtual environment at the stable mounted lane path",
     };
+
+const PYTHON_CACHE_COMMAND_BINDINGS: &[WorkspaceEnvironmentCacheCommandBinding] = &[
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "python-downloads",
+        environment: "PIP_CACHE_DIR",
+        relative_path: "pip",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "python-downloads",
+        environment: "UV_CACHE_DIR",
+        relative_path: "uv",
+        required: true,
+    },
+];
+
+#[cfg(windows)]
+const PYTHON_VENV_EXECUTABLE_DIRECTORY: &str = "Scripts";
+#[cfg(not(windows))]
+const PYTHON_VENV_EXECUTABLE_DIRECTORY: &str = "bin";
+#[cfg(windows)]
+const PYTHON_VENV_EXECUTABLE: &str = "Scripts/python.exe";
+#[cfg(not(windows))]
+const PYTHON_VENV_EXECUTABLE: &str = "bin/python";
+
+const PYTHON_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] = &[
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "venv",
+        environment: Some("VIRTUAL_ENV"),
+        relative_path: "",
+        direct: false,
+        prepend_path: false,
+        required: true,
+    },
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "venv",
+        environment: None,
+        relative_path: PYTHON_VENV_EXECUTABLE_DIRECTORY,
+        direct: false,
+        prepend_path: true,
+        required: true,
+    },
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "venv",
+        environment: Some("TRAIL_VENV_PYTHON"),
+        relative_path: PYTHON_VENV_EXECUTABLE,
+        direct: false,
+        prepend_path: false,
+        required: true,
+    },
+];
+
+const PYTHON_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] =
+    &[WorkspaceEnvironmentToolCommandBinding {
+        programs: &["python3", "python"],
+        environment: "TRAIL_PYTHON",
+        required: true,
+        prepend_path: false,
+    }];
 
 impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
@@ -62,6 +123,18 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
         } else {
             format!("python-venv:{root}")
         })
+    }
+
+    fn cache_command_bindings(&self) -> &'static [WorkspaceEnvironmentCacheCommandBinding] {
+        PYTHON_CACHE_COMMAND_BINDINGS
+    }
+
+    fn output_command_bindings(&self) -> &'static [WorkspaceEnvironmentOutputCommandBinding] {
+        PYTHON_OUTPUT_COMMAND_BINDINGS
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        PYTHON_TOOL_COMMAND_BINDINGS
     }
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {
@@ -176,7 +249,7 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
         let component_id = self.component_id(&component_root)?;
         let mount_path = join_python_path(&component_root, ".venv");
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:python-venv-plan-v2".to_string();
+        let distribution_digest = "builtin:python-venv-plan-v3".to_string();
         let mut mounted_args = vec![
             "-m".to_string(),
             "venv".to_string(),
@@ -221,6 +294,12 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
             (
                 "mounted_action".to_string(),
                 workspace_mounted_commands_identity(std::slice::from_ref(&mounted_command))?,
+            ),
+            (
+                "command_environment".to_string(),
+                format!(
+                    "PIP_CACHE_DIR=cache:python-downloads/pip;UV_CACHE_DIR=cache:python-downloads/uv;VIRTUAL_ENV=output:venv;TRAIL_VENV_PYTHON=output:venv/{PYTHON_VENV_EXECUTABLE};PATH+=output:venv/{PYTHON_VENV_EXECUTABLE_DIRECTORY};TRAIL_PYTHON=tool:python3|python"
+                ),
             ),
         ]);
         let source_resolution = python_source_resolution(db, source_root, &component_root)?;
@@ -1104,6 +1183,25 @@ mod tests {
             let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
             assert!(workdir.join(".venv/pyvenv.cfg").is_file());
+            let environment = db
+                .lane_workspace_environment(lane)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                Path::new(&environment["VIRTUAL_ENV"]),
+                workdir.join(".venv")
+            );
+            assert_eq!(
+                Path::new(&environment["TRAIL_VENV_PYTHON"]),
+                workdir.join(".venv/bin/python")
+            );
+            assert_eq!(
+                std::env::split_paths(OsStr::new(&environment["PATH"]))
+                    .next()
+                    .unwrap(),
+                workdir.join(".venv/bin")
+            );
             let venv_python = workdir.join(".venv/bin/python");
             let prefix = Command::new(&venv_python)
                 .args(["-c", "import sys; print(sys.prefix)"])

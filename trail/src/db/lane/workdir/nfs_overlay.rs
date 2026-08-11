@@ -468,19 +468,22 @@ mod macos {
         };
         // Checkpointing reads the pinned source upper and authenticated view
         // journal directly, so it does not depend on an uncached READDIR of
-        // this mount. Retain a short attribute cache: disabling it makes every
-        // repeated parent lookup cross the userspace NFS server and turns
-        // framework builds with thousands of files into multi-minute metadata
-        // walks. Negative-name caching uses the same short lifetime. All live
-        // mutations pass through this one client mount, so CREATE/RENAME
-        // invalidates its own cached directory state; the cache only suppresses
-        // repeated misses from Node-style module resolution. macOS defaults to
+        // this mount. Each managed command receives a fresh mount, while all
+        // live mutations pass through the mount's one NFS client and invalidate
+        // that client's cached directory state. The managed-execution mount
+        // lifetime bounds this 60-second attribute/negative-name cache;
+        // explicit mount callers retain the same single-client mutation
+        // requirement. The cache suppresses repeated parent and source-file
+        // validation during Go, Cargo, Node, and CMake metadata walks. A
+        // one-second cache still made a verified Go build-cache hit spend more
+        // than a minute reopening an otherwise unchanged 158-file source tree.
+        // macOS defaults to
         // `nosync`, where a write syscall may return before this userspace server
         // has received the WRITE RPC. `sync` keeps successful writes as an
         // actual durability boundary; the server itself fsyncs every WRITE
         // before reporting FILE_SYNC.
         let opts = format!(
-            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,actimeo=1,nobrowse,port={port},mountport={port}"
+            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,actimeo=60,nobrowse,port={port},mountport={port}"
         );
         let status = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])

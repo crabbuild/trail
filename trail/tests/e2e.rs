@@ -12473,7 +12473,7 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
     assert_eq!(status[0]["status"], "ready");
     assert_eq!(
         status[0]["adapter"]["distribution_digest"],
-        "builtin:node-plan-v1"
+        "builtin:node-plan-v2"
     );
 
     let generation = trail::server::handle_http_request(
@@ -13312,7 +13312,7 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
     assert_eq!(status[0]["status"], "ready");
     assert_eq!(
         status[0]["adapter"]["distribution_digest"],
-        "builtin:node-plan-v1"
+        "builtin:node-plan-v2"
     );
 }
 

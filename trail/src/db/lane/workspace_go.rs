@@ -1,8 +1,11 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCacheAccess,
-    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentCacheCommandBinding, WorkspaceEnvironmentCacheProtocol,
+    WorkspaceEnvironmentCommand, WorkspaceEnvironmentCommandBinding,
+    WorkspaceEnvironmentConstructionSeed, WorkspaceEnvironmentOutput,
     WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 
@@ -17,7 +20,7 @@ static GO_VENDOR_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "go-vendor",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:go-vendor-plan-v1",
+        distribution_digest: "builtin:go-vendor-plan-v2",
         selectors: &["trail/go-vendor@1", "go-vendor", "go"],
         kind: "dependency",
         layer_adapter_name: "go-vendor",
@@ -27,6 +30,44 @@ static GO_VENDOR_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         stability: "experimental",
         description: "Single-module Go vendor tree with shared module and compiler caches",
     };
+
+const GO_CACHE_COMMAND_BINDINGS: &[WorkspaceEnvironmentCacheCommandBinding] = &[
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "module-store",
+        environment: "GOMODCACHE",
+        relative_path: "",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "build-cache",
+        environment: "GOCACHE",
+        relative_path: "",
+        required: true,
+    },
+];
+
+const GO_COMMAND_BINDINGS: &[WorkspaceEnvironmentCommandBinding] = &[
+    WorkspaceEnvironmentCommandBinding {
+        environment: "GOWORK",
+        value: "off",
+    },
+    WorkspaceEnvironmentCommandBinding {
+        environment: "GOTOOLCHAIN",
+        value: "local",
+    },
+    WorkspaceEnvironmentCommandBinding {
+        environment: "GOFLAGS",
+        value: "-mod=vendor -trimpath",
+    },
+];
+
+const GO_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] =
+    &[WorkspaceEnvironmentToolCommandBinding {
+        programs: &["go"],
+        environment: "TRAIL_GO",
+        required: true,
+        prepend_path: true,
+    }];
 
 impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
@@ -40,6 +81,18 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
         } else {
             format!("go-vendor:{root}")
         })
+    }
+
+    fn cache_command_bindings(&self) -> &'static [WorkspaceEnvironmentCacheCommandBinding] {
+        GO_CACHE_COMMAND_BINDINGS
+    }
+
+    fn command_bindings(&self) -> &'static [WorkspaceEnvironmentCommandBinding] {
+        GO_COMMAND_BINDINGS
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        GO_TOOL_COMMAND_BINDINGS
     }
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {
@@ -79,7 +132,7 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
         let go_version = command_identity("go", &["version"])?;
         let go_tool = resolve_workspace_tool_executable("go")?;
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:go-vendor-plan-v1".to_string();
+        let distribution_digest = "builtin:go-vendor-plan-v2".to_string();
         let cache_compatibility = BTreeMap::from([
             ("go".to_string(), go_version.clone()),
             ("go_executable".to_string(), go_tool.identity.clone()),
@@ -128,6 +181,11 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
                 "output_contract".to_string(),
                 format!("immutable-seed-private:{mount_path}"),
             ),
+            (
+                "command_environment".to_string(),
+                "GOMODCACHE=cache:module-store;GOCACHE=cache:build-cache;GOWORK=off;GOTOOLCHAIN=local;GOFLAGS=-mod=vendor -trimpath;TRAIL_GO=tool:go;PATH+=tool-dir:go"
+                    .to_string(),
+            ),
         ]);
         inputs.insert(
             go_sum_path,
@@ -172,7 +230,12 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
-            construction_seed: None,
+            construction_seed: Some(WorkspaceEnvironmentConstructionSeed {
+                ignored_identity_inputs: BTreeSet::from([
+                    "source_root".to_string(),
+                    "host:adapter_identity_v3".to_string(),
+                ]),
+            }),
             source_projection: Some((source_root.clone(), "project".to_string())),
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {
@@ -249,6 +312,7 @@ fn command_identity(program: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn go_adapter_vendors_once_and_reuses_the_immutable_tree_across_lanes() {
@@ -367,6 +431,39 @@ mod tests {
         assert_eq!(status[0].component.component_id, "go-vendor");
         assert_eq!(status[0].adapter.name, "go-vendor");
         assert_eq!(status[0].status, "ready");
+        let go_one_environment = db
+            .lane_workspace_environment("go-one")
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let generation = db.active_environment_generation("go-one").unwrap().unwrap();
+        let caches = generation.components[0]
+            .caches
+            .iter()
+            .map(|cache| (cache.name.as_str(), cache.namespace_id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            Path::new(&go_one_environment["GOMODCACHE"]),
+            db.db_dir
+                .join("cache/namespaces")
+                .join(caches["module-store"])
+        );
+        assert_eq!(
+            Path::new(&go_one_environment["GOCACHE"]),
+            db.db_dir
+                .join("cache/namespaces")
+                .join(caches["build-cache"])
+        );
+        assert_eq!(go_one_environment["GOWORK"], "off");
+        assert_eq!(go_one_environment["GOTOOLCHAIN"], "local");
+        assert_eq!(go_one_environment["GOFLAGS"], "-mod=vendor -trimpath");
+        assert!(Path::new(&go_one_environment["TRAIL_GO"]).is_absolute());
+        assert_eq!(
+            std::env::split_paths(OsStr::new(&go_one_environment["PATH"]))
+                .next()
+                .unwrap(),
+            Path::new(&go_one_environment["TRAIL_GO"]).parent().unwrap()
+        );
 
         let all = db.sync_all_workspace_environments("go-all", None).unwrap();
         assert_eq!(all.generation.generation_sequence, 1);

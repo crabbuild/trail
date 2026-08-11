@@ -7,6 +7,20 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Managed lane commands now derive fixed policy, resolved executable, cache,
+  and output bindings from each active environment adapter instead of injecting
+  Cargo/npm defaults globally. Go, pnpm/npm/Yarn/Bun, Python, and CMake commands
+  receive isolated framework-native caches and exact tool paths, while inactive
+  frameworks no longer leak variables into the command.
+- Node dependency executables and CMake build trees now bind directly from the
+  lane's generated upper, avoiding metadata-heavy build/dependency traversal
+  through macOS NFS while preserving a mounted source path and lane-private
+  mutation. Python also exposes its path-correct interpreter through
+  `TRAIL_VENV_PYTHON`.
+- macOS NFS lane mounts now retain attributes and negative lookups for up to 60
+  seconds within a mounted execution. Same-client mutations still invalidate
+  cached entries and synchronous writes remain enabled, while unchanged Go and
+  Node source/dependency walks avoid repeated userspace NFS round trips.
 - Lane/root diff addition and deletion totals now come from the emitted text
   diff rather than stable-line identity churn, so statistics agree with the
   unified patch while line-identity inspection remains available separately.

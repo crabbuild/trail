@@ -48,7 +48,7 @@ Use `immutable_shared` for read-only generated content,
 `writable_private` for persistent lane-only state, and `disposable` for scratch.
 Never model a live mutable tree as shared.
 
-## Executable Cargo and Node examples
+## Executable Cargo, Go, Node, Python, and CMake examples
 
 The built-in adapters need no framework-specific Trail configuration. In a
 Git-tracked Rust repository with `Cargo.toml` and `Cargo.lock`:
@@ -85,8 +85,38 @@ trail lane exec node-b -- npm test
 ```
 
 The immutable dependency lower is referenced by identity while consumer writes
-go to each lane's private upper. Package-manager caches are performance-only
+go to each lane's private upper. Trail exposes that upper directly through
+`TRAIL_NODE_MODULES` and `NODE_PATH`, prepends its `.bin` directory to `PATH`,
+and binds the selected package manager through `TRAIL_NPM`, `TRAIL_PNPM`,
+`TRAIL_YARN`, or `TRAIL_BUN`. This avoids metadata-heavy dependency traversal
+through the mounted source view. Package-manager caches are performance-only
 namespaces; they are never accepted as dependency correctness evidence.
+
+The other built-ins use the same lane handoff:
+
+```sh
+# Go: a shared module/build cache plus a lane-private vendor seed.
+trail env sync all agent-a
+trail lane exec agent-a -- sh -c '"$TRAIL_GO" test ./...'
+
+# Python: a lane-private, path-correct virtual environment.
+trail env sync all agent-a
+trail lane exec agent-a -- sh -c '"$TRAIL_VENV_PYTHON" -m compileall -q .'
+
+# CMake: configure and build outside the NFS/FUSE/Dokan transport.
+trail env sync all agent-a
+trail lane exec agent-a -- sh -c '
+  "$TRAIL_CMAKE" -S . -B "$TRAIL_CMAKE_BUILD_DIR"
+  "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_BUILD_DIR" --parallel
+'
+```
+
+Go binds `GOMODCACHE`, `GOCACHE`, `TRAIL_GO`, and a local-toolchain/offline
+vendor policy. Python binds `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `VIRTUAL_ENV`,
+`TRAIL_VENV_PYTHON`, and the venv executable directory. CMake binds the exact
+host executable as `TRAIL_CMAKE` and a lane-private direct build path as
+`TRAIL_CMAKE_BUILD_DIR`. A login shell may replace `PATH`; use the absolute
+`TRAIL_*` executable variables in automated lane commands.
 
 The framework-neutral TOML above is executable as `trail.environment.toml`.
 Create its declared input, record it, and run:

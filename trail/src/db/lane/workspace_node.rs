@@ -1,10 +1,12 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
-    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
-    WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheCommandBinding,
+    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
+    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputCommandBinding,
     WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
     WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 use crate::ids::sha256_hex;
@@ -20,7 +22,7 @@ static NODE_WORKSPACE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "node",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:node-plan-v1",
+        distribution_digest: "builtin:node-plan-v2",
         selectors: &["trail/node@1", "node"],
         kind: "dependency",
         layer_adapter_name: "node",
@@ -31,6 +33,99 @@ static NODE_WORKSPACE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         description:
             "Frozen npm, pnpm, Yarn, or Bun dependency tree with a private writable lane upper",
     };
+
+const NODE_CACHE_COMMAND_BINDINGS: &[WorkspaceEnvironmentCacheCommandBinding] = &[
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "package-manager",
+        environment: "npm_config_cache",
+        relative_path: "npm",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "package-manager",
+        environment: "PNPM_HOME",
+        relative_path: "pnpm-home",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "package-manager",
+        environment: "PNPM_STORE_DIR",
+        relative_path: "pnpm-store",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "package-manager",
+        environment: "YARN_CACHE_FOLDER",
+        relative_path: "yarn",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "package-manager",
+        environment: "BUN_INSTALL_CACHE_DIR",
+        relative_path: "bun",
+        required: true,
+    },
+];
+
+const NODE_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] = &[
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["node"],
+        environment: "TRAIL_NODE",
+        required: true,
+        prepend_path: true,
+    },
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["npm"],
+        environment: "TRAIL_NPM",
+        required: false,
+        prepend_path: true,
+    },
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["pnpm"],
+        environment: "TRAIL_PNPM",
+        required: false,
+        prepend_path: true,
+    },
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["yarn"],
+        environment: "TRAIL_YARN",
+        required: false,
+        prepend_path: true,
+    },
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["bun"],
+        environment: "TRAIL_BUN",
+        required: false,
+        prepend_path: true,
+    },
+];
+
+const NODE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] = &[
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "node_modules",
+        environment: Some("TRAIL_NODE_MODULES"),
+        relative_path: "",
+        direct: true,
+        prepend_path: false,
+        required: true,
+    },
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "node_modules",
+        environment: Some("NODE_PATH"),
+        relative_path: "",
+        direct: true,
+        prepend_path: false,
+        required: true,
+    },
+    WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "node_modules",
+        environment: None,
+        relative_path: ".bin",
+        direct: true,
+        prepend_path: true,
+        required: true,
+    },
+];
 
 impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
@@ -44,6 +139,18 @@ impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
         } else {
             format!("node:{root}")
         })
+    }
+
+    fn cache_command_bindings(&self) -> &'static [WorkspaceEnvironmentCacheCommandBinding] {
+        NODE_CACHE_COMMAND_BINDINGS
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        NODE_TOOL_COMMAND_BINDINGS
+    }
+
+    fn output_command_bindings(&self) -> &'static [WorkspaceEnvironmentOutputCommandBinding] {
+        NODE_OUTPUT_COMMAND_BINDINGS
     }
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {
@@ -64,6 +171,9 @@ impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
             .root_file_entry(source_root, &join_repo_path(&root, "package.json"))?
             .is_none()
         {
+            return Ok(None);
+        }
+        if node_component_is_descendant_of_locked_workspace(db, source_root, &root)? {
             return Ok(None);
         }
         for (name, _) in supported_lockfiles() {
@@ -319,18 +429,6 @@ impl Trail {
                 display_package_root(&package_root)
             )));
         }
-        if manager == "pnpm"
-            && self
-                .root_file_entry(
-                    root_id,
-                    &join_repo_path(&package_root, "pnpm-workspace.yaml"),
-                )?
-                .is_some()
-        {
-            return Err(Error::InvalidInput(
-                "pnpm workspace roots require the future monorepo environment adapter".to_string(),
-            ));
-        }
         if manager == "yarn"
             && (!manager_version.starts_with('1')
                 || self
@@ -359,7 +457,7 @@ impl Trail {
             }
         }
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:node-plan-v1".to_string();
+        let distribution_digest = "builtin:node-plan-v2".to_string();
         let mut key_inputs = files
             .iter()
             .map(|(path, entry)| (path.clone(), entry.content_hash.clone()))
@@ -373,6 +471,10 @@ impl Trail {
         key_inputs.insert(
             "adapter_distribution_digest".to_string(),
             distribution_digest.clone(),
+        );
+        key_inputs.insert(
+            "command_environment".to_string(),
+            "npm_config_cache=cache:package-manager/npm;PNPM_HOME=cache:package-manager/pnpm-home;PNPM_STORE_DIR=cache:package-manager/pnpm-store;YARN_CACHE_FOLDER=cache:package-manager/yarn;BUN_INSTALL_CACHE_DIR=cache:package-manager/bun;TRAIL_NODE=tool:node;TRAIL_NPM=tool?:npm;TRAIL_PNPM=tool?:pnpm;TRAIL_YARN=tool?:yarn;TRAIL_BUN=tool?:bun;TRAIL_NODE_MODULES=direct:node_modules;NODE_PATH=direct:node_modules;PATH+=tool-dirs+direct:node_modules/.bin".to_string(),
         );
         let key = WorkspaceLayerKeyV1 {
             kind: "dependency".to_string(),
@@ -429,7 +531,12 @@ impl Trail {
         ]);
         let args = match manager.as_str() {
             "npm" => vec!["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
-            "pnpm" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
+            "pnpm" => vec![
+                "install",
+                "--ignore-workspace",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+            ],
             "yarn" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
             "bun" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
             other => {
@@ -507,6 +614,75 @@ impl Trail {
                     .to_string(),
         })
     }
+}
+
+fn node_component_is_descendant_of_locked_workspace(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<bool> {
+    if component_root.is_empty() {
+        return Ok(false);
+    }
+    for (lock_name, _) in supported_lockfiles() {
+        if db
+            .root_file_entry(source_root, &join_repo_path(component_root, lock_name))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+
+    let segments = component_root.split('/').collect::<Vec<_>>();
+    for depth in (0..segments.len()).rev() {
+        let ancestor = segments[..depth].join("/");
+        let has_pnpm_workspace = db
+            .root_file_entry(
+                source_root,
+                &join_repo_path(&ancestor, "pnpm-workspace.yaml"),
+            )?
+            .is_some()
+            && db
+                .root_file_entry(source_root, &join_repo_path(&ancestor, "pnpm-lock.yaml"))?
+                .is_some();
+        if has_pnpm_workspace {
+            return Ok(true);
+        }
+
+        let package_path = join_repo_path(&ancestor, "package.json");
+        let Some(package_entry) = db.root_file_entry(source_root, &package_path)? else {
+            continue;
+        };
+        let package_bytes = db.materialize_entry_bytes(&package_entry)?;
+        let package: serde_json::Value =
+            serde_json::from_slice(&package_bytes).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "Node manifest `{package_path}` is malformed JSON: {error}"
+                ))
+            })?;
+        let declares_workspaces =
+            package
+                .get("workspaces")
+                .is_some_and(|workspaces| match workspaces {
+                    serde_json::Value::Array(values) => !values.is_empty(),
+                    serde_json::Value::Object(values) => values
+                        .get("packages")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|packages| !packages.is_empty()),
+                    _ => false,
+                });
+        if declares_workspaces {
+            for (lock_name, _) in supported_lockfiles() {
+                if db
+                    .root_file_entry(source_root, &join_repo_path(&ancestor, lock_name))?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,6 +956,92 @@ mod tests {
     }
 
     #[test]
+    fn discovery_collapses_locked_workspace_descendants_but_keeps_nested_locks() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("packages/member/example")).unwrap();
+        fs::write(
+            workspace.path().join("packages/member/package.json"),
+            r#"{"name":"member"}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .path()
+                .join("packages/member/example/package.json"),
+            r#"{"name":"example"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("standalone")).unwrap();
+        fs::write(
+            workspace.path().join("standalone/package.json"),
+            r#"{"name":"standalone"}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("standalone/package-lock.json"),
+            r#"{"name":"standalone","lockfileVersion":3,"packages":{}}"#,
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "node-workspace",
+            Some("main"),
+            native_cow_mode(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let discovered = db
+            .discover_workspace_environment("node-workspace", None)
+            .unwrap();
+        assert_eq!(
+            discovered
+                .components
+                .iter()
+                .filter(|component| component.adapter_identity == "trail/node@1")
+                .map(|component| component.component_id.as_str())
+                .collect::<Vec<_>>(),
+            ["node", "node:standalone"]
+        );
+        if resolve_workspace_tool_executable("node").is_ok()
+            && resolve_workspace_tool_executable("pnpm").is_ok()
+        {
+            let plan = db
+                .plan_workspace_environment("node-workspace", "node", None)
+                .unwrap();
+            assert_eq!(
+                plan.commands[0].args,
+                [
+                    "install",
+                    "--ignore-workspace",
+                    "--frozen-lockfile",
+                    "--ignore-scripts"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn package_manager_specific_snapshot_formats_are_distinct_and_validated() {
         let cases = [
             (
@@ -1047,6 +1309,43 @@ mod tests {
         assert_eq!(cache_one.protocol, "content_store");
         assert_eq!(cache_one.access, "tool_concurrent");
         assert_eq!(cache_one.authority, "performance_only");
+        let command_environment = db
+            .lane_workspace_environment("node-one")
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let cache_root = db
+            .db_dir
+            .join("cache/namespaces")
+            .join(&cache_one.namespace_id);
+        for (name, relative) in [
+            ("npm_config_cache", "npm"),
+            ("PNPM_HOME", "pnpm-home"),
+            ("PNPM_STORE_DIR", "pnpm-store"),
+            ("YARN_CACHE_FOLDER", "yarn"),
+            ("BUN_INSTALL_CACHE_DIR", "bun"),
+        ] {
+            assert_eq!(
+                Path::new(&command_environment[name]),
+                cache_root.join(relative)
+            );
+        }
+        let direct_node_modules = Path::new(&view_one.generated_upper).join("node_modules");
+        assert_eq!(
+            Path::new(&command_environment["TRAIL_NODE_MODULES"]),
+            direct_node_modules
+        );
+        assert_eq!(
+            Path::new(&command_environment["NODE_PATH"]),
+            direct_node_modules
+        );
+        assert_eq!(
+            std::env::split_paths(std::ffi::OsStr::new(&command_environment["PATH"]))
+                .next()
+                .unwrap(),
+            direct_node_modules.join(".bin")
+        );
+        assert!(Path::new(&command_environment["TRAIL_NODE"]).is_absolute());
         assert!(db
             .db_dir
             .join("cache/namespaces")
