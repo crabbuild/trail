@@ -274,6 +274,10 @@ jobs:
           path: ${{ runner.temp }}/trail-real-framework-candidate
       - name: Restore candidate executable permission
         run: chmod 0755 "${{ runner.temp }}/trail-real-framework-candidate/trail"
+      - if: ${{ matrix.framework == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
       - if: ${{ matrix.framework == 'pnpm' || matrix.framework == 'npm' }}
         uses: actions/setup-node@v4
         with:
