@@ -7,6 +7,20 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Managed lane commands now derive fixed policy, resolved executable, cache,
+  and output bindings from each active environment adapter instead of injecting
+  Cargo/npm defaults globally. Go, pnpm/npm/Yarn/Bun, Python, and CMake commands
+  receive isolated framework-native caches and exact tool paths, while inactive
+  frameworks no longer leak variables into the command.
+- Node dependency executables and CMake build trees now bind directly from the
+  lane's generated upper, avoiding metadata-heavy build/dependency traversal
+  through macOS NFS while preserving a mounted source path and lane-private
+  mutation. Python also exposes its path-correct interpreter through
+  `TRAIL_VENV_PYTHON`.
+- macOS NFS lane mounts now retain attributes and negative lookups for up to 60
+  seconds within a mounted execution. Same-client mutations still invalidate
+  cached entries and synchronous writes remain enabled, while unchanged Go and
+  Node source/dependency walks avoid repeated userspace NFS round trips.
 - Lane/root diff addition and deletion totals now come from the emitted text
   diff rather than stable-line identity churn, so statistics agree with the
   unified patch while line-identity inspection remains available separately.
@@ -35,6 +49,11 @@ All notable changes to Trail are documented in this file. Trail follows
   clone/reflink, Cargo revalidates the seed and recompiles affected workspace
   code, and lockfile, manifest, toolchain, target, platform, or build-policy
   changes still force an unseeded construction.
+- Built-in Node dependency layers produced by a lockfile-frozen,
+  script-disabled install now allow public private-key example literals in
+  ordinary documentation, source, and type declarations. Strict scanning still
+  rejects secret-bearing paths such as `.env`, credential, `.pem`, and `.key`
+  files; custom or script-enabled producers receive no exemption.
 - `trail env ... --path .` now selects the repository-root component instead
   of failing path normalization.
 - Changed-path daemon authority now follows workspace generation changes and
@@ -45,6 +64,10 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- Added an opt-in macOS real-framework qualification matrix for pinned bbolt,
+  date-fns, uuid, httpx, and LevelDB revisions. Each row produces checksummed
+  Agent A → B → C evidence for source-only handoff, parent-generation
+  inheritance, framework checks, cache/layer reuse, and lane-private outputs.
 - Added deterministic 10k/100k/1M artifact and source scale matrices for
   1/5/20 lanes, fail-closed JSON evidence validation, and compositional
   owning-host NFS/FUSE/Dokan qualification that distinguishes mounted backend

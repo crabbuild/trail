@@ -1019,9 +1019,10 @@ mod fuse_overlay {
                 .exec_lane_workspace(
                     "rust-seed-b",
                     &[
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--offline".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cargo build --offline -vv --color never > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
+                            .to_string(),
                     ],
                 )
                 .unwrap();
@@ -1037,10 +1038,16 @@ mod fuse_overlay {
                 .any(|layer_id| layer_id == layer.layer_id));
             let view_b = db.lane_workspace_view("rust-seed-b").unwrap().unwrap();
             let target_b = PathBuf::from(&view_b.generated_upper).join("target");
+            let cargo_stderr = fs::read_to_string(target_b.join("trail-cargo.stderr")).unwrap();
             assert!(
-                !tree_has_name_fragment(&target_b, "libshared_dep"),
-                "the second lane rebuilt a dependency that was available in its immutable target seed"
+                cargo_stderr.contains("Fresh shared-dep"),
+                "the second lane did not reuse its private clone of the immutable target seed:\n{cargo_stderr}"
             );
+            assert!(
+                !cargo_stderr.contains("Compiling shared-dep"),
+                "the second lane rebuilt a dependency that was available in its immutable target seed:\n{cargo_stderr}"
+            );
+            assert!(tree_has_name_fragment(&target_b, "libshared_dep"));
             assert!(!target_b.join("lane-a-private").exists());
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),

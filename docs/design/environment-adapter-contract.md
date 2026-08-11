@@ -21,8 +21,9 @@ generation activation. The first built-ins are:
   graph-aware multi-module adapter is available;
 - `trail/cmake-build@1`: provisions a `writable_private` build tree with no synthetic
   shared layer. Configure is deliberately deferred until execution inside the mounted
-  lane so absolute paths in `CMakeCache.txt` name the stable lane workdir rather than a
-  disposable staging directory;
+  lane so its source path names the stable lane workdir rather than disposable staging;
+  the writable build directory is bound directly from the generated upper so configure,
+  compilation, and tests do not route build-tree metadata through NFS/FUSE/Dokan;
 - `trail/python-venv@1`: recognizes `pyproject.toml` and the common uv, Poetry, PDM,
   Pipenv, and requirements lock/manifest files, provisions a layer-free lane-private
   `.venv`, and keys it by every present dependency file plus the resolved Python
@@ -56,6 +57,14 @@ compatibility, external/runtime declarations, platform/ABI, portability, and tru
 scope. Host cache storage paths are rewritten to logical cache names before hashing, so
 moving `.trail` storage cannot change artifact correctness identity. This projection
 does not advertise or invoke plugin protocol v3 and grants no v3-only capability.
+
+Ordinary managed commands receive bindings declared by each active built-in adapter:
+fixed policy values, resolved absolute tools, cache namespace subpaths, and generated
+outputs. Direct output bindings are limited to lane-private or private-seeded policies;
+they never expose a shared immutable layer for mutation. Binding-name collisions fail
+closed, and an inactive adapter contributes nothing. This keeps command execution
+framework-neutral while allowing Cargo targets, Node dependency trees, and CMake build
+trees to bypass metadata-heavy filesystem transports safely.
 
 The mapping deliberately preserves adapter semantics: Go's module/build stores remain
 performance-only while its vendor output remains an immutable private seed; CMake's

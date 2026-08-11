@@ -2484,8 +2484,11 @@ impl Trail {
             let validated_entries = scan_layer_entries(&staging, false)?;
             sync_layer_tree(&staging)?;
             test_crash_point("layer_after_staging_sync");
-            let (artifact_tree_id, artifact_tree) =
-                self.ingest_artifact_tree_under_write_lock(&staging)?;
+            let (artifact_tree_id, artifact_tree) = self
+                .ingest_artifact_tree_under_write_lock_with_secret_policy(
+                    &staging,
+                    workspace_layer_artifact_secret_policy(key),
+                )?;
             test_crash_point("layer_after_cas_tree");
             let stable_entries = scan_layer_entries(&staging, false)?;
             if stable_entries != validated_entries {
@@ -2698,8 +2701,11 @@ impl Trail {
                 "workspace layer `{layer_id}` cannot recover because its published tree is corrupt"
             )));
         }
-        let (artifact_tree_id, artifact_tree) =
-            self.ingest_artifact_tree_under_write_lock(final_path)?;
+        let (artifact_tree_id, artifact_tree) = self
+            .ingest_artifact_tree_under_write_lock_with_secret_policy(
+                final_path,
+                workspace_layer_artifact_secret_policy(key),
+            )?;
         verify_artifact_shadow_matches_layer_entries(
             &artifact_tree,
             &self.artifact_tree_flat_entries(&artifact_tree_id)?,
@@ -6531,6 +6537,16 @@ pub(crate) fn scan_layer_entries(
     Ok(entries)
 }
 
+fn workspace_layer_artifact_secret_policy(
+    key: &WorkspaceLayerKeyV1,
+) -> super::workspace_artifact::ArtifactSecretPolicy {
+    if key.adapter == "node" && key.strategy.ends_with("-frozen-ignore-scripts-v1") {
+        super::workspace_artifact::ArtifactSecretPolicy::LockedPublicDependencies
+    } else {
+        super::workspace_artifact::ArtifactSecretPolicy::Strict
+    }
+}
+
 pub(crate) fn verify_artifact_shadow_matches_layer_entries(
     tree: &ArtifactTreeRootV1,
     artifact_entries: &BTreeMap<String, super::workspace_artifact::ArtifactFlatEntry>,
@@ -6769,6 +6785,28 @@ mod tests {
             portability_scope: "platform".to_string(),
             strategy: "npm-ci-ignore-scripts".to_string(),
         }
+    }
+
+    #[test]
+    fn only_script_disabled_node_layers_use_public_dependency_secret_policy() {
+        let mut node = key();
+        node.strategy = "npm-frozen-ignore-scripts-v1".to_string();
+        assert_eq!(
+            workspace_layer_artifact_secret_policy(&node),
+            super::super::workspace_artifact::ArtifactSecretPolicy::LockedPublicDependencies
+        );
+
+        node.strategy = "npm-frozen-allow-scripts-v1".to_string();
+        assert_eq!(
+            workspace_layer_artifact_secret_policy(&node),
+            super::super::workspace_artifact::ArtifactSecretPolicy::Strict
+        );
+        node.strategy = "npm-frozen-ignore-scripts-v1".to_string();
+        node.adapter = "custom-node".to_string();
+        assert_eq!(
+            workspace_layer_artifact_secret_policy(&node),
+            super::super::workspace_artifact::ArtifactSecretPolicy::Strict
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -7502,7 +7540,7 @@ validation = "path-contract"
                 "INSERT INTO environment_component_states(
                      view_id,component_id,adapter_identity,adapter_version,implementation_version,
                      distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
-                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v1',
+                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v2',
                         'dependency',?2,?2,'ready',NULL,1)",
                 params![env!("CARGO_PKG_VERSION"), &layer.cache_key],
             )
@@ -7558,7 +7596,7 @@ validation = "path-contract"
         db.conn
             .execute(
                 "UPDATE environment_component_states
-                 SET distribution_digest='builtin:node-plan-v1'
+                 SET distribution_digest='builtin:node-plan-v2'
                  WHERE view_id='parent-view' AND component_id='node'",
                 [],
             )

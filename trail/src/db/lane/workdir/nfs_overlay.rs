@@ -468,19 +468,22 @@ mod macos {
         };
         // Checkpointing reads the pinned source upper and authenticated view
         // journal directly, so it does not depend on an uncached READDIR of
-        // this mount. Retain a short attribute cache: disabling it makes every
-        // repeated parent lookup cross the userspace NFS server and turns
-        // framework builds with thousands of files into multi-minute metadata
-        // walks. Negative-name caching uses the same short lifetime. All live
-        // mutations pass through this one client mount, so CREATE/RENAME
-        // invalidates its own cached directory state; the cache only suppresses
-        // repeated misses from Node-style module resolution. macOS defaults to
+        // this mount. Each managed command receives a fresh mount, while all
+        // live mutations pass through the mount's one NFS client and invalidate
+        // that client's cached directory state. The managed-execution mount
+        // lifetime bounds this 60-second attribute/negative-name cache;
+        // explicit mount callers retain the same single-client mutation
+        // requirement. The cache suppresses repeated parent and source-file
+        // validation during Go, Cargo, Node, and CMake metadata walks. A
+        // one-second cache still made a verified Go build-cache hit spend more
+        // than a minute reopening an otherwise unchanged 158-file source tree.
+        // macOS defaults to
         // `nosync`, where a write syscall may return before this userspace server
         // has received the WRITE RPC. `sync` keeps successful writes as an
         // actual durability boundary; the server itself fsyncs every WRITE
         // before reporting FILE_SYNC.
         let opts = format!(
-            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,actimeo=1,nobrowse,port={port},mountport={port}"
+            "locallocks,vers=3,tcp,sync,rsize=1048576,wsize=1048576,actimeo=60,nobrowse,port={port},mountport={port}"
         );
         let status = Command::new("/sbin/mount_nfs")
             .args(["-o", &opts, "127.0.0.1:/", &mountpoint.to_string_lossy()])
@@ -1400,7 +1403,7 @@ mod macos {
                 .unwrap();
             assert!(gate.success);
             assert_eq!(gate.source_root, checkpoint.root_id);
-            assert!(gate.environment_keys.is_empty());
+            assert_eq!(gate.environment_keys, vec![layer.cache_key.clone()]);
             assert_eq!(gate.layer_ids, vec![layer.layer_id]);
 
             let newer_exec = db
@@ -2197,9 +2200,10 @@ mod macos {
                 .exec_lane_workspace(
                     "rust-nfs-b",
                     &[
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--offline".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cargo build --offline -vv --color never > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
+                            .to_string(),
                     ],
                 )
                 .unwrap();
@@ -2215,10 +2219,16 @@ mod macos {
                 .any(|layer_id| layer_id == layer.layer_id));
             let view_b = db.lane_workspace_view("rust-nfs-b").unwrap().unwrap();
             let target_b = PathBuf::from(&view_b.generated_upper).join("target");
+            let cargo_stderr = fs::read_to_string(target_b.join("trail-cargo.stderr")).unwrap();
             assert!(
-                !tree_has_name_fragment(&target_b, "libshared_dep"),
-                "the second NFS lane rebuilt a dependency present in its immutable target seed"
+                cargo_stderr.contains("Fresh shared-dep"),
+                "the second NFS lane did not reuse its private clone of the immutable target seed:\n{cargo_stderr}"
             );
+            assert!(
+                !cargo_stderr.contains("Compiling shared-dep"),
+                "the second NFS lane rebuilt a dependency present in its immutable target seed:\n{cargo_stderr}"
+            );
+            assert!(tree_has_name_fragment(&target_b, "libshared_dep"));
             assert!(!target_b.join("lane-a-private").exists());
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),

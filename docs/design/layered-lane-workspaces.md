@@ -738,6 +738,19 @@ The compiler cache is the primary cross-branch reuse mechanism. Target seeds
 are an optimization and may be disabled if toolchain behavior or absolute-path
 inputs make them unreliable.
 
+### Managed command bindings
+
+The workspace host does not inject Cargo or npm variables unconditionally.
+Each active built-in adapter declares its fixed policy values, resolved tools,
+cache namespace paths, and output paths. Go receives `GOMODCACHE`, `GOCACHE`,
+and `TRAIL_GO`; Node receives manager caches and a direct lane-private
+`TRAIL_NODE_MODULES`; Python receives its mounted `VIRTUAL_ENV` and
+`TRAIL_VENV_PYTHON`; CMake receives a direct writable-private
+`TRAIL_CMAKE_BUILD_DIR`. Cargo retains direct private `CARGO_TARGET_DIR` and
+managed `CARGO_HOME`/compiler-cache bindings. Output bindings may bypass the
+mounted transport only for private-seeded, writable-private, or disposable
+state, never for a live shared immutable directory.
+
 ### Generic adapters
 
 A generic cache profile can declare:

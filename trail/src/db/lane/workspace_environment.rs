@@ -134,6 +134,50 @@ pub(crate) struct WorkspaceEnvironmentCache {
     pub(crate) compatibility: BTreeMap<String, String>,
 }
 
+/// One adapter-declared binding from an active performance cache into normal
+/// managed lane commands. Storage paths remain host-owned execution details;
+/// adapters name only their logical cache and an optional contained subpath.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceEnvironmentCacheCommandBinding {
+    pub(crate) cache_name: &'static str,
+    pub(crate) environment: &'static str,
+    pub(crate) relative_path: &'static str,
+    pub(crate) required: bool,
+}
+
+/// One adapter-declared fixed policy value applied to normal managed lane
+/// commands while that adapter component is active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceEnvironmentCommandBinding {
+    pub(crate) environment: &'static str,
+    pub(crate) value: &'static str,
+}
+
+/// One adapter-declared executable binding for ordinary managed commands.
+/// Resolution uses the same host policy as planning and exposes an absolute
+/// executable path so login shells cannot silently select another toolchain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceEnvironmentToolCommandBinding {
+    pub(crate) programs: &'static [&'static str],
+    pub(crate) environment: &'static str,
+    pub(crate) required: bool,
+    pub(crate) prepend_path: bool,
+}
+
+/// One adapter-declared binding from an active generated output into normal
+/// managed lane commands. Direct bindings bypass the filesystem transport for
+/// metadata-heavy tool output while mounted bindings retain path-sensitive
+/// prefixes such as Python virtual environments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceEnvironmentOutputCommandBinding {
+    pub(crate) output_name: &'static str,
+    pub(crate) environment: Option<&'static str>,
+    pub(crate) relative_path: &'static str,
+    pub(crate) direct: bool,
+    pub(crate) prepend_path: bool,
+    pub(crate) required: bool,
+}
+
 /// Immutable identity owned by an external provider rather than Trail's
 /// filesystem layer store. Trail records and composes the identity but never
 /// deletes provider-owned content.
@@ -588,6 +632,22 @@ pub(crate) trait WorkspaceEnvironmentAdapter: Sync {
 
     fn component_id(&self, component_root: &str) -> Result<String>;
 
+    fn cache_command_bindings(&self) -> &'static [WorkspaceEnvironmentCacheCommandBinding] {
+        &[]
+    }
+
+    fn command_bindings(&self) -> &'static [WorkspaceEnvironmentCommandBinding] {
+        &[]
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        &[]
+    }
+
+    fn output_command_bindings(&self) -> &'static [WorkspaceEnvironmentOutputCommandBinding] {
+        &[]
+    }
+
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool>;
 
     fn resolution_plan(
@@ -639,7 +699,7 @@ pub(super) fn registered_environment_adapter_metadata(
     metadata
 }
 
-fn builtin_environment_adapter_for_selector(
+pub(super) fn builtin_environment_adapter_for_selector(
     selector: &str,
 ) -> Option<&'static dyn WorkspaceEnvironmentAdapter> {
     builtin_environment_adapters()

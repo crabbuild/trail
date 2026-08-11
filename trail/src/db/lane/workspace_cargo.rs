@@ -1,10 +1,12 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
-    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
-    WorkspaceEnvironmentCommand, WorkspaceEnvironmentConstructionSeed, WorkspaceEnvironmentOutput,
-    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
-    WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheCommandBinding,
+    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand,
+    WorkspaceEnvironmentConstructionSeed, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentOutputCommandBinding, WorkspaceEnvironmentOutputPolicy,
+    WorkspaceEnvironmentPlan, WorkspaceEnvironmentResolutionInput,
+    WorkspaceEnvironmentSandboxPolicy, WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 use crate::ids::sha256_hex;
@@ -31,6 +33,46 @@ static CARGO_TARGET_SEED_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         description:
             "Locked Cargo target seed keyed by the complete source root and Rust toolchain identity",
     };
+
+const CARGO_CACHE_COMMAND_BINDINGS: &[WorkspaceEnvironmentCacheCommandBinding] = &[
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "cargo-home",
+        environment: "CARGO_HOME",
+        relative_path: "",
+        required: true,
+    },
+    WorkspaceEnvironmentCacheCommandBinding {
+        cache_name: "sccache",
+        environment: "SCCACHE_DIR",
+        relative_path: "",
+        required: false,
+    },
+];
+
+const CARGO_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] =
+    &[WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "target-seed",
+        environment: Some("CARGO_TARGET_DIR"),
+        relative_path: "",
+        direct: true,
+        prepend_path: false,
+        required: true,
+    }];
+
+const CARGO_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] = &[
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["cargo"],
+        environment: "TRAIL_CARGO",
+        required: true,
+        prepend_path: true,
+    },
+    WorkspaceEnvironmentToolCommandBinding {
+        programs: &["rustc"],
+        environment: "TRAIL_RUSTC",
+        required: true,
+        prepend_path: true,
+    },
+];
 
 #[cfg(target_os = "linux")]
 fn sccache_server_endpoint(cache_path: &Path) -> String {
@@ -67,6 +109,18 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
         } else {
             format!("cargo-target-seed:{root}")
         })
+    }
+
+    fn cache_command_bindings(&self) -> &'static [WorkspaceEnvironmentCacheCommandBinding] {
+        CARGO_CACHE_COMMAND_BINDINGS
+    }
+
+    fn output_command_bindings(&self) -> &'static [WorkspaceEnvironmentOutputCommandBinding] {
+        CARGO_OUTPUT_COMMAND_BINDINGS
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        CARGO_TOOL_COMMAND_BINDINGS
     }
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {

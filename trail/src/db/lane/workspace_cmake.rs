@@ -1,7 +1,9 @@
 use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentOutput,
-    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentOutputCommandBinding, WorkspaceEnvironmentOutputPolicy,
+    WorkspaceEnvironmentPlan, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 
@@ -16,7 +18,7 @@ static CMAKE_BUILD_TREE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "cmake-build",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:cmake-build-plan-v1",
+        distribution_digest: "builtin:cmake-build-plan-v2",
         selectors: &["trail/cmake-build@1", "cmake-build", "cmake"],
         kind: "build",
         layer_adapter_name: "cmake-build",
@@ -26,6 +28,24 @@ static CMAKE_BUILD_TREE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         stability: "experimental",
         description: "Lane-private CMake build tree with configure deferred to the mounted lane",
     };
+
+const CMAKE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] =
+    &[WorkspaceEnvironmentOutputCommandBinding {
+        output_name: "build-tree",
+        environment: Some("TRAIL_CMAKE_BUILD_DIR"),
+        relative_path: "",
+        direct: true,
+        prepend_path: false,
+        required: true,
+    }];
+
+const CMAKE_TOOL_COMMAND_BINDINGS: &[WorkspaceEnvironmentToolCommandBinding] =
+    &[WorkspaceEnvironmentToolCommandBinding {
+        programs: &["cmake"],
+        environment: "TRAIL_CMAKE",
+        required: true,
+        prepend_path: true,
+    }];
 
 impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
@@ -39,6 +59,14 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
         } else {
             format!("cmake-build:{root}")
         })
+    }
+
+    fn output_command_bindings(&self) -> &'static [WorkspaceEnvironmentOutputCommandBinding] {
+        CMAKE_OUTPUT_COMMAND_BINDINGS
+    }
+
+    fn tool_command_bindings(&self) -> &'static [WorkspaceEnvironmentToolCommandBinding] {
+        CMAKE_TOOL_COMMAND_BINDINGS
     }
 
     fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {
@@ -64,7 +92,7 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
         }
         let cmake = resolve_workspace_tool_executable("cmake")?;
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:cmake-build-plan-v1".to_string();
+        let distribution_digest = "builtin:cmake-build-plan-v2".to_string();
         let mount_path = join_repo_path(&component_root, "build");
         let component_id = self.component_id(&component_root)?;
         let inputs = BTreeMap::from([
@@ -86,6 +114,11 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
             (
                 "configure_phase".to_string(),
                 "deferred-to-mounted-lane".to_string(),
+            ),
+            (
+                "command_environment".to_string(),
+                "TRAIL_CMAKE_BUILD_DIR=direct-output:build-tree;TRAIL_CMAKE=tool:cmake;PATH+=tool-dir:cmake"
+                    .to_string(),
             ),
         ]);
         Ok(WorkspaceEnvironmentPlan {
@@ -320,20 +353,35 @@ mod tests {
             #[cfg(target_os = "linux")]
             let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
+            let environment = db
+                .lane_workspace_environment(lane)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let build_dir = PathBuf::from(&environment["TRAIL_CMAKE_BUILD_DIR"]);
+            let view = db.lane_workspace_view(lane).unwrap().unwrap();
+            assert_eq!(build_dir, Path::new(&view.generated_upper).join("build"));
+            assert!(!build_dir.starts_with(&workdir));
             let configured = Command::new("cmake")
-                .args(["-S", ".", "-B", "build", "-G", "Unix Makefiles"])
+                .arg("-S")
+                .arg(".")
+                .arg("-B")
+                .arg(&build_dir)
+                .args(["-G", "Unix Makefiles"])
                 .current_dir(&workdir)
                 .status()
                 .unwrap();
             assert!(configured.success());
             let built = Command::new("cmake")
-                .args(["--build", "build", "--parallel", "2"])
+                .arg("--build")
+                .arg(&build_dir)
+                .args(["--parallel", "2"])
                 .current_dir(&workdir)
                 .status()
                 .unwrap();
             assert!(built.success());
-            assert!(workdir.join("build/hello").is_file());
-            let cache = fs::read_to_string(workdir.join("build/CMakeCache.txt")).unwrap();
+            assert!(build_dir.join("hello").is_file());
+            let cache = fs::read_to_string(build_dir.join("CMakeCache.txt")).unwrap();
             assert!(cache.contains(workdir.to_string_lossy().as_ref()));
             drop(mounted);
         }
@@ -343,21 +391,32 @@ mod tests {
         #[cfg(target_os = "linux")]
         let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-a").unwrap();
         let workdir_a = PathBuf::from(db.lane_workdir("cmake-a").unwrap().workdir.unwrap());
+        let build_dir_a = db
+            .lane_workspace_environment("cmake-a")
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()["TRAIL_CMAKE_BUILD_DIR"]
+            .clone();
         let cleaned = Command::new("cmake")
-            .args(["--build", "build", "--target", "clean"])
+            .args(["--build", &build_dir_a, "--target", "clean"])
             .current_dir(&workdir_a)
             .status()
             .unwrap();
         assert!(cleaned.success());
-        assert!(!workdir_a.join("build/hello").exists());
+        assert!(!Path::new(&build_dir_a).join("hello").exists());
         drop(mounted);
 
         #[cfg(target_os = "macos")]
         let mounted = db.mount_nfs_cow_workdir_for_lane("cmake-b").unwrap();
         #[cfg(target_os = "linux")]
         let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-b").unwrap();
-        let workdir_b = PathBuf::from(db.lane_workdir("cmake-b").unwrap().workdir.unwrap());
-        assert!(workdir_b.join("build/hello").is_file());
+        let build_dir_b = db
+            .lane_workspace_environment("cmake-b")
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()["TRAIL_CMAKE_BUILD_DIR"]
+            .clone();
+        assert!(Path::new(&build_dir_b).join("hello").is_file());
         drop(mounted);
         assert!(db.list_workspace_layers().unwrap().is_empty());
     }

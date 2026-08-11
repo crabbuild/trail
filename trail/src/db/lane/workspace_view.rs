@@ -92,10 +92,16 @@ impl WorkspaceMountLease {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        db.conn.execute(
+        let updated = db.conn.execute(
             "UPDATE workspace_views SET status = 'unmounted', owner_pid = NULL, owner_start_token = NULL, heartbeat_at = NULL, updated_at = ?1 WHERE view_id = ?2 AND owner_start_token = ?3",
             params![now_ts(), self.view_id, self.owner_start_token],
         )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{}` mount lease changed before release",
+                self.view_id
+            )));
+        }
         if let Some(meta_dir) = view {
             let _ = fs::remove_file(Path::new(&meta_dir).join("mount.json"));
         }
@@ -111,6 +117,52 @@ impl Drop for WorkspaceMountLease {
 }
 
 impl Trail {
+    pub(crate) fn release_current_process_workspace_mount_lease(
+        &self,
+        view_id: &str,
+    ) -> Result<()> {
+        let owner = self
+            .conn
+            .query_row(
+                "SELECT owner_pid, owner_start_token, meta_dir FROM workspace_views WHERE view_id = ?1",
+                params![view_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u32>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_pid, owner_token, meta_dir)) = owner else {
+            return Err(Error::Corrupt(format!(
+                "workspace view `{view_id}` disappeared during managed unmount"
+            )));
+        };
+        let Some((owner_pid, owner_token)) = owner_pid.zip(owner_token) else {
+            return Ok(());
+        };
+        let current_pid = std::process::id();
+        let current_token = current_process_start_token();
+        if owner_pid != current_pid || owner_token != current_token {
+            // The managed mount is gone and a different owner acquired the
+            // view after it. Never clear that successor's lease.
+            return Ok(());
+        }
+        let updated = self.conn.execute(
+            "UPDATE workspace_views SET status = 'unmounted', owner_pid = NULL, owner_start_token = NULL, heartbeat_at = NULL, updated_at = ?1 WHERE view_id = ?2 AND owner_pid = ?3 AND owner_start_token = ?4",
+            params![now_ts(), view_id, current_pid, current_token],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{view_id}` mount lease changed during managed unmount"
+            )));
+        }
+        let _ = fs::remove_file(Path::new(&meta_dir).join("mount.json"));
+        Ok(())
+    }
+
     /// Start a mount worker owned by the current long-lived Trail process.
     /// HTTP/MCP daemons use this non-blocking entry point; the worker still
     /// owns the same foreground lifecycle and durable lease as the CLI path.
@@ -933,32 +985,11 @@ impl Trail {
         source_root: &ObjectId,
         component_root: &str,
     ) -> Result<Vec<(String, String)>> {
-        let node_cache = self.db_dir.join("cache/tool-home/node/npm");
         let component_root = if component_root.is_empty() || component_root == "." {
             String::new()
         } else {
             normalize_relative_path(component_root)?
         };
-        let cargo_component = if component_root.is_empty() {
-            "cargo-target-seed".to_string()
-        } else {
-            format!("cargo-target-seed:{component_root}")
-        };
-        let cargo_home = self
-            .active_workspace_cache_path(view, &cargo_component, "cargo-home")?
-            .unwrap_or_else(|| self.db_dir.join("cache/tool-home/cargo"));
-        let sccache_dir = self
-            .active_workspace_cache_path(view, &cargo_component, "sccache")?
-            .unwrap_or_else(|| self.db_dir.join("cache/tool-home/sccache"));
-        let target_mount = if component_root.is_empty() {
-            "target".to_string()
-        } else {
-            format!("{component_root}/target")
-        };
-        let target_dir = self.prepare_direct_private_seed(view, &target_mount)?;
-        for path in [&cargo_home, &node_cache, &sccache_dir] {
-            fs::create_dir_all(path)?;
-        }
         let mut environment = vec![
             (
                 "TRAIL_WORKSPACE".to_string(),
@@ -971,23 +1002,16 @@ impl Trail {
                 "TRAIL_VIEW_GENERATION".to_string(),
                 view.generation.to_string(),
             ),
-            (
-                "CARGO_HOME".to_string(),
-                cargo_home.to_string_lossy().into_owned(),
-            ),
-            (
-                "CARGO_TARGET_DIR".to_string(),
-                target_dir.to_string_lossy().into_owned(),
-            ),
-            (
-                "SCCACHE_DIR".to_string(),
-                sccache_dir.to_string_lossy().into_owned(),
-            ),
-            (
-                "npm_config_cache".to_string(),
-                node_cache.to_string_lossy().into_owned(),
-            ),
         ];
+        environment.extend(
+            self.active_workspace_command_bindings(view, &component_root)
+                .map_err(|error| {
+                    Error::InvalidInput(format!(
+                        "workspace view `{}` command bindings could not be resolved: {error}",
+                        view.view_id
+                    ))
+                })?,
+        );
         if let Some(generation_id) = self
             .conn
             .query_row(
@@ -1060,15 +1084,27 @@ impl Trail {
                 serde_json::to_string(&services)?,
             ));
         }
-        if command_available("sccache") {
+        let has_cargo_target = environment
+            .iter()
+            .any(|(name, _)| name == "CARGO_TARGET_DIR");
+        let has_sccache_cache = environment.iter().any(|(name, _)| name == "SCCACHE_DIR");
+        if has_sccache_cache && command_available("sccache") {
             environment.extend([
                 ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
                 ("CARGO_INCREMENTAL".to_string(), "0".to_string()),
             ]);
-        } else {
+        } else if has_cargo_target {
             environment.push(("CARGO_INCREMENTAL".to_string(), "1".to_string()));
         }
-        if let Some(shadow) = self.ensure_workspace_git_shadow(view, source_root)? {
+        if let Some(shadow) = self
+            .ensure_workspace_git_shadow(view, source_root)
+            .map_err(|error| {
+                Error::InvalidInput(format!(
+                    "workspace view `{}` Git shadow could not be prepared: {error}",
+                    view.view_id
+                ))
+            })?
+        {
             environment.extend([
                 ("GIT_DIR".to_string(), shadow.git_dir.clone()),
                 ("GIT_WORK_TREE".to_string(), shadow.work_tree.clone()),
@@ -1085,27 +1121,272 @@ impl Trail {
         Ok(environment)
     }
 
+    fn active_workspace_command_bindings(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        component_root: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT c.component_id, c.adapter_identity
+             FROM environment_view_generations active
+             JOIN environment_generation_components c
+               ON c.generation_id = active.generation_id
+             WHERE active.view_id = ?1
+             ORDER BY c.component_id, c.adapter_identity",
+        )?;
+        let components = statement
+            .query_map(params![&view.view_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut bindings = BTreeMap::<String, String>::new();
+        let mut output_path_prefixes = Vec::<PathBuf>::new();
+        let mut tool_path_prefixes = Vec::<PathBuf>::new();
+        for (component_id, adapter_identity) in components {
+            let Some(adapter) =
+                super::workspace_environment::builtin_environment_adapter_for_selector(
+                    &adapter_identity,
+                )
+            else {
+                continue;
+            };
+            if adapter.component_id(component_root)? != component_id {
+                continue;
+            }
+            for binding in adapter.command_bindings() {
+                insert_workspace_command_binding(
+                    &mut bindings,
+                    binding.environment,
+                    binding.value.to_string(),
+                    &component_id,
+                )?;
+            }
+            for binding in adapter.tool_command_bindings() {
+                let mut resolved = None;
+                let mut errors = Vec::new();
+                for program in binding.programs {
+                    match super::workspace_environment::resolve_workspace_tool_executable(program) {
+                        Ok(tool) => {
+                            resolved = Some(tool);
+                            break;
+                        }
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                let Some(tool) = resolved else {
+                    if binding.required {
+                        return Err(Error::InvalidInput(format!(
+                            "active component `{component_id}` requires one of [{}]: {}",
+                            binding.programs.join(", "),
+                            errors.join("; ")
+                        )));
+                    }
+                    continue;
+                };
+                if binding.prepend_path {
+                    let parent = tool.path.parent().ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "resolved tool for component `{component_id}` has no parent directory"
+                        ))
+                    })?;
+                    tool_path_prefixes.push(parent.to_path_buf());
+                }
+                insert_workspace_command_binding(
+                    &mut bindings,
+                    binding.environment,
+                    tool.path.to_string_lossy().into_owned(),
+                    &component_id,
+                )?;
+            }
+            for binding in adapter.cache_command_bindings() {
+                let Some(root) = self
+                    .active_workspace_cache_path(view, &component_id, binding.cache_name)
+                    .map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` cache `{}` root could not be resolved: {error}",
+                            binding.cache_name
+                        ))
+                    })?
+                else {
+                    if binding.required {
+                        return Err(Error::Corrupt(format!(
+                            "active component `{component_id}` is missing required cache `{}`",
+                            binding.cache_name
+                        )));
+                    }
+                    continue;
+                };
+                let path = if binding.relative_path.is_empty() {
+                    root
+                } else {
+                    safe_join(&root, binding.relative_path).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` cache `{}` binding `{}` could not be resolved beneath `{}`: {error}",
+                            binding.cache_name,
+                            binding.relative_path,
+                            root.display()
+                        ))
+                    })?
+                };
+                fs::create_dir_all(&path)?;
+                insert_workspace_command_binding(
+                    &mut bindings,
+                    binding.environment,
+                    path.to_string_lossy().into_owned(),
+                    &component_id,
+                )?;
+            }
+            for binding in adapter.output_command_bindings() {
+                let output =
+                    self.active_workspace_output_binding(view, &component_id, binding.output_name)?;
+                let Some((mount_path, policy)) = output else {
+                    if binding.required {
+                        return Err(Error::Corrupt(format!(
+                            "active component `{component_id}` is missing required output `{}`",
+                            binding.output_name
+                        )));
+                    }
+                    continue;
+                };
+                let root = if binding.direct {
+                    match policy.as_str() {
+                        "immutable_seed_private" => {
+                            self.prepare_direct_private_seed(view, &mount_path)?
+                        }
+                        "writable_private" | "disposable" => {
+                            let path = safe_join(Path::new(&view.generated_upper), &mount_path)?;
+                            fs::create_dir_all(&path)?;
+                            path
+                        }
+                        other => {
+                            return Err(Error::Corrupt(format!(
+                                "component `{component_id}` output `{}` cannot bind policy `{other}` directly",
+                                binding.output_name
+                            )));
+                        }
+                    }
+                } else {
+                    let relative = if binding.relative_path.is_empty() {
+                        mount_path.clone()
+                    } else {
+                        format!("{mount_path}/{}", binding.relative_path)
+                    };
+                    safe_join(Path::new(&view.mountpoint), &relative).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` output `{}` binding `{relative}` could not be resolved beneath mounted workspace `{}`: {error}",
+                            binding.output_name, view.mountpoint
+                        ))
+                    })?
+                };
+                let path = if !binding.direct || binding.relative_path.is_empty() {
+                    root
+                } else {
+                    safe_join(&root, binding.relative_path)?
+                };
+                if binding.prepend_path {
+                    output_path_prefixes.push(path.clone());
+                }
+                if let Some(environment) = binding.environment {
+                    insert_workspace_command_binding(
+                        &mut bindings,
+                        environment,
+                        path.to_string_lossy().into_owned(),
+                        &component_id,
+                    )?;
+                }
+            }
+        }
+        if !output_path_prefixes.is_empty() || !tool_path_prefixes.is_empty() {
+            // Project-local output executables (for example node_modules/.bin
+            // or a virtual environment's bin directory) must win over global
+            // tool directories while the resolved tools still win over the
+            // ambient PATH.
+            let mut paths = output_path_prefixes;
+            paths.extend(tool_path_prefixes);
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            let joined = std::env::join_paths(paths).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "cannot construct managed command PATH from active environment outputs: {error}"
+                ))
+            })?;
+            bindings.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
+        }
+        Ok(bindings.into_iter().collect())
+    }
+
+    fn active_workspace_output_binding(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        component_id: &str,
+        output_name: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT o.mount_path, o.policy
+                 FROM environment_view_generations active
+                 JOIN environment_generation_outputs o
+                   ON o.generation_id = active.generation_id
+                 WHERE active.view_id = ?1 AND o.component_id = ?2
+                   AND o.output_name = ?3",
+                params![&view.view_id, component_id, output_name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn active_workspace_cache_path(
         &self,
         view: &LaneWorkspaceViewReport,
         component_id: &str,
         cache_name: &str,
     ) -> Result<Option<PathBuf>> {
-        let namespace = self
+        let cache = self
             .conn
             .query_row(
-                "SELECT c.namespace_id
+                "SELECT c.namespace_id, n.storage_path
                  FROM environment_view_generations active
                  JOIN environment_generation_caches c
                    ON c.generation_id = active.generation_id
+                 JOIN environment_cache_namespaces n
+                   ON n.namespace_id = c.namespace_id
                  WHERE active.view_id = ?1 AND c.component_id = ?2 AND c.cache_name = ?3",
                 params![&view.view_id, component_id, cache_name],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        namespace
-            .map(|namespace| safe_join(&self.db_dir.join("cache/namespaces"), &namespace))
-            .transpose()
+        let Some((namespace, storage_path)) = cache else {
+            return Ok(None);
+        };
+        let namespace_root = self.db_dir.join("cache/namespaces");
+        fs::create_dir_all(&namespace_root)?;
+        let expected = safe_join(&namespace_root, &namespace)?;
+        if let Ok(metadata) = fs::symlink_metadata(&expected)
+            && (!metadata.is_dir() || metadata.file_type().is_symlink())
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment cache namespace `{namespace}` is not a real directory"
+            )));
+        }
+        fs::create_dir_all(&expected)?;
+        let canonical_storage = Path::new(&storage_path).canonicalize()?;
+        if canonical_storage != expected {
+            return Err(Error::Corrupt(format!(
+                "environment cache namespace `{namespace}` has invalid storage path `{storage_path}`"
+            )));
+        }
+        let updated = self.conn.execute(
+            "UPDATE environment_cache_namespaces SET last_used_at = ?1 WHERE namespace_id = ?2",
+            params![now_ts(), namespace],
+        )?;
+        if updated != 1 {
+            return Err(Error::Corrupt(format!(
+                "environment cache namespace `{namespace}` disappeared while preparing command bindings"
+            )));
+        }
+        Ok(Some(expected))
     }
 
     fn prepare_direct_private_seed(
@@ -1679,6 +1960,34 @@ impl Trail {
 fn checkpoint_view(source_upper: &Path) -> Result<ViewJournalCut> {
     let journal: ViewIntentWriter = ViewMutationJournal::open(source_upper)?;
     Ok(journal.cut())
+}
+
+fn insert_workspace_command_binding(
+    bindings: &mut BTreeMap<String, String>,
+    name: &str,
+    value: String,
+    component_id: &str,
+) -> Result<()> {
+    let valid_name = !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+    if !valid_name || value.contains('\0') {
+        return Err(Error::Corrupt(format!(
+            "active component `{component_id}` declares invalid command environment binding `{name}`"
+        )));
+    }
+    if let Some(existing) = bindings.get(name) {
+        if existing != &value {
+            return Err(Error::InvalidInput(format!(
+                "active component `{component_id}` command environment binding `{name}` conflicts with another component"
+            )));
+        }
+        return Ok(());
+    }
+    bindings.insert(name.to_string(), value);
+    Ok(())
 }
 
 fn runtime_service_environment_segment(name: &str) -> String {
@@ -2694,6 +3003,18 @@ mod tests {
             "unmounted"
         );
 
+        let mut leaked = db.acquire_workspace_mount_lease("lease", &backend).unwrap();
+        leaked.mark_mounted().unwrap();
+        std::mem::forget(leaked);
+        db.release_current_process_workspace_mount_lease(
+            &db.lane_workspace_view("lease").unwrap().unwrap().view_id,
+        )
+        .unwrap();
+        let released = db.lane_workspace_view("lease").unwrap().unwrap();
+        assert_eq!(released.status, "unmounted");
+        assert_eq!(released.owner_pid, None);
+        assert_eq!(released.owner_start_token, None);
+
         let view = db.lane_workspace_view("lease").unwrap().unwrap();
         db.conn
             .execute(
@@ -2860,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_environment_shares_downloads_and_compiler_cache_but_not_target_state() {
+    fn workspace_environment_does_not_inject_inactive_framework_bindings() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path().join("Cargo.toml"),
@@ -2878,61 +3199,38 @@ mod tests {
         } else {
             LaneWorkdirMode::FuseCow
         };
-        for lane in ["cargo-a", "cargo-b"] {
-            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
-                lane,
-                Some("main"),
-                mode.clone(),
-                None,
-                None,
-                None,
-                &[],
-                false,
-            )
-            .unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "inactive",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let view = db.lane_workspace_view("inactive").unwrap().unwrap();
+        let root = db
+            .get_ref(&db.lane_branch("inactive").unwrap().ref_name)
+            .unwrap()
+            .root_id;
+        let environment = db
+            .workspace_command_environment(&view, &root)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        for name in [
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "GOCACHE",
+            "GOMODCACHE",
+            "npm_config_cache",
+            "VIRTUAL_ENV",
+            "TRAIL_CMAKE_BUILD_DIR",
+        ] {
+            assert!(!environment.contains_key(name), "unexpected binding {name}");
         }
-        let environment = |lane: &str| {
-            let view = db.lane_workspace_view(lane).unwrap().unwrap();
-            let root = db
-                .get_ref(&db.lane_branch(lane).unwrap().ref_name)
-                .unwrap()
-                .root_id;
-            db.workspace_command_environment(&view, &root)
-                .unwrap()
-                .into_iter()
-                .collect::<BTreeMap<_, _>>()
-        };
-        let a = environment("cargo-a");
-        let b = environment("cargo-b");
-        assert_eq!(a["CARGO_HOME"], b["CARGO_HOME"]);
-        assert_eq!(a["SCCACHE_DIR"], b["SCCACHE_DIR"]);
-        assert_ne!(a["CARGO_TARGET_DIR"], b["CARGO_TARGET_DIR"]);
-        assert_eq!(
-            Path::new(&a["CARGO_TARGET_DIR"]).parent(),
-            Some(Path::new(
-                &db.lane_workspace_view("cargo-a")
-                    .unwrap()
-                    .unwrap()
-                    .generated_upper
-            ))
-        );
-        assert_eq!(
-            Path::new(&b["CARGO_TARGET_DIR"]).parent(),
-            Some(Path::new(
-                &db.lane_workspace_view("cargo-b")
-                    .unwrap()
-                    .unwrap()
-                    .generated_upper
-            ))
-        );
-        assert_eq!(
-            Path::new(&a["CARGO_TARGET_DIR"]).file_name(),
-            Some(std::ffi::OsStr::new("target"))
-        );
-        assert_eq!(
-            Path::new(&b["CARGO_TARGET_DIR"]).file_name(),
-            Some(std::ffi::OsStr::new("target"))
-        );
     }
 
     #[test]
