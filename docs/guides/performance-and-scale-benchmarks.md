@@ -129,11 +129,14 @@ httpx/Python virtual environments, and LevelDB/CMake:
 ```sh
 TRAIL_BIN=/absolute/path/to/trail \
 TRAIL_FRAMEWORK_EVIDENCE_DIR=/absolute/new/evidence/go \
+TRAIL_FRAMEWORK_WORK_ROOT=/absolute/new/work/go \
 scripts/verify-real-framework-handoff.sh go
 ```
 
 Valid selectors are `go`, `pnpm`, `npm`, `python`, and `cmake`. The output
-directory must not exist. `evidence.json` pins the repository/revision, three
+and optional work directories must not exist. When omitted, the work directory
+defaults to `<evidence>.work` and remains outside the uploaded evidence set.
+`evidence.json` pins the repository/revision, three
 distinct source roots, active component keys, layer identities, cache
 namespaces, lane-private output identities, and SHA-256 digests of every raw
 Trail report. The checker requires each edit to checkpoint only `README.md`,

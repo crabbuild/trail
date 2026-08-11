@@ -17,6 +17,9 @@ framework=$1
 [[ -x $TRAIL_BIN ]] || die "TRAIL_BIN is not executable: $TRAIL_BIN"
 [[ $TRAIL_FRAMEWORK_EVIDENCE_DIR == /* ]] || die "TRAIL_FRAMEWORK_EVIDENCE_DIR must be absolute"
 [[ ! -e $TRAIL_FRAMEWORK_EVIDENCE_DIR ]] || die "evidence directory already exists"
+qualification_root=${TRAIL_FRAMEWORK_WORK_ROOT:-$TRAIL_FRAMEWORK_EVIDENCE_DIR.work}
+[[ $qualification_root == /* ]] || die "TRAIL_FRAMEWORK_WORK_ROOT must be absolute when set"
+[[ ! -e $qualification_root ]] || die "qualification work directory already exists"
 
 case "$framework" in
   go)
@@ -53,7 +56,6 @@ case "$framework" in
 esac
 
 mkdir -p "$TRAIL_FRAMEWORK_EVIDENCE_DIR/raw"
-qualification_root=$TRAIL_FRAMEWORK_EVIDENCE_DIR/workspace
 repository_root=$qualification_root/repository
 mkdir -p "$qualification_root"
 
