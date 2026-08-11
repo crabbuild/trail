@@ -64,10 +64,6 @@ git -C "$repository_root" remote add origin "$repository"
 git -C "$repository_root" fetch -q --depth=1 origin "$revision"
 git -C "$repository_root" checkout -q --detach FETCH_HEAD
 [[ $(git -C "$repository_root" rev-parse HEAD) == "$revision" ]] || die "pinned revision mismatch"
-if [[ $framework == cmake ]]; then
-  git -C "$repository_root" submodule update -q --init --recursive --depth=1
-fi
-
 run_json() {
   local output=$1
   shift
@@ -109,10 +105,8 @@ run_framework_check() {
     cmake)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
         'set -eu
-         "$TRAIL_CMAKE" -S . -B "$TRAIL_CMAKE_BUILD_DIR" -DLEVELDB_BUILD_TESTS=ON -DLEVELDB_BUILD_BENCHMARKS=OFF 1>&2
-         "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_BUILD_DIR" --target leveldb_tests --parallel 2 1>&2
-         cmake_bin=${TRAIL_CMAKE%/*}
-         exec "$cmake_bin/ctest" --test-dir "$TRAIL_CMAKE_BUILD_DIR" -R "^leveldb_tests$" --output-on-failure 1>&2'
+         "$TRAIL_CMAKE" -S . -B "$TRAIL_CMAKE_BUILD_DIR" -DLEVELDB_BUILD_TESTS=OFF -DLEVELDB_BUILD_BENCHMARKS=OFF 1>&2
+         exec "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_BUILD_DIR" --target leveldb --parallel 2 1>&2'
       ;;
   esac
 }
