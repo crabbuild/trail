@@ -7190,7 +7190,7 @@ mod tests {
             forward.source_closure.declared_inputs = inputs
                 .iter()
                 .map(|(name, value)| ArtifactResolutionInputV1 {
-                    source_path: format!("inputs/{name}"),
+                    source_path: format!("inputs/input-{name}"),
                     content_hash: sha256_hex(&value.to_le_bytes()),
                     size_bytes: 8,
                 })
