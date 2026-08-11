@@ -92,10 +92,16 @@ impl WorkspaceMountLease {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        db.conn.execute(
+        let updated = db.conn.execute(
             "UPDATE workspace_views SET status = 'unmounted', owner_pid = NULL, owner_start_token = NULL, heartbeat_at = NULL, updated_at = ?1 WHERE view_id = ?2 AND owner_start_token = ?3",
             params![now_ts(), self.view_id, self.owner_start_token],
         )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{}` mount lease changed before release",
+                self.view_id
+            )));
+        }
         if let Some(meta_dir) = view {
             let _ = fs::remove_file(Path::new(&meta_dir).join("mount.json"));
         }
@@ -111,6 +117,52 @@ impl Drop for WorkspaceMountLease {
 }
 
 impl Trail {
+    pub(crate) fn release_current_process_workspace_mount_lease(
+        &self,
+        view_id: &str,
+    ) -> Result<()> {
+        let owner = self
+            .conn
+            .query_row(
+                "SELECT owner_pid, owner_start_token, meta_dir FROM workspace_views WHERE view_id = ?1",
+                params![view_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u32>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_pid, owner_token, meta_dir)) = owner else {
+            return Err(Error::Corrupt(format!(
+                "workspace view `{view_id}` disappeared during managed unmount"
+            )));
+        };
+        let Some((owner_pid, owner_token)) = owner_pid.zip(owner_token) else {
+            return Ok(());
+        };
+        let current_pid = std::process::id();
+        let current_token = current_process_start_token();
+        if owner_pid != current_pid || owner_token != current_token {
+            // The managed mount is gone and a different owner acquired the
+            // view after it. Never clear that successor's lease.
+            return Ok(());
+        }
+        let updated = self.conn.execute(
+            "UPDATE workspace_views SET status = 'unmounted', owner_pid = NULL, owner_start_token = NULL, heartbeat_at = NULL, updated_at = ?1 WHERE view_id = ?2 AND owner_pid = ?3 AND owner_start_token = ?4",
+            params![now_ts(), view_id, current_pid, current_token],
+        )?;
+        if updated != 1 {
+            return Err(Error::InvalidInput(format!(
+                "workspace view `{view_id}` mount lease changed during managed unmount"
+            )));
+        }
+        let _ = fs::remove_file(Path::new(&meta_dir).join("mount.json"));
+        Ok(())
+    }
+
     /// Start a mount worker owned by the current long-lived Trail process.
     /// HTTP/MCP daemons use this non-blocking entry point; the worker still
     /// owns the same foreground lifecycle and durable lease as the CLI path.
@@ -951,7 +1003,15 @@ impl Trail {
                 view.generation.to_string(),
             ),
         ];
-        environment.extend(self.active_workspace_command_bindings(view, &component_root)?);
+        environment.extend(
+            self.active_workspace_command_bindings(view, &component_root)
+                .map_err(|error| {
+                    Error::InvalidInput(format!(
+                        "workspace view `{}` command bindings could not be resolved: {error}",
+                        view.view_id
+                    ))
+                })?,
+        );
         if let Some(generation_id) = self
             .conn
             .query_row(
@@ -1036,7 +1096,15 @@ impl Trail {
         } else if has_cargo_target {
             environment.push(("CARGO_INCREMENTAL".to_string(), "1".to_string()));
         }
-        if let Some(shadow) = self.ensure_workspace_git_shadow(view, source_root)? {
+        if let Some(shadow) = self
+            .ensure_workspace_git_shadow(view, source_root)
+            .map_err(|error| {
+                Error::InvalidInput(format!(
+                    "workspace view `{}` Git shadow could not be prepared: {error}",
+                    view.view_id
+                ))
+            })?
+        {
             environment.extend([
                 ("GIT_DIR".to_string(), shadow.git_dir.clone()),
                 ("GIT_WORK_TREE".to_string(), shadow.work_tree.clone()),
@@ -1131,8 +1199,14 @@ impl Trail {
                 )?;
             }
             for binding in adapter.cache_command_bindings() {
-                let Some(root) =
-                    self.active_workspace_cache_path(view, &component_id, binding.cache_name)?
+                let Some(root) = self
+                    .active_workspace_cache_path(view, &component_id, binding.cache_name)
+                    .map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` cache `{}` root could not be resolved: {error}",
+                            binding.cache_name
+                        ))
+                    })?
                 else {
                     if binding.required {
                         return Err(Error::Corrupt(format!(
@@ -1145,7 +1219,14 @@ impl Trail {
                 let path = if binding.relative_path.is_empty() {
                     root
                 } else {
-                    safe_join(&root, binding.relative_path)?
+                    safe_join(&root, binding.relative_path).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` cache `{}` binding `{}` could not be resolved beneath `{}`: {error}",
+                            binding.cache_name,
+                            binding.relative_path,
+                            root.display()
+                        ))
+                    })?
                 };
                 fs::create_dir_all(&path)?;
                 insert_workspace_command_binding(
@@ -1185,9 +1266,19 @@ impl Trail {
                         }
                     }
                 } else {
-                    safe_join(Path::new(&view.mountpoint), &mount_path)?
+                    let relative = if binding.relative_path.is_empty() {
+                        mount_path.clone()
+                    } else {
+                        format!("{mount_path}/{}", binding.relative_path)
+                    };
+                    safe_join(Path::new(&view.mountpoint), &relative).map_err(|error| {
+                        Error::InvalidInput(format!(
+                            "active component `{component_id}` output `{}` binding `{relative}` could not be resolved beneath mounted workspace `{}`: {error}",
+                            binding.output_name, view.mountpoint
+                        ))
+                    })?
                 };
-                let path = if binding.relative_path.is_empty() {
+                let path = if !binding.direct || binding.relative_path.is_empty() {
                     root
                 } else {
                     safe_join(&root, binding.relative_path)?
@@ -2882,6 +2973,18 @@ mod tests {
             db.lane_workspace_view("lease").unwrap().unwrap().status,
             "unmounted"
         );
+
+        let mut leaked = db.acquire_workspace_mount_lease("lease", &backend).unwrap();
+        leaked.mark_mounted().unwrap();
+        std::mem::forget(leaked);
+        db.release_current_process_workspace_mount_lease(
+            &db.lane_workspace_view("lease").unwrap().unwrap().view_id,
+        )
+        .unwrap();
+        let released = db.lane_workspace_view("lease").unwrap().unwrap();
+        assert_eq!(released.status, "unmounted");
+        assert_eq!(released.owner_pid, None);
+        assert_eq!(released.owner_start_token, None);
 
         let view = db.lane_workspace_view("lease").unwrap().unwrap();
         db.conn

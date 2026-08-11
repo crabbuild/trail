@@ -263,9 +263,19 @@ impl Trail {
             .iter()
             .map(|node| (node.component_id.clone(), node.component_key.clone()))
             .collect::<BTreeMap<_, _>>();
-        let has_environment = !desired_environment.is_empty() || !existing_environment.is_empty();
-        let must_sync = has_environment
-            && !managed_environment_is_current(&desired_environment, &existing_environment);
+        // Legacy/manual layer bindings also have compatibility rows in
+        // workspace_environment_states, but they are not adapter-managed
+        // generations and must not trigger automatic framework discovery.
+        let had_active_generation = if view.is_some() {
+            self.active_environment_generation(lane)?.is_some()
+        } else {
+            false
+        };
+        let must_sync = managed_environment_requires_sync(
+            &desired_environment,
+            &existing_environment,
+            had_active_generation,
+        );
         if must_sync && view.is_none() {
             let error = Error::InvalidInput(format!(
                 "lane `{lane}` declares workspace environments but does not use a layered COW workdir"
@@ -284,7 +294,9 @@ impl Trail {
             return Err(error);
         }
         if must_sync {
-            if let Err(error) = self.sync_all_workspace_environments(lane, Some(&component_root)) {
+            let discovery_root =
+                (!desired_environment.is_empty()).then_some(component_root.as_str());
+            if let Err(error) = self.sync_all_workspace_environments(lane, discovery_root) {
                 self.push_managed_execution_phase(
                     &mut phases,
                     &branch.lane_id,
@@ -841,13 +853,26 @@ impl Trail {
             }
         };
 
-        drop(context.mount.take());
         let had_mount = context.view.is_some();
+        drop(context.mount.take());
+        let unmount_error = if let Some(view) = context.view.as_ref() {
+            self.release_current_process_workspace_mount_lease(&view.view_id)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
         let _ = self.push_managed_context_phase(
             &mut context,
             "unmount",
-            if had_mount { "succeeded" } else { "skipped" },
-            None,
+            if unmount_error.is_some() {
+                "failed"
+            } else if had_mount {
+                "succeeded"
+            } else {
+                "skipped"
+            },
+            unmount_error.as_deref(),
             None,
         );
 
@@ -880,10 +905,17 @@ impl Trail {
         } else {
             "skipped"
         };
-        let unmount_status = if had_mount { "succeeded" } else { "skipped" };
+        let unmount_status = if unmount_error.is_some() {
+            "failed"
+        } else if had_mount {
+            "succeeded"
+        } else {
+            "skipped"
+        };
         let errors = checkpoint_error
             .iter()
             .chain(disposal_error.iter())
+            .chain(unmount_error.iter())
             .cloned()
             .collect::<Vec<_>>();
         let finalization = ManagedExecutionFinalizationReceipt {
@@ -1437,6 +1469,15 @@ fn managed_environment_is_current(
         })
 }
 
+fn managed_environment_requires_sync(
+    desired: &BTreeMap<String, String>,
+    existing: &[WorkspaceEnvironmentReport],
+    had_active_generation: bool,
+) -> bool {
+    (!desired.is_empty() || had_active_generation)
+        && !managed_environment_is_current(desired, existing)
+}
+
 fn managed_execution_output_pins(
     generation: &EnvironmentGenerationReport,
     bindings: &[ArtifactGenerationBindingReportV1],
@@ -1724,9 +1765,30 @@ mod tests {
         ));
         assert!(!managed_environment_is_current(
             &BTreeMap::from([("python-venv".to_string(), "key-a".to_string())]),
-            &[ready]
+            std::slice::from_ref(&ready)
         ));
         assert!(managed_environment_is_current(&BTreeMap::new(), &[]));
+
+        let manual = WorkspaceEnvironmentReport {
+            view_id: "view-a".to_string(),
+            adapter: "manual".to_string(),
+            expected_key: "manual-key".to_string(),
+            attached_key: Some("manual-key".to_string()),
+            status: "ready".to_string(),
+            reason: None,
+            updated_at: 1,
+        };
+        assert!(!managed_environment_requires_sync(
+            &BTreeMap::new(),
+            &[manual],
+            false
+        ));
+        assert!(managed_environment_requires_sync(
+            &BTreeMap::new(),
+            std::slice::from_ref(&ready),
+            true
+        ));
+        assert!(managed_environment_requires_sync(&desired, &[], false));
     }
 
     #[test]
