@@ -2,9 +2,9 @@ use super::workspace_environment::{
     resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
     WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
     WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheProtocol,
-    WorkspaceEnvironmentCommand, WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy,
-    WorkspaceEnvironmentPlan, WorkspaceEnvironmentResolutionInput,
-    WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentCommand, WorkspaceEnvironmentConstructionSeed, WorkspaceEnvironmentOutput,
+    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
+    WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
 };
 use super::*;
 use crate::ids::sha256_hex;
@@ -89,6 +89,9 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
         {
             return Ok(None);
         }
+        if cargo_component_is_ancestor_workspace_member(db, source_root, &root)? {
+            return Ok(None);
+        }
         if db
             .root_file_entry(source_root, &join_repo_path(&root, "Cargo.lock"))?
             .is_some()
@@ -126,7 +129,7 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
         let proposal_key = cargo_resolution_proposal_key(source_root, &root);
         let policy_identity = sha256_hex(
             format!(
-                "cargo-lock-resolver-v1\0{}\0offline\0scripts-denied",
+                "cargo-lock-resolver-v2\0{}\0host-cargo-cache\0offline\0scripts-denied",
                 cargo_tool.identity
             )
             .as_bytes(),
@@ -160,7 +163,13 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
             allowed_authorities: Vec::new(),
             credential_handles: Vec::new(),
             script_policy: ArtifactScriptPolicyV1::Deny,
-            environment_roles: BTreeMap::new(),
+            environment_roles: BTreeMap::from([
+                ("CARGO_HOME".to_string(), ArtifactEnvironmentRoleV1::Runtime),
+                (
+                    "CARGO_NET_OFFLINE".to_string(),
+                    ArtifactEnvironmentRoleV1::Identity,
+                ),
+            ]),
             limits: ArtifactActionLimitsV1 {
                 timeout_ms: 5 * 60 * 1_000,
                 stdout_bytes: 1024 * 1024,
@@ -427,6 +436,13 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
             },
             inputs: Vec::new(),
             resolution_inputs,
+            construction_seed: Some(WorkspaceEnvironmentConstructionSeed {
+                ignored_identity_inputs: BTreeSet::from([
+                    "source_root".to_string(),
+                    "lock_authority".to_string(),
+                    "host:adapter_identity_v3".to_string(),
+                ]),
+            }),
             source_projection: Some((source_root.clone(), "project".to_string())),
             pre_commands: vec![WorkspaceEnvironmentCommand {
                 program: "cargo".to_string(),
@@ -477,6 +493,89 @@ impl WorkspaceEnvironmentAdapter for CargoTargetSeedAdapter {
     }
 }
 
+fn cargo_component_is_ancestor_workspace_member(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<bool> {
+    if component_root.is_empty() {
+        return Ok(false);
+    }
+    let own_manifest_path = join_repo_path(component_root, "Cargo.toml");
+    let Some(own_entry) = db.root_file_entry(source_root, &own_manifest_path)? else {
+        return Ok(false);
+    };
+    let own_manifest =
+        parse_cargo_manifest(&db.materialize_entry_bytes(&own_entry)?, &own_manifest_path)?;
+    if own_manifest.get("workspace").is_some() {
+        return Ok(false);
+    }
+
+    let segments = component_root.split('/').collect::<Vec<_>>();
+    for depth in (0..segments.len()).rev() {
+        let ancestor = segments[..depth].join("/");
+        let manifest_path = join_repo_path(&ancestor, "Cargo.toml");
+        let Some(entry) = db.root_file_entry(source_root, &manifest_path)? else {
+            continue;
+        };
+        let manifest = parse_cargo_manifest(&db.materialize_entry_bytes(&entry)?, &manifest_path)?;
+        let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let relative = if ancestor.is_empty() {
+            component_root.to_string()
+        } else {
+            component_root
+                .strip_prefix(&format!("{ancestor}/"))
+                .unwrap_or(component_root)
+                .to_string()
+        };
+        if cargo_workspace_patterns_match(workspace.get("exclude"), &relative)? {
+            return Ok(false);
+        }
+        if cargo_workspace_patterns_match(workspace.get("members"), &relative)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn parse_cargo_manifest(bytes: &[u8], path: &str) -> Result<toml::Value> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidInput(format!("Cargo manifest `{path}` is not UTF-8")))?;
+    toml::from_str(text).map_err(|error| {
+        Error::InvalidInput(format!(
+            "Cargo manifest `{path}` is malformed TOML: {error}"
+        ))
+    })
+}
+
+fn cargo_workspace_patterns_match(patterns: Option<&toml::Value>, path: &str) -> Result<bool> {
+    let Some(patterns) = patterns.and_then(toml::Value::as_array) else {
+        return Ok(false);
+    };
+    for pattern in patterns {
+        let pattern = pattern.as_str().ok_or_else(|| {
+            Error::InvalidInput(
+                "Cargo workspace member/exclude patterns must be strings".to_string(),
+            )
+        })?;
+        let matcher = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| {
+                Error::InvalidInput(format!(
+                    "Cargo workspace pattern `{pattern}` is invalid: {error}"
+                ))
+            })?
+            .compile_matcher();
+        if matcher.is_match(path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn cargo_resolution_proposal_key(source_root: &ObjectId, component_root: &str) -> String {
     let identity = format!(
         "cargo-lock-resolution-v1\0{}\0{}\0{}",
@@ -500,6 +599,27 @@ fn cargo_resolution_snapshot(
         "cargo-lock-toml-v1",
         validate_cargo_lock_snapshot,
     )
+}
+
+pub(super) fn managed_cargo_resolution_input(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let component_root = normalize_component_root(component_root)?;
+    let manifest_path = join_repo_path(&component_root, "Cargo.toml");
+    if db.root_file_entry(source_root, &manifest_path)?.is_none() {
+        return Ok(None);
+    }
+    let lock_path = join_repo_path(&component_root, "Cargo.lock");
+    if db.root_file_entry(source_root, &lock_path)?.is_some() {
+        return Ok(None);
+    }
+    let Some((_, _, bytes)) = cargo_resolution_snapshot(db, source_root, &component_root)? else {
+        return Ok(None);
+    };
+    validate_cargo_lock_snapshot(&bytes)?;
+    Ok(Some((lock_path, bytes)))
 }
 
 fn validate_cargo_lock_snapshot(bytes: &[u8]) -> Result<()> {
@@ -587,6 +707,73 @@ mod tests {
         assert!(!sccache_supports_client_side("sccache unknown"));
     }
 
+    #[test]
+    fn discovery_collapses_workspace_members_but_keeps_nested_workspace_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::create_dir_all(workspace.path().join("crates/member/src")).unwrap();
+        fs::create_dir_all(workspace.path().join("standalone/src")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='root'\nversion='0.1.0'\nedition='2024'\n\
+             [workspace]\nmembers=['.', 'crates/*']\nexclude=['standalone']\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn root() {}\n").unwrap();
+        fs::write(
+            workspace.path().join("crates/member/Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("crates/member/src/lib.rs"),
+            "pub fn member() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("standalone/Cargo.toml"),
+            "[package]\nname='standalone'\nversion='0.1.0'\nedition='2024'\n\
+             [workspace]\nmembers=['.']\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("standalone/src/lib.rs"),
+            "pub fn standalone() {}\n",
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "workspace",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let discovery = db
+            .discover_workspace_environment("workspace", None)
+            .unwrap();
+        assert_eq!(
+            discovery
+                .components
+                .iter()
+                .filter(|component| component.adapter_identity == "trail/cargo-target-seed@1")
+                .map(|component| component.component_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cargo-target-seed", "cargo-target-seed:standalone"]
+        );
+        let root_only = db
+            .discover_workspace_environment("workspace", Some("."))
+            .unwrap();
+        assert_eq!(root_only.components.len(), 1);
+        assert_eq!(root_only.components[0].component_id, "cargo-target-seed");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn sccache_server_endpoint_is_stable_and_cache_scoped() {
@@ -659,12 +846,20 @@ mod tests {
             .resolution_plan(&db, &source_root, "")
             .unwrap()
             .unwrap();
+        assert_eq!(
+            resolution_plan.environment_roles.get("CARGO_HOME"),
+            Some(&ArtifactEnvironmentRoleV1::Runtime)
+        );
+        assert_eq!(
+            resolution_plan.environment_roles.get("CARGO_NET_OFFLINE"),
+            Some(&ArtifactEnvironmentRoleV1::Identity)
+        );
         let resolved = db
             .resolve_artifact_component(
                 ArtifactResolutionRequestV1 {
                     plan: resolution_plan,
                     candidate: ArtifactResolutionCandidateV1 {
-                        snapshot_bytes: lock_bytes,
+                        snapshot_bytes: lock_bytes.clone(),
                         resolved_identities: BTreeMap::new(),
                         checksums: BTreeMap::new(),
                         contacted_authorities: Vec::new(),
@@ -713,6 +908,33 @@ mod tests {
             .root_file_entry(&source_root, "Cargo.lock")
             .unwrap()
             .is_none());
+        let mut context = db
+            .prepare_managed_lane_execution(
+                "managed-lock-one",
+                "lane_exec",
+                &["cargo".into(), "test".into(), "--locked".into()],
+            )
+            .unwrap();
+        let source_upper = PathBuf::from(&context.view.as_ref().unwrap().source_upper);
+        assert_eq!(
+            fs::read(source_upper.join("Cargo.lock")).unwrap(),
+            lock_bytes
+        );
+        db.mark_managed_lane_execution_command(&mut context, "succeeded", None, Some(0))
+            .unwrap();
+        let lifecycle = db.finalize_managed_lane_execution(
+            context,
+            Some("managed lock projection test".to_string()),
+        );
+        assert!(lifecycle.checkpoint_error.is_none());
+        assert!(lifecycle
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .source_paths
+            .iter()
+            .all(|path| path != "Cargo.lock"));
+        assert!(!source_upper.join("Cargo.lock").exists());
 
         fs::write(
             workspace.path().join("README.md"),
@@ -807,6 +1029,31 @@ mod tests {
         assert_eq!(first.cache_key, second.cache_key);
         assert!(Path::new(&first.storage_path).join("debug").is_dir());
 
+        let cargo_one_view = db.lane_workspace_view("cargo-one").unwrap().unwrap();
+        let cargo_one_head = db
+            .get_ref(&db.lane_branch("cargo-one").unwrap().ref_name)
+            .unwrap();
+        let cargo_one_environment = db
+            .workspace_command_environment(&cargo_one_view, &cargo_one_head.root_id)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let direct_target = PathBuf::from(&cargo_one_environment["CARGO_TARGET_DIR"]);
+        assert!(Path::new(&cargo_one_environment["CARGO_HOME"])
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cache_")));
+        assert_eq!(
+            direct_target,
+            Path::new(&cargo_one_view.generated_upper).join("target")
+        );
+        assert!(direct_target.join("debug").is_dir());
+        let lock_path = direct_target.join("debug/.cargo-lock");
+        if lock_path.is_file() {
+            let mut lock = OpenOptions::new().write(true).open(&lock_path).unwrap();
+            lock.write_all(b"").unwrap();
+        }
+
         let status = db.environment_component_status("cargo-two").unwrap();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].component.component_id, "cargo-target-seed");
@@ -820,5 +1067,36 @@ mod tests {
             Some("builtin:cargo-target-seed-plan-v1")
         );
         assert_eq!(status[0].status, "ready");
+
+        let paths = db.workspace_view_paths_for_lane("cargo-one").unwrap();
+        let mut journal =
+            super::super::workdir::ViewMutationJournal::open(&paths.source_upper).unwrap();
+        journal
+            .append(
+                super::super::workdir::ViewMutationKind::Write,
+                "src/lib.rs",
+                None,
+            )
+            .unwrap();
+        fs::create_dir_all(paths.source_upper.join("src")).unwrap();
+        fs::write(
+            paths.source_upper.join("src/lib.rs"),
+            "pub fn answer() -> u64 { 43 }\n",
+        )
+        .unwrap();
+        db.checkpoint_lane_workspace("cargo-one", Some("change Rust source".to_string()))
+            .unwrap();
+        let rebuilt = db
+            .sync_workspace_environment_component("cargo-one", "cargo", None, None)
+            .unwrap();
+        assert_eq!(rebuilt.layers.len(), 1);
+        assert_ne!(rebuilt.layers[0].layer_id, first.layer_id);
+        let decision = rebuilt
+            .decisions
+            .iter()
+            .find(|decision| decision.desired_key == rebuilt.layers[0].cache_key)
+            .unwrap();
+        assert_eq!(decision.decision_source, "compatible_predecessor_seed");
+        assert_eq!(decision.bytes_avoided, Some(first.logical_bytes));
     }
 }

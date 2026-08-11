@@ -166,6 +166,46 @@ fn lane_test_uses_managed_lifecycle_and_checkpoints_after_command_failure() {
 }
 
 #[test]
+fn root_managed_preparation_ignores_unrelated_nested_environment_components() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("README.md"), "root\n").unwrap();
+    fs::create_dir_all(root.path().join("nested")).unwrap();
+    fs::write(
+        root.path().join("nested/package.json"),
+        r#"{"name":"nested-only","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("nested/package-lock.json"),
+        r#"{"name":"nested-only","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"nested-only","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(root.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "root-only",
+        Some("main"),
+        LaneWorkdirMode::PortableCopy,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let context = db
+        .prepare_managed_lane_execution(
+            "root-only",
+            "lane_exec",
+            &["/bin/sh".into(), "-c".into(), "printf root".into()],
+        )
+        .unwrap();
+    assert_eq!(context.lane, "root-only");
+    assert!(context.environment_generation.is_none());
+}
+
+#[test]
 fn missing_gate_program_still_finalizes_checkpoint_disposal_and_unmount() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("README.md"), "root\n").unwrap();

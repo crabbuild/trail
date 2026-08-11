@@ -683,6 +683,11 @@ pub(super) struct AgentStartArgs {
         help = "Filesystem view for the terminal agent task"
     )]
     pub(super) workdir_mode: String,
+    #[arg(
+        long,
+        help = "Allow provider project/local integrations; disabled by default for isolated tasks"
+    )]
+    pub(super) allow_project_integrations: bool,
     #[arg(last = true, num_args = 0..)]
     pub(super) command: Vec<String>,
 }
@@ -709,6 +714,11 @@ pub(super) struct AgentContinueArgs {
         help = "Filesystem view for the terminal follow-up task"
     )]
     pub(super) workdir_mode: String,
+    #[arg(
+        long,
+        help = "Allow provider project/local integrations; disabled by default for isolated tasks"
+    )]
+    pub(super) allow_project_integrations: bool,
     #[arg(last = true, num_args = 0..)]
     pub(super) command: Vec<String>,
 }

@@ -194,6 +194,12 @@ fresh writable private uppers, so sibling lanes share unchanged bytes while
 copy-up writes and whiteouts remain isolated. Materializations are reconstructible
 CAS projections, not a second source of truth.
 
+For Cargo, a source-only change keeps a new exact desired key but may initialize
+construction from a compatible active predecessor target. Cargo validates that
+seed and recompiles affected workspace code; Trail never treats the predecessor
+as the final artifact for the new source root. Manifest, lockfile, toolchain,
+target, platform, or build-policy changes remain hard compatibility misses.
+
 ```sh
 trail env discover fix-login
 trail env plan fix-login
@@ -202,6 +208,9 @@ trail env resolve all fix-login
 trail env sync all fix-login
 trail env generation fix-login
 ```
+
+In repositories containing several independent projects, use `--path .` to
+resolve or synchronize only the repository-root component graph.
 
 `immutable_shared` and `immutable_seed_private` outputs can be reused under
 their declared scope. `writable_private` and `disposable` output stays lane

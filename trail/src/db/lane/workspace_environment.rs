@@ -447,6 +447,11 @@ pub(crate) struct WorkspaceEnvironmentPlan {
     /// Verified resolution metadata projected after the immutable source root.
     /// Host validation forbids these entries from replacing tracked source.
     pub(crate) resolution_inputs: Vec<WorkspaceEnvironmentResolutionInput>,
+    /// Optional performance-only predecessor contract used to initialize a
+    /// new exact build. The final layer key remains complete; ignored inputs
+    /// apply only while selecting an immutable seed that the build tool must
+    /// revalidate before publication.
+    pub(crate) construction_seed: Option<WorkspaceEnvironmentConstructionSeed>,
     /// Optional complete pinned source projection for adapters such as Cargo
     /// whose build graph can include arbitrary workspace source files. The
     /// host streams this root in bounded chunks during explicit sync.
@@ -474,6 +479,11 @@ pub(crate) struct WorkspaceEnvironmentPlan {
     pub(crate) sandbox_policy: WorkspaceEnvironmentSandboxPolicy,
     pub(crate) outputs: Vec<WorkspaceEnvironmentOutput>,
     pub(crate) stale_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceEnvironmentConstructionSeed {
+    pub(crate) ignored_identity_inputs: BTreeSet<String>,
 }
 
 struct PreparedPrivateEnvironmentOutputs {
@@ -964,7 +974,7 @@ impl Trail {
                 .flat_map(|plugin| plugin.manifest.adapter.discovery_markers.iter().cloned()),
         );
         if let Some(component_root) = component_root {
-            let root = if component_root.trim_matches('/').is_empty() {
+            let root = if component_root.trim_matches('/').is_empty() || component_root == "." {
                 String::new()
             } else {
                 normalize_relative_path(component_root)?
@@ -1279,6 +1289,21 @@ impl Trail {
                 &"reviewed built-in resolution currently permits only offline, credential-free plans",
             ));
         }
+        let cargo_environment_roles = BTreeMap::from([
+            ("CARGO_HOME".to_string(), ArtifactEnvironmentRoleV1::Runtime),
+            (
+                "CARGO_NET_OFFLINE".to_string(),
+                ArtifactEnvironmentRoleV1::Identity,
+            ),
+        ]);
+        if (plan.program == "cargo" && plan.environment_roles != cargo_environment_roles)
+            || (plan.program != "cargo" && !plan.environment_roles.is_empty())
+        {
+            return Err(fail(
+                "resolver_environment_roles_invalid",
+                &"reviewed built-in resolver declared unsupported environment roles",
+            ));
+        }
         let actual_identity = workspace_tool_identity_for_path(Path::new(&plan.resolved_program))
             .map_err(|error| fail("resolver_tool_identity_failed", &error))?;
         if actual_identity != plan.executable_identity {
@@ -1387,6 +1412,31 @@ impl Trail {
             command.env("PATH", path);
         }
         if plan.program == "cargo" {
+            let host_cargo_home = std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".cargo"))
+                })
+                .filter(|path| path.is_dir());
+            let cargo_home =
+                host_cargo_home.unwrap_or_else(|| self.db_dir.join("cache/tool-home/cargo"));
+            if let Ok(metadata) = fs::symlink_metadata(&cargo_home)
+                && (metadata.file_type().is_symlink() || !metadata.is_dir())
+            {
+                return Err(fail(
+                    "resolver_cargo_home_invalid",
+                    &"managed Cargo resolver home is not a real directory",
+                ));
+            }
+            fs::create_dir_all(&cargo_home)
+                .map_err(|error| fail("resolver_cargo_home_failed", &error))?;
+            let canonical_cargo_home = fs::canonicalize(&cargo_home)
+                .map_err(|error| fail("resolver_cargo_home_failed", &error))?;
+            command
+                .env("CARGO_HOME", canonical_cargo_home)
+                .env("CARGO_NET_OFFLINE", "true");
             let rustup_home = std::env::var_os("RUSTUP_HOME").or_else(|| {
                 std::env::var_os("HOME")
                     .map(PathBuf::from)
@@ -2459,6 +2509,7 @@ impl Trail {
                 &source_root,
                 &plan,
                 &cache_key,
+                predecessor_key.as_deref(),
             );
             let mut prepared = match prepared {
                 Ok(prepared) => prepared,
@@ -3616,6 +3667,7 @@ impl Trail {
         source_root: &ObjectId,
         plan: &WorkspaceEnvironmentPlan,
         component_key: &str,
+        predecessor_key: Option<&str>,
     ) -> Result<PreparedEnvironmentArtifacts> {
         let Some(policy) = plan.outputs.first().map(|output| output.policy) else {
             if !plan.external_artifacts.is_empty() {
@@ -3643,10 +3695,21 @@ impl Trail {
             WorkspaceEnvironmentOutputPolicy::ImmutableShared
             | WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate => {
                 let prior = self.workspace_layer_by_cache_key(component_key)?;
+                let construction_seed =
+                    self.compatible_workspace_environment_construction_seed(plan, predecessor_key)?;
+                let construction_seed_path = construction_seed
+                    .as_ref()
+                    .map(|layer| PathBuf::from(&layer.storage_path));
                 let layer = self.build_workspace_layer_singleflight(
                     &plan.layer_key,
                     source_root,
-                    |build_dir| self.execute_workspace_environment_plan(plan, build_dir),
+                    |build_dir| {
+                        self.execute_workspace_environment_plan(
+                            plan,
+                            build_dir,
+                            construction_seed_path.as_deref(),
+                        )
+                    },
                 )?;
                 let hit = prior
                     .as_ref()
@@ -3663,11 +3726,17 @@ impl Trail {
                     },
                     if hit {
                         "exact_layer"
+                    } else if construction_seed.is_some() {
+                        "compatible_predecessor_seed"
                     } else {
                         "singleflight_builder"
                     },
                     (!hit).then_some(EnvironmentRebuildReason::Missing),
-                    hit.then_some(layer.logical_bytes),
+                    if hit {
+                        Some(layer.logical_bytes)
+                    } else {
+                        construction_seed.as_ref().map(|seed| seed.logical_bytes)
+                    },
                     (!hit).then_some(layer.logical_bytes),
                 )?;
                 Ok(PreparedEnvironmentArtifacts::Immutable(layer))
@@ -3717,6 +3786,64 @@ impl Trail {
                 Ok(PreparedEnvironmentArtifacts::WritablePrivate(Some(outputs)))
             }
         }
+    }
+
+    fn compatible_workspace_environment_construction_seed(
+        &self,
+        plan: &WorkspaceEnvironmentPlan,
+        predecessor_key: Option<&str>,
+    ) -> Result<Option<WorkspaceLayerReport>> {
+        let Some(contract) = &plan.construction_seed else {
+            return Ok(None);
+        };
+        if plan.outputs.len() != 1
+            || plan.outputs[0].policy != WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+            || contract.ignored_identity_inputs.is_empty()
+        {
+            return Err(Error::Corrupt(format!(
+                "component `{}` has an invalid construction-seed contract",
+                plan.component_id
+            )));
+        }
+        let mut candidate_keys = predecessor_key
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT attached_key FROM environment_component_states
+             WHERE component_id = ?1 AND attached_key IS NOT NULL
+             ORDER BY updated_at DESC, attached_key ASC",
+        )?;
+        for candidate in statement
+            .query_map(params![&plan.component_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        {
+            if !candidate_keys.contains(&candidate) {
+                candidate_keys.push(candidate);
+            }
+        }
+        for candidate_key in candidate_keys {
+            let Some(previous_layer) = self.workspace_layer_by_cache_key(&candidate_key)? else {
+                continue;
+            };
+            if previous_layer.state != "ready" {
+                continue;
+            }
+            let Some(previous_key) = self.workspace_layer_key_by_cache_key(&candidate_key)? else {
+                continue;
+            };
+            if !workspace_environment_construction_seed_compatible(
+                &previous_key,
+                &plan.layer_key,
+                contract,
+            ) {
+                continue;
+            }
+            return self
+                .verify_workspace_layer_for_attach(&previous_layer.layer_id)
+                .map(Some);
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3874,8 +4001,14 @@ impl Trail {
         if concurrency == 1 || planned.len() < 2 {
             return planned
                 .iter()
-                .map(|(plan, key, _)| {
-                    self.prepare_workspace_environment_artifacts(view_id, source_root, plan, key)
+                .map(|(plan, key, predecessor)| {
+                    self.prepare_workspace_environment_artifacts(
+                        view_id,
+                        source_root,
+                        plan,
+                        key,
+                        predecessor.as_deref(),
+                    )
                 })
                 .collect();
         }
@@ -3918,6 +4051,7 @@ impl Trail {
                     let component_id = component_id.clone();
                     let plan = planned[*index].0.clone();
                     let key = planned[*index].1.clone();
+                    let predecessor = planned[*index].2.clone();
                     let workspace = workspace.clone();
                     let view_id = view_id.clone();
                     let source_root = source_root.clone();
@@ -3940,6 +4074,7 @@ impl Trail {
                                 &source_root,
                                 &plan,
                                 &key,
+                                predecessor.as_deref(),
                             )
                         }),
                     ));
@@ -4564,7 +4699,7 @@ impl Trail {
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         );
         let paths =
-            self.execute_workspace_environment_plan_in_directory(plan, &root, restricted)?;
+            self.execute_workspace_environment_plan_in_directory(plan, &root, restricted, None)?;
         if restricted {
             let mut entries = 0usize;
             for output in &paths {
@@ -4581,6 +4716,7 @@ impl Trail {
         &self,
         plan: &WorkspaceEnvironmentPlan,
         build_dir: &Path,
+        construction_seed: Option<&Path>,
     ) -> Result<PathBuf> {
         if matches!(
             plan.sandbox_policy,
@@ -4594,8 +4730,12 @@ impl Trail {
                 .prefix("trail-environment-")
                 .tempdir_in(&sandbox_parent)?;
             let sandbox_root = fs::canonicalize(sandbox.path())?;
-            let outputs =
-                self.execute_workspace_environment_plan_in_directory(plan, &sandbox_root, true)?;
+            let outputs = self.execute_workspace_environment_plan_in_directory(
+                plan,
+                &sandbox_root,
+                true,
+                None,
+            )?;
             let mut output_entries = 0usize;
             for output in &outputs {
                 self.validate_restricted_recipe_output(plan, output, &mut output_entries)?;
@@ -4613,8 +4753,12 @@ impl Trail {
             }
             return package_workspace_environment_outputs(build_dir, "recipe-outputs", &outputs);
         }
-        let outputs =
-            self.execute_workspace_environment_plan_in_directory(plan, build_dir, false)?;
+        let outputs = self.execute_workspace_environment_plan_in_directory(
+            plan,
+            build_dir,
+            false,
+            construction_seed,
+        )?;
         package_workspace_environment_outputs(build_dir, "published-outputs", &outputs)
     }
 
@@ -4726,6 +4870,7 @@ impl Trail {
         plan: &WorkspaceEnvironmentPlan,
         build_dir: &Path,
         create_output_before_command: bool,
+        construction_seed: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         if let Some((source_root, staging_root)) = &plan.source_projection {
             self.for_each_root_file_chunk(source_root, 1024, |chunk| {
@@ -4770,6 +4915,16 @@ impl Trail {
                 fs::create_dir_all(&output)?;
             }
             outputs.push(output);
+        }
+        if let Some(seed) = construction_seed {
+            let [output] = outputs.as_slice() else {
+                return Err(Error::Corrupt(format!(
+                    "component `{}` construction seed requires exactly one output",
+                    plan.component_id
+                )));
+            };
+            clone_or_copy_dir_recursive(seed, output)?;
+            make_tree_writable(output);
         }
         for command in &plan.pre_commands {
             self.run_workspace_environment_command(plan, command, build_dir)?;
@@ -6745,6 +6900,32 @@ fn diff_workspace_layer_keys(
     changes
 }
 
+fn workspace_environment_construction_seed_compatible(
+    previous: &WorkspaceLayerKeyV1,
+    current: &WorkspaceLayerKeyV1,
+    contract: &WorkspaceEnvironmentConstructionSeed,
+) -> bool {
+    if previous.kind != current.kind
+        || previous.adapter != current.adapter
+        || previous.adapter_version != current.adapter_version
+        || previous.tool_versions != current.tool_versions
+        || previous.platform != current.platform
+        || previous.architecture != current.architecture
+        || previous.portability_scope != current.portability_scope
+        || previous.strategy != current.strategy
+    {
+        return false;
+    }
+    let mut previous_inputs = previous.inputs.clone();
+    let mut current_inputs = current.inputs.clone();
+    for input in &contract.ignored_identity_inputs {
+        if previous_inputs.remove(input).is_none() || current_inputs.remove(input).is_none() {
+            return false;
+        }
+    }
+    previous_inputs == current_inputs
+}
+
 fn environment_rebuild_reason_str(reason: &EnvironmentRebuildReason) -> &'static str {
     match reason {
         EnvironmentRebuildReason::Missing => "missing",
@@ -7809,6 +7990,164 @@ mod tests {
     use super::*;
 
     #[test]
+    fn construction_seed_compatibility_ignores_only_declared_non_authoritative_inputs() {
+        let key = |source_root: &str, lock_authority: &str| WorkspaceLayerKeyV1 {
+            kind: "compiler-results".to_string(),
+            adapter: "cargo-target-seed".to_string(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([
+                ("source_root".to_string(), source_root.to_string()),
+                ("Cargo.toml".to_string(), "manifest-hash".to_string()),
+                ("Cargo.lock".to_string(), "lock-hash".to_string()),
+                ("lock_authority".to_string(), lock_authority.to_string()),
+                (
+                    "host:adapter_identity_v3".to_string(),
+                    format!("identity:{source_root}"),
+                ),
+            ]),
+            tool_versions: BTreeMap::from([("rustc-vV".to_string(), "rustc 1.89".to_string())]),
+            platform: "macos".to_string(),
+            architecture: "aarch64".to_string(),
+            portability_scope: "source-root-toolchain-target-platform".to_string(),
+            strategy: "cargo-build-locked-offline-target-seed-v1:incremental".to_string(),
+        };
+        let contract = WorkspaceEnvironmentConstructionSeed {
+            ignored_identity_inputs: BTreeSet::from([
+                "source_root".to_string(),
+                "lock_authority".to_string(),
+                "host:adapter_identity_v3".to_string(),
+            ]),
+        };
+        let previous = key("root-a", "snapshot:a");
+        let current = key("root-b", "snapshot:b");
+        assert!(workspace_environment_construction_seed_compatible(
+            &previous, &current, &contract
+        ));
+
+        let mut changed_lock = current.clone();
+        changed_lock
+            .inputs
+            .insert("Cargo.lock".to_string(), "different-lock".to_string());
+        assert!(!workspace_environment_construction_seed_compatible(
+            &previous,
+            &changed_lock,
+            &contract
+        ));
+        let mut changed_tool = current;
+        changed_tool
+            .tool_versions
+            .insert("rustc-vV".to_string(), "rustc 1.90".to_string());
+        assert!(!workspace_environment_construction_seed_compatible(
+            &previous,
+            &changed_tool,
+            &contract
+        ));
+    }
+
+    #[test]
+    fn compatible_predecessor_layer_initializes_a_new_exact_build() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let layer_key = |source_root: &str| WorkspaceLayerKeyV1 {
+            kind: "compiler-results".to_string(),
+            adapter: "cargo-target-seed".to_string(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([
+                ("source_root".to_string(), source_root.to_string()),
+                ("Cargo.toml".to_string(), "manifest-hash".to_string()),
+                ("Cargo.lock".to_string(), "lock-hash".to_string()),
+                (
+                    "lock_authority".to_string(),
+                    format!("snapshot:{source_root}"),
+                ),
+                (
+                    "host:adapter_identity_v3".to_string(),
+                    format!("identity:{source_root}"),
+                ),
+            ]),
+            tool_versions: BTreeMap::from([("rustc-vV".to_string(), "rustc 1.89".to_string())]),
+            platform: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            portability_scope: "source-root-toolchain-target-platform".to_string(),
+            strategy: "cargo-build-locked-offline-target-seed-v1:incremental".to_string(),
+        };
+        let previous_key = layer_key("root-a");
+        let seed = tempfile::tempdir().unwrap();
+        fs::create_dir_all(seed.path().join("debug/deps")).unwrap();
+        fs::write(
+            seed.path().join("debug/deps/dependency.rlib"),
+            b"compiled dependency",
+        )
+        .unwrap();
+        let previous = db
+            .publish_workspace_layer_from_directory(&previous_key, seed.path())
+            .unwrap();
+        let current_key = layer_key("root-b");
+        assert_ne!(
+            db.workspace_layer_cache_key(&previous_key).unwrap(),
+            db.workspace_layer_cache_key(&current_key).unwrap()
+        );
+        let plan = WorkspaceEnvironmentPlan {
+            component_id: "cargo-target-seed".to_string(),
+            adapter_identity: "trail/cargo-target-seed@1".to_string(),
+            adapter_version: 1,
+            implementation_version: "test".to_string(),
+            distribution_digest: "builtin:test".to_string(),
+            kind: "compiler-results".to_string(),
+            dependencies: Vec::new(),
+            resolved_dependencies: Vec::new(),
+            layer_key: current_key,
+            inputs: Vec::new(),
+            resolution_inputs: Vec::new(),
+            construction_seed: Some(WorkspaceEnvironmentConstructionSeed {
+                ignored_identity_inputs: BTreeSet::from([
+                    "source_root".to_string(),
+                    "lock_authority".to_string(),
+                    "host:adapter_identity_v3".to_string(),
+                ]),
+            }),
+            source_projection: None,
+            pre_commands: Vec::new(),
+            command: None,
+            mounted_commands: Vec::new(),
+            caches: Vec::new(),
+            external_artifacts: Vec::new(),
+            runtime_resources: Vec::new(),
+            sandbox_policy: WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin,
+            outputs: vec![WorkspaceEnvironmentOutput {
+                name: "target-seed".to_string(),
+                output_path: "project/target".to_string(),
+                mount_path: "target".to_string(),
+                policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                reuse: EnvironmentReuseMode::Exact,
+                scope: EnvironmentSharingScope::Workspace,
+                publish: EnvironmentPublicationTrigger::OnSync,
+                gate: None,
+                create_if_missing: false,
+            }],
+            stale_reason: "test".to_string(),
+        };
+        let selected = db
+            .compatible_workspace_environment_construction_seed(&plan, Some(&previous.cache_key))
+            .unwrap()
+            .unwrap();
+        let build = tempfile::tempdir().unwrap();
+        let output = db
+            .execute_workspace_environment_plan(
+                &plan,
+                build.path(),
+                Some(Path::new(&selected.storage_path)),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(output.join("debug/deps/dependency.rlib")).unwrap(),
+            b"compiled dependency"
+        );
+    }
+
+    #[test]
     fn phase_capability_ceilings_are_total_deny_publication_and_do_not_elevate_signatures() {
         use ArtifactExecutionPhaseV1 as Phase;
         use ArtifactNetworkCapabilityV1 as Network;
@@ -8022,6 +8361,7 @@ mod tests {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -8427,6 +8767,7 @@ mod tests {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,
@@ -8763,6 +9104,7 @@ mod tests {
                     },
                     inputs: Vec::new(),
                     resolution_inputs: Vec::new(),
+                    construction_seed: None,
                     source_projection: None,
                     pre_commands: Vec::new(),
                     command: None,
@@ -8827,6 +9169,7 @@ mod tests {
                 },
                 inputs: Vec::new(),
                 resolution_inputs: Vec::new(),
+                construction_seed: None,
                 source_projection: None,
                 pre_commands: Vec::new(),
                 command: None,
@@ -8947,6 +9290,7 @@ mod tests {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command.clone()),
@@ -9293,6 +9637,7 @@ mod tests {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {
@@ -9386,6 +9731,7 @@ mod tests {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: Some(command),

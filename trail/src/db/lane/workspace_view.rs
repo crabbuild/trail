@@ -924,10 +924,38 @@ impl Trail {
         view: &LaneWorkspaceViewReport,
         source_root: &ObjectId,
     ) -> Result<Vec<(String, String)>> {
-        let cargo_home = self.db_dir.join("cache/tool-home/cargo");
+        self.workspace_command_environment_at_root(view, source_root, "")
+    }
+
+    pub(crate) fn workspace_command_environment_at_root(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Vec<(String, String)>> {
         let node_cache = self.db_dir.join("cache/tool-home/node/npm");
-        let sccache_dir = self.db_dir.join("cache/tool-home/sccache");
-        let target_dir = Path::new(&view.mountpoint).join("target");
+        let component_root = if component_root.is_empty() || component_root == "." {
+            String::new()
+        } else {
+            normalize_relative_path(component_root)?
+        };
+        let cargo_component = if component_root.is_empty() {
+            "cargo-target-seed".to_string()
+        } else {
+            format!("cargo-target-seed:{component_root}")
+        };
+        let cargo_home = self
+            .active_workspace_cache_path(view, &cargo_component, "cargo-home")?
+            .unwrap_or_else(|| self.db_dir.join("cache/tool-home/cargo"));
+        let sccache_dir = self
+            .active_workspace_cache_path(view, &cargo_component, "sccache")?
+            .unwrap_or_else(|| self.db_dir.join("cache/tool-home/sccache"));
+        let target_mount = if component_root.is_empty() {
+            "target".to_string()
+        } else {
+            format!("{component_root}/target")
+        };
+        let target_dir = self.prepare_direct_private_seed(view, &target_mount)?;
         for path in [&cargo_home, &node_cache, &sccache_dir] {
             fs::create_dir_all(path)?;
         }
@@ -1055,6 +1083,86 @@ impl Trail {
             ]);
         }
         Ok(environment)
+    }
+
+    fn active_workspace_cache_path(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        component_id: &str,
+        cache_name: &str,
+    ) -> Result<Option<PathBuf>> {
+        let namespace = self
+            .conn
+            .query_row(
+                "SELECT c.namespace_id
+                 FROM environment_view_generations active
+                 JOIN environment_generation_caches c
+                   ON c.generation_id = active.generation_id
+                 WHERE active.view_id = ?1 AND c.component_id = ?2 AND c.cache_name = ?3",
+                params![&view.view_id, component_id, cache_name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        namespace
+            .map(|namespace| safe_join(&self.db_dir.join("cache/namespaces"), &namespace))
+            .transpose()
+    }
+
+    fn prepare_direct_private_seed(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        mount_path: &str,
+    ) -> Result<PathBuf> {
+        let destination = safe_join(Path::new(&view.generated_upper), mount_path)?;
+        let binding = self
+            .conn
+            .query_row(
+                "SELECT b.binding_identity, b.layer_subpath, l.storage_path, l.state
+                 FROM environment_component_output_bindings b
+                 JOIN workspace_layers l ON l.layer_id = b.binding_identity
+                 WHERE b.view_id = ?1 AND b.mount_path = ?2
+                   AND b.policy = 'immutable_seed_private'",
+                params![&view.view_id, mount_path],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((layer_id, layer_subpath, storage_path, state)) = binding else {
+            fs::create_dir_all(&destination)?;
+            return Ok(destination);
+        };
+        if state != "ready" {
+            return Err(Error::Corrupt(format!(
+                "private seed layer `{layer_id}` for `{mount_path}` is `{state}`"
+            )));
+        }
+        let source = if layer_subpath.is_empty() {
+            PathBuf::from(storage_path)
+        } else {
+            safe_join(Path::new(&storage_path), &layer_subpath)?
+        };
+        let marker_dir = Path::new(&view.meta_dir).join("direct-private-seeds");
+        let marker_path = marker_dir.join(format!("{}.json", sha256_hex(mount_path.as_bytes())));
+        let marker = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "mount_path": mount_path,
+            "layer_id": layer_id,
+            "layer_subpath": layer_subpath,
+        }))?;
+        if fs::read(&marker_path).ok().as_deref() == Some(marker.as_slice()) && destination.is_dir()
+        {
+            return Ok(destination);
+        }
+        clone_or_copy_missing_dir_entries(&source, &destination)?;
+        fs::create_dir_all(marker_dir)?;
+        write_file_atomic(&marker_path, &marker, false)?;
+        Ok(destination)
     }
 
     pub fn lane_workspace_view(&self, lane: &str) -> Result<Option<LaneWorkspaceViewReport>> {
@@ -2805,7 +2913,7 @@ mod tests {
                 &db.lane_workspace_view("cargo-a")
                     .unwrap()
                     .unwrap()
-                    .mountpoint
+                    .generated_upper
             ))
         );
         assert_eq!(
@@ -2814,7 +2922,7 @@ mod tests {
                 &db.lane_workspace_view("cargo-b")
                     .unwrap()
                     .unwrap()
-                    .mountpoint
+                    .generated_upper
             ))
         );
         assert_eq!(

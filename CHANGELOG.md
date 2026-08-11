@@ -7,6 +7,36 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Fixed
 
+- Lane/root diff addition and deletion totals now come from the emitted text
+  diff rather than stable-line identity churn, so statistics agree with the
+  unified patch while line-identity inspection remains available separately.
+- Built-in Claude terminal tasks now start with project instructions, plugins,
+  hooks, MCP servers, skills, and agents disabled. The new
+  `--allow-project-integrations` flag restores the previous project-integrated
+  launch explicitly; custom commands after `--` remain unchanged.
+- Managed execution now scopes environment discovery and synchronization to
+  the command's component root, projects a verified manifest-only Cargo lock
+  snapshot only for the command, and removes it before checkpointing. Unrelated
+  nested projects no longer block root commands or leak generated lockfiles
+  into lane source.
+- Managed Cargo commands now use the active generation's declared Cargo and
+  compiler cache namespaces. Lane-private mutable targets are seeded with
+  owner-writable clones in the generated upper outside loopback NFS, avoiding
+  metadata-heavy build I/O through the mount while preserving isolated target
+  state and immutable-layer reuse.
+- Cargo lock resolution now receives the declared offline `CARGO_HOME` cache
+  instead of an empty isolated home, so manifest-only repositories can reuse
+  the host's existing registry/Git index without network access. Cargo
+  workspace members are collapsed into their owning root component, avoiding
+  member-local lockfile failures, while independently nested workspaces remain
+  separate components.
+- Source-only Cargo lane handoffs now initialize a new source-root-exact target
+  seed from the newest compatible active predecessor. Trail prefers native
+  clone/reflink, Cargo revalidates the seed and recompiles affected workspace
+  code, and lockfile, manifest, toolchain, target, platform, or build-policy
+  changes still force an unseeded construction.
+- `trail env ... --path .` now selects the repository-root component instead
+  of failing path normalization.
 - Changed-path daemon authority now follows workspace generation changes and
   hands off atomically between automatic and explicit daemons. Sparse lane
   hydration also narrows native directory events to authenticated selections

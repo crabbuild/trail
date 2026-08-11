@@ -34,6 +34,146 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<u6
     Ok(bytes)
 }
 
+/// Clone a directory tree into mutable staging, preferring filesystem-native
+/// copy-on-write for every regular file and falling back to an ordinary copy
+/// only when the source/destination filesystem cannot clone it.
+pub(crate) fn clone_or_copy_dir_recursive(source: &Path, destination: &Path) -> Result<u64> {
+    if !source.is_dir() {
+        return Err(Error::InvalidPath {
+            path: source.to_string_lossy().into_owned(),
+            reason: "construction seed must be a real directory".to_string(),
+        });
+    }
+    if destination.exists() {
+        return Err(Error::InvalidPath {
+            path: destination.to_string_lossy().into_owned(),
+            reason: "construction seed destination already exists".to_string(),
+        });
+    }
+    fs::create_dir_all(destination)?;
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = fs::read_link(&source_path)?;
+                symlink_file(target, destination_path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(Error::InvalidInput(format!(
+                    "cannot seed symlink `{}` on this platform",
+                    source_path.display()
+                )));
+            }
+        } else if metadata.is_dir() {
+            bytes = bytes.saturating_add(clone_or_copy_dir_recursive(
+                &source_path,
+                &destination_path,
+            )?);
+        } else if metadata.is_file() {
+            clone_or_copy_projected_file(&source_path, &destination_path)?;
+            bytes = bytes.saturating_add(metadata.len());
+        } else {
+            return Err(Error::InvalidInput(format!(
+                "construction seed contains unsupported filesystem entry `{}`",
+                source_path.display()
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
+/// Populate only entries missing from an existing mutable directory, using
+/// native clones where possible. Existing private files always win over the
+/// immutable seed, matching layered-view precedence.
+pub(crate) fn clone_or_copy_missing_dir_entries(source: &Path, destination: &Path) -> Result<u64> {
+    if !source.is_dir() {
+        return Err(Error::InvalidPath {
+            path: source.to_string_lossy().into_owned(),
+            reason: "private seed source must be a real directory".to_string(),
+        });
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(Error::InvalidPath {
+                path: destination.to_string_lossy().into_owned(),
+                reason: "private seed destination must be a real directory".to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(destination)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path)?;
+        match fs::symlink_metadata(&destination_path) {
+            Ok(destination_metadata) => {
+                if source_metadata.is_dir()
+                    && destination_metadata.is_dir()
+                    && !destination_metadata.file_type().is_symlink()
+                {
+                    bytes = bytes.saturating_add(clone_or_copy_missing_dir_entries(
+                        &source_path,
+                        &destination_path,
+                    )?);
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if source_metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                symlink_file(fs::read_link(&source_path)?, &destination_path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(Error::InvalidInput(format!(
+                    "cannot seed symlink `{}` on this platform",
+                    source_path.display()
+                )));
+            }
+        } else if source_metadata.is_dir() {
+            bytes = bytes.saturating_add(clone_or_copy_missing_dir_entries(
+                &source_path,
+                &destination_path,
+            )?);
+        } else if source_metadata.is_file() {
+            clone_or_copy_projected_file(&source_path, &destination_path)?;
+            make_private_seed_file_writable(&destination_path)?;
+            bytes = bytes.saturating_add(source_metadata.len());
+        } else {
+            return Err(Error::InvalidInput(format!(
+                "private seed contains unsupported filesystem entry `{}`",
+                source_path.display()
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
+fn make_private_seed_file_writable(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    permissions.set_mode(permissions.mode() | 0o200);
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
 pub(crate) fn materialize_into_batched_report<F>(
     workspace_root: &Path,
     output_root: &Path,

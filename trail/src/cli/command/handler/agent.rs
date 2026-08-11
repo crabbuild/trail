@@ -1367,7 +1367,10 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
         provider,
         args.from,
         workdir_mode,
-        args.command,
+        TerminalAgentLaunch {
+            allow_project_integrations: args.allow_project_integrations,
+            command: args.command,
+        },
     )?;
     render_agent_run(&report, ctx.json, &ctx.render)
 }
@@ -1398,7 +1401,10 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
         provider,
         Some(from_change.0.clone()),
         workdir_mode,
-        args.command,
+        TerminalAgentLaunch {
+            allow_project_integrations: args.allow_project_integrations,
+            command: args.command,
+        },
     )?;
     let mut suggestions = vec![StatusSuggestion {
         command: format!("trail agent view {}", run.task.lane),
@@ -1423,6 +1429,11 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
     render_agent_continue(&report, ctx.json, &ctx.render)
 }
 
+struct TerminalAgentLaunch {
+    allow_project_integrations: bool,
+    command: Vec<String>,
+}
+
 fn run_terminal_agent_task(
     ctx: &RuntimeContext,
     mut db: trail::Trail,
@@ -1430,7 +1441,7 @@ fn run_terminal_agent_task(
     provider: String,
     from: Option<String>,
     workdir_mode: LaneWorkdirMode,
-    command: Vec<String>,
+    launch: TerminalAgentLaunch,
 ) -> Result<AgentRunReport> {
     const TERMINAL_CAPTURE_LEASE_MS: u64 = 86_400_000;
 
@@ -1484,15 +1495,22 @@ fn run_terminal_agent_task(
     } else {
         None
     };
-    let command_is_default = command.is_empty();
+    let command_is_default = launch.command.is_empty();
     let mut command = if command_is_default {
         default_terminal_agent_command(&provider)?
     } else {
-        command
+        launch.command
     };
-    if command_is_default && let Some(settings) = project_hook_settings {
-        command.push("--settings".to_string());
-        command.push(settings.to_string_lossy().into_owned());
+    if command_is_default && provider == "claude-code" {
+        if launch.allow_project_integrations {
+            if let Some(settings) = project_hook_settings {
+                command.push("--settings".to_string());
+                command.push(settings.to_string_lossy().into_owned());
+            }
+        } else {
+            command.push("--safe-mode".to_string());
+            command.push("--strict-mcp-config".to_string());
+        }
     }
     let mut managed = db.prepare_managed_lane_execution(&lane, "terminal_agent", &command)?;
     let mut workspace_environment = managed.environment.clone();
@@ -2882,6 +2900,7 @@ fn handle_agent_empty_action(
                 name: None,
                 from: None,
                 workdir_mode: "native-cow".to_string(),
+                allow_project_integrations: false,
                 command: Vec::new(),
             },
         ),
@@ -2893,6 +2912,7 @@ fn handle_agent_empty_action(
                 name: None,
                 from: None,
                 workdir_mode: "native-cow".to_string(),
+                allow_project_integrations: false,
                 command: Vec::new(),
             },
         ),

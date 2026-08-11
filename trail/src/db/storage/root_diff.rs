@@ -335,7 +335,8 @@ impl Trail {
                 .cmp(&right.path)
                 .then_with(|| left.old_path.cmp(&right.old_path))
         });
-        let summaries = summarize_file_changes(&changes);
+        let summaries =
+            self.summarize_file_changes_from_content(&changes, patch_left, patch_right)?;
         Ok(RootDiff { changes, summaries })
     }
 }

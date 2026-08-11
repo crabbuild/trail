@@ -710,16 +710,21 @@ The safe default is:
 - Use a shared content-addressed compiler cache such as `sccache`.
 - Disable Cargo incremental compilation when `sccache` is active, because
   incremental rustc invocations are not safely compiler-cacheable.
-- Route the virtual view's `target` path through `ViewCore`; writes copy into
-  the lane's generated upper while immutable seed files remain readable below.
+- Clone/reflink the immutable target seed into the lane's generated upper and
+  point `CARGO_TARGET_DIR` there directly. This preserves lane isolation and
+  immutable-byte reuse without routing Cargo's metadata-heavy writes through a
+  FUSE/NFS/Dokan protocol path.
 - Optionally attach an immutable Cargo target seed created for an identical
   base root, lockfile, toolchain, target triple, feature/profile set, Cargo
   config, and relevant flags.
 
 Library repositories that intentionally omit `Cargo.lock` use the same construction
 path after an explicit resolution operation records the lock bytes as Trail metadata.
-The verified snapshot is projected only into the attempt-owned source staging tree; it
-is never added to the lane source upper or Git. Until certified Cargo input-closure
+Construction projects the verified snapshot only into attempt-owned staging.
+Managed commands project it transiently into the mounted lane, normalize its
+mtime, and remove it before checkpointing; it never enters a Trail source root
+or Git. A conflicting dirty lane lockfile fails closed instead of being
+overwritten. Until certified Cargo input-closure
 analysis exists, both its proposal and target seed remain keyed by the complete source
 root, so even an unrelated source change requires a new lock snapshot rather than
 silently reusing dependency selection from another root.
