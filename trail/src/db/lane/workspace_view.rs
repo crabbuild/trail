@@ -1343,21 +1343,50 @@ impl Trail {
         component_id: &str,
         cache_name: &str,
     ) -> Result<Option<PathBuf>> {
-        let namespace = self
+        let cache = self
             .conn
             .query_row(
-                "SELECT c.namespace_id
+                "SELECT c.namespace_id, n.storage_path
                  FROM environment_view_generations active
                  JOIN environment_generation_caches c
                    ON c.generation_id = active.generation_id
+                 JOIN environment_cache_namespaces n
+                   ON n.namespace_id = c.namespace_id
                  WHERE active.view_id = ?1 AND c.component_id = ?2 AND c.cache_name = ?3",
                 params![&view.view_id, component_id, cache_name],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        namespace
-            .map(|namespace| safe_join(&self.db_dir.join("cache/namespaces"), &namespace))
-            .transpose()
+        let Some((namespace, storage_path)) = cache else {
+            return Ok(None);
+        };
+        let namespace_root = self.db_dir.join("cache/namespaces");
+        fs::create_dir_all(&namespace_root)?;
+        let expected = safe_join(&namespace_root, &namespace)?;
+        if let Ok(metadata) = fs::symlink_metadata(&expected)
+            && (!metadata.is_dir() || metadata.file_type().is_symlink())
+        {
+            return Err(Error::InvalidInput(format!(
+                "environment cache namespace `{namespace}` is not a real directory"
+            )));
+        }
+        fs::create_dir_all(&expected)?;
+        let canonical_storage = Path::new(&storage_path).canonicalize()?;
+        if canonical_storage != expected {
+            return Err(Error::Corrupt(format!(
+                "environment cache namespace `{namespace}` has invalid storage path `{storage_path}`"
+            )));
+        }
+        let updated = self.conn.execute(
+            "UPDATE environment_cache_namespaces SET last_used_at = ?1 WHERE namespace_id = ?2",
+            params![now_ts(), namespace],
+        )?;
+        if updated != 1 {
+            return Err(Error::Corrupt(format!(
+                "environment cache namespace `{namespace}` disappeared while preparing command bindings"
+            )));
+        }
+        Ok(Some(expected))
     }
 
     fn prepare_direct_private_seed(

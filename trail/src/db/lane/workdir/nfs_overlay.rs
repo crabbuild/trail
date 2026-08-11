@@ -1403,7 +1403,7 @@ mod macos {
                 .unwrap();
             assert!(gate.success);
             assert_eq!(gate.source_root, checkpoint.root_id);
-            assert!(gate.environment_keys.is_empty());
+            assert_eq!(gate.environment_keys, vec![layer.cache_key.clone()]);
             assert_eq!(gate.layer_ids, vec![layer.layer_id]);
 
             let newer_exec = db
@@ -2200,9 +2200,10 @@ mod macos {
                 .exec_lane_workspace(
                     "rust-nfs-b",
                     &[
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--offline".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cargo build --offline -vv > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
+                            .to_string(),
                     ],
                 )
                 .unwrap();
@@ -2218,10 +2219,16 @@ mod macos {
                 .any(|layer_id| layer_id == layer.layer_id));
             let view_b = db.lane_workspace_view("rust-nfs-b").unwrap().unwrap();
             let target_b = PathBuf::from(&view_b.generated_upper).join("target");
+            let cargo_stderr = fs::read_to_string(target_b.join("trail-cargo.stderr")).unwrap();
             assert!(
-                !tree_has_name_fragment(&target_b, "libshared_dep"),
-                "the second NFS lane rebuilt a dependency present in its immutable target seed"
+                cargo_stderr.contains("Fresh shared-dep"),
+                "the second NFS lane did not reuse its private clone of the immutable target seed:\n{cargo_stderr}"
             );
+            assert!(
+                !cargo_stderr.contains("Compiling shared-dep"),
+                "the second NFS lane rebuilt a dependency present in its immutable target seed:\n{cargo_stderr}"
+            );
+            assert!(tree_has_name_fragment(&target_b, "libshared_dep"));
             assert!(!target_b.join("lane-a-private").exists());
             assert!(tree_has_name_fragment(
                 Path::new(&layer.storage_path),
