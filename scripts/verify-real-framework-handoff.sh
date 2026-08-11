@@ -96,7 +96,7 @@ run_framework_check() {
       ;;
     pnpm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        'exec "$TRAIL_NODE" "$TRAIL_NODE_MODULES/vitest/vitest.mjs" run pkgs/core/src/getYear/test.ts 1>&2'
+        'exec "$TRAIL_NODE" "$TRAIL_NODE_MODULES/oxfmt/bin/oxfmt" --check README.md 1>&2'
       ;;
     npm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
