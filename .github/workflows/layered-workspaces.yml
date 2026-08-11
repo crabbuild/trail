@@ -240,8 +240,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: scripts/verify-macos-nfs-framework-layers.sh
 
-  real-framework-handoffs:
+  real-framework-candidate:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_real_framework_handoffs }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: real-framework-candidate
+      - name: Build candidate Trail once
+        run: cargo build -p trail --release --locked
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-real-framework-target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trail-real-framework-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/trail-real-framework-target/release/trail
+          if-no-files-found: error
+
+  real-framework-handoffs:
+    needs: real-framework-candidate
     strategy:
       fail-fast: false
       matrix:
@@ -249,24 +268,22 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          key: real-framework-${{ matrix.framework }}
+          name: trail-real-framework-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/trail-real-framework-candidate
+      - name: Restore candidate executable permission
+        run: chmod 0755 "${{ runner.temp }}/trail-real-framework-candidate/trail"
       - if: ${{ matrix.framework == 'pnpm' || matrix.framework == 'npm' }}
         uses: actions/setup-node@v4
         with:
           node-version: "22"
       - if: ${{ matrix.framework == 'pnpm' }}
         run: corepack enable && corepack prepare pnpm@10.14.0 --activate
-      - name: Build candidate Trail
-        run: cargo build -p trail --release --locked
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/trail-real-framework-target-${{ matrix.framework }}
       - name: Qualify ${{ matrix.framework }} A -> B -> C handoff
         run: scripts/verify-real-framework-handoff.sh "${{ matrix.framework }}"
         env:
-          TRAIL_BIN: ${{ runner.temp }}/trail-real-framework-target-${{ matrix.framework }}/release/trail
+          TRAIL_BIN: ${{ runner.temp }}/trail-real-framework-candidate/trail
           TRAIL_FRAMEWORK_EVIDENCE_DIR: ${{ runner.temp }}/trail-real-framework-${{ matrix.framework }}
           TRAIL_FRAMEWORK_WORK_ROOT: ${{ runner.temp }}/trail-real-framework-work-${{ matrix.framework }}
       - uses: actions/upload-artifact@v4
