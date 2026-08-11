@@ -2202,7 +2202,7 @@ mod macos {
                     &[
                         "sh".to_string(),
                         "-c".to_string(),
-                        "cargo build --offline -vv > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
+                        "cargo build --offline -vv --color never > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
                             .to_string(),
                     ],
                 )
