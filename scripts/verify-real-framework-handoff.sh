@@ -98,7 +98,7 @@ run_framework_check() {
       ;;
     python)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        '"$TRAIL_VENV_PYTHON" -c '\''import os,sys; assert os.path.realpath(sys.prefix) == os.path.realpath(os.environ["VIRTUAL_ENV"])'\'' && exec "$TRAIL_VENV_PYTHON" -m compileall -q httpx'
+        '"$TRAIL_VENV_PYTHON" -c '\''import os,sys; expected=os.path.join(os.getcwd(), ".venv"); assert os.path.realpath(sys.prefix) == os.path.realpath(os.environ["VIRTUAL_ENV"]) == os.path.realpath(expected)'\'' && exec "$TRAIL_VENV_PYTHON" -m compileall -q httpx'
       ;;
     cmake)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
@@ -125,7 +125,8 @@ for lane in agent-a agent-b agent-c; do
     fi
   fi
   run_edit "$lane"
-  run_json "sync-$lane" env sync component "$component_selector" --lane "$lane"
+  run_json "sync-$lane" env sync component "$component_id" \
+    --adapter "$component_selector" --lane "$lane"
   run_framework_check "$lane"
   run_json "generation-$lane" env generation "$lane"
   previous=$lane

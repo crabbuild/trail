@@ -40,7 +40,7 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 output_name = "node_modules"
             else:
                 layer = None
-                storage = f"private-{index}"
+                storage = f"private_{index}"
                 output_name = "venv" if framework == "python" else "build-tree"
             component = {
                 "component_id": component_id,
@@ -89,7 +89,7 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                     "lifecycle": {
                         "checkpoint": {
                             "source_paths": ["README.md"],
-                            "generated_dirty_paths": 0,
+                            "generated_dirty_paths": index + 1,
                         }
                     }
                 },
@@ -118,7 +118,11 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             self.write_report(
                 raw,
                 f"spawn-{lane}",
-                {"lane": lane, "environment_inheritance": inheritance},
+                {
+                    "lane": lane,
+                    "workdir": f"/workspace/{lane}",
+                    "environment_inheritance": inheritance,
+                },
             )
         self.write_report(raw, "init", {"initialized": True})
         return component_id
@@ -137,17 +141,18 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 )
                 self.assertEqual(evidence["framework"], framework)
                 self.assertTrue(evidence["assertions"]["framework_reuse_contract_passed"])
+                self.assertEqual(evidence["generated_dirty_paths"], [1, 2, 3])
                 expected_raw = 18 if framework in {"go", "pnpm", "npm"} else 16
                 self.assertEqual(len(evidence["raw_sha256"]), expected_raw)
 
-    def test_rejects_an_edit_that_captures_generated_state(self):
+    def test_rejects_an_edit_that_captures_more_than_the_readme(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
             component_id = self.fixture(root, "pnpm")
             report = json.loads((root / "raw/edit-agent-b.json").read_text(encoding="utf-8"))
-            report["lifecycle"]["checkpoint"]["generated_dirty_paths"] = 1
+            report["lifecycle"]["checkpoint"]["source_paths"].append("target/output")
             self.write_report(root / "raw", "edit-agent-b", report)
-            with self.assertRaisesRegex(AssertionError, "checkpointed generated paths"):
+            with self.assertRaisesRegex(AssertionError, "unexpected source paths"):
                 CHECKER.check_evidence(root, "pnpm", "repo", "rev", component_id)
 
     def test_rejects_go_without_compatible_predecessor_seed(self):

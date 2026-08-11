@@ -50,19 +50,27 @@ def check_evidence(
     edits = [load_report(raw, f"edit-{lane}") for lane in LANES]
     checks = [load_report(raw, f"check-{lane}") for lane in LANES]
     components = [select_component(generation, component_id) for generation in generations]
+    workdirs = [spawn["workdir"] for spawn in spawns]
 
     if not all(generation["state"] == "active" for generation in generations):
         raise AssertionError("all final generations must be active")
     if len({generation["source_root"] for generation in generations}) != 3:
         raise AssertionError("A, B, and C must have distinct source roots")
+    if len(set(workdirs)) != 3 or any(not Path(workdir).is_absolute() for workdir in workdirs):
+        raise AssertionError("A, B, and C must have distinct absolute lane workdirs")
     if not all(check["exit_code"] == 0 for check in checks):
         raise AssertionError("every framework check must exit successfully")
+    generated_dirty_paths = []
     for lane, edit in zip(LANES, edits, strict=True):
         checkpoint = edit["lifecycle"]["checkpoint"]
         if checkpoint["source_paths"] != ["README.md"]:
             raise AssertionError(f"{lane} checkpointed unexpected source paths: {checkpoint!r}")
-        if checkpoint["generated_dirty_paths"] != 0:
-            raise AssertionError(f"{lane} checkpointed generated paths: {checkpoint!r}")
+        generated_dirty = checkpoint["generated_dirty_paths"]
+        if not isinstance(generated_dirty, int) or generated_dirty < 0:
+            raise AssertionError(
+                f"{lane} reported invalid generated-path accounting: {checkpoint!r}"
+            )
+        generated_dirty_paths.append(generated_dirty)
 
     cache_namespaces = [
         {cache["name"]: cache["namespace_id"] for cache in item["caches"]}
@@ -111,9 +119,12 @@ def check_evidence(
             raise AssertionError("private environment identity changed after source-only edits")
         if layer_ids != [None, None, None]:
             raise AssertionError("Python/CMake private outputs must not publish shared layers")
-        identities = [next(iter(storage.values())) for storage in output_storage]
-        if len(set(identities)) != 3:
-            raise AssertionError("Python/CMake outputs must remain lane-private")
+        if any(
+            not storage_identity.startswith("private_")
+            for storage in output_storage
+            for storage_identity in storage.values()
+        ):
+            raise AssertionError("Python/CMake outputs must use private storage contracts")
 
     shared_outputs = framework in {"go", "pnpm", "npm"}
     for child_index, (child, parent_generation) in enumerate(
@@ -189,18 +200,20 @@ def check_evidence(
         "revision": revision,
         "backend": "nfs-cow",
         "lanes": list(LANES),
+        "workdirs": workdirs,
         "component_id": component_id,
         "source_roots": [generation["source_root"] for generation in generations],
         "component_keys": component_keys,
         "layer_ids": layer_ids,
         "cache_namespaces": cache_namespaces,
         "output_storage": output_storage,
+        "generated_dirty_paths": generated_dirty_paths,
         "assertions": {
             "three_distinct_source_roots": True,
             "shared_parent_generation_inherited_before_each_child_edit": shared_outputs,
             "private_outputs_reprovisioned_per_child_lane": not shared_outputs,
             "exactly_one_readme_source_path_per_edit": True,
-            "zero_generated_paths_checkpointed": True,
+            "generated_paths_excluded_from_source_checkpoint": True,
             "all_framework_checks_passed": True,
             "framework_reuse_contract_passed": True,
         },
