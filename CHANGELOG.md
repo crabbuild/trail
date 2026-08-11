@@ -49,6 +49,11 @@ All notable changes to Trail are documented in this file. Trail follows
   clone/reflink, Cargo revalidates the seed and recompiles affected workspace
   code, and lockfile, manifest, toolchain, target, platform, or build-policy
   changes still force an unseeded construction.
+- Built-in Node dependency layers produced by a lockfile-frozen,
+  script-disabled install now allow public private-key example literals in
+  ordinary documentation, source, and type declarations. Strict scanning still
+  rejects secret-bearing paths such as `.env`, credential, `.pem`, and `.key`
+  files; custom or script-enabled producers receive no exemption.
 - `trail env ... --path .` now selects the repository-root component instead
   of failing path normalization.
 - Changed-path daemon authority now follows workspace generation changes and
@@ -60,7 +65,7 @@ All notable changes to Trail are documented in this file. Trail follows
 ### Added
 
 - Added an opt-in macOS real-framework qualification matrix for pinned bbolt,
-  date-fns, lodash, httpx, and LevelDB revisions. Each row produces checksummed
+  date-fns, uuid, httpx, and LevelDB revisions. Each row produces checksummed
   Agent A → B → C evidence for source-only handoff, parent-generation
   inheritance, framework checks, cache/layer reuse, and lane-private outputs.
 - Added deterministic 10k/100k/1M artifact and source scale matrices for

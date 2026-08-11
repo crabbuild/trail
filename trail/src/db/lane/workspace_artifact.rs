@@ -1583,7 +1583,7 @@ impl Trail {
     }
 
     fn ingest_artifact_file_bytes(&self, bytes: &[u8], mode: u32) -> Result<ArtifactFileId> {
-        self.ingest_artifact_file_bytes_with_path(bytes, mode, None)
+        self.ingest_artifact_file_bytes_with_path(bytes, mode, None, ArtifactSecretPolicy::Strict)
     }
 
     fn ingest_artifact_file_bytes_with_path(
@@ -1591,13 +1591,14 @@ impl Trail {
         bytes: &[u8],
         mode: u32,
         relative_path: Option<&str>,
+        secret_policy: ArtifactSecretPolicy,
     ) -> Result<ArtifactFileId> {
         if mode & !0o777 != 0 {
             return Err(Error::InvalidInput(format!(
                 "artifact file mode {mode:o} contains unsupported bits"
             )));
         }
-        validate_artifact_secret_policy(bytes, relative_path)?;
+        validate_artifact_secret_policy(bytes, relative_path, secret_policy)?;
         let complete_hash = sha256_hex(bytes);
         let content = if bytes.len() <= ARTIFACT_WHOLE_BLOB_MAX_BYTES {
             let blob = ArtifactBlobV1 {
@@ -1690,6 +1691,7 @@ impl Trail {
         path: &Path,
         relative_path: &str,
         mode: u32,
+        secret_policy: ArtifactSecretPolicy,
     ) -> Result<ArtifactFileId> {
         let before = fs::symlink_metadata(path)?;
         if !before.is_file() {
@@ -1702,7 +1704,12 @@ impl Trail {
             let bytes = fs::read(path)?;
             let after = fs::symlink_metadata(path)?;
             ensure_artifact_file_unchanged(path, &before, &after, bytes.len() as u64)?;
-            return self.ingest_artifact_file_bytes_with_path(&bytes, mode, Some(relative_path));
+            return self.ingest_artifact_file_bytes_with_path(
+                &bytes,
+                mode,
+                Some(relative_path),
+                secret_policy,
+            );
         }
 
         let mut complete_hasher = Sha256::new();
@@ -1719,7 +1726,7 @@ impl Trail {
                     path.display()
                 ))
             })?;
-            validate_artifact_secret_policy(&boundary.data, Some(relative_path))?;
+            validate_artifact_secret_policy(&boundary.data, Some(relative_path), secret_policy)?;
             complete_hasher.update(&boundary.data);
             let chunk = ArtifactChunkV1 {
                 version: ARTIFACT_CHUNK_VERSION,
@@ -1794,6 +1801,17 @@ impl Trail {
         &self,
         source: &Path,
     ) -> Result<(ArtifactTreeId, ArtifactTreeRootV1)> {
+        self.ingest_artifact_tree_under_write_lock_with_secret_policy(
+            source,
+            ArtifactSecretPolicy::Strict,
+        )
+    }
+
+    pub(crate) fn ingest_artifact_tree_under_write_lock_with_secret_policy(
+        &self,
+        source: &Path,
+        secret_policy: ArtifactSecretPolicy,
+    ) -> Result<(ArtifactTreeId, ArtifactTreeRootV1)> {
         let root_before = fs::symlink_metadata(source)?;
         if root_before.file_type().is_symlink() || !root_before.is_dir() {
             return Err(Error::InvalidPath {
@@ -1862,6 +1880,7 @@ impl Trail {
                     entry.path(),
                     &relative,
                     normalized_artifact_file_mode(&metadata),
+                    secret_policy,
                 )?;
                 directories
                     .get_mut(parent)
@@ -6445,7 +6464,17 @@ fn ensure_artifact_file_unchanged(
     Ok(())
 }
 
-fn validate_artifact_secret_policy(bytes: &[u8], relative_path: Option<&str>) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactSecretPolicy {
+    Strict,
+    LockedPublicDependencies,
+}
+
+fn validate_artifact_secret_policy(
+    bytes: &[u8],
+    relative_path: Option<&str>,
+    policy: ArtifactSecretPolicy,
+) -> Result<()> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(());
     };
@@ -6454,6 +6483,10 @@ fn validate_artifact_secret_policy(bytes: &[u8], relative_path: Option<&str>) ->
         upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----")
     };
     let sensitive = match relative_path {
+        Some(path) if policy == ArtifactSecretPolicy::LockedPublicDependencies => {
+            is_secret_bearing_artifact_path(path)
+                && (contains_private_key || contains_sensitive_text(text))
+        }
         Some(path) => {
             contains_private_key
                 || is_secret_bearing_artifact_path(path) && contains_sensitive_text(text)
@@ -8138,6 +8171,21 @@ mod tests {
         let error = db.ingest_artifact_tree(source.path()).unwrap_err();
         assert!(error.to_string().contains("private.pem"));
         assert!(error.to_string().contains("secret material"));
+
+        let public_type_fixture = b"export type Example = '-----BEGIN PRIVATE KEY-----';\n";
+        validate_artifact_secret_policy(
+            public_type_fixture,
+            Some("@example/openapi-types/types.d.ts"),
+            ArtifactSecretPolicy::LockedPublicDependencies,
+        )
+        .unwrap();
+        let error = validate_artifact_secret_policy(
+            public_type_fixture,
+            Some("package/private.key"),
+            ArtifactSecretPolicy::LockedPublicDependencies,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("private.key"));
     }
 
     #[cfg(unix)]

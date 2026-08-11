@@ -123,7 +123,7 @@ scripts/cli-scale-bench.sh
 Framework adapters have a separate opt-in macOS qualification matrix. Each row
 fetches an exact upstream revision, uses the candidate Trail binary, and moves
 three native NFS lanes through a source edit, environment synchronization, and
-real framework check. The gate covers bbolt/Go, date-fns/pnpm, lodash/npm,
+real framework check. The gate covers bbolt/Go, date-fns/pnpm, uuid/npm,
 httpx/Python virtual environments, and LevelDB/CMake:
 
 ```sh

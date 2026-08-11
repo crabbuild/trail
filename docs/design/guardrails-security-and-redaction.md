@@ -57,6 +57,15 @@ rejects credential-like content, protected paths, escaping links, special
 files, unsafe modes/xattrs, case collisions, concurrent mutation, and declared
 entry/byte/depth limit violations before publishing an envelope.
 
+One narrow content-scanning distinction applies to the built-in Node adapter.
+When a dependency tree is produced from a frozen lockfile with lifecycle
+scripts disabled and a cleared environment, public example literals in ordinary
+documentation, source, and type declarations do not taint the tree merely
+because they spell a private-key marker. Secret-bearing paths (`.env`,
+credentials, `.pem`, `.key`, and their protected equivalents) remain rejected.
+Custom adapters, script-enabled installs, private-output promotion, and every
+other artifact producer retain strict scanning.
+
 ```mermaid
 flowchart TB
     Input["User, agent, CLI, HTTP, or MCP request"]

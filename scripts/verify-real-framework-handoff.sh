@@ -35,8 +35,8 @@ case "$framework" in
     component_id=node
     ;;
   npm)
-    repository=https://github.com/lodash/lodash.git
-    revision=a666ba591064c8011988275790ad7d625279f09c
+    repository=https://github.com/uuidjs/uuid.git
+    revision=b1da338815af4d919295eacb33aae340e372232a
     component_selector=node
     component_id=node
     ;;
@@ -71,7 +71,13 @@ fi
 run_json() {
   local output=$1
   shift
-  "$TRAIL_BIN" --format json "$@" >"$TRAIL_FRAMEWORK_EVIDENCE_DIR/raw/$output.json"
+  local destination=$TRAIL_FRAMEWORK_EVIDENCE_DIR/raw/$output.json
+  local pending=$destination.pending
+  if ! "$TRAIL_BIN" --format json "$@" >"$pending"; then
+    rm -f -- "$pending"
+    return 1
+  fi
+  mv -- "$pending" "$destination"
 }
 
 run_edit() {
@@ -86,27 +92,27 @@ run_framework_check() {
   case "$framework" in
     go)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        'exec "$TRAIL_GO" test ./... -run "^TestTxStats_add$"'
+        'exec "$TRAIL_GO" test ./... -run "^TestTxStats_add$" 1>&2'
       ;;
     pnpm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        'exec "$TRAIL_NODE" "$TRAIL_NODE_MODULES/vitest/vitest.mjs" run pkgs/core/src/getYear/test.ts'
+        'exec "$TRAIL_NODE" "$TRAIL_NODE_MODULES/vitest/vitest.mjs" run pkgs/core/src/getYear/test.ts 1>&2'
       ;;
     npm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        'exec "$TRAIL_NODE" -e '\''const lodash = require("./lodash.js"); if (lodash.chunk([1,2,3], 2).length !== 2) process.exit(1)'\'''
+        'exec "$TRAIL_NODE" "$TRAIL_NODE_MODULES/typescript/bin/tsc" --version 1>&2'
       ;;
     python)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
-        '"$TRAIL_VENV_PYTHON" -c '\''import os,sys; expected=os.path.join(os.getcwd(), ".venv"); assert os.path.realpath(sys.prefix) == os.path.realpath(os.environ["VIRTUAL_ENV"]) == os.path.realpath(expected)'\'' && exec "$TRAIL_VENV_PYTHON" -m compileall -q httpx'
+        '"$TRAIL_VENV_PYTHON" -c '\''import os,sys; expected=os.path.join(os.getcwd(), ".venv"); assert os.path.realpath(sys.prefix) == os.path.realpath(os.environ["VIRTUAL_ENV"]) == os.path.realpath(expected)'\'' && exec "$TRAIL_VENV_PYTHON" -m compileall -q httpx 1>&2'
       ;;
     cmake)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
         'set -eu
-         "$TRAIL_CMAKE" -S . -B "$TRAIL_CMAKE_BUILD_DIR" -DLEVELDB_BUILD_TESTS=ON -DLEVELDB_BUILD_BENCHMARKS=OFF
-         "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_BUILD_DIR" --target leveldb_tests --parallel 2
+         "$TRAIL_CMAKE" -S . -B "$TRAIL_CMAKE_BUILD_DIR" -DLEVELDB_BUILD_TESTS=ON -DLEVELDB_BUILD_BENCHMARKS=OFF 1>&2
+         "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_BUILD_DIR" --target leveldb_tests --parallel 2 1>&2
          cmake_bin=${TRAIL_CMAKE%/*}
-         exec "$cmake_bin/ctest" --test-dir "$TRAIL_CMAKE_BUILD_DIR" -R "^leveldb_tests$" --output-on-failure'
+         exec "$cmake_bin/ctest" --test-dir "$TRAIL_CMAKE_BUILD_DIR" -R "^leveldb_tests$" --output-on-failure 1>&2'
       ;;
   esac
 }
