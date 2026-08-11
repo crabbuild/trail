@@ -46,6 +46,7 @@ def check_evidence(
     raw = evidence_dir / "raw"
     generations = [load_report(raw, f"generation-{lane}") for lane in LANES]
     syncs = [load_report(raw, f"sync-{lane}") for lane in LANES]
+    spawns = [load_report(raw, f"spawn-{lane}") for lane in LANES]
     edits = [load_report(raw, f"edit-{lane}") for lane in LANES]
     checks = [load_report(raw, f"check-{lane}") for lane in LANES]
     components = [select_component(generation, component_id) for generation in generations]
@@ -114,15 +115,47 @@ def check_evidence(
         if len(set(identities)) != 3:
             raise AssertionError("Python/CMake outputs must remain lane-private")
 
-    for child, parent_generation in zip(LANES[1:], generations[:-1], strict=True):
-        inherited = select_component(load_report(raw, f"generation-before-edit-{child}"), component_id)
-        parent = select_component(parent_generation, component_id)
-        if inherited["component_key"] != parent["component_key"]:
-            raise AssertionError(f"{child} did not inherit its parent component key")
-        if inherited["layer_id"] != parent["layer_id"]:
-            raise AssertionError(f"{child} did not inherit its parent layer")
-        if inherited["caches"] != parent["caches"]:
-            raise AssertionError(f"{child} did not inherit its parent caches")
+    shared_outputs = framework in {"go", "pnpm", "npm"}
+    for child_index, (child, parent_generation) in enumerate(
+        zip(LANES[1:], generations[:-1], strict=True), start=1
+    ):
+        inheritance = spawns[child_index].get("environment_inheritance")
+        if shared_outputs:
+            if not isinstance(inheritance, dict) or inheritance.get("status") != "inherited":
+                raise AssertionError(f"{child} did not report inherited outputs: {inheritance!r}")
+            inherited = select_component(
+                load_report(raw, f"generation-before-edit-{child}"), component_id
+            )
+            parent = select_component(parent_generation, component_id)
+            if inherited["component_key"] != parent["component_key"]:
+                raise AssertionError(f"{child} did not inherit its parent component key")
+            if inherited["layer_id"] != parent["layer_id"]:
+                raise AssertionError(f"{child} did not inherit its parent layer")
+            if inherited["caches"] != parent["caches"]:
+                raise AssertionError(f"{child} did not inherit its parent caches")
+        else:
+            if not isinstance(inheritance, dict):
+                raise AssertionError(f"{child} has no private-output decision report")
+            if (
+                inheritance.get("status") != "skipped"
+                or inheritance.get("reason") != "no_compatible_outputs"
+            ):
+                raise AssertionError(
+                    f"{child} unexpectedly inherited a lane-private output: {inheritance!r}"
+                )
+            decisions = [
+                item
+                for item in inheritance.get("outputs", [])
+                if item.get("component_id") == component_id
+            ]
+            if not decisions or any(
+                item.get("decision") != "private"
+                or item.get("reason") != "fresh_lane_private_upper"
+                for item in decisions
+            ):
+                raise AssertionError(
+                    f"{child} did not require a fresh lane-private output: {decisions!r}"
+                )
 
     raw_hashes = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -135,9 +168,14 @@ def check_evidence(
         *(f"sync-{lane}.json" for lane in LANES),
         *(f"check-{lane}.json" for lane in LANES),
         *(f"generation-{lane}.json" for lane in LANES),
-        "generation-before-edit-agent-b.json",
-        "generation-before-edit-agent-c.json",
     }
+    if shared_outputs:
+        expected_names.update(
+            {
+                "generation-before-edit-agent-b.json",
+                "generation-before-edit-agent-c.json",
+            }
+        )
     if set(raw_hashes) != expected_names:
         raise AssertionError(
             f"raw evidence set mismatch: missing={sorted(expected_names - set(raw_hashes))!r} "
@@ -159,7 +197,8 @@ def check_evidence(
         "output_storage": output_storage,
         "assertions": {
             "three_distinct_source_roots": True,
-            "parent_generation_inherited_before_each_child_edit": True,
+            "shared_parent_generation_inherited_before_each_child_edit": shared_outputs,
+            "private_outputs_reprovisioned_per_child_lane": not shared_outputs,
             "exactly_one_readme_source_path_per_edit": True,
             "zero_generated_paths_checkpointed": True,
             "all_framework_checks_passed": True,

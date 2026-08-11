@@ -120,7 +120,9 @@ for lane in agent-a agent-b agent-c; do
     run_json "spawn-$lane" lane spawn "$lane" --from main --workdir-mode nfs-cow
   else
     run_json "spawn-$lane" lane spawn "$lane" --from "$previous" --workdir-mode nfs-cow
-    run_json "generation-before-edit-$lane" env generation "$lane"
+    if [[ $framework == go || $framework == pnpm || $framework == npm ]]; then
+      run_json "generation-before-edit-$lane" env generation "$lane"
+    fi
   fi
   run_edit "$lane"
   run_json "sync-$lane" env sync component "$component_selector" --lane "$lane"

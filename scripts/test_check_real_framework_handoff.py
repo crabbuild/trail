@@ -72,7 +72,8 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                 )
-                self.write_report(raw, f"generation-before-edit-{lane}", parent)
+                if framework in {"go", "pnpm", "npm"}:
+                    self.write_report(raw, f"generation-before-edit-{lane}", parent)
             decision = {
                 "component_id": component_id,
                 "decision_source": (
@@ -94,7 +95,31 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 },
             )
             self.write_report(raw, f"check-{lane}", {"exit_code": 0})
-            self.write_report(raw, f"spawn-{lane}", {"lane": lane})
+            inheritance = None
+            if index:
+                if framework in {"go", "pnpm", "npm"}:
+                    inheritance = {
+                        "status": "inherited",
+                        "reason": None,
+                        "outputs": [],
+                    }
+                else:
+                    inheritance = {
+                        "status": "skipped",
+                        "reason": "no_compatible_outputs",
+                        "outputs": [
+                            {
+                                "component_id": component_id,
+                                "decision": "private",
+                                "reason": "fresh_lane_private_upper",
+                            }
+                        ],
+                    }
+            self.write_report(
+                raw,
+                f"spawn-{lane}",
+                {"lane": lane, "environment_inheritance": inheritance},
+            )
         self.write_report(raw, "init", {"initialized": True})
         return component_id
 
@@ -112,7 +137,8 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 )
                 self.assertEqual(evidence["framework"], framework)
                 self.assertTrue(evidence["assertions"]["framework_reuse_contract_passed"])
-                self.assertEqual(len(evidence["raw_sha256"]), 18)
+                expected_raw = 18 if framework in {"go", "pnpm", "npm"} else 16
+                self.assertEqual(len(evidence["raw_sha256"]), expected_raw)
 
     def test_rejects_an_edit_that_captures_generated_state(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -133,6 +159,22 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             self.write_report(root / "raw", "sync-agent-b", report)
             with self.assertRaisesRegex(AssertionError, "did not seed from its predecessor"):
                 CHECKER.check_evidence(root, "go", "repo", "rev", component_id)
+
+    def test_rejects_private_output_inheritance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "python")
+            report = json.loads(
+                (root / "raw/spawn-agent-b.json").read_text(encoding="utf-8")
+            )
+            report["environment_inheritance"] = {
+                "status": "inherited",
+                "reason": None,
+                "outputs": [],
+            }
+            self.write_report(root / "raw", "spawn-agent-b", report)
+            with self.assertRaisesRegex(AssertionError, "unexpectedly inherited"):
+                CHECKER.check_evidence(root, "python", "repo", "rev", component_id)
 
 
 if __name__ == "__main__":
