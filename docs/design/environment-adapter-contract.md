@@ -83,7 +83,9 @@ executor candidates, validate pinned source/tool/policy identity, reuse snapshot
 an explicit refresh, and own durable attempt evidence and publication. The public
 `trail env resolve` operation selects the exact discovered component and runs reviewed
 built-in offline, credential-free plans in host-owned isolated staging before entering
-that publication boundary. Restricted repository/plugin resolver execution and aligned
+that publication boundary. The Cargo resolver receives only its declared offline
+`CARGO_HOME` role and reuses the invoking host's existing registry/Git cache; it does
+not receive credentials or network authority. Restricted repository/plugin resolver execution and aligned
 HTTP/MCP operations remain planned. Discovery reports unsupported installed plugins
 from their pinned marker and package metadata without launching the plugin.
 
@@ -161,6 +163,16 @@ refuses to replace a tracked path. Target-seed construction then uses the conven
 `Cargo.lock` location with `--locked --offline`; generation keys retain both the complete
 source root and snapshot authority. Source discovery and planning never write a lockfile
 back to the repository.
+
+Discovery treats Cargo manifests declared by an ancestor `[workspace].members`
+as part of the owning workspace component rather than independent lock/build
+components. A genuinely nested manifest with its own `[workspace]` remains a
+separate component. When only source/snapshot provenance changes and the
+manifest bytes, resolved lock bytes, toolchain, target, platform, adapter, and
+build contract still match, a new exact target-seed construction may start from
+an active compatible predecessor. The predecessor is performance-only input:
+Cargo runs the current locked build, and Trail publishes a distinct layer under
+the complete current identity.
 
 The initial Node adapter deliberately rejects workspace-root installs, local file/link
 dependencies, pnpm workspace roots, and Yarn Berry/PnP rather than publishing an empty,

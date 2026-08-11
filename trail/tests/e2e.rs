@@ -405,7 +405,7 @@ fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
 
 #[cfg(unix)]
 #[test]
-fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
+fn terminal_agent_start_disables_claude_project_integrations_unless_explicitly_allowed() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -442,14 +442,14 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
-        .env("PATH", path)
+        .env("PATH", &path)
         .args([
             "agent",
             "start",
             "--provider",
             "claude-code",
             "--name",
-            "hook-settings",
+            "safe-settings",
             "--workdir-mode",
             "auto",
         ])
@@ -464,11 +464,40 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        format!("--settings\n{settings}\n")
+        "--safe-mode\n--strict-mcp-config\n"
     );
     assert_eq!(
         report["lifecycle"]["checkpoint"]["source_paths"],
         serde_json::json!(["CLAUDE_ARGS.txt"])
+    );
+
+    let allowed = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("PATH", path)
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "project-settings",
+            "--workdir-mode",
+            "auto",
+            "--allow-project-integrations",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&allowed.stderr),
+        format!("--settings\n{settings}\n")
     );
 }
 
@@ -21365,6 +21394,46 @@ fn lane_diff_cli_renders_scannable_overview() {
     assert!(stdout.contains("M  README.md  +1 -0"), "{stdout}");
     assert!(stdout.contains("A  docs/guide.md  +1 -0"), "{stdout}");
     assert!(stdout.contains("2 files changed, 2 insertions, 0 deletions"));
+}
+
+#[test]
+fn lane_diff_stats_follow_content_diff_instead_of_line_identity_churn() {
+    let temp = tempfile::tempdir().unwrap();
+    let original =
+        "}\n\n#[test]\nfn existing_test() {\n    let value = 1;\n    assert_eq!(value, 1);\n}\n";
+    let inserted = "fn inserted_test() {\n    let first = 1;\n    let second = 2;\n    assert_eq!(first + second, 3);\n}\n\n#[test]\n";
+    let updated = original.replacen(
+        "fn existing_test()",
+        &format!("{inserted}fn existing_test()"),
+        1,
+    );
+    fs::write(temp.path().join("tests.rs"), original).unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("stats-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "edits": [
+            {"op": "write", "path": "tests.rs", "content": updated}
+        ]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "stats-bot", patch).unwrap();
+
+    let diff = db.diff_lane("stats-bot", true).unwrap();
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].additions, inserted.lines().count() as u64);
+    assert_eq!(diff.files[0].deletions, 0);
+    let patch = diff.files[0].patch.as_deref().unwrap();
+    assert_eq!(
+        patch.lines().filter(|line| line.starts_with('+')).count() - 1,
+        inserted.lines().count()
+    );
+    assert_eq!(
+        patch.lines().filter(|line| line.starts_with('-')).count() - 1,
+        0
+    );
 }
 
 #[test]

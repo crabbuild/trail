@@ -172,6 +172,7 @@ impl WorkspaceEnvironmentAdapter for GoVendorAdapter {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: Some((source_root.clone(), "project".to_string())),
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {

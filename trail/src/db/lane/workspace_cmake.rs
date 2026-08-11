@@ -110,6 +110,7 @@ impl WorkspaceEnvironmentAdapter for CmakeBuildTreeAdapter {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,

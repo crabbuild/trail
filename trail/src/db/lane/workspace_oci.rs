@@ -314,6 +314,7 @@ impl WorkspaceEnvironmentAdapter for OciImageAdapter {
             },
             inputs: Vec::new(),
             resolution_inputs: Vec::new(),
+            construction_seed: None,
             source_projection: None,
             pre_commands: Vec::new(),
             command: None,

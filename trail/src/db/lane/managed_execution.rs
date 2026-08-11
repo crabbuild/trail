@@ -22,12 +22,18 @@ pub struct ManagedExecutionContext {
     pub workdir: PathBuf,
     pub environment: Vec<(String, String)>,
     pub environment_generation: Option<String>,
+    projected_source_inputs: Vec<ManagedProjectedSourceInput>,
     preparation: ManagedExecutionPreparationReceipt,
     sealing_decisions: Vec<ManagedExecutionSealingDecision>,
     mount: Option<Box<dyn Any + Send>>,
     phases: Vec<ManagedExecutionPhaseReceipt>,
     #[cfg(test)]
     injected_disposal_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedProjectedSourceInput {
+    path: PathBuf,
 }
 
 impl Trail {
@@ -87,6 +93,7 @@ impl Trail {
                 ))
             })?;
         let head = self.get_ref(&branch.ref_name)?;
+        let component_root = managed_execution_component_root(command);
         self.push_managed_execution_phase(
             &mut phases,
             &branch.lane_id,
@@ -100,7 +107,7 @@ impl Trail {
         )?;
 
         let view = self.lane_workspace_view(lane)?;
-        let discovered = match self.discover_workspace_environment(lane, None) {
+        let discovered = match self.discover_workspace_environment(lane, Some(&component_root)) {
             Ok(report) if report.conflicts.is_empty() => report,
             Ok(report) => {
                 let error = Error::InvalidInput(format!(
@@ -210,7 +217,7 @@ impl Trail {
                 edges: Vec::new(),
             }
         } else {
-            match self.workspace_environment_graph(lane, None) {
+            match self.workspace_environment_graph(lane, Some(&component_root)) {
                 Ok(graph) => graph,
                 Err(error) => {
                     self.push_managed_execution_phase(
@@ -277,7 +284,7 @@ impl Trail {
             return Err(error);
         }
         if must_sync {
-            if let Err(error) = self.sync_all_workspace_environments(lane, None) {
+            if let Err(error) = self.sync_all_workspace_environments(lane, Some(&component_root)) {
                 self.push_managed_execution_phase(
                     &mut phases,
                     &branch.lane_id,
@@ -490,21 +497,31 @@ impl Trail {
             None,
         )?;
 
-        let environment = match view
+        let (environment, projected_source_inputs) = match view
             .as_ref()
-            .map(|view| self.workspace_command_environment(view, &head.root_id))
+            .map(|view| {
+                let environment = self.workspace_command_environment_at_root(
+                    view,
+                    &head.root_id,
+                    &component_root,
+                )?;
+                let projected_source_inputs =
+                    self.prepare_managed_resolution_inputs(view, &head.root_id, &component_root)?;
+                Ok((environment, projected_source_inputs))
+            })
             .transpose()
         {
-            Ok(Some(environment)) => environment,
+            Ok(Some(result)) => result,
             Ok(None) => {
-                vec![
+                let environment = vec![
                     (
                         "TRAIL_WORKSPACE".to_string(),
                         self.workspace_root.to_string_lossy().into_owned(),
                     ),
                     ("TRAIL_LANE".to_string(), branch.lane_id.clone()),
                     ("TRAIL_SOURCE_ROOT".to_string(), head.root_id.0.clone()),
-                ]
+                ];
+                (environment, Vec::new())
             }
             Err(error) => {
                 let disposal = if has_runtime {
@@ -567,6 +584,7 @@ impl Trail {
             environment_generation: active_generation
                 .as_ref()
                 .map(|generation| generation.generation_id.clone()),
+            projected_source_inputs,
             preparation: ManagedExecutionPreparationReceipt {
                 source_root: head.root_id.clone(),
                 view_id: view.as_ref().map(|view| view.view_id.clone()),
@@ -584,6 +602,75 @@ impl Trail {
             #[cfg(test)]
             injected_disposal_error: None,
         })
+    }
+
+    fn prepare_managed_resolution_inputs(
+        &self,
+        view: &LaneWorkspaceViewReport,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<Vec<ManagedProjectedSourceInput>> {
+        let Some((lock_path, bytes)) = super::workspace_cargo::managed_cargo_resolution_input(
+            self,
+            source_root,
+            component_root,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let destination = safe_join(Path::new(&view.source_upper), &lock_path)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidPath {
+                    path: lock_path,
+                    reason: "managed Cargo.lock projection would replace a non-file source entry"
+                        .to_string(),
+                });
+            }
+            Ok(_) => {
+                if fs::read(&destination)? != bytes {
+                    return Err(Error::InvalidInput(format!(
+                        "managed Cargo.lock projection would replace dirty lane source `{}`; checkpoint or remove it before managed execution",
+                        destination.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_file_atomic(&destination, &bytes, false)?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&destination)?
+                    .set_modified(SystemTime::UNIX_EPOCH)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(vec![ManagedProjectedSourceInput { path: destination }])
+    }
+
+    fn cleanup_managed_resolution_inputs(&self, context: &ManagedExecutionContext) -> Result<()> {
+        for input in &context.projected_source_inputs {
+            match fs::symlink_metadata(&input.path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    fs::remove_file(&input.path)?;
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    fs::remove_file(&input.path)?;
+                }
+                Ok(_) => {
+                    return Err(Error::InvalidPath {
+                        path: input.path.to_string_lossy().into_owned(),
+                        reason: "managed resolution input became a non-file entry; refusing to checkpoint it"
+                            .to_string(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -628,7 +715,10 @@ impl Trail {
         checkpoint_message: Option<String>,
         turn_id: Option<&str>,
     ) -> ManagedExecutionLifecycleReport {
-        let checkpoint = if let Some(turn_id) = turn_id {
+        let projected_input_cleanup = self.cleanup_managed_resolution_inputs(&context);
+        let checkpoint = if let Err(error) = projected_input_cleanup {
+            Err(error)
+        } else if let Some(turn_id) = turn_id {
             self.record_lane_workdir_for_turn(&context.lane, turn_id, checkpoint_message)
                 .map(|record| {
                     (
@@ -1303,6 +1393,36 @@ fn managed_execution_id(lane: &str, surface: &str, command: &[String]) -> Result
             nonce
         ))?)[..32]
     ))
+}
+
+fn managed_execution_component_root(command: &[String]) -> String {
+    let is_cargo = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|program| program == "cargo");
+    if !is_cargo {
+        return String::new();
+    }
+    let manifest_path = command
+        .windows(2)
+        .find_map(|args| (args[0] == "--manifest-path").then_some(args[1].as_str()))
+        .or_else(|| {
+            command
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--manifest-path="))
+        });
+    let Some(manifest_path) = manifest_path else {
+        return String::new();
+    };
+    let manifest_path = Path::new(manifest_path);
+    if manifest_path.is_absolute() {
+        return String::new();
+    }
+    manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 fn managed_environment_is_current(

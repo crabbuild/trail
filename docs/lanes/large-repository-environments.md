@@ -57,7 +57,7 @@ Git-tracked Rust repository with `Cargo.toml` and `Cargo.lock`:
 trail init --from-git
 trail lane spawn cargo-a --from main
 trail env plan cargo-a --adapter trail/cargo@1
-trail env sync all cargo-a
+trail env sync all cargo-a --path .
 trail lane exec cargo-a -- cargo test --locked
 trail lane spawn cargo-b --from cargo-a
 trail lane exec cargo-b -- cargo test --locked
@@ -65,8 +65,12 @@ trail lane exec cargo-b -- cargo test --locked
 
 The Cargo plan uses complete-source-root identity, publishes a verified target
 seed as `immutable_seed_private`, and gives `cargo-b` a fresh target upper.
-Cargo may reuse the seed and configured compiler cache; the two lanes never
-write one live target directory.
+For a source-only handoff, construction of B's new exact seed may start from
+A's compatible active seed using clone/reflink; Cargo revalidates it and
+recompiles affected workspace code. Manifest, lockfile, toolchain, target,
+platform, and build-policy differences remain hard misses. The two lanes never
+write one live target directory. `--path .` keeps independent nested Cargo
+projects outside this root-component sync.
 
 In a Git-tracked Node repository with `package.json` and its lockfile:
 

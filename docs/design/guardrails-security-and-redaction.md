@@ -37,6 +37,13 @@ resolved executable, fixed argv, working directory, readable inputs, writable
 candidate/cache/temp roots, network authorities, environment roles, child and
 byte limits, cancellation, capture redaction, and publication decision.
 
+Built-in Claude terminal execution also disables project instructions, hooks,
+plugins, skills, agents, and MCP servers by default and enables strict MCP
+configuration. Users can explicitly opt back into project integrations when
+they have verified that every integration confines writes to the lane. Commands
+supplied explicitly after `--` remain the user's authority boundary and are not
+rewritten.
+
 Discovery never runs repository code or tools. Resolver, constructor,
 validator, and mounted execution capabilities are separate and deny by default.
 Repository v2 and adapter v3 requests may narrow a certified profile but cannot

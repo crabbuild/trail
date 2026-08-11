@@ -385,6 +385,7 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
             },
             inputs,
             resolution_inputs,
+            construction_seed: None,
             source_projection,
             pre_commands,
             // Python virtual environments commonly embed absolute interpreter

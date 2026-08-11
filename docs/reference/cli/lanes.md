@@ -353,7 +353,9 @@ Timeline default limit: 30.
 `lane diff --patch` prints a Git-style unified diff. In an interactive
 terminal, Trail colorizes patch headers, hunks, additions, and deletions by
 default. Use `--color never` or set `NO_COLOR=1` to disable human-mode color;
-use `--format plain` for deterministic ASCII logs.
+use `--format plain` for deterministic ASCII logs. Addition/deletion totals are
+computed from this content diff; stable line-identity changes are available via
+`--show-line-ids` but do not inflate textual statistics.
 
 `lane rewind` records a `LaneRewind` operation. With `--record-current`, Trail
 first records dirty materialized workdir edits when possible and preserves the

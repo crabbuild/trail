@@ -473,6 +473,7 @@ impl Trail {
             layer_key: key,
             inputs,
             resolution_inputs,
+            construction_seed: None,
             source_projection,
             pre_commands: Vec::new(),
             command: Some(WorkspaceEnvironmentCommand {

@@ -217,6 +217,9 @@ reviewed|db/lane/workdir/view_core.rs|ensure_upper_file_under_barrier|File::crea
 reviewed|db/lane/workdir/view_core.rs|ensure_upper_file_under_barrier|OpenOptions::truncate|1
 reviewed|db/lane/workdir/view_core.rs|ensure_upper_file_under_barrier|OpenOptions::write|1
 reviewed|db/lane/workdir/view_core.rs|ensure_upper_parent|fs::create_dir_all|1
+reviewed|db/lane/managed_execution.rs|cleanup_managed_resolution_inputs|fs::remove_file|2
+reviewed|db/lane/managed_execution.rs|prepare_managed_resolution_inputs|fs::create_dir_all|1
+reviewed|db/lane/managed_execution.rs|prepare_managed_resolution_inputs|OpenOptions::write|1
 reviewed|db/lane/workdir/view_core.rs|merge_lower_subtree_into_upper|fs::create_dir_all|2
 reviewed|db/lane/workdir/view_core.rs|merge_artifact_subtree_into_upper|fs::create_dir_all|1
 reviewed|db/lane/workdir/view_core.rs|mkdir|fs::create_dir_all|1
@@ -263,7 +266,7 @@ reviewed|db/lane/workspace_environment.rs|environment_cache_namespace_has_live_l
 reviewed|db/lane/workspace_environment.rs|execute_workspace_environment_plan_in_directory|fs::create_dir_all|2
 reviewed|db/lane/workspace_environment.rs|initialize_mounted_workspace_environment_plans|fs::create_dir_all|1
 reviewed|db/lane/workspace_environment.rs|initialize_mounted_workspace_environment_plans|fs::remove_dir_all|1
-reviewed|db/lane/workspace_environment.rs|execute_reviewed_builtin_resolution_plan|fs::create_dir_all|4
+reviewed|db/lane/workspace_environment.rs|execute_reviewed_builtin_resolution_plan|fs::create_dir_all|5
 reviewed|db/lane/workspace_environment.rs|execute_reviewed_builtin_resolution_plan|fs::set_permissions|1
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_resolution_input|fs::create_dir_all|1
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_resolution_input|fs::set_permissions|1
@@ -338,10 +341,11 @@ reviewed|db/lane/workspace_plugin.rs|invoke_environment_plugin|fs::create_dir|2
 reviewed|db/lane/workspace_plugin.rs|invoke_environment_plugin|fs::set_permissions|1
 reviewed|db/lane/workspace_view.rs|create_workspace_view|fs::create_dir_all|1
 reviewed|db/lane/workspace_view.rs|mount_lane_workspace_until_requested|fs::remove_file|2
+reviewed|db/lane/workspace_view.rs|prepare_direct_private_seed|fs::create_dir_all|2
 reviewed|db/lane/workspace_view.rs|prepare_workspace_view_storage_for_lane_name|fs::create_dir_all|1
 reviewed|db/lane/workspace_view.rs|recover_workspace_views|fs::remove_file|1
 reviewed|db/lane/workspace_view.rs|release|fs::remove_file|1
-reviewed|db/lane/workspace_view.rs|workspace_command_environment|fs::create_dir_all|1
+reviewed|db/lane/workspace_view.rs|workspace_command_environment_at_root|fs::create_dir_all|1
 reviewed|db/merge/git_export.rs|write_patch_to|fs::create_dir_all|1
 reviewed|db/merge/git_export.rs|write_patch_to|fs::write|1
 reviewed|db/mod.rs|acquire_workspace_lock_with_admission|OpenOptions::create|1
@@ -391,6 +395,10 @@ reviewed|db/util/ignore.rs|write_default_trailignore|fs::write|1
 reviewed|db/util/materialize.rs|copy_dir_recursive|fs::copy|1
 reviewed|db/util/materialize.rs|copy_dir_recursive|fs::create_dir_all|1
 reviewed|db/util/materialize.rs|copy_dir_recursive|symlink_file|1
+reviewed|db/util/materialize.rs|clone_or_copy_dir_recursive|fs::create_dir_all|1
+reviewed|db/util/materialize.rs|clone_or_copy_dir_recursive|symlink_file|1
+reviewed|db/util/materialize.rs|clone_or_copy_missing_dir_entries|fs::create_dir_all|1
+reviewed|db/util/materialize.rs|clone_or_copy_missing_dir_entries|symlink_file|1
 reviewed|db/util/materialize.rs|create_dir_all_durable|fs::create_dir|1
 reviewed|db/util/materialize.rs|create_materialize_temp_file|OpenOptions::create_new|1
 reviewed|db/util/materialize.rs|create_materialize_temp_file|OpenOptions::write|1
@@ -399,6 +407,7 @@ reviewed|db/util/materialize.rs|is_case_insensitive_filesystem|OpenOptions::crea
 reviewed|db/util/materialize.rs|is_case_insensitive_filesystem|OpenOptions::write|1
 reviewed|db/util/materialize.rs|materialize_batch|fs::create_dir_all|1
 reviewed|db/util/materialize.rs|materialize_into_batched_with_durability|fs::remove_file|1
+reviewed|db/util/materialize.rs|make_private_seed_file_writable|fs::set_permissions|1
 reviewed|db/util/materialize.rs|write_file_atomic|fs::create_dir_all|1
 reviewed|db/util/materialize.rs|write_file_atomic|fs::remove_file|1
 reviewed|db/util/materialize.rs|write_file_atomic|fs::rename|1
