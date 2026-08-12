@@ -261,6 +261,54 @@ class ExternalBuildSystemHandoffCheckerTests(unittest.TestCase):
                 )
                 self.assertEqual(len(evidence["lane_ancestry"]), 3)
 
+    def test_accepts_windows_workdirs_when_verified_on_any_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root)
+            for index, lane in enumerate(CHECKER.LANES):
+                self.write(
+                    root / "raw",
+                    f"spawn-{lane}",
+                    {
+                        "base_change": "main" if not index else f"change-{index - 1}",
+                        "workdir": f"D:\\trail\\{lane}",
+                        "workdir_mode": "dokan-cow",
+                    },
+                )
+            evidence = CHECKER.check_evidence(
+                root, "gradle", "repo", "revision", component_id
+            )
+            self.assertEqual(evidence["backend"], "dokan-cow")
+            self.assertEqual(
+                evidence["workdirs"],
+                [f"D:\\trail\\{lane}" for lane in CHECKER.LANES],
+            )
+
+    def test_rejects_windows_workdirs_that_differ_only_by_case(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root)
+            for lane, workdir in zip(
+                CHECKER.LANES,
+                (r"D:\trail\lane", r"d:\TRAIL\LANE", r"D:\trail\lane-c"),
+                strict=True,
+            ):
+                path = root / "raw" / f"spawn-{lane}.json"
+                report = json.loads(path.read_text(encoding="utf-8"))
+                report["workdir"] = workdir
+                self.write(root / "raw", f"spawn-{lane}", report)
+            with self.assertRaisesRegex(AssertionError, "distinct absolute workdirs"):
+                CHECKER.check_evidence(
+                    root, "gradle", "repo", "revision", component_id
+                )
+
+    def test_rejects_relative_workdir(self):
+        self.mutate_and_reject(
+            "spawn-agent-b",
+            lambda report: report.update(workdir="workspace/agent-b"),
+            "distinct absolute workdirs",
+        )
+
     def mutate_and_reject(self, name, mutate, message):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

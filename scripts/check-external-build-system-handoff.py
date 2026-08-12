@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import platform
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -18,6 +18,19 @@ NIX_BUILDER_IMAGE = (
 )
 NIX_BUILDER_DIGEST = "sha256:" + "286285edfc390096bd7e8aada40c5044dadff1eb0b60f28b193eef7ed52e5925"
 NIX_PLATFORM = "linux/arm64"
+
+
+def portable_absolute_path_identity(value: Any) -> tuple[str, str] | None:
+    """Return a stable identity for an absolute POSIX or Windows evidence path."""
+    if not isinstance(value, str):
+        return None
+    windows_path = PureWindowsPath(value)
+    if windows_path.is_absolute():
+        return ("windows", str(windows_path).casefold())
+    posix_path = PurePosixPath(value)
+    if posix_path.is_absolute():
+        return ("posix", str(posix_path))
+    return None
 
 
 def load_report(raw: Path, name: str) -> dict[str, Any]:
@@ -247,10 +260,8 @@ def check_evidence(
 
     workdirs = [spawn.get("workdir") for spawn in spawns]
     backends = [spawn.get("workdir_mode") for spawn in spawns]
-    if len(set(workdirs)) != 3 or any(
-        not isinstance(workdir, str) or not Path(workdir).is_absolute()
-        for workdir in workdirs
-    ):
+    workdir_identities = [portable_absolute_path_identity(item) for item in workdirs]
+    if None in workdir_identities or len(set(workdir_identities)) != 3:
         raise AssertionError("A, B, and C need distinct absolute workdirs")
     if len(set(backends)) != 1 or backends[0] not in {
         "fuse-cow",
