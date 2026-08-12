@@ -18,6 +18,103 @@ const MAX_RESOLVER_SOURCE_ENTRIES: u64 = 1_000_000;
 const MAX_RESOLVER_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
+fn relative_path_between(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0
+        || from[common..]
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || to[common..].iter().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in &from[common..] {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        if let std::path::Component::Normal(component) = component {
+            relative.push(component);
+        }
+    }
+    Some(relative)
+}
+
+fn resolve_absolute_path_allow_missing(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(Error::Corrupt(format!(
+            "expected an absolute path while validating process output: {}",
+            path.display()
+        )));
+    }
+    let mut ancestor = path;
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "process output symlink target `{}` has no existing ancestor",
+                        path.display()
+                    ))
+                })?;
+                missing.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "process output symlink target `{}` has no parent",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn relocatable_process_tree_project_root(
+    declaration: &WorkspaceEnvironmentOutput,
+    output: &Path,
+) -> Result<Option<PathBuf>> {
+    let output_root = fs::canonicalize(output)?;
+    let relative_output = Path::new(&declaration.output_path);
+    let staged_mount = relative_output.strip_prefix("project").map_err(|_| {
+        Error::Corrupt(format!(
+            "process-tree output `{}` is outside the staged project",
+            declaration.output_path
+        ))
+    })?;
+    if staged_mount.parent() != Path::new(&declaration.mount_path).parent() {
+        return Ok(None);
+    }
+    let mut sandbox_root = output_root;
+    for _ in relative_output.components() {
+        if !sandbox_root.pop() {
+            return Err(Error::Corrupt(format!(
+                "process-tree output `{}` does not match its staging declaration",
+                declaration.output_path
+            )));
+        }
+    }
+    Ok(Some(fs::canonicalize(sandbox_root.join("project"))?))
+}
+
 struct BoundedResolverPipe {
     bytes: Vec<u8>,
     original_bytes: u64,
@@ -47,6 +144,26 @@ fn spawn_bounded_environment_command_diagnostic(
         }
         Ok(BoundedEnvironmentCommandDiagnostic { bytes, truncated })
     })
+}
+
+fn combine_environment_command_diagnostics(
+    stdout: BoundedEnvironmentCommandDiagnostic,
+    stderr: BoundedEnvironmentCommandDiagnostic,
+) -> BoundedEnvironmentCommandDiagnostic {
+    let mut bytes = Vec::with_capacity(MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES);
+    let mut truncated = stdout.truncated || stderr.truncated;
+    for (label, diagnostic) in [(b"stdout:\n".as_slice(), stdout), (b"stderr:\n", stderr)] {
+        if diagnostic.bytes.is_empty() {
+            continue;
+        }
+        for chunk in [label, diagnostic.bytes.as_slice(), b"\n"] {
+            let remaining = MAX_ENVIRONMENT_COMMAND_DIAGNOSTIC_BYTES.saturating_sub(bytes.len());
+            let retained = remaining.min(chunk.len());
+            bytes.extend_from_slice(&chunk[..retained]);
+            truncated |= retained != chunk.len();
+        }
+    }
+    BoundedEnvironmentCommandDiagnostic { bytes, truncated }
 }
 
 /// One repository file that the host projects into an adapter-owned staging
@@ -152,6 +269,9 @@ pub(crate) struct WorkspaceEnvironmentCommandBinding {
     pub(crate) environment: &'static str,
     pub(crate) value: &'static str,
 }
+
+/// Adapter binding value resolved by the host to the stable mounted lane root.
+pub(crate) const WORKSPACE_COMMAND_BINDING_MOUNTPOINT: &str = "{trail-workspace-mountpoint}";
 
 /// One adapter-declared executable binding for ordinary managed commands.
 /// Resolution uses the same host policy as planning and exposes an absolute
@@ -420,6 +540,10 @@ pub(crate) enum WorkspaceEnvironmentSandboxPolicy {
     /// is maintained with Trail. These remain open-world until migrated onto
     /// individually certified capability profiles.
     TrustedBuiltin,
+    /// Reviewed built-in execution selected by an exact committed repository
+    /// approval. Repository code may spawn its lifecycle toolchain, while the
+    /// host still enforces native filesystem and network isolation.
+    ApprovedLifecycle,
     /// Repository-authored argv command. The host must execute it inside a
     /// supported kernel sandbox or fail closed before launching the tool.
     RestrictedRecipe,
@@ -427,6 +551,10 @@ pub(crate) enum WorkspaceEnvironmentSandboxPolicy {
     /// namespaces. Cache access is projected into the deny-by-default native
     /// sandbox and is never available to planning or mounted actions.
     RestrictedPluginStaging,
+    /// An explicitly requested protocol-v2 staging action whose exact build
+    /// tool may spawn children. Writes remain confined to declared outputs and
+    /// caches, and networking remains denied by the native sandbox.
+    RestrictedPluginProcessTree,
     /// An installed protocol-v2 plugin requested mounted initialization. The
     /// host authorizes the typed action only after normalizing the authenticated
     /// package plan, then applies the same native deny-by-default sandbox while
@@ -678,11 +806,12 @@ pub(crate) trait WorkspaceEnvironmentAdapter: Sync {
     ) -> Result<WorkspaceEnvironmentPlan>;
 }
 
-fn builtin_environment_adapters() -> [&'static dyn WorkspaceEnvironmentAdapter; 6] {
+fn builtin_environment_adapters() -> [&'static dyn WorkspaceEnvironmentAdapter; 7] {
     [
         &super::workspace_node::NODE_WORKSPACE_ADAPTER,
         &super::workspace_cargo::CARGO_TARGET_SEED_ADAPTER,
         &super::workspace_cmake::CMAKE_BUILD_TREE_ADAPTER,
+        &super::workspace_go::GO_WORKSPACE_VENDOR_ADAPTER,
         &super::workspace_go::GO_VENDOR_ADAPTER,
         &super::workspace_python::PYTHON_VENV_ADAPTER,
         &super::workspace_oci::OCI_IMAGE_ADAPTER,
@@ -1898,33 +2027,39 @@ impl Trail {
             .runtime_resources
             .iter()
             .any(|resource| !resource.secrets.is_empty());
-        let capabilities = if !plan.external_artifacts.is_empty()
-            || !plan.runtime_resources.is_empty()
-        {
-            EnvironmentCapabilityReport {
-                filesystem_read: Vec::new(),
-                filesystem_write: Vec::new(),
-                process: Vec::new(),
-                network: "none".to_string(),
-                shell: "none".to_string(),
-                scripts: "none".to_string(),
-                secrets: if has_runtime_secrets {
-                    "opaque-references-only; host-runtime-file-handle-resolution".to_string()
-                } else {
-                    "none".to_string()
-                },
-                sandbox: "not-applicable-metadata-only".to_string(),
-            }
-        } else {
-            match plan.sandbox_policy {
-                WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+        let capabilities =
+            if !plan.external_artifacts.is_empty() || !plan.runtime_resources.is_empty() {
+                EnvironmentCapabilityReport {
+                    filesystem_read: Vec::new(),
+                    filesystem_write: Vec::new(),
+                    process: Vec::new(),
+                    network: "none".to_string(),
+                    shell: "none".to_string(),
+                    scripts: "none".to_string(),
+                    secrets: if has_runtime_secrets {
+                        "opaque-references-only; host-runtime-file-handle-resolution".to_string()
+                    } else {
+                        "none".to_string()
+                    },
+                    sandbox: "not-applicable-metadata-only".to_string(),
+                }
+            } else {
+                match plan.sandbox_policy {
+                WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => {
                     EnvironmentCapabilityReport {
                         filesystem_read: plan
                             .inputs
                             .iter()
                             .map(|input| input.source_path.clone())
+                            .chain(
+                                plan.source_projection
+                                    .iter()
+                                    .map(|_| "pinned-source-root/**".to_string()),
+                            )
                             .collect(),
                         filesystem_write: plan
                             .outputs
@@ -1945,9 +2080,28 @@ impl Trail {
                             )
                             .collect(),
                         process,
-                        network: "deny".to_string(),
-                        shell: "deny".to_string(),
-                        scripts: "deny".to_string(),
+                        network: if cfg!(target_os = "macos")
+                            && plan.sandbox_policy
+                                == WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+                        {
+                            "outbound-deny; local-bind-and-receive".to_string()
+                        } else {
+                            "deny".to_string()
+                        },
+                        shell: if plan.sandbox_policy
+                            == WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                        {
+                            "approved-process-tree".to_string()
+                        } else {
+                            "deny".to_string()
+                        },
+                        scripts: if plan.sandbox_policy
+                            == WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                        {
+                            "exact-committed-approval".to_string()
+                        } else {
+                            "deny".to_string()
+                        },
                         secrets: "deny".to_string(),
                         sandbox: restricted_recipe_sandbox_name().to_string(),
                     }
@@ -1979,7 +2133,7 @@ impl Trail {
                     sandbox: "trusted-builtin".to_string(),
                 },
             }
-        };
+            };
         let tools = plan.layer_key.tool_versions.clone();
         let external_artifacts = environment_external_artifact_activations(&plan);
         let runtime_resources = environment_runtime_resource_activations(&plan);
@@ -1987,6 +2141,8 @@ impl Trail {
             source_root,
             component_id: plan.component_id,
             adapter_identity: plan.adapter_identity,
+            adapter_implementation_version: plan.implementation_version,
+            adapter_distribution_digest: plan.distribution_digest,
             kind: plan.kind,
             component_key,
             dependencies: plan
@@ -2252,7 +2408,16 @@ impl Trail {
         selected: WorkspaceEnvironmentPlan,
     ) -> Result<WorkspaceEnvironmentPlan> {
         if selected.dependencies.is_empty() {
-            return Ok(selected);
+            let selected_id = selected.component_id.clone();
+            return self
+                .finalize_workspace_environment_plan_graph(vec![selected])?
+                .into_iter()
+                .find_map(|(plan, _)| (plan.component_id == selected_id).then_some(plan))
+                .ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "environment preview finalizer lost selected component `{selected_id}`"
+                    ))
+                });
         }
         let selected_id = selected.component_id.clone();
         let discovery = self.discover_workspace_environment(lane, None)?;
@@ -3055,13 +3220,18 @@ impl Trail {
                     && plan.mounted_commands.is_empty()
             }
             trail_environment_adapter_sdk::PROTOCOL_V2 if plan.mounted_commands.is_empty() => {
-                plan.sandbox_policy
-                    == if plan.caches.is_empty() {
+                if plan.command.is_some() {
+                    matches!(
+                        plan.sandbox_policy,
                         WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
-                    } else {
-                        WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
-                    }
-                    && plan.command.is_some()
+                            | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                            | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+                    )
+                } else {
+                    plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+                        && (!plan.external_artifacts.is_empty()
+                            || !plan.runtime_resources.is_empty())
+                }
             }
             trail_environment_adapter_sdk::PROTOCOL_V2 => {
                 plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
@@ -3106,7 +3276,11 @@ impl Trail {
 
         let expected_sandbox = match producer_trust {
             Trust::ReviewedBuiltin => {
-                plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+                matches!(
+                    plan.sandbox_policy,
+                    WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+                        | WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                )
             }
             Trust::RepositoryDeclaration => {
                 plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
@@ -3115,6 +3289,7 @@ impl Trail {
                 plan.sandbox_policy,
                 WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
                     | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                    | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                     | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
             ),
         };
@@ -3342,9 +3517,30 @@ impl Trail {
                     plan.component_id
                 )));
             }
-        } else if !plan.external_artifacts.is_empty() || !plan.runtime_resources.is_empty() {
+        } else if !plan.external_artifacts.is_empty() {
+            if plan.kind != "external"
+                || !plan.runtime_resources.is_empty()
+                || plan.command.is_some()
+                || !plan.pre_commands.is_empty()
+                || !plan.mounted_commands.is_empty()
+                || !plan.caches.is_empty()
+                || plan.source_projection.is_some()
+                || plan.outputs.iter().any(|output| {
+                    output.policy != WorkspaceEnvironmentOutputPolicy::WritablePrivate
+                        || output.reuse != EnvironmentReuseMode::None
+                        || output.scope != EnvironmentSharingScope::Lane
+                        || output.publish != EnvironmentPublicationTrigger::Never
+                        || output.gate.is_some()
+                })
+            {
+                return Err(Error::InvalidInput(format!(
+                    "component `{}` external artifacts permit only action-free lane-private never-published companion outputs",
+                    plan.component_id
+                )));
+            }
+        } else if !plan.runtime_resources.is_empty() {
             return Err(Error::InvalidInput(format!(
-                "component `{}` mixes external/runtime resources with filesystem outputs; split independently owned resources into separate components",
+                "component `{}` mixes runtime resources with filesystem outputs; split independently owned resources into separate components",
                 plan.component_id
             )));
         }
@@ -3454,8 +3650,10 @@ impl Trail {
         }
         if !plan.caches.is_empty() {
             match plan.sandbox_policy {
-                WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin => {}
+                WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+                | WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle => {}
                 WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
                     if plan.caches.iter().all(|cache| {
                         cache.access == WorkspaceEnvironmentCacheAccess::HostExclusive
@@ -4609,10 +4807,13 @@ impl Trail {
                     mountpoint,
                     &isolated_home,
                     &isolated_tmp,
+                    false,
                 )?
             }
-            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
-            | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging => {
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+            | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+            | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree => {
                 return Err(Error::Corrupt(format!(
                     "repository command component `{}` unexpectedly requested mounted initialization",
                     plan.component_id
@@ -4643,7 +4844,7 @@ impl Trail {
             .env("TMP", &isolated_tmp)
             .env("TEMP", &isolated_tmp)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
             command
@@ -4670,13 +4871,20 @@ impl Trail {
                 command_plan.program, plan.component_id
             ))
         })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "mounted initializer for component `{}` lost its stdout diagnostic pipe",
+                plan.component_id
+            ))
+        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             Error::Corrupt(format!(
                 "mounted initializer for component `{}` lost its diagnostic pipe",
                 plan.component_id
             ))
         })?;
-        let diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
+        let stdout_diagnostic = spawn_bounded_environment_command_diagnostic(stdout);
+        let stderr_diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
         let status =
             if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted {
                 wait_for_supervised_mounted_plugin_process(&mut child).map_err(|err| {
@@ -4688,7 +4896,7 @@ impl Trail {
             } else {
                 child.wait()?
             };
-        let diagnostic = diagnostic
+        let stdout_diagnostic = stdout_diagnostic
             .join()
             .map_err(|_| {
                 Error::Corrupt(format!(
@@ -4697,6 +4905,17 @@ impl Trail {
                 ))
             })?
             .map_err(Error::Io)?;
+        let stderr_diagnostic = stderr_diagnostic
+            .join()
+            .map_err(|_| {
+                Error::Corrupt(format!(
+                    "mounted initialization stderr reader for component `{}` panicked",
+                    plan.component_id
+                ))
+            })?
+            .map_err(Error::Io)?;
+        let diagnostic =
+            combine_environment_command_diagnostics(stdout_diagnostic, stderr_diagnostic);
         if !status.success() {
             let diagnostic_text =
                 redact_sensitive_text(&String::from_utf8_lossy(&diagnostic.bytes));
@@ -4818,7 +5037,7 @@ impl Trail {
         let layout =
             super::workdir::ViewUpperLayout::from_source_upper(PathBuf::from(source_upper));
         let class = match plan.kind.as_str() {
-            "dependency" => super::workdir::ViewPathClass::Dependency,
+            "dependency" | "external" => super::workdir::ViewPathClass::Dependency,
             "compiler-results" | "generated" | "build" => super::workdir::ViewPathClass::Generated,
             _ => return Ok(false),
         };
@@ -4848,8 +5067,10 @@ impl Trail {
     ) -> Result<PreparedPrivateEnvironmentOutputs> {
         if matches!(
             plan.sandbox_policy,
-            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         ) {
             ensure_restricted_recipe_sandbox_available()?;
@@ -4861,15 +5082,18 @@ impl Trail {
         let root = fs::canonicalize(staging.path())?;
         let restricted = matches!(
             plan.sandbox_policy,
-            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         );
         let paths =
             self.execute_workspace_environment_plan_in_directory(plan, &root, restricted, None)?;
         if restricted {
             let mut entries = 0usize;
-            for output in &paths {
+            for (declaration, output) in plan.outputs.iter().zip(&paths) {
+                self.normalize_process_tree_output_symlinks(plan, declaration, output)?;
                 self.validate_restricted_recipe_output(plan, output, &mut entries)?;
             }
         }
@@ -4887,8 +5111,10 @@ impl Trail {
     ) -> Result<PathBuf> {
         if matches!(
             plan.sandbox_policy,
-            WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+                | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
                 | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
         ) {
             ensure_restricted_recipe_sandbox_available()?;
@@ -4904,7 +5130,8 @@ impl Trail {
                 None,
             )?;
             let mut output_entries = 0usize;
-            for output in &outputs {
+            for (declaration, output) in plan.outputs.iter().zip(&outputs) {
+                self.normalize_process_tree_output_symlinks(plan, declaration, output)?;
                 self.validate_restricted_recipe_output(plan, output, &mut output_entries)?;
             }
             if let [output] = outputs.as_slice() {
@@ -4929,12 +5156,82 @@ impl Trail {
         package_workspace_environment_outputs(build_dir, "published-outputs", &outputs)
     }
 
+    fn normalize_process_tree_output_symlinks(
+        &self,
+        plan: &WorkspaceEnvironmentPlan,
+        declaration: &WorkspaceEnvironmentOutput,
+        output: &Path,
+    ) -> Result<()> {
+        if !matches!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+        ) {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let output_root = fs::canonicalize(output)?;
+            let project_root = relocatable_process_tree_project_root(declaration, output)?;
+
+            for entry in walkdir::WalkDir::new(&output_root).follow_links(false) {
+                let entry = entry.map_err(|error| {
+                    Error::InvalidInput(format!(
+                        "cannot inspect output for command component `{}`: {error}",
+                        plan.component_id
+                    ))
+                })?;
+                if !fs::symlink_metadata(entry.path())?.file_type().is_symlink() {
+                    continue;
+                }
+                let target = fs::read_link(entry.path())?;
+                if !target.is_absolute() {
+                    continue;
+                }
+                let resolved = resolve_absolute_path_allow_missing(&target)?;
+                let relocatable = resolved.starts_with(&output_root)
+                    || project_root
+                        .as_ref()
+                        .is_some_and(|root| resolved.starts_with(root));
+                if !relocatable {
+                    continue;
+                }
+                let parent = entry.path().parent().ok_or_else(|| {
+                    Error::Corrupt("process-tree output symlink has no parent".to_string())
+                })?;
+                let relative = relative_path_between(parent, &resolved).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "process-tree output symlink `{}` cannot be made relocatable",
+                        entry.path().display()
+                    ))
+                })?;
+                fs::remove_file(entry.path())?;
+                symlink(relative, entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_restricted_recipe_output(
         &self,
         plan: &WorkspaceEnvironmentPlan,
         output: &Path,
         entries: &mut usize,
     ) -> Result<()> {
+        let relocatable_project_root = if matches!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+        ) {
+            plan.outputs
+                .iter()
+                .find(|declaration| output.ends_with(&declaration.output_path))
+                .map(|declaration| relocatable_process_tree_project_root(declaration, output))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         for entry in walkdir::WalkDir::new(output).follow_links(false) {
             let entry = entry.map_err(|err| {
                 Error::InvalidInput(format!(
@@ -4952,6 +5249,56 @@ impl Trail {
             let metadata = fs::symlink_metadata(entry.path())?;
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
+                if matches!(
+                    plan.sandbox_policy,
+                    WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+                        | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+                ) {
+                    let target = fs::read_link(entry.path())?;
+                    if target.is_absolute() {
+                        if matches!(
+                            plan.sandbox_policy,
+                            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+                        ) && plan
+                            .command
+                            .as_ref()
+                            .and_then(|command| command.environment.get("JAVA_HOME"))
+                            .is_some_and(|java_home| {
+                                resolve_absolute_path_allow_missing(&target).is_ok_and(|resolved| {
+                                    fs::canonicalize(java_home)
+                                        .is_ok_and(|root| resolved.starts_with(root))
+                                })
+                            })
+                        {
+                            continue;
+                        }
+                        return Err(Error::InvalidInput(format!(
+                            "approved lifecycle output contains absolute symlink `{}`",
+                            entry.path().display()
+                        )));
+                    }
+                    let resolved = resolve_absolute_path_allow_missing(
+                        &entry
+                            .path()
+                            .parent()
+                            .ok_or_else(|| {
+                                Error::Corrupt("lifecycle symlink has no parent".to_string())
+                            })?
+                            .join(target),
+                    )?;
+                    let output_root = fs::canonicalize(output)?;
+                    if resolved.starts_with(&output_root)
+                        || relocatable_project_root
+                            .as_ref()
+                            .is_some_and(|root| resolved.starts_with(root))
+                    {
+                        continue;
+                    }
+                    return Err(Error::InvalidInput(format!(
+                        "approved lifecycle output symlink `{}` escapes its declared output",
+                        entry.path().display()
+                    )));
+                }
                 return Err(Error::InvalidInput(format!(
                     "command component `{}` output contains unsupported symlink `{}`",
                     plan.component_id,
@@ -5074,6 +5421,35 @@ impl Trail {
                 &input.staging_path,
                 &bytes,
             )?;
+        }
+        if matches!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+        ) {
+            // Some build scanners (notably Maven Compiler Plugin) treat the
+            // Unix epoch as an unknown/sentinel mtime and silently skip source
+            // files. Preserve deterministic staging while avoiding that
+            // sentinel for external process-tree build tools.
+            let deterministic_build_time = SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(946_684_800))
+                .ok_or_else(|| {
+                    Error::Corrupt("cannot construct deterministic build time".to_string())
+                })?;
+            for staging_path in plan
+                .inputs
+                .iter()
+                .map(|input| input.staging_path.as_str())
+                .chain(
+                    plan.resolution_inputs
+                        .iter()
+                        .map(|input| input.staging_path.as_str()),
+                )
+            {
+                OpenOptions::new()
+                    .write(true)
+                    .open(safe_join(build_dir, staging_path)?)?
+                    .set_modified(deterministic_build_time)?;
+            }
         }
         let mut outputs = Vec::with_capacity(plan.outputs.len());
         for declaration in &plan.outputs {
@@ -5312,6 +5688,15 @@ impl Trail {
                 command_plan.resolved_program.clone(),
                 command_plan.args.iter().map(OsString::from).collect(),
             ),
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle => self
+                .restricted_recipe_launcher(
+                    plan,
+                    command_plan,
+                    build_dir,
+                    &isolated_home,
+                    &isolated_tmp,
+                    true,
+                )?,
             WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe
             | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging => self
                 .restricted_recipe_launcher(
@@ -5320,6 +5705,7 @@ impl Trail {
                     build_dir,
                     &isolated_home,
                     &isolated_tmp,
+                    false,
                 )?,
             WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => self
                 .restricted_recipe_launcher(
@@ -5328,6 +5714,16 @@ impl Trail {
                     build_dir,
                     &isolated_home,
                     &isolated_tmp,
+                    false,
+                )?,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree => self
+                .restricted_recipe_launcher(
+                    plan,
+                    command_plan,
+                    build_dir,
+                    &isolated_home,
+                    &isolated_tmp,
+                    true,
                 )?,
         };
         let mut command = Command::new(launcher);
@@ -5341,8 +5737,17 @@ impl Trail {
             .env("TMP", &isolated_tmp)
             .env("TEMP", &isolated_tmp)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if matches!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+        ) {
+            command.env(
+                "JAVA_TOOL_OPTIONS",
+                format!("-Djava.io.tmpdir={}", isolated_tmp.to_string_lossy()),
+            );
+        }
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -5361,15 +5766,22 @@ impl Trail {
                 command_plan.program, plan.component_id
             ))
         })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "environment build for component `{}` lost its stdout diagnostic pipe",
+                plan.component_id
+            ))
+        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             Error::Corrupt(format!(
                 "environment build for component `{}` lost its diagnostic pipe",
                 plan.component_id
             ))
         })?;
-        let diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
+        let stdout_diagnostic = spawn_bounded_environment_command_diagnostic(stdout);
+        let stderr_diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
         let status = child.wait();
-        let diagnostic = diagnostic
+        let stdout_diagnostic = stdout_diagnostic
             .join()
             .map_err(|_| {
                 Error::Corrupt(format!(
@@ -5378,6 +5790,17 @@ impl Trail {
                 ))
             })?
             .map_err(Error::Io)?;
+        let stderr_diagnostic = stderr_diagnostic
+            .join()
+            .map_err(|_| {
+                Error::Corrupt(format!(
+                    "environment build stderr reader for component `{}` panicked",
+                    plan.component_id
+                ))
+            })?
+            .map_err(Error::Io)?;
+        let diagnostic =
+            combine_environment_command_diagnostics(stdout_diagnostic, stderr_diagnostic);
         let status = status?;
         if !status.success() {
             let truncated = diagnostic.truncated;
@@ -5406,6 +5829,7 @@ impl Trail {
         build_dir: &Path,
         isolated_home: &Path,
         isolated_tmp: &Path,
+        allow_process_tree: bool,
     ) -> Result<(PathBuf, Vec<OsString>)> {
         let cache_paths = command_plan
             .cache_names
@@ -5454,6 +5878,16 @@ impl Trail {
                         &input.staging_path,
                     )?)?)
                 })
+                .chain(plan.source_projection.iter().map(|(_, staging_root)| {
+                    Ok(fs::canonicalize(safe_join(&build_dir, staging_root)?)?)
+                }))
+                .chain(
+                    ["npm_config_nodedir", "JAVA_HOME"]
+                        .into_iter()
+                        .filter_map(|name| command_plan.environment.get(name))
+                        .filter(|_| allow_process_tree)
+                        .map(|path| Ok(fs::canonicalize(path)?)),
+                )
                 .collect::<Result<Vec<_>>>()?;
             let working_directory = if command_plan.working_directory.is_empty() {
                 build_dir.clone()
@@ -5464,6 +5898,9 @@ impl Trail {
             let isolated_tmp = fs::canonicalize(isolated_tmp)?;
             let executable = command_plan.resolved_program.clone();
             let canonical_executable = fs::canonicalize(&command_plan.resolved_program)?;
+            let process_tree_tool_root = allow_process_tree
+                .then(|| Self::process_tree_tool_installation_root(&canonical_executable))
+                .flatten();
             let executable_rules = if canonical_executable == executable {
                 format!("(literal \"{}\")", sandbox_profile_escape(&executable))
             } else {
@@ -5481,32 +5918,90 @@ impl Trail {
                 .join(" ");
             let input_rules = readable_inputs
                 .iter()
-                .map(|input| format!("(literal \"{}\")", sandbox_profile_escape(input)))
+                .map(|input| {
+                    if input.is_dir() {
+                        format!("(subpath \"{}\")", sandbox_profile_escape(input))
+                    } else {
+                        format!("(literal \"{}\")", sandbox_profile_escape(input))
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
+            let metadata_rules = readable_inputs
+                .iter()
+                .chain([&executable, &canonical_executable])
+                .chain(caches.iter())
+                .flat_map(|path| path.ancestors().skip(1))
+                .filter(|path| path.parent().is_some())
+                .map(|path| format!("(literal \"{}\")", sandbox_profile_escape(path)))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let approved_toolchain_rules = command_plan
+                .environment
+                .iter()
+                .filter(|(name, _)| {
+                    allow_process_tree
+                        && matches!(name.as_str(), "npm_config_nodedir" | "JAVA_HOME")
+                })
+                .map(|(_, path)| {
+                    fs::canonicalize(path)
+                        .map(|path| format!("(subpath \"{}\")", sandbox_profile_escape(&path)))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .chain(
+                    process_tree_tool_root
+                        .iter()
+                        .map(|path| format!("(subpath \"{}\")", sandbox_profile_escape(path))),
+                )
+                .collect::<Vec<_>>()
+                .join(" ");
+            let process_tree_staging_read_rules = if allow_process_tree {
+                // Build systems discover inputs by enumerating source
+                // directories. The staging tree contains only Trail-pinned
+                // inputs plus declared outputs/caches, so permitting reads
+                // here does not widen repository authority.
+                format!("(subpath \"{}\")", sandbox_profile_escape(&build_dir))
+            } else {
+                String::new()
+            };
+            let process_rules = if allow_process_tree {
+                format!(
+                    "(allow process-fork)\n(allow process-exec {} {} {} (subpath \"/bin\") (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/opt/homebrew\") (subpath \"/nix/store\") (subpath \"/private/var/select\"))",
+                    executable_rules, output_rules, approved_toolchain_rules
+                )
+            } else {
+                format!(
+                    "(deny process-fork)\n(deny process-exec)\n(allow process-exec {})",
+                    executable_rules
+                )
+            };
             let profile = format!(
                 "(version 1)\n\
                  (deny default)\n\
                  (import \"system.sb\")\n\
-                 (deny mach-lookup)\n\
                  (deny mach-register)\n\
-                 (deny process-fork)\n\
-                 (deny process-exec)\n\
-                 (allow process-exec {})\n\
+                 {}\n\
                  (deny file-write*)\n\
                  (allow file-write* {} (subpath \"{}\") (subpath \"{}\"))\n\
                  (deny file-read* (subpath \"/Users\") (subpath \"/Volumes\") (subpath \"/private/etc\") (subpath \"/private/var\"))\n\
-                 (allow file-read-metadata (subpath \"{}\"))\n\
-                 (allow file-read* (literal \"{}\") {} {} (subpath \"{}\") (subpath \"{}\") (literal \"{}\") (literal \"{}\") (subpath \"/bin\") (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/opt/homebrew\") (subpath \"/nix/store\"))\n\
-                 (deny network*)",
-                executable_rules,
+                 (allow file-read-metadata (subpath \"{}\") {})\n\
+                 (allow file-read* (literal \"{}\") {} {} {} {} (subpath \"{}\") (subpath \"{}\") (literal \"{}\") (literal \"{}\") (subpath \"/bin\") (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/opt/homebrew\") (subpath \"/nix/store\") (subpath \"/private/var/select\"))\n\
+                 (allow network-bind (local ip))
+                 (allow network-inbound (local ip))",
+                process_rules,
                 output_rules,
                 sandbox_profile_escape(&isolated_home),
                 sandbox_profile_escape(&isolated_tmp),
                 sandbox_profile_escape(&build_dir),
+                metadata_rules,
                 sandbox_profile_escape(&working_directory),
                 input_rules,
                 output_rules,
+                process_tree_staging_read_rules,
+                approved_toolchain_rules,
                 sandbox_profile_escape(&isolated_home),
                 sandbox_profile_escape(&isolated_tmp),
                 sandbox_profile_escape(&executable),
@@ -5536,6 +6031,10 @@ impl Trail {
                 .iter()
                 .map(fs::canonicalize)
                 .collect::<std::io::Result<Vec<_>>>()?;
+            let executable = fs::canonicalize(&command_plan.resolved_program)?;
+            let process_tree_tool_root = allow_process_tree
+                .then(|| Self::process_tree_tool_installation_root(&executable))
+                .flatten();
             let readable_inputs = plan
                 .inputs
                 .iter()
@@ -5545,10 +6044,20 @@ impl Trail {
                         &input.staging_path,
                     )?)?)
                 })
+                .chain(plan.source_projection.iter().map(|(_, staging_root)| {
+                    Ok(fs::canonicalize(safe_join(&build_dir, staging_root)?)?)
+                }))
+                .chain(
+                    ["npm_config_nodedir", "JAVA_HOME"]
+                        .into_iter()
+                        .filter_map(|name| command_plan.environment.get(name))
+                        .filter(|_| allow_process_tree)
+                        .map(|path| Ok(fs::canonicalize(path)?)),
+                )
+                .chain(process_tree_tool_root.into_iter().map(Ok))
                 .collect::<Result<Vec<_>>>()?;
             let isolated_home = fs::canonicalize(isolated_home)?;
             let isolated_tmp = fs::canonicalize(isolated_tmp)?;
-            let executable = fs::canonicalize(&command_plan.resolved_program)?;
             let mut args = vec![
                 OsString::from("__environment-sandbox"),
                 OsString::from("--root"),
@@ -5573,13 +6082,22 @@ impl Trail {
                 isolated_tmp.into_os_string(),
                 OsString::from("--program"),
                 executable.into_os_string(),
-                OsString::from("--"),
             ]);
+            if allow_process_tree {
+                args.push(OsString::from("--allow-process-tree"));
+            }
+            args.push(OsString::from("--"));
             args.extend(command_plan.args.iter().map(OsString::from));
             Ok((launcher, args))
         }
         #[cfg(all(target_os = "windows", not(test)))]
         {
+            if allow_process_tree {
+                return Err(Error::InvalidInput(
+                    "approved lifecycle process trees are not yet certified by Trail's Windows AppContainer backend"
+                        .to_string(),
+                ));
+            }
             let launcher = std::env::current_exe()?;
             let build_dir = fs::canonicalize(build_dir)?;
             let outputs = plan
@@ -5603,6 +6121,16 @@ impl Trail {
                         &input.staging_path,
                     )?)?)
                 })
+                .chain(plan.source_projection.iter().map(|(_, staging_root)| {
+                    Ok(fs::canonicalize(safe_join(&build_dir, staging_root)?)?)
+                }))
+                .chain(
+                    ["npm_config_nodedir", "JAVA_HOME"]
+                        .into_iter()
+                        .filter_map(|name| command_plan.environment.get(name))
+                        .filter(|_| allow_process_tree)
+                        .map(|path| Ok(fs::canonicalize(path)?)),
+                )
                 .collect::<Result<Vec<_>>>()?;
             let isolated_home = fs::canonicalize(isolated_home)?;
             let isolated_tmp = fs::canonicalize(isolated_tmp)?;
@@ -5649,12 +6177,21 @@ impl Trail {
                 isolated_home,
                 isolated_tmp,
                 cache_paths,
+                allow_process_tree,
             );
             Err(Error::InvalidInput(format!(
                 "restricted command recipe sandboxing is unavailable on {}; Trail refuses to run the repository command without kernel enforcement",
                 std::env::consts::OS
             )))
         }
+    }
+
+    fn process_tree_tool_installation_root(executable: &Path) -> Option<PathBuf> {
+        let bin = executable.parent()?;
+        if bin.file_name()? != "bin" {
+            return None;
+        }
+        bin.parent().map(Path::to_path_buf)
     }
 
     fn materialize_workspace_environment_input(
@@ -6677,7 +7214,7 @@ fn materialize_mounted_output_value(
 
 fn environment_upper_class(kind: &str) -> Result<ViewPathClass> {
     match kind {
-        "dependency" => Ok(ViewPathClass::Dependency),
+        "dependency" | "external" => Ok(ViewPathClass::Dependency),
         "compiler-results" | "generated" | "build" => Ok(ViewPathClass::Generated),
         other => Err(Error::InvalidInput(format!(
             "environment kind `{other}` cannot own a mounted writable output"
@@ -6781,7 +7318,7 @@ pub(super) fn workspace_environment_artifact_contract_digest(
         phase: &'a str,
         program: &'a str,
         executable_identity: &'a str,
-        args: &'a [String],
+        args: Vec<String>,
         working_directory: &'a str,
         environment: BTreeMap<String, String>,
     }
@@ -6850,7 +7387,17 @@ pub(super) fn workspace_environment_artifact_contract_digest(
             phase,
             program: &command.program,
             executable_identity: &command.executable_identity,
-            args: &command.args,
+            args: command
+                .args
+                .iter()
+                .map(|argument| {
+                    cache_paths
+                        .iter()
+                        .fold(argument.clone(), |value, (path, logical)| {
+                            value.replace(path, logical)
+                        })
+                })
+                .collect(),
             working_directory: &command.working_directory,
             environment: command
                 .environment
@@ -6987,8 +7534,10 @@ pub(super) fn workspace_environment_identity_contract_v3(
         });
     let trust_scope = match plan.sandbox_policy {
         WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin => "builtin",
-        WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe => "repository",
+        WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+        | WorkspaceEnvironmentSandboxPolicy::RestrictedRecipe => "repository",
         WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
+        | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
         | WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => "plugin",
     };
 
@@ -8217,6 +8766,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_tree_build_time_is_stable_and_not_the_epoch_sentinel() {
+        let build_time = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(946_684_800))
+            .unwrap();
+        assert_eq!(
+            build_time.duration_since(SystemTime::UNIX_EPOCH).unwrap(),
+            Duration::from_secs(946_684_800)
+        );
+    }
+
+    #[test]
+    fn command_failure_diagnostics_include_bounded_stdout_and_stderr() {
+        let combined = combine_environment_command_diagnostics(
+            BoundedEnvironmentCommandDiagnostic {
+                bytes: b"build failed".to_vec(),
+                truncated: false,
+            },
+            BoundedEnvironmentCommandDiagnostic {
+                bytes: b"tool notice".to_vec(),
+                truncated: false,
+            },
+        );
+        assert_eq!(
+            String::from_utf8(combined.bytes).unwrap(),
+            "stdout:\nbuild failed\nstderr:\ntool notice\n"
+        );
+        assert!(!combined.truncated);
+    }
+
+    #[test]
     fn construction_seed_compatibility_ignores_only_declared_non_authoritative_inputs() {
         let key = |source_root: &str, lock_authority: &str| WorkspaceLayerKeyV1 {
             kind: "compiler-results".to_string(),
@@ -8655,6 +9234,31 @@ mod tests {
         assert_eq!(
             plan.outputs[0].policy,
             WorkspaceEnvironmentOutputPolicy::WritablePrivate
+        );
+    }
+
+    #[test]
+    fn zero_dependency_preview_uses_the_graph_finalizer_key() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::HostExclusive);
+        add_host_canonical_environment_identity(&mut plan).unwrap();
+        let preview = db
+            .finalize_workspace_environment_plan_preview(
+                "unused-for-zero-dependency-preview",
+                &ObjectId("object_fixture".to_string()),
+                plan.clone(),
+            )
+            .unwrap();
+        let graph = db
+            .finalize_workspace_environment_plan_graph(vec![plan])
+            .unwrap()
+            .remove(0)
+            .0;
+        assert_eq!(
+            db.workspace_layer_cache_key(&preview.layer_key).unwrap(),
+            db.workspace_layer_cache_key(&graph.layer_key).unwrap()
         );
     }
 
@@ -9985,5 +10589,116 @@ mod tests {
             .validate_restricted_recipe_output(&plan, &output, &mut entries)
             .unwrap_err();
         assert!(error.to_string().contains("hard-linked or unverifiable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_lifecycle_allows_only_contained_relative_output_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::ToolConcurrent);
+        plan.sandbox_policy = WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle;
+
+        let staging = tempfile::tempdir().unwrap();
+        let output = staging.path().join("node_modules");
+        fs::create_dir_all(output.join("package/bin")).unwrap();
+        fs::write(output.join("package/bin/tool.js"), "tool\n").unwrap();
+        fs::create_dir(output.join(".bin")).unwrap();
+        symlink("../package/bin/tool.js", output.join(".bin/tool")).unwrap();
+        let mut entries = 0;
+        db.validate_restricted_recipe_output(&plan, &output, &mut entries)
+            .unwrap();
+
+        fs::write(staging.path().join("outside"), "outside\n").unwrap();
+        let escape = output.join(".bin/escape");
+        symlink("../../outside", &escape).unwrap();
+        let mut entries = 0;
+        let error = db
+            .validate_restricted_recipe_output(&plan, &output, &mut entries)
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes its declared output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_outputs_relocate_absolute_staging_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::ToolConcurrent);
+        plan.sandbox_policy = WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree;
+        plan.outputs[0].output_path = "project/component/tool-output".to_string();
+        plan.outputs[0].mount_path = "component/.tool-output".to_string();
+
+        let staging = tempfile::tempdir().unwrap();
+        let project = staging.path().join("project/component");
+        let output = project.join("tool-output");
+        fs::create_dir_all(output.join("nested")).unwrap();
+        fs::write(project.join("source.txt"), "source\n").unwrap();
+        fs::write(output.join("nested/artifact"), "artifact\n").unwrap();
+        symlink(project.join("source.txt"), output.join("source-link")).unwrap();
+        symlink(output.join("nested/artifact"), output.join("artifact-link")).unwrap();
+        symlink(
+            output.join("nested/not-materialized"),
+            output.join("dangling-link"),
+        )
+        .unwrap();
+
+        db.normalize_process_tree_output_symlinks(&plan, &plan.outputs[0], &output)
+            .unwrap();
+        assert!(!fs::read_link(output.join("source-link"))
+            .unwrap()
+            .is_absolute());
+        assert!(!fs::read_link(output.join("artifact-link"))
+            .unwrap()
+            .is_absolute());
+        assert!(!fs::read_link(output.join("dangling-link"))
+            .unwrap()
+            .is_absolute());
+        let mut entries = 0;
+        db.validate_restricted_recipe_output(&plan, &output, &mut entries)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_outputs_allow_only_identity_bound_java_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let (mut plan, _) = cache_test_plan(&db, WorkspaceEnvironmentCacheAccess::ToolConcurrent);
+        plan.sandbox_policy = WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree;
+        let staging = tempfile::tempdir().unwrap();
+        let java_home = staging.path().join("jdk");
+        fs::create_dir(&java_home).unwrap();
+        fs::write(java_home.join("release"), "JAVA_VERSION=fixture\n").unwrap();
+        plan.command.as_mut().unwrap().environment.insert(
+            "JAVA_HOME".to_string(),
+            java_home.to_string_lossy().into_owned(),
+        );
+        let output = staging.path().join("output");
+        fs::create_dir(&output).unwrap();
+        symlink(java_home.join("release"), output.join("java-release")).unwrap();
+        let mut entries = 0;
+        db.validate_restricted_recipe_output(&plan, &output, &mut entries)
+            .unwrap();
+
+        fs::write(staging.path().join("outside"), "outside\n").unwrap();
+        symlink(staging.path().join("outside"), output.join("outside")).unwrap();
+        let mut entries = 0;
+        let error = db
+            .validate_restricted_recipe_output(&plan, &output, &mut entries)
+            .unwrap_err();
+        assert!(error.to_string().contains("absolute symlink"));
     }
 }

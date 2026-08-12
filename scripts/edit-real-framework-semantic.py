@@ -84,6 +84,73 @@ def contract(framework: str, marker: str) -> list[tuple[Path, str]]:
                 ),
             ),
         ]
+    if framework == "go-workspace":
+        return [
+            (
+                Path("common/must.go"),
+                block("//", f'const TrailQualificationMarker = "{marker}"'),
+            ),
+            (
+                Path("common/must_test.go"),
+                block(
+                    "//",
+                    "func TestTrailQualificationMarker(t *testing.T) {\n"
+                    f'\tassert.Equal(t, "{marker}", common.TrailQualificationMarker)\n'
+                    "}",
+                ),
+            ),
+        ]
+    if framework == "yarn":
+        return [
+            (
+                Path("index.js"),
+                block("//", f'module.exports.trailQualificationMarker = "{marker}";'),
+            ),
+            (
+                Path("test.js"),
+                block(
+                    "//",
+                    'describe("Trail qualification marker", function() {\n'
+                    '\tit("executes the current lane source", function() {\n'
+                    f'\t\tassert.strictEqual(require("./").trailQualificationMarker, "{marker}");\n'
+                    "\t});\n"
+                    "});",
+                ),
+            ),
+        ]
+    if framework == "bun":
+        return [
+            (
+                Path("src/app.ts"),
+                block("//", f'export const trailQualificationMarker = "{marker}";'),
+            ),
+            (
+                Path("tests/app.test.ts"),
+                block(
+                    "//",
+                    'test("Trail qualification marker", async () => {\n'
+                    '\tconst { trailQualificationMarker } = await import("../src/app.ts");\n'
+                    f'\texpect(trailQualificationMarker).toBe("{marker}");\n'
+                    "});",
+                ),
+            ),
+        ]
+    if framework == "uv":
+        return [
+            (
+                Path("src/pyprojectx/__init__.py"),
+                block("#", f'TRAIL_QUALIFICATION_MARKER = "{marker}"'),
+            ),
+            (
+                Path("tests/unit/test_trail_qualification.py"),
+                block(
+                    "#",
+                    "def test_trail_qualification_marker():\n"
+                    "    from pyprojectx import TRAIL_QUALIFICATION_MARKER\n\n"
+                    f'    assert TRAIL_QUALIFICATION_MARKER == "{marker}"',
+                ),
+            ),
+        ]
     if framework == "pnpm":
         return [
             (
@@ -163,6 +230,20 @@ def contract(framework: str, marker: str) -> list[tuple[Path, str]]:
                 ),
             ),
         ]
+    if framework == "cmake-modern":
+        return [
+            (
+                Path("examples/minimal.cpp"),
+                block(
+                    "//",
+                    "namespace trail_qualification {\n"
+                    "const char* TrailQualificationMarker() {\n"
+                    f'  return "{marker}";\n'
+                    "}\n"
+                    "}  // namespace trail_qualification",
+                ),
+            )
+        ]
     raise AssertionError(f"unsupported framework {framework!r}")
 
 
@@ -175,14 +256,39 @@ def expected_previous(marker: str) -> str | None:
     }[marker]
 
 
+def invalidation_contract(framework: str) -> tuple[Path, str]:
+    if framework == "yarn":
+        return Path(".yarnrc"), block("#", "--network-timeout 300000")
+    if framework == "bun":
+        return Path("bunfig.toml"), block("#", '[install]\nlinker = "hoisted"')
+    raise AssertionError(f"{framework} has no qualification invalidation contract")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("edit", "verify"))
-    parser.add_argument("framework", choices=("go", "pnpm", "npm", "python", "cmake"))
+    parser.add_argument("action", choices=("edit", "verify", "invalidate"))
+    parser.add_argument(
+        "framework",
+        choices=(
+            "go",
+            "go-workspace",
+            "yarn",
+            "bun",
+            "uv",
+            "pnpm",
+            "npm",
+            "python",
+            "cmake",
+            "cmake-modern",
+        ),
+    )
     parser.add_argument("marker", choices=("baseline", *sorted(LANES)))
     args = parser.parse_args()
 
-    if args.action == "edit":
+    if args.action == "invalidate":
+        path, replacement = invalidation_contract(args.framework)
+        replace_block(path, None, replacement)
+    elif args.action == "edit":
         if args.marker not in LANES:
             raise AssertionError("baseline cannot be applied as an edit")
         previous = {"agent-a": None, "agent-b": "agent-a", "agent-c": "agent-b"}[

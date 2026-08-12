@@ -335,8 +335,10 @@ pub struct AdapterPlanV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caches: Vec<AdapterCache>,
     /// Provider-owned immutable identities. A plan that declares external
-    /// artifacts is metadata-only: it must not also declare actions, caches,
-    /// or filesystem outputs.
+    /// artifacts cannot also declare actions or caches. It may declare only
+    /// lane-scoped writable-private, never-published companion outputs for
+    /// mutable client state such as a Nix profile; those directories are
+    /// created by Trail without adapter execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_artifacts: Vec<AdapterExternalArtifact>,
     /// Per-lane runtime resources derived from declared immutable artifacts.
@@ -1037,16 +1039,24 @@ impl AdapterPlanV2Builder {
                 });
             }
         }
-        let metadata_only = !self.external_artifacts.is_empty();
-        if metadata_only
-            && (self.kind != "external"
-                || !self.actions.is_empty()
-                || !self.caches.is_empty()
-                || !self.outputs.is_empty())
+        let external = !self.external_artifacts.is_empty();
+        if external
+            && (self.kind != "external" || !self.actions.is_empty() || !self.caches.is_empty())
         {
             return Err(AdapterPlanBuildError::ExternalArtifactPlanConflict);
         }
-        if !metadata_only && self.actions.is_empty() {
+        if external
+            && self.outputs.iter().any(|output| {
+                output.policy != AdapterOutputPolicy::WritablePrivate
+                    || output.reuse != AdapterReuseMode::None
+                    || output.scope != AdapterSharingScope::Lane
+                    || output.publish != AdapterPublicationTrigger::Never
+                    || output.gate.is_some()
+            })
+        {
+            return Err(AdapterPlanBuildError::ExternalArtifactPlanConflict);
+        }
+        if !external && self.actions.is_empty() {
             return Err(AdapterPlanBuildError::MissingAction);
         }
         if self.actions.len() > 9 {
@@ -1076,7 +1086,7 @@ impl AdapterPlanV2Builder {
             };
             validate_adapter_command(command, field)?;
         }
-        if !metadata_only {
+        if !self.outputs.is_empty() {
             validate_adapter_outputs(&self.outputs)?;
         }
         let stale_reason = self
@@ -1113,6 +1123,8 @@ pub enum AdapterPlanBuildError {
     EmptyValue { field: &'static str },
     #[error("adapter plan field `{field}` contains a NUL byte")]
     NulValue { field: &'static str },
+    #[error("adapter plan field `{field}` contains an invalid command identity declaration")]
+    InvalidCommand { field: &'static str },
     #[error("adapter plan field `{field}` contains duplicate value `{value}`")]
     DuplicateValue { field: &'static str, value: String },
     #[error("adapter component `{component_id}` cannot depend on itself")]
@@ -1128,7 +1140,7 @@ pub enum AdapterPlanBuildError {
     #[error("adapter protocol-v2 plans support at most sixteen caches; received {actual}")]
     CacheCount { actual: usize },
     #[error(
-        "external-artifact plans require kind `external` and cannot mix actions, caches, or filesystem outputs"
+        "external-artifact plans require kind `external`, cannot mix actions or caches, and permit only lane-scoped writable-private never-published companion outputs"
     )]
     ExternalArtifactPlanConflict,
     #[error("adapter protocol-v2 plans support at most 32 external artifacts; received {actual}")]
@@ -1475,9 +1487,15 @@ fn validate_adapter_command(
 ) -> Result<(), AdapterPlanBuildError> {
     require_non_empty(&command.program, field)?;
     require_non_empty(&command.working_directory, field)?;
+    if command.identity_args.len() > 16
+        || command.identity_args.iter().any(|value| value.len() > 4096)
+    {
+        return Err(AdapterPlanBuildError::InvalidCommand { field });
+    }
     if command
         .args
         .iter()
+        .chain(&command.identity_args)
         .chain(command.environment.keys())
         .chain(command.environment.values())
         .any(|value| value.contains('\0'))
@@ -1541,6 +1559,19 @@ pub struct AdapterCommand {
     pub working_directory: String,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Explicitly requests a native-sandboxed child process tree for build
+    /// tools such as Bazel, Gradle, Maven, or Nix. The host may deny this
+    /// capability based on package trust, protocol, platform, or policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub process_tree: bool,
+    /// Optional bounded argv used by the host during planning to capture a
+    /// deterministic tool-version identity in addition to executable bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_args: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AdapterCommand {
@@ -1554,6 +1585,8 @@ impl AdapterCommand {
             args: args.into_iter().map(Into::into).collect(),
             working_directory: ".".to_string(),
             environment: BTreeMap::new(),
+            process_tree: false,
+            identity_args: Vec::new(),
         }
     }
 
@@ -1568,6 +1601,20 @@ impl AdapterCommand {
         value: impl Into<String>,
     ) -> Self {
         self.environment.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn sandboxed_process_tree(mut self) -> Self {
+        self.process_tree = true;
+        self
+    }
+
+    pub fn identity_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.identity_args = args.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -1936,6 +1983,8 @@ mod tests {
                 args: Vec::new(),
                 working_directory: ".".to_string(),
                 environment: BTreeMap::new(),
+                process_tree: false,
+                identity_args: Vec::new(),
             },
             outputs: vec![AdapterOutput {
                 name: "generated".to_string(),
@@ -2082,6 +2131,47 @@ mod tests {
             serde_cbor::from_slice(&serde_cbor::to_vec(&plan).unwrap()).unwrap();
         assert_eq!(decoded, plan);
 
+        let with_private_state = AdapterPlanV2::builder("nix-store", "external")
+            .identity_input("flake.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "package",
+                "nix-store",
+                "/nix/store/example-package",
+                digest,
+                "linux/aarch64",
+            ))
+            .output(AdapterOutput::writable_private(
+                "profile",
+                "trail-nix-profile",
+                ".trail-nix-profile",
+            ))
+            .stale_reason("Nix store identity or private profile policy changed")
+            .build()
+            .unwrap();
+        assert!(with_private_state.actions.is_empty());
+        assert_eq!(with_private_state.external_artifacts.len(), 1);
+        assert_eq!(with_private_state.outputs.len(), 1);
+
+        let shared_state = AdapterPlanV2::builder("invalid-nix-store", "external")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "package",
+                "nix-store",
+                "/nix/store/example-package",
+                digest,
+                "linux/aarch64",
+            ))
+            .output(AdapterOutput::immutable_shared(
+                "profile",
+                "trail-nix-profile",
+                ".trail-nix-profile",
+            ))
+            .stale_reason("invalid shared external state")
+            .build();
+        assert_eq!(
+            shared_state,
+            Err(AdapterPlanBuildError::ExternalArtifactPlanConflict)
+        );
+
         let runtime = AdapterPlanV2::builder("invalid-runtime", "external")
             .external_artifact(AdapterExternalArtifact::verified_external(
                 "store",
@@ -2163,6 +2253,46 @@ mod tests {
         let decoded: AdapterPlanV2 =
             serde_cbor::from_slice(&serde_cbor::to_vec(&plan).unwrap()).unwrap();
         assert_eq!(decoded, plan);
+    }
+
+    #[test]
+    fn v2_command_process_tree_and_tool_identity_are_explicit_and_bounded() {
+        let command = AdapterCommand::new("builder", ["test"])
+            .identity_args(["--version"])
+            .sandboxed_process_tree();
+        let plan = AdapterPlanV2::builder("generated", "generated")
+            .staging_command(command.clone())
+            .output(AdapterOutput::writable_private(
+                "generated",
+                "generated",
+                "generated",
+            ))
+            .stale_reason("source or exact tool identity changed")
+            .build()
+            .unwrap();
+        assert_eq!(plan.actions, [AdapterAction::Staging(command)]);
+        let decoded: AdapterPlanV2 =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+
+        let too_many = AdapterPlanV2::builder("generated", "generated")
+            .staging_command(
+                AdapterCommand::new("builder", ["test"])
+                    .identity_args((0..17).map(|index| index.to_string())),
+            )
+            .output(AdapterOutput::writable_private(
+                "generated",
+                "generated",
+                "generated",
+            ))
+            .stale_reason("source or exact tool identity changed")
+            .build();
+        assert_eq!(
+            too_many,
+            Err(AdapterPlanBuildError::InvalidCommand {
+                field: "actions.staging"
+            })
+        );
     }
 
     #[test]

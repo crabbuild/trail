@@ -929,6 +929,8 @@ pub struct EnvironmentPlanReport {
     pub source_root: ObjectId,
     pub component_id: String,
     pub adapter_identity: String,
+    pub adapter_implementation_version: String,
+    pub adapter_distribution_digest: String,
     pub kind: String,
     pub component_key: String,
     #[serde(default)]

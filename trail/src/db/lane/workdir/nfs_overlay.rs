@@ -2060,33 +2060,63 @@ mod macos {
                     .is_ok_and(|output| output.status.success()),
                 "cargo is required for the real NFS target-layer acceptance test"
             );
+            assert!(
+                Command::new("git")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success()),
+                "git is required for the pinned dependency in the real NFS target-layer acceptance test"
+            );
 
             let temp = tempfile::tempdir().unwrap();
-            fs::create_dir_all(temp.path().join("src")).unwrap();
-            fs::create_dir_all(temp.path().join("shared-dep/src")).unwrap();
+            let repository = temp.path().join("repository");
+            let shared_dep = temp.path().join("shared-dep");
+            fs::create_dir_all(repository.join("src")).unwrap();
+            fs::create_dir_all(shared_dep.join("src")).unwrap();
             fs::write(
-                temp.path().join("Cargo.toml"),
-                "[package]\nname = \"nfs-cache-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nshared-dep = { path = \"shared-dep\" }\n",
-            )
-            .unwrap();
-            fs::write(
-                temp.path().join("src/lib.rs"),
-                "pub fn answer() -> u64 { shared_dep::answer() }\n",
-            )
-            .unwrap();
-            fs::write(
-                temp.path().join("shared-dep/Cargo.toml"),
+                shared_dep.join("Cargo.toml"),
                 "[package]\nname = \"shared-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
             )
             .unwrap();
             fs::write(
-                temp.path().join("shared-dep/src/lib.rs"),
+                shared_dep.join("src/lib.rs"),
                 "pub fn answer() -> u64 { 42 }\n",
             )
             .unwrap();
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["config", "user.name", "Trail Test"],
+                vec!["config", "user.email", "trail@example.invalid"],
+                vec!["add", "Cargo.toml", "src/lib.rs"],
+                vec!["commit", "--quiet", "-m", "fixture"],
+            ] {
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(&shared_dep)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let shared_dep_url = format!(
+                "file://{}",
+                shared_dep.canonicalize().unwrap().to_string_lossy()
+            );
+            fs::write(
+                repository.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"nfs-cache-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nshared-dep = {{ git = {shared_dep_url:?} }}\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                repository.join("src/lib.rs"),
+                "pub fn answer() -> u64 { shared_dep::answer() }\n",
+            )
+            .unwrap();
             let lock = Command::new("cargo")
-                .args(["generate-lockfile", "--offline"])
-                .current_dir(temp.path())
+                .arg("generate-lockfile")
+                .current_dir(&repository)
                 .output()
                 .unwrap();
             assert!(
@@ -2094,19 +2124,8 @@ mod macos {
                 "cargo generate-lockfile failed: {}",
                 String::from_utf8_lossy(&lock.stderr)
             );
-            let nested_lock = Command::new("cargo")
-                .args(["generate-lockfile", "--offline"])
-                .current_dir(temp.path().join("shared-dep"))
-                .output()
-                .unwrap();
-            assert!(
-                nested_lock.status.success(),
-                "nested cargo generate-lockfile failed: {}",
-                String::from_utf8_lossy(&nested_lock.stderr)
-            );
-
-            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
-            let mut db = Trail::open(temp.path()).unwrap();
+            Trail::init(&repository, "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(&repository).unwrap();
             for lane in ["rust-nfs-a", "rust-nfs-b"] {
                 db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                     lane,
@@ -2125,9 +2144,10 @@ mod macos {
                 .exec_lane_workspace(
                     "rust-nfs-a",
                     &[
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--offline".to_string(),
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cargo build --offline -vv --color never > target/trail-cargo.stdout 2> target/trail-cargo.stderr"
+                            .to_string(),
                     ],
                 )
                 .unwrap();
@@ -2189,13 +2209,18 @@ mod macos {
                 .phases
                 .iter()
                 .any(|phase| { phase.phase == "sync_all" && phase.status == "skipped" }));
-
             let layer = db
                 .sync_workspace_environment("rust-nfs-b", "cargo", None)
                 .unwrap();
             assert_eq!(layer.adapter, "cargo-target-seed");
             assert!(layer_ids_a.contains(&layer.layer_id));
-
+            assert!(
+                tree_has_name_fragment(
+                    &Path::new(&layer.storage_path).join("debug/.fingerprint"),
+                    "lib-shared_dep"
+                ),
+                "the immutable Cargo target seed omitted Cargo fingerprint metadata"
+            );
             let second = db
                 .exec_lane_workspace(
                     "rust-nfs-b",

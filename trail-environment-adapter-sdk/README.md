@@ -272,11 +272,14 @@ let plan = AdapterPlanV2::builder("images", "external")
 # Ok::<(), trail_environment_adapter_sdk::AdapterPlanBuildError>(())
 ```
 
-External-artifact plans must use kind `external` and cannot mix actions, caches, or
-outputs. Trail validates the digest/reference/platform tuple, includes the sorted
-contract in the component key, persists it with each generation, and treats cleanup as
-provider-owned. Registry access, tag resolution, credentials, and runtime allocation
-are deliberately outside the planner.
+External-artifact plans must use kind `external` and cannot mix actions or caches. They
+may omit outputs, or declare only lane-scoped `writable_private` companion state with
+`reuse = none` and `publish = never`. Trail creates those empty private directories
+without adapter execution; immutable/shared, gated, compatible, or host-scoped outputs
+remain invalid. Trail validates the digest/reference/platform tuple, includes the sorted
+contract in the component key, persists it with each generation, and treats external
+artifact cleanup as provider-owned. Registry access, tag resolution, credentials, and
+runtime allocation are deliberately outside the planner.
 
 The same metadata-only contract represents an already verified provider store without
 copying it into a Trail layer. This is suitable for content-addressed build stores,
@@ -304,6 +307,13 @@ let plan = AdapterPlanV2::builder("external-stores", "external")
 `verified_external` accepts a bounded provider token, opaque safe reference, SHA-256
 digest, and exact platform identity (or `any`). It cannot back an OCI runtime resource;
 container declarations still require a digest-pinned `oci_image` in the same plan.
+
+For example, a Nix planner can record verified `/nix/store/...` package/check identities
+and a digest-pinned builder image while declaring lane-private profile and client-state
+directories. The adapter does not run Nix, read the host store, receive the Docker
+socket, or create those directories. The repository marker or verified resolution
+evidence remains responsible for proving that pure, locked evaluation produced the
+reported store references and NAR SHA-256 digests.
 
 An external plan may bind a pinned image to a lane-private service declaration. The
 adapter still performs no provider calls and receives no Docker socket, network, port,

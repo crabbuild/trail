@@ -70,7 +70,7 @@ fn lane_fork_inherits_verified_immutable_layer_with_fresh_private_uppers() {
         "INSERT INTO environment_component_states(
              view_id,component_id,adapter_identity,adapter_version,implementation_version,
              distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
-         VALUES(?1,'node','trail/node@1',1,?2,'builtin:node-plan-v2','dependency',
+         VALUES(?1,'node','trail/node@1',1,?2,'builtin:node-plan-v3','dependency',
                 ?3,?3,'ready',NULL,1)",
         params![
             &parent_view.view_id,

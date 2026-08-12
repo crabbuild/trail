@@ -2,6 +2,10 @@
 
 `trail.env_promote` promotes a declared manual private output. Environment sync
 tools return the same cache decisions and identity edges as Rust, CLI, and HTTP.
+`trail.env_plan` returns the shared `EnvironmentPlanReport`, including required
+`adapter_identity`, `adapter_implementation_version`, and
+`adapter_distribution_digest` fields that bind the logical adapter and exact
+implementation/package bytes before reuse.
 `trail.lane_spawn` includes the same typed backend prerequisite report used by
 doctor and the HTTP API.
 

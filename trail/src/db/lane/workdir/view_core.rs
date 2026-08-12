@@ -360,7 +360,7 @@ impl ViewCore {
                     .is_some_and(|rest| rest.starts_with('/'))
         });
         match binding.map(|binding| binding.kind.as_str()) {
-            Some("dependency") => ViewPathClass::Dependency,
+            Some("dependency" | "external") => ViewPathClass::Dependency,
             Some("compiler-results" | "generated" | "build") => ViewPathClass::Generated,
             _ => conventional,
         }
@@ -1547,7 +1547,7 @@ impl ViewCore {
             )));
         }
         let class = match layer_kind {
-            "dependency" => ViewPathClass::Dependency,
+            "dependency" | "external" => ViewPathClass::Dependency,
             "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
             other => {
                 return Err(Error::InvalidInput(format!(
@@ -1587,7 +1587,7 @@ impl ViewCore {
             )));
         }
         let class = match layer_kind {
-            "dependency" => ViewPathClass::Dependency,
+            "dependency" | "external" => ViewPathClass::Dependency,
             "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
             other => {
                 return Err(Error::InvalidInput(format!(
@@ -1648,7 +1648,7 @@ impl ViewCore {
             )));
         }
         let class = match layer_kind {
-            "dependency" => ViewPathClass::Dependency,
+            "dependency" | "external" => ViewPathClass::Dependency,
             "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
             other => {
                 return Err(Error::InvalidInput(format!(
@@ -2953,6 +2953,18 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+    }
+
+    #[test]
+    fn external_private_state_can_initialize_in_private_upper_storage() {
+        let (_temp, db, root, upper) = fixture();
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        let mut view = lazy_core(&db, &root, upper);
+
+        view.ensure_declared_private_mount_path(".trail-nix-profile", "external")
+            .unwrap();
+
+        assert!(layout.generated_upper.join(".trail-nix-profile").is_dir());
     }
 
     #[test]

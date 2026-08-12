@@ -1264,9 +1264,20 @@ explicit source-export contracts.
 
 Bazel/Nix-like provider stores use a protocol-v2 plugin metadata component containing
 sorted `verified_external` entries. Each entry binds a provider token, opaque bounded
-reference, SHA-256 digest, and platform identity. It has no action, cache, output,
-runtime allocation, or Trail-owned cleanup. OCI runtime declarations remain restricted
-to `oci_image`, so a generic store reference cannot be relabeled as a container image.
+reference, SHA-256 digest, and platform identity. It has no action, cache, runtime
+allocation, or Trail-owned cleanup. A provider-store plan may additionally declare only
+lane-scoped `writable_private`, non-reused, never-published client state; Trail creates
+that state without invoking the adapter. OCI runtime declarations remain restricted to
+`oci_image`, so a generic store reference cannot be relabeled as a container image.
+
+The locally qualified Nix example requires a strict committed `trail.nix.toml` marker and a
+matching pinned `flake.lock`. The marker records `locked = true`, `pure = true`, exact
+Nix version, digest-pinned OCI builder/platform, and package/check `/nix/store` paths plus
+NAR SHA-256 digests. Changed lock bytes, builder substitution, unlocked/impure markers,
+malformed store references, and writable/shared external identities fail planning. The
+host records metadata and lane-private profile/state only; qualification performs the
+actual `nix build --offline --no-write-lock-file --option pure-eval true` outside the
+adapter and verifies lock bytes are unchanged.
 
 The implemented `trail/cmake-build@1` adapter covers the safe first slice: discovery,
 deterministic host/tool compatibility identity, atomic lane-private build-directory
@@ -1319,7 +1330,7 @@ trail lane exec <lane> -- "$TRAIL_VENV_PYTHON" -m pytest
 
 The supported install contracts are `uv.lock`, a hash-pinned
 `requirements.lock`, or a verified Trail-managed hash-bearing requirements snapshot.
-`uv.lock` uses `uv sync --frozen --no-install-project`; requirements snapshots use
+`uv.lock` uses contained project-aware `uv sync --frozen --offline`; requirements snapshots use
 `uv pip sync --require-hashes`. A plain `requirements.txt`, Poetry/PDM/Pipenv lock, or
 unhashed requirements file is rejected until an adapter can implement its exact frozen
 installation semantics.

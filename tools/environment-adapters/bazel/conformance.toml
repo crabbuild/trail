@@ -1,0 +1,8 @@
+schema = "trail.environment-adapter-conformance/v1"
+adapter = "trail-examples/bazel@1"
+identity_authorities = ["MODULE.bazel", "MODULE.bazel.lock", "WORKSPACE", "WORKSPACE.bazel", ".bazelrc", "trail.bazel.toml"]
+cache_only = ["repository", "disk"]
+private_outputs = [".bazel-trail-output"]
+network = "deny"
+process = "native-sandboxed-tree"
+validation = "bazel test //..."

@@ -236,7 +236,19 @@ On macOS, `nfs-cow` provides the same write-time copy-up behavior through the
 built-in loopback NFS client and requires no kernel extension.
 On Windows, `dokan-cow` exposes the same layered semantics through Dokan 2.x.
 
-### Prewarm or promote a lane environment
+### Inspect, prewarm, or promote a lane environment
+
+```sh
+trail env discover <LANE>
+trail env graph <LANE>
+trail env plan <LANE> [--component <ID>] [--adapter <ADAPTER>] [--path <ROOT>]
+```
+
+`env plan --format json` returns the same `EnvironmentPlanReport` used by HTTP
+and MCP. Its required `adapter_identity`, `adapter_implementation_version`, and
+`adapter_distribution_digest` fields bind the logical adapter, implementation
+version, and exact built-in or installed package distribution that produced the
+plan. Automation should compare all three before accepting reusable state.
 
 ```sh
 trail env sync all <LANE>

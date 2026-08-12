@@ -55,6 +55,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Events, traces, and spans](lanes/events-traces-and-spans.md)
 - [Tests, evals, gates, and readiness](lanes/tests-evals-gates-and-readiness.md)
 - [Handoff, review, and merge](lanes/handoff-review-and-merge.md)
+- [Ecosystem environment certification](lanes/ecosystem-environment-certification.md)
 
 ## Integrations
 

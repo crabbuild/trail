@@ -46,19 +46,39 @@ tests=(
   db::lane::workspace_environment::tests::host_resolver_executes_cargo_in_isolated_staging_and_reuses_snapshot
   db::lane::workspace_node::tests::manifest_only_npm_uses_managed_lock_and_preserves_seed_cache_isolation
   db::lane::workspace_cargo::tests::cargo_adapter_builds_once_and_reuses_one_immutable_target_seed
-  db::lane::workspace_python::tests::real_python_venvs_embed_lane_paths_and_remain_isolated
+  db::lane::workspace_python::tests::real_python_venvs_use_direct_private_bindings_and_remain_isolated
   db::lane::workspace_cmake::tests::real_cmake_configure_build_and_clean_stay_lane_private
   db::lane::workspace_plugin::tests::protocol_v2_bazel_nix_like_stores_remain_metadata_only_after_host_normalization
   db::lane::workspace_recipe::tests::maven_gradle_like_and_unknown_custom_shapes_use_repository_v2_components
   db::lane::source_export::tests::source_export_execution_checkpoints_normal_source_and_reports_git_handoff
 )
 
+run_exact_test() {
+  local target_kind="$1"
+  local target_name="$2"
+  local test_name="$3"
+  local -a target_args
+  if [[ "${target_kind}" == "lib" ]]; then
+    target_args=(--lib)
+  else
+    target_args=(--test "${target_name}")
+  fi
+  local listed matches
+  listed="$(cargo test -p trail "${target_args[@]}" "${test_name}" --locked -- --list --format terse)"
+  matches="$(printf '%s\n' "${listed}" | awk -v expected="${test_name}: test" '$0 == expected { count += 1 } END { print count + 0 }')"
+  if [[ "${matches}" != "1" ]]; then
+    printf 'real-tool gate must select exactly one test, found %s for %s\n' \
+      "${matches}" "${test_name}" >&2
+    exit 2
+  fi
+  cargo test -p trail "${target_args[@]}" "${test_name}" --locked -- --exact --nocapture
+}
+
 for test_name in "${tests[@]}"; do
-  cargo test -p trail --lib "${test_name}" --locked -- --exact --nocapture
+  run_exact_test lib "" "${test_name}"
 done
 
-cargo test -p trail --test e2e \
-  next_and_vite_v2_components_compose_through_native_cli_sandbox \
-  --locked -- --exact --nocapture
+run_exact_test test e2e \
+  next_and_vite_v2_components_compose_through_native_cli_sandbox
 
 printf '%s\n' 'artifact real-tool gates: passed'

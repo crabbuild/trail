@@ -23,13 +23,14 @@ mod linux {
         temporary: PathBuf,
         program: PathBuf,
         interpreter: Option<PathBuf>,
+        allow_process_tree: bool,
         args: Vec<OsString>,
     }
 
     pub(super) fn run(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
         let invocation = parse(arguments)?;
         apply_landlock(&invocation)?;
-        apply_network_and_privilege_seccomp()?;
+        apply_network_and_privilege_seccomp(invocation.allow_process_tree)?;
         let error = Command::new(&invocation.program)
             .args(&invocation.args)
             .exec();
@@ -88,9 +89,15 @@ mod linux {
         };
         let temporary = value(&mut arguments, "--tmp")?;
         let program = value(&mut arguments, "--program")?;
-        let separator = arguments
+        let mut separator = arguments
             .next()
             .ok_or_else(|| "missing internal sandbox argument separator".to_string())?;
+        let allow_process_tree = separator == OsStr::new("--allow-process-tree");
+        if allow_process_tree {
+            separator = arguments
+                .next()
+                .ok_or_else(|| "missing internal sandbox argument separator".to_string())?;
+        }
         if separator != OsStr::new("--") {
             return Err("invalid internal sandbox argument separator".to_string());
         }
@@ -156,7 +163,11 @@ mod linux {
             .map_err(|error| format!("cannot canonicalize sandbox temporary directory: {error}"))?;
         let program = fs::canonicalize(&program)
             .map_err(|error| format!("cannot canonicalize sandbox program: {error}"))?;
-        let interpreter = elf_interpreter(&program)?;
+        let interpreter = if allow_process_tree {
+            None
+        } else {
+            elf_interpreter(&program)?
+        };
         for (kind, paths) in [("input", &reads), ("output", &outputs)] {
             for path in paths {
                 if path.starts_with(&root) {
@@ -180,6 +191,7 @@ mod linux {
             temporary,
             program,
             interpreter,
+            allow_process_tree,
             args: arguments.collect(),
         })
     }
@@ -313,7 +325,11 @@ mod linux {
         let read_without_execute = AccessFs::from_read(abi) & !AccessFs::Execute;
         let read_file = read_without_execute & AccessFs::from_file(abi);
         let read_execute_file = read_file | AccessFs::Execute;
-        let writable = all & !AccessFs::Execute;
+        let writable = if invocation.allow_process_tree {
+            all
+        } else {
+            all & !AccessFs::Execute
+        };
         let writable_file = writable & AccessFs::from_file(abi);
         let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
@@ -330,7 +346,11 @@ mod linux {
                         PathFd::new(path).map_err(|error| {
                             format!("cannot open sandbox system path `{path}`: {error}")
                         })?,
-                        read_without_execute,
+                        if invocation.allow_process_tree {
+                            read_without_execute | AccessFs::Execute
+                        } else {
+                            read_without_execute
+                        },
                     ))
                     .map_err(|error| {
                         format!("cannot allow sandbox system path `{path}`: {error}")
@@ -370,7 +390,11 @@ mod linux {
                         format!("cannot open sandbox input `{}`: {error}", path.display())
                     })?,
                     if path.is_dir() {
-                        read_without_execute
+                        if invocation.allow_process_tree {
+                            read_without_execute | AccessFs::Execute
+                        } else {
+                            read_without_execute
+                        }
                     } else {
                         read_file
                     },
@@ -457,7 +481,7 @@ mod linux {
         Ok(())
     }
 
-    fn apply_network_and_privilege_seccomp() -> Result<(), String> {
+    fn apply_network_and_privilege_seccomp(allow_process_tree: bool) -> Result<(), String> {
         // A deny-list is appropriate here because Landlock supplies the
         // filesystem allow-list and exact executable policy. Seccomp closes
         // every socket-family entry point plus kernel/namespace escape hatches.
@@ -513,46 +537,52 @@ mod linux {
             ));
         }
         #[cfg(target_arch = "x86_64")]
-        for syscall in [libc::SYS_fork, libc::SYS_vfork] {
-            filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, syscall as u32, 0, 1));
-            filter.push(stmt(
-                BPF_RET | BPF_K,
-                SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            ));
+        if !allow_process_tree {
+            for syscall in [libc::SYS_fork, libc::SYS_vfork] {
+                filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, syscall as u32, 0, 1));
+                filter.push(stmt(
+                    BPF_RET | BPF_K,
+                    SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                ));
+            }
         }
         // Modern pthread implementations may probe clone3. Report it as
         // unavailable so they can fall back to clone, whose flags we can
         // inspect in classic BPF without dereferencing user memory.
-        filter.push(jump(
-            BPF_JMP | BPF_JEQ | BPF_K,
-            libc::SYS_clone3 as u32,
-            0,
-            1,
-        ));
-        filter.push(stmt(
-            BPF_RET | BPF_K,
-            SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
-        ));
+        if !allow_process_tree {
+            filter.push(jump(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                libc::SYS_clone3 as u32,
+                0,
+                1,
+            ));
+            filter.push(stmt(
+                BPF_RET | BPF_K,
+                SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+            ));
+        }
         // Permit threads but reject process creation. clone's first argument
         // is the flags word on every Linux architecture Trail supports.
-        filter.push(jump(
-            BPF_JMP | BPF_JEQ | BPF_K,
-            libc::SYS_clone as u32,
-            0,
-            4,
-        ));
-        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 16));
-        filter.push(jump(
-            BPF_JMP | BPF_JSET | BPF_K,
-            libc::CLONE_THREAD as u32,
-            1,
-            0,
-        ));
-        filter.push(stmt(
-            BPF_RET | BPF_K,
-            SECCOMP_RET_ERRNO | libc::EPERM as u32,
-        ));
-        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        if !allow_process_tree {
+            filter.push(jump(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                libc::SYS_clone as u32,
+                0,
+                4,
+            ));
+            filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 16));
+            filter.push(jump(
+                BPF_JMP | BPF_JSET | BPF_K,
+                libc::CLONE_THREAD as u32,
+                1,
+                0,
+            ));
+            filter.push(stmt(
+                BPF_RET | BPF_K,
+                SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ));
+            filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        }
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
         let mut program = libc::sock_fprog {
             len: u16::try_from(filter.len())
