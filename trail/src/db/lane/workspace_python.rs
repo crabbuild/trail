@@ -1,12 +1,14 @@
 use super::workspace_environment::{
-    resolve_workspace_tool_executable, workspace_mounted_commands_identity,
-    WorkspaceEnvironmentAdapter, WorkspaceEnvironmentAdapterMetadata,
-    WorkspaceEnvironmentAdapterProposal, WorkspaceEnvironmentCacheAccess,
-    WorkspaceEnvironmentCacheCommandBinding, WorkspaceEnvironmentCacheProtocol,
-    WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput, WorkspaceEnvironmentOutput,
-    WorkspaceEnvironmentOutputCommandBinding, WorkspaceEnvironmentOutputPolicy,
-    WorkspaceEnvironmentPlan, WorkspaceEnvironmentResolutionInput,
-    WorkspaceEnvironmentSandboxPolicy, WorkspaceEnvironmentToolCommandBinding,
+    mounted_output_placeholder, mounted_output_relative_placeholder,
+    mounted_resolution_input_placeholder, resolve_workspace_tool_executable,
+    workspace_mounted_commands_identity, WorkspaceEnvironmentAdapter,
+    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentAdapterProposal,
+    WorkspaceEnvironmentCacheAccess, WorkspaceEnvironmentCacheCommandBinding,
+    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
+    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputCommandBinding,
+    WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
+    WorkspaceEnvironmentResolutionInput, WorkspaceEnvironmentSandboxPolicy,
+    WorkspaceEnvironmentToolCommandBinding,
 };
 use super::*;
 use crate::ids::sha256_hex;
@@ -15,8 +17,16 @@ pub(crate) struct PythonVenvAdapter;
 
 pub(crate) static PYTHON_VENV_ADAPTER: PythonVenvAdapter = PythonVenvAdapter;
 
-const PYTHON_IDENTITY_FILES: [&str; 7] = [
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PythonInstallContract {
+    UvLock,
+    HashedRequirements,
+    ManagedHashedRequirements,
+}
+
+const PYTHON_IDENTITY_FILES: [&str; 8] = [
     "pyproject.toml",
+    ".python-version",
     "uv.lock",
     "poetry.lock",
     "pdm.lock",
@@ -41,7 +51,7 @@ static PYTHON_VENV_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "python-venv",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:python-venv-plan-v3",
+        distribution_digest: "builtin:python-venv-plan-v6",
         selectors: &["trail/python-venv@1", "python-venv", "python"],
         kind: "dependency",
         layer_adapter_name: "python-venv",
@@ -49,7 +59,7 @@ static PYTHON_VENV_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         supported_operating_systems: &["linux", "macos", "windows"],
         supported_architectures: &["aarch64", "x86_64"],
         stability: "experimental",
-        description: "Automatically initialized lane-private Python virtual environment at the stable mounted lane path",
+        description: "Automatically initialized lane-private Python virtual environment with direct command bindings",
     };
 
 const PYTHON_CACHE_COMMAND_BINDINGS: &[WorkspaceEnvironmentCacheCommandBinding] = &[
@@ -81,7 +91,7 @@ const PYTHON_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding
         output_name: "venv",
         environment: Some("VIRTUAL_ENV"),
         relative_path: "",
-        direct: false,
+        direct: true,
         prepend_path: false,
         required: true,
     },
@@ -89,7 +99,7 @@ const PYTHON_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding
         output_name: "venv",
         environment: None,
         relative_path: PYTHON_VENV_EXECUTABLE_DIRECTORY,
-        direct: false,
+        direct: true,
         prepend_path: true,
         required: true,
     },
@@ -97,7 +107,7 @@ const PYTHON_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding
         output_name: "venv",
         environment: Some("TRAIL_VENV_PYTHON"),
         relative_path: PYTHON_VENV_EXECUTABLE,
-        direct: false,
+        direct: true,
         prepend_path: false,
         required: true,
     },
@@ -245,11 +255,17 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
         component_root: &str,
     ) -> Result<WorkspaceEnvironmentPlan> {
         let component_root = normalize_python_component_root(component_root)?;
-        let python = resolve_python_executable()?;
+        let python = resolve_python_executable_for_source(db, source_root, &component_root)?;
         let component_id = self.component_id(&component_root)?;
         let mount_path = join_python_path(&component_root, ".venv");
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:python-venv-plan-v3".to_string();
+        let distribution_digest = "builtin:python-venv-plan-v6".to_string();
+        let source_resolution = python_source_resolution(db, source_root, &component_root)?;
+        let managed_snapshot = if source_resolution.is_none() {
+            python_resolution_snapshot(db, source_root, &component_root)?
+        } else {
+            None
+        };
         let mut mounted_args = vec![
             "-m".to_string(),
             "venv".to_string(),
@@ -261,8 +277,8 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
         // directly for a clean first-run experience.
         #[cfg(target_os = "macos")]
         mounted_args.push("--copies".to_string());
-        mounted_args.push(".venv".to_string());
-        let mounted_command = WorkspaceEnvironmentCommand {
+        mounted_args.push(mounted_output_placeholder("venv"));
+        let venv_command = WorkspaceEnvironmentCommand {
             program: "python".to_string(),
             resolved_program: python.path.clone(),
             executable_identity: python.identity.clone(),
@@ -292,25 +308,36 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 "host-mounted-initialization".to_string(),
             ),
             (
-                "mounted_action".to_string(),
-                workspace_mounted_commands_identity(std::slice::from_ref(&mounted_command))?,
-            ),
-            (
                 "command_environment".to_string(),
                 format!(
-                    "PIP_CACHE_DIR=cache:python-downloads/pip;UV_CACHE_DIR=cache:python-downloads/uv;VIRTUAL_ENV=output:venv;TRAIL_VENV_PYTHON=output:venv/{PYTHON_VENV_EXECUTABLE};PATH+=output:venv/{PYTHON_VENV_EXECUTABLE_DIRECTORY};TRAIL_PYTHON=tool:python3|python"
+                    "PIP_CACHE_DIR=cache:python-downloads/pip;UV_CACHE_DIR=cache:python-downloads/uv;VIRTUAL_ENV=direct:venv;TRAIL_VENV_PYTHON=direct:venv/{PYTHON_VENV_EXECUTABLE};PATH+=direct:venv/{PYTHON_VENV_EXECUTABLE_DIRECTORY};TRAIL_PYTHON=tool:python3|python"
                 ),
             ),
         ]);
-        let source_resolution = python_source_resolution(db, source_root, &component_root)?;
-        let managed_snapshot = if source_resolution.is_none() {
-            python_resolution_snapshot(db, source_root, &component_root)?
-        } else {
-            None
-        };
         let mut resolution_inputs = Vec::new();
         let mut source_projection = None;
         let managed_resolution = managed_snapshot.is_some();
+        let install_contract = match source_resolution.as_deref() {
+            Some(path) if path.ends_with("uv.lock") => Some(PythonInstallContract::UvLock),
+            Some(path) if path.ends_with("requirements.lock") => {
+                let entry = db.root_file_entry(source_root, path)?.ok_or_else(|| {
+                    Error::Corrupt(format!("Python resolution input `{path}` disappeared"))
+                })?;
+                validate_python_requirements_snapshot(&db.materialize_entry_bytes(&entry)?)?;
+                Some(PythonInstallContract::HashedRequirements)
+            }
+            Some(path) => {
+                return Err(Error::InvalidInput(format!(
+                    "Python component `{}` uses `{path}`, which is not a frozen install contract; provide uv.lock or a hash-pinned requirements.lock",
+                    display_python_root(&component_root)
+                )));
+            }
+            None if managed_resolution => Some(PythonInstallContract::ManagedHashedRequirements),
+            None => None,
+        };
+        let uv = install_contract
+            .map(|_| resolve_workspace_tool_executable("uv"))
+            .transpose()?;
         if let Some((snapshot_id, snapshot, bytes)) = managed_snapshot {
             let resolution_plan = self
                 .resolution_plan(db, source_root, &component_root)?
@@ -439,6 +466,89 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
         } else {
             Vec::new()
         };
+        let mut mounted_commands = vec![venv_command];
+        if let (Some(contract), Some(uv)) = (install_contract, uv.as_ref()) {
+            let venv_python = mounted_output_relative_placeholder("venv", PYTHON_VENV_EXECUTABLE);
+            let mut args = match contract {
+                PythonInstallContract::UvLock => vec![
+                    "sync".to_string(),
+                    "--frozen".to_string(),
+                    "--no-install-project".to_string(),
+                    "--no-python-downloads".to_string(),
+                    "--active".to_string(),
+                ],
+                PythonInstallContract::HashedRequirements => vec![
+                    "pip".to_string(),
+                    "sync".to_string(),
+                    "--require-hashes".to_string(),
+                    "--python".to_string(),
+                    venv_python,
+                    "requirements.lock".to_string(),
+                ],
+                PythonInstallContract::ManagedHashedRequirements => vec![
+                    "pip".to_string(),
+                    "sync".to_string(),
+                    "--require-hashes".to_string(),
+                    "--offline".to_string(),
+                    "--find-links".to_string(),
+                    download_cache
+                        .storage_path
+                        .join("wheels")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "--python".to_string(),
+                    venv_python,
+                    mounted_resolution_input_placeholder(&join_python_path(
+                        &component_root,
+                        "requirements.lock",
+                    )),
+                ],
+            };
+            args.shrink_to_fit();
+            mounted_commands.push(WorkspaceEnvironmentCommand {
+                program: "uv".to_string(),
+                resolved_program: uv.path.clone(),
+                executable_identity: uv.identity.clone(),
+                args,
+                working_directory: component_root.clone(),
+                environment: BTreeMap::from([
+                    (
+                        "PIP_CACHE_DIR".to_string(),
+                        download_cache
+                            .storage_path
+                            .join("pip")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "UV_CACHE_DIR".to_string(),
+                        download_cache
+                            .storage_path
+                            .join("uv")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    ("UV_NO_PROGRESS".to_string(), "1".to_string()),
+                    ("UV_LINK_MODE".to_string(), "copy".to_string()),
+                    ("UV_PYTHON_DOWNLOADS".to_string(), "never".to_string()),
+                    (
+                        "VIRTUAL_ENV".to_string(),
+                        mounted_output_placeholder("venv"),
+                    ),
+                ]),
+                remove_environment: Vec::new(),
+                cache_names: Vec::new(),
+            });
+        }
+        key_inputs.insert(
+            "mounted_action".to_string(),
+            workspace_mounted_commands_identity(&mounted_commands)?,
+        );
+        let mut tool_versions =
+            BTreeMap::from([("python-executable".to_string(), python.identity.clone())]);
+        if let Some(uv) = &uv {
+            tool_versions.insert("uv-executable".to_string(), uv.identity.clone());
+        }
         Ok(WorkspaceEnvironmentPlan {
             component_id,
             adapter_identity: self.identity().to_string(),
@@ -453,14 +563,11 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 adapter: self.layer_adapter_name().to_string(),
                 adapter_version: 1,
                 inputs: key_inputs,
-                tool_versions: BTreeMap::from([(
-                    "python-executable".to_string(),
-                    python.identity.clone(),
-                )]),
+                tool_versions,
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
                 portability_scope: "lane-private-host-python".to_string(),
-                strategy: "python-venv-private-mounted-init-v2".to_string(),
+                strategy: "python-venv-private-direct-init-v5".to_string(),
             },
             inputs,
             resolution_inputs,
@@ -468,10 +575,11 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
             source_projection,
             pre_commands,
             // Python virtual environments commonly embed absolute interpreter
-            // and prefix paths, so the host initializes this output through
-            // an ephemeral candidate view mounted at the final lane path.
+            // and prefix paths. The host initializes the candidate's physical
+            // private upper, then binds that exact path into managed commands;
+            // the conventional `.venv` path remains visible in the lane view.
             command: None,
-            mounted_commands: vec![mounted_command],
+            mounted_commands,
             caches: vec![download_cache],
             external_artifacts: Vec::new(),
             runtime_resources: Vec::new(),
@@ -538,13 +646,34 @@ fn validate_python_requirements_snapshot(bytes: &[u8]) -> Result<()> {
         Error::InvalidInput("Trail-managed Python requirements snapshot is not UTF-8".to_string())
     })?;
     let mut has_requirement = false;
+    let mut current_requirement_hashed = true;
     for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') || line.starts_with("--hash=sha256:") {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(hash) = line.strip_prefix("--hash=sha256:") {
+            let hash = hash.trim_end_matches('\\').trim();
+            if !has_requirement
+                || hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(Error::InvalidInput(
+                    "Trail-managed Python requirements snapshot contains an invalid or unbound SHA-256 hash"
+                        .to_string(),
+                ));
+            }
+            current_requirement_hashed = true;
             continue;
         }
         if line.starts_with('-') || line.contains(" @ ") {
             return Err(Error::InvalidInput(
                 "Trail-managed Python requirements snapshot contains an unpinned directive or URL"
+                    .to_string(),
+            ));
+        }
+        if has_requirement && !current_requirement_hashed {
+            return Err(Error::InvalidInput(
+                "Trail-managed Python requirements snapshot contains packages without SHA-256 hashes"
                     .to_string(),
             ));
         }
@@ -555,8 +684,13 @@ fn validate_python_requirements_snapshot(bytes: &[u8]) -> Result<()> {
                     .to_string(),
             ));
         }
+        current_requirement_hashed = line
+            .split_whitespace()
+            .filter_map(|token| token.strip_prefix("--hash=sha256:"))
+            .map(|hash| hash.trim_end_matches('\\'))
+            .any(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
-    if has_requirement && !text.contains("--hash=sha256:") {
+    if has_requirement && !current_requirement_hashed {
         return Err(Error::InvalidInput(
             "Trail-managed Python requirements snapshot contains packages without SHA-256 hashes"
                 .to_string(),
@@ -581,6 +715,60 @@ fn resolve_python_executable() -> Result<super::workspace_environment::ResolvedW
         "Python adapter requires `python3` or `python` on PATH: {}",
         errors.join("; ")
     )))
+}
+
+fn resolve_python_executable_for_source(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<super::workspace_environment::ResolvedWorkspaceTool> {
+    let version_path = join_python_path(component_root, ".python-version");
+    let Some(entry) = db.root_file_entry(source_root, &version_path)? else {
+        return resolve_python_executable();
+    };
+    let version_bytes = db.materialize_entry_bytes(&entry)?;
+    let selector = python_version_selector(&version_bytes)?;
+    let program = format!("python{selector}");
+    resolve_workspace_tool_executable(&program).map_err(|error| {
+        Error::InvalidInput(format!(
+            "Python component `{}` pins `{selector}` in `{version_path}`, but `{program}` is unavailable on PATH: {error}",
+            display_python_root(component_root)
+        ))
+    })
+}
+
+fn python_version_selector(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidInput(".python-version must be UTF-8".to_string()))?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let raw = lines.next().ok_or_else(|| {
+        Error::InvalidInput(".python-version must contain one Python version".to_string())
+    })?;
+    if lines.next().is_some()
+        || raw.len() > 64
+        || raw
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && !matches!(ch, '.' | '-' | '_'))
+    {
+        return Err(Error::InvalidInput(
+            ".python-version must contain one bounded, portable Python version selector"
+                .to_string(),
+        ));
+    }
+    let numeric = raw.strip_prefix("cpython-").unwrap_or(raw);
+    let mut parts = numeric.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.chars().all(|ch| ch.is_ascii_digit())
+        || !minor.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(Error::InvalidInput(format!(
+            "unsupported Python version selector `{raw}`; use a CPython major.minor or major.minor.patch version"
+        )));
+    }
+    Ok(format!("{major}.{minor}"))
 }
 
 fn normalize_python_component_root(component_root: &str) -> Result<String> {
@@ -647,10 +835,114 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("without SHA-256"));
+        assert!(validate_python_requirements_snapshot(
+            b"first==1 --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsecond==2\n"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("without SHA-256"));
+        assert!(
+            validate_python_requirements_snapshot(b"example==1 --hash=sha256:not-a-digest\n")
+                .unwrap_err()
+                .to_string()
+                .contains("without SHA-256")
+        );
+        assert!(validate_python_requirements_snapshot(
+            b"--hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("invalid or unbound"));
         assert!(validate_python_requirements_snapshot(b"-e ../example\n")
             .unwrap_err()
             .to_string()
             .contains("directive or URL"));
+    }
+
+    #[test]
+    fn python_version_file_selects_a_portable_major_minor_executable() {
+        assert_eq!(python_version_selector(b"3.12\n").unwrap(), "3.12");
+        assert_eq!(
+            python_version_selector(b"cpython-3.13.2\n").unwrap(),
+            "3.13"
+        );
+        assert!(python_version_selector(b"3.12\n3.13\n").is_err());
+        assert!(python_version_selector(b"../python\n").is_err());
+        assert!(python_version_selector(b"pypy-3.11\n").is_err());
+    }
+
+    #[test]
+    fn python_plan_rejects_unfrozen_requirements_instead_of_creating_an_empty_venv() {
+        if resolve_python_executable().is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("pyproject.toml"),
+            "[project]\nname = \"unfrozen\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("requirements.txt"), "pytest>=8\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "unfrozen",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let error = db
+            .plan_workspace_environment("unfrozen", "python", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a frozen install contract"), "{error}");
+        assert!(error.contains("requirements.lock"), "{error}");
+    }
+
+    #[test]
+    fn python_hashed_requirements_plan_uses_uv_hash_enforcement_and_direct_output() {
+        if resolve_python_executable().is_err() || resolve_workspace_tool_executable("uv").is_err()
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("pyproject.toml"),
+            "[project]\nname = \"hashed\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("requirements.lock"),
+            "example==1 --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "hashed",
+            Some("main"),
+            LaneWorkdirMode::Virtual,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let plan = db
+            .plan_workspace_environment("hashed", "python", None)
+            .unwrap();
+        let install = &plan.commands[1];
+        assert_eq!(install.program, "uv");
+        assert!(install.args.iter().any(|arg| arg == "--require-hashes"));
+        assert!(install.args.iter().any(|arg| arg == "requirements.lock"));
+        let expected_python = format!("{{trail-mounted-output:venv:{PYTHON_VENV_EXECUTABLE}}}");
+        assert!(install.args.iter().any(|arg| arg == &expected_python));
     }
 
     #[test]
@@ -740,9 +1032,11 @@ mod tests {
         assert_eq!(plan.caches.len(), 1);
         assert_eq!(plan.caches[0].protocol, "content_store");
         assert_eq!(plan.caches[0].authority, "performance_only");
-        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(plan.commands.len(), 3);
         assert_eq!(plan.commands[0].phase, "staging");
         assert_eq!(plan.commands[1].phase, "mounted_initialization");
+        assert_eq!(plan.commands[2].phase, "mounted_initialization");
+        assert_eq!(plan.commands[2].program, "uv");
         assert!(!workspace.path().join("requirements.lock").exists());
         assert!(db
             .root_file_entry(&source_root, "requirements.lock")
@@ -842,8 +1136,9 @@ mod tests {
     }
 
     #[test]
-    fn python_venv_is_keyed_private_and_initialized_at_the_mounted_lane() {
-        if resolve_python_executable().is_err() {
+    fn python_venv_is_keyed_private_and_initialized_in_the_private_upper() {
+        if resolve_python_executable().is_err() || resolve_workspace_tool_executable("uv").is_err()
+        {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();
@@ -883,17 +1178,26 @@ mod tests {
         let plan = db
             .plan_workspace_environment("python", "trail/python-venv@1", None)
             .unwrap();
-        assert_eq!(plan.commands.len(), 1);
+        assert_eq!(plan.commands.len(), 2);
         assert_eq!(plan.commands[0].phase, "mounted_initialization");
+        assert_eq!(plan.commands[1].phase, "mounted_initialization");
+        assert_eq!(plan.commands[1].program, "uv");
+        assert!(plan.commands[1].args.iter().any(|arg| arg == "--frozen"));
         #[cfg(target_os = "macos")]
         assert_eq!(
             plan.commands[0].args,
-            ["-m", "venv", "--without-pip", "--copies", ".venv"]
+            [
+                "-m",
+                "venv",
+                "--without-pip",
+                "--copies",
+                "{trail-mounted-output:venv}"
+            ]
         );
         #[cfg(not(target_os = "macos"))]
         assert_eq!(
             plan.commands[0].args,
-            ["-m", "venv", "--without-pip", ".venv"]
+            ["-m", "venv", "--without-pip", "{trail-mounted-output:venv}"]
         );
         assert_eq!(plan.outputs[0].mount_path, ".venv");
         assert_eq!(
@@ -1106,8 +1410,10 @@ mod tests {
         #[cfg(any(target_os = "linux", windows))]
         let mounted = db.mount_fuse_cow_workdir_for_lane("python-all").unwrap();
         let workdir = PathBuf::from(db.lane_workdir("python-all").unwrap().workdir.unwrap());
+        let paths = db.workspace_view_paths_for_lane("python-all").unwrap();
         for component in ["services/api", "services/worker"] {
             let venv = workdir.join(component).join(".venv");
+            let direct_venv = paths.generated_upper.join(component).join(".venv");
             assert!(venv.join("pyvenv.cfg").is_file());
             #[cfg(windows)]
             let executable = venv.join("Scripts/python.exe");
@@ -1121,12 +1427,12 @@ mod tests {
             #[cfg(windows)]
             assert_eq!(
                 fs::canonicalize(String::from_utf8(prefix.stdout).unwrap().trim()).unwrap(),
-                fs::canonicalize(&venv).unwrap()
+                fs::canonicalize(&direct_venv).unwrap()
             );
             #[cfg(not(windows))]
             assert_eq!(
                 String::from_utf8(prefix.stdout).unwrap().trim(),
-                venv.to_string_lossy()
+                direct_venv.to_string_lossy()
             );
         }
         drop(mounted);
@@ -1134,7 +1440,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn real_python_venvs_embed_lane_paths_and_remain_isolated() {
+    fn real_python_venvs_use_direct_private_bindings_and_remain_isolated() {
         #[cfg(target_os = "linux")]
         if std::env::var_os("TRAIL_RUN_FUSE_COW_TESTS").as_deref() != Some(OsStr::new("1")) {
             return;
@@ -1188,21 +1494,14 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(
-                Path::new(&environment["VIRTUAL_ENV"]),
-                workdir.join(".venv")
-            );
+            let paths = db.workspace_view_paths_for_lane(lane).unwrap();
+            let direct_venv = paths.generated_upper.join(".venv");
+            assert_eq!(Path::new(&environment["VIRTUAL_ENV"]), direct_venv);
             assert_eq!(
                 Path::new(&environment["TRAIL_VENV_PYTHON"]),
-                workdir.join(".venv/bin/python")
+                direct_venv.join("bin/python")
             );
-            assert_eq!(
-                std::env::split_paths(OsStr::new(&environment["PATH"]))
-                    .next()
-                    .unwrap(),
-                workdir.join(".venv/bin")
-            );
-            let venv_python = workdir.join(".venv/bin/python");
+            let venv_python = direct_venv.join("bin/python");
             let prefix = Command::new(&venv_python)
                 .args(["-c", "import sys; print(sys.prefix)"])
                 .current_dir(&workdir)
@@ -1211,7 +1510,7 @@ mod tests {
             assert!(prefix.status.success());
             assert_eq!(
                 String::from_utf8(prefix.stdout).unwrap().trim(),
-                workdir.join(".venv").to_string_lossy()
+                direct_venv.to_string_lossy()
             );
             if lane == "python-a" {
                 fs::write(workdir.join(".venv/lane-a.txt"), "private\n").unwrap();
@@ -1281,7 +1580,13 @@ mod tests {
             assert!(prefix.status.success());
             let actual_prefix =
                 fs::canonicalize(String::from_utf8(prefix.stdout).unwrap().trim()).unwrap();
-            let expected_prefix = fs::canonicalize(workdir.join(".venv")).unwrap();
+            let expected_prefix = fs::canonicalize(
+                db.workspace_view_paths_for_lane(lane)
+                    .unwrap()
+                    .generated_upper
+                    .join(".venv"),
+            )
+            .unwrap();
             assert_eq!(actual_prefix, expected_prefix);
             if lane == "python-a" {
                 fs::write(workdir.join(".venv/lane-a.txt"), "private\n").unwrap();

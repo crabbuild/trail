@@ -99,9 +99,9 @@ The other built-ins use the same lane handoff:
 trail env sync all agent-a
 trail lane exec agent-a -- sh -c '"$TRAIL_GO" test ./...'
 
-# Python: a lane-private, path-correct virtual environment.
+# Python: a frozen, lane-private virtual environment bound outside mounted I/O.
 trail env sync all agent-a
-trail lane exec agent-a -- sh -c '"$TRAIL_VENV_PYTHON" -m compileall -q .'
+trail lane exec agent-a -- sh -c '"$TRAIL_VENV_PYTHON" -m pytest -q tests/test_line.py'
 
 # CMake: configure and build outside the NFS/FUSE/Dokan transport.
 trail env sync all agent-a
@@ -112,11 +112,21 @@ trail lane exec agent-a -- sh -c '
 ```
 
 Go binds `GOMODCACHE`, `GOCACHE`, `TRAIL_GO`, and a local-toolchain/offline
-vendor policy. Python binds `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `VIRTUAL_ENV`,
-`TRAIL_VENV_PYTHON`, and the venv executable directory. CMake binds the exact
+vendor policy. Python accepts `uv.lock`, hash-pinned `requirements.lock`, or a
+verified Trail-managed hashed snapshot; binds `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+`VIRTUAL_ENV`, `TRAIL_VENV_PYTHON`, and the direct private venv executable
+directory; and rejects unfrozen install inputs. CMake binds the exact
 host executable as `TRAIL_CMAKE` and a lane-private direct build path as
 `TRAIL_CMAKE_BUILD_DIR`. A login shell may replace `PATH`; use the absolute
 `TRAIL_*` executable variables in automated lane commands.
+
+For release evidence, `scripts/verify-real-framework-handoff.sh` runs pinned
+bbolt, Polymarket CLOB client, uuid, tappy, or LevelDB through Agent A → B → C.
+The checker requires each child to start at its parent's semantic checkpoint,
+real typecheck/test/build behavior to pass before and after each deterministic
+production/test edit, stable dependency identities for source-only changes,
+fresh private Python/CMake outputs, exact source checkpoint paths, and CMake
+object/link evidence that rejects a stale build.
 
 The framework-neutral TOML above is executable as `trail.environment.toml`.
 Create its declared input, record it, and run:

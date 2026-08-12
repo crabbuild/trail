@@ -203,8 +203,8 @@ target, platform, or build-policy changes remain hard compatibility misses.
 Managed command bindings are adapter-owned rather than Cargo-specific. Active
 Go components receive shared module/build caches and an exact `TRAIL_GO`;
 Node components receive package-manager caches plus a direct private
-`TRAIL_NODE_MODULES`; Python components receive a lane-private `VIRTUAL_ENV`
-and `TRAIL_VENV_PYTHON`; and CMake components receive a direct lane-private
+`TRAIL_NODE_MODULES`; Python components receive a direct lane-private
+`VIRTUAL_ENV`, venv `PATH`, and `TRAIL_VENV_PYTHON`; and CMake components receive a direct lane-private
 `TRAIL_CMAKE_BUILD_DIR`. Inactive frameworks inject no cache, tool, or output
 variables into the command.
 

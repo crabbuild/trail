@@ -62,7 +62,7 @@ pub(crate) fn classify_view_path(path: &str) -> ViewPathClass {
     if components.iter().any(|component| {
         matches!(
             *component,
-            "target" | "dist" | "build" | "coverage" | ".next" | ".turbo"
+            "target" | "dist" | "dist-node" | "build" | "coverage" | ".next" | ".turbo"
         )
     }) {
         return ViewPathClass::Generated;
@@ -152,6 +152,10 @@ mod tests {
         );
         assert_eq!(
             classify_view_path("crates/core/target/debug/core"),
+            ViewPathClass::Generated
+        );
+        assert_eq!(
+            classify_view_path("dist-node/test/version.test.js"),
             ViewPathClass::Generated
         );
         assert_eq!(classify_view_path(".env.local"), ViewPathClass::Secret);

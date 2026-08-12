@@ -15,7 +15,29 @@ impl Trail {
         view: &LaneWorkspaceViewReport,
         source_root: &ObjectId,
     ) -> Result<Option<WorkspaceGitShadowReport>> {
-        if let Some(shadow) = self.workspace_git_shadow(view)? {
+        self.ensure_git_shadow(&view.view_id, &view.mountpoint, source_root)
+    }
+
+    pub(crate) fn ensure_materialized_lane_git_shadow(
+        &self,
+        lane_id: &str,
+        work_tree: &Path,
+        source_root: &ObjectId,
+    ) -> Result<Option<WorkspaceGitShadowReport>> {
+        self.ensure_git_shadow(
+            &format!("materialized-{lane_id}"),
+            &work_tree.to_string_lossy(),
+            source_root,
+        )
+    }
+
+    fn ensure_git_shadow(
+        &self,
+        shadow_id: &str,
+        work_tree: &str,
+        source_root: &ObjectId,
+    ) -> Result<Option<WorkspaceGitShadowReport>> {
+        if let Some(shadow) = self.git_shadow(shadow_id, work_tree)? {
             return self.refresh_workspace_git_shadow(&shadow).map(Some);
         }
         let pinned_head = self
@@ -31,7 +53,7 @@ impl Trail {
         };
         let common_dir = git_real_common_dir(&self.workspace_root)?;
         let object_dir = common_dir.join("objects").canonicalize()?;
-        let git_dir = self.db_dir.join("git-shadows").join(&view.view_id);
+        let git_dir = self.db_dir.join("git-shadows").join(shadow_id);
         if git_dir.exists() && fs::read_dir(&git_dir)?.next().transpose()?.is_some() {
             return Err(Error::InvalidInput(format!(
                 "Git shadow directory `{}` contains untracked recovery state",
@@ -69,45 +91,49 @@ impl Trail {
         )?;
         git_shadow_command(
             &git_dir,
-            Path::new(&view.mountpoint),
+            Path::new(work_tree),
             &["config", "core.bare", "false"],
         )?;
         git_shadow_command(
             &git_dir,
-            Path::new(&view.mountpoint),
-            &["config", "core.worktree", &view.mountpoint],
+            Path::new(work_tree),
+            &["config", "core.worktree", work_tree],
         )?;
         git_shadow_command(
             &git_dir,
-            Path::new(&view.mountpoint),
+            Path::new(work_tree),
             &["config", "advice.detachedHead", "false"],
         )?;
-        git_shadow_command(
-            &git_dir,
-            Path::new(&view.mountpoint),
-            &["read-tree", &pinned_head],
-        )?;
+        git_shadow_command(&git_dir, Path::new(work_tree), &["read-tree", &pinned_head])?;
         let now = now_ts();
         self.conn.execute(
             "INSERT INTO workspace_git_shadows (view_id, git_dir, policy, pinned_head, current_head, status, created_at, updated_at) VALUES (?1, ?2, 'status', ?3, ?3, 'ready', ?4, ?4)",
-            params![view.view_id, git_dir.to_string_lossy(), pinned_head, now],
+            params![shadow_id, git_dir.to_string_lossy(), pinned_head, now],
         )?;
-        self.workspace_git_shadow(view)
+        self.git_shadow(shadow_id, work_tree)
     }
 
     pub(crate) fn workspace_git_shadow(
         &self,
         view: &LaneWorkspaceViewReport,
     ) -> Result<Option<WorkspaceGitShadowReport>> {
+        self.git_shadow(&view.view_id, &view.mountpoint)
+    }
+
+    fn git_shadow(
+        &self,
+        shadow_id: &str,
+        work_tree: &str,
+    ) -> Result<Option<WorkspaceGitShadowReport>> {
         self.conn
             .query_row(
                 "SELECT view_id, git_dir, policy, pinned_head, current_head, status, updated_at FROM workspace_git_shadows WHERE view_id = ?1",
-                params![view.view_id],
+                params![shadow_id],
                 |row| {
                     Ok(WorkspaceGitShadowReport {
                         view_id: row.get(0)?,
                         git_dir: row.get(1)?,
-                        work_tree: view.mountpoint.clone(),
+                        work_tree: work_tree.to_string(),
                         policy: row.get(2)?,
                         pinned_head: row.get(3)?,
                         current_head: row.get(4)?,

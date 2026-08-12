@@ -1232,6 +1232,23 @@ pub struct AgentRunReport {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<ManagedExecutionLifecycleReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<AgentLaunchContainmentReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentLaunchContainmentReport {
+    pub profile: String,
+    pub project_integrations: String,
+    pub environment_policy: String,
+    pub sandbox_backend: String,
+    pub filesystem_enforcement: String,
+    pub lane_root: String,
+    pub git_work_tree: Option<String>,
+    pub protected_roots: Vec<String>,
+    pub writable_roots: Vec<String>,
+    pub ambient_repository_variables_scrubbed: bool,
+    pub original_checkout_unchanged: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

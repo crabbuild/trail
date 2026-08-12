@@ -24,14 +24,15 @@ generation activation. The first built-ins are:
   lane so its source path names the stable lane workdir rather than disposable staging;
   the writable build directory is bound directly from the generated upper so configure,
   compilation, and tests do not route build-tree metadata through NFS/FUSE/Dokan;
-- `trail/python-venv@1`: recognizes `pyproject.toml` and the common uv, Poetry, PDM,
-  Pipenv, and requirements lock/manifest files, provisions a layer-free lane-private
-  `.venv`, and keys it by every present dependency file plus the resolved Python
-  executable. An optional uv-generated hash-bearing requirements snapshot remains Trail
-  metadata and warms a shared performance-only wheel/download cache. Trail automatically
-  creates the virtual environment through an ephemeral candidate view at the lane's final
-  mountpoint, so scripts, bytecode, and prefix metadata stay private and embed the correct
-  absolute path without exposing partial state;
+- `trail/python-venv@1`: recognizes `pyproject.toml`, `.python-version`, and common
+  lock/manifest markers, but installs only from `uv.lock`, hash-pinned
+  `requirements.lock`, or a verified Trail-managed hashed snapshot. Other recognized
+  formats return explicit unsupported-contract guidance. It provisions a layer-free
+  lane-private `.venv`, keys it by every present dependency file plus the selected
+  Python and uv executable identities, and warms a shared performance-only download
+  cache. Trail creates and installs the environment in an ephemeral candidate's
+  physical private upper, then exposes direct bindings so scripts, bytecode, and prefix
+  metadata stay private without routing venv I/O through the mounted source transport;
 - `trail/oci-image@1`: reads `trail.oci.toml`, accepts only lowercase SHA-256
   digest-pinned OCI references with an explicit platform, and records provider-owned
   image identities without commands, caches, mounts, or manufactured directories;
@@ -1306,26 +1307,37 @@ delete a user-owned image, container, volume, or remote builder cache.
 
 The experimental `trail/python-venv@1` built-in implements the safe baseline today. It
 owns `<component>/.venv` as `writable_private`, publishes no shared layer, and preserves
-the directory across a compatible re-sync. Synchronization automatically runs
-`python -m venv --without-pip .venv` at the lane's final mountpoint:
+the directory across a compatible re-sync. If `.python-version` is present, Trail
+selects its CPython major/minor executable from `PATH`; otherwise it resolves
+`python3`/`python`. Synchronization creates a copy-based virtual environment in the
+physical lane-private generated upper and installs only from a frozen contract:
 
 ```sh
-trail env sync component python.venv --lane <lane> --adapter trail/python-venv@1
-# Optionally let a lockfile-aware tool populate the initialized private path:
-trail lane exec <lane> -- uv sync --frozen
+trail env sync component python-venv --lane <lane> --adapter trail/python-venv@1
+trail lane exec <lane> -- "$TRAIL_VENV_PYTHON" -m pytest
 ```
 
-Mounted initialization never runs against the active lane upper. Trail constructs an
+The supported install contracts are `uv.lock`, a hash-pinned
+`requirements.lock`, or a verified Trail-managed hash-bearing requirements snapshot.
+`uv.lock` uses `uv sync --frozen --no-install-project`; requirements snapshots use
+`uv pip sync --require-hashes`. A plain `requirements.txt`, Poetry/PDM/Pipenv lock, or
+unhashed requirements file is rejected until an adapter can implement its exact frozen
+installation semantics.
+
+Initialization never runs against the active lane upper. Trail constructs an
 ephemeral candidate view with the pinned source root, desired immutable bindings, and
-prepared private seeds; source and unrelated writes land in disposable uppers. After
-the command succeeds, Trail rejects every write outside the newly prepared private
-outputs, copies those outputs back to staging, and performs the ordinary atomic
-generation activation. A non-zero exit, undeclared write, process kill, or host crash
-therefore leaves the predecessor generation and its private upper unchanged. Recovery
-also removes abandoned candidate directories.
+prepared private seeds. Host-expanded output references direct the interpreter and uv
+to the candidate's physical private upper, avoiding metadata-heavy venv I/O through
+FUSE/NFS/Dokan while source reads retain lane semantics. Source and unrelated writes
+land in disposable uppers. After the command succeeds, Trail rejects every write
+outside the newly prepared private outputs, copies those outputs back to staging, and
+performs the ordinary atomic generation activation. A non-zero exit, undeclared write,
+process kill, or host crash therefore leaves the predecessor generation and its private
+upper unchanged. Recovery also removes abandoned candidate directories. Initializer
+stderr is drained, bounded to 64 KiB, secret-redacted, and included on failure.
 
 Real Linux/FUSE, macOS/NFS, and Windows/Dokan conformance creates two virtual
-environments, verifies that `sys.prefix` identifies each mounted lane, mutates one
+environments, verifies that `sys.prefix` identifies each direct private upper, mutates one
 environment, and requires the other lane to remain unchanged. It also verifies that a
 compatible re-sync preserves the private environment and creates no shared layer.
 Additional native fixtures cover multi-component `env sync all`, initializer failure,
@@ -1335,9 +1347,10 @@ An optional resolver plan pins the complete source root, exact uv executable, of
 hash-generation policy, and `pyproject.toml`, then stores the resulting
 `requirements.lock` as verified environment metadata. The host projects it only into
 attempt staging and runs hash-required `pip download` into a host-owned
-`cache_shared_content` namespace. Evicting that cache affects performance only. Trail
-still must not represent a path-bearing virtual environment, its bytecode, or embedded
-scripts as a portable immutable artifact without relocation validation.
+`cache_shared_content` namespace before the mounted initializer performs an offline,
+hash-required `uv pip sync`. Evicting that cache affects performance only. Trail still
+must not represent a path-bearing virtual environment, its bytecode, or embedded scripts
+as a portable immutable artifact without relocation validation.
 
 | Concern | Inputs | Policy/binding |
 | --- | --- | --- |

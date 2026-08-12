@@ -357,6 +357,8 @@ fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
+        .env("MCP_CONFIG", "/escaped/project/mcp.json")
+        .env("CODEX_THREAD_ID", "escaped-thread")
         .args([
             "agent",
             "start",
@@ -389,6 +391,9 @@ fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
         .any(|line| line == format!("TRAIL_WORKSPACE={}", workspace.display())));
     assert!(environment
         .lines()
+        .any(|line| line == format!("TRAIL_AGENT_ROOT={workdir}")));
+    assert!(environment
+        .lines()
         .any(|line| line.starts_with("TRAIL_LANE=lane_")));
     assert!(environment
         .lines()
@@ -401,6 +406,15 @@ fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
                     .any(|path| path == workspace.to_string_lossy())
             })
     }));
+    assert_eq!(report["containment"]["profile"], "custom-compatibility-v1");
+    assert_eq!(
+        report["containment"]["environment_policy"],
+        "compatibility-inherited"
+    );
+    assert_eq!(
+        report["containment"]["ambient_repository_variables_scrubbed"],
+        false
+    );
 }
 
 #[cfg(unix)]
@@ -424,10 +438,25 @@ fn terminal_agent_start_disables_claude_project_integrations_unless_explicitly_a
     let settings = install["config_path"].as_str().unwrap().to_string();
 
     let bin = tempfile::tempdir().unwrap();
+    let host_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(host_home.path().join(".claude")).unwrap();
+    fs::write(
+        host_home.path().join(".claude/settings.json"),
+        serde_json::json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "secret-settings-token",
+                "ANTHROPIC_BASE_URL": "https://contained.example.invalid",
+                "MCP_CONFIG": "/escaped/settings/mcp.json"
+            },
+            "enabledPlugins": {"escaped-plugin": true}
+        })
+        .to_string(),
+    )
+    .unwrap();
     let fake_claude = bin.path().join("claude");
     fs::write(
         &fake_claude,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" | tee CLAUDE_ARGS.txt >&2\n",
+        "#!/bin/sh\nprintf 'HOME=%s\\n' \"$HOME\" >&2\nprintf 'TRAIL_AGENT_ROOT=%s\\n' \"$TRAIL_AGENT_ROOT\" >&2\nprintf 'CLAUDE_CODE_TMPDIR=%s\\n' \"$CLAUDE_CODE_TMPDIR\" >&2\nif test -n \"${MCP_CONFIG+x}\"; then printf 'MCP_CONFIG_LEAKED=yes\\n' >&2; fi\nif test -n \"${CODEX_THREAD_ID+x}\"; then printf 'CODEX_THREAD_ID_LEAKED=yes\\n' >&2; fi\nif test \"${ANTHROPIC_AUTH_TOKEN:-}\" = secret-settings-token && test \"${ANTHROPIC_BASE_URL:-}\" = https://contained.example.invalid; then printf 'CLAUDE_SETTINGS_AUTH_AVAILABLE=yes\\n' >&2; fi\nif test -n \"${CLAUDE_CODE_OAUTH_TOKEN:-}\"; then printf 'CLAUDE_OAUTH_AVAILABLE=yes\\n' >&2; fi\nprintf '%s\\n' \"$@\" | tee CLAUDE_ARGS.txt >&2\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&fake_claude).unwrap().permissions();
@@ -443,6 +472,10 @@ fn terminal_agent_start_disables_claude_project_integrations_unless_explicitly_a
         .arg(temp.path())
         .arg("--json")
         .env("PATH", &path)
+        .env("HOME", host_home.path())
+        .env("MCP_CONFIG", "/escaped/project/mcp.json")
+        .env("CODEX_THREAD_ID", "escaped-thread")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "secret-test-token")
         .args([
             "agent",
             "start",
@@ -462,20 +495,49 @@ fn terminal_agent_start_disables_claude_project_integrations_unless_explicitly_a
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "--safe-mode\n--strict-mcp-config\n"
-    );
+    let workdir = report["workdir"].as_str().unwrap();
+    let environment = String::from_utf8_lossy(&output.stderr);
+    assert!(environment.lines().any(|line| line == "--safe-mode"));
+    assert!(environment
+        .lines()
+        .any(|line| line == "--strict-mcp-config"));
+    assert!(environment.lines().any(|line| line == "--no-chrome"));
+    assert!(environment.lines().any(|line| line == "--permission-mode"));
+    assert!(environment.lines().any(|line| line == "acceptEdits"));
+    assert!(environment
+        .lines()
+        .any(|line| line == "CLAUDE_OAUTH_AVAILABLE=yes"));
+    assert!(environment
+        .lines()
+        .any(|line| line == "CLAUDE_SETTINGS_AUTH_AVAILABLE=yes"));
+    assert!(!environment.contains("secret-test-token"));
+    assert!(!environment.contains("secret-settings-token"));
     assert_eq!(
         report["lifecycle"]["checkpoint"]["source_paths"],
         serde_json::json!(["CLAUDE_ARGS.txt"])
     );
+    assert!(environment
+        .lines()
+        .any(|line| line == format!("TRAIL_AGENT_ROOT={workdir}")));
+    assert!(!environment
+        .lines()
+        .any(|line| line == "MCP_CONFIG_LEAKED=yes"));
+    assert!(!environment
+        .lines()
+        .any(|line| line == "CODEX_THREAD_ID_LEAKED=yes"));
+    assert!(!environment
+        .lines()
+        .any(|line| line == format!("HOME={}", host_home.path().display())));
+    assert!(environment.lines().any(|line| {
+        line.starts_with("CLAUDE_CODE_TMPDIR=") && line.contains("/.trail/tmp/agent-launches/")
+    }));
 
     let allowed = Command::new(trail_bin())
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
         .env("PATH", path)
+        .env("HOME", host_home.path())
         .args([
             "agent",
             "start",
@@ -495,9 +557,73 @@ fn terminal_agent_start_disables_claude_project_integrations_unless_explicitly_a
         String::from_utf8_lossy(&allowed.stdout),
         String::from_utf8_lossy(&allowed.stderr)
     );
+    assert!(String::from_utf8_lossy(&allowed.stderr)
+        .lines()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|lines| lines == ["--settings", settings.as_str()]));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_start_applies_the_contained_codex_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    let host_home = tempfile::tempdir().unwrap();
+    let fake_codex = bin.path().join("codex");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" | tee CODEX_ARGS.txt >&2\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("PATH", path)
+        .env("HOME", host_home.path())
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "codex",
+            "--name",
+            "contained-codex",
+            "--workdir-mode",
+            "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = report["workdir"].as_str().unwrap();
     assert_eq!(
-        String::from_utf8_lossy(&allowed.stderr),
-        format!("--settings\n{settings}\n")
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "--strict-config\n--cd\n{workdir}\n--sandbox\nworkspace-write\n--config\nmcp_servers={{}}\n"
+        )
+    );
+    assert_eq!(report["containment"]["profile"], "codex-contained-v1");
+    assert_eq!(report["containment"]["project_integrations"], "disabled");
+    assert_eq!(
+        report["lifecycle"]["checkpoint"]["source_paths"],
+        serde_json::json!(["CODEX_ARGS.txt"])
     );
 }
 
@@ -509,27 +635,40 @@ fn terminal_agent_native_cow_does_not_discover_or_write_the_parent_git_checkout(
     }
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
+    fs::write(
+        temp.path().join(".trailignore"),
+        ".trail/\n.git/\n.env\n.env.*\n*.pem\n*.key\n*.p12\n*.pfx\nid_rsa\nid_ed25519\nnode_modules/\ntarget/\ndist/\nbuild/\ncoverage/\n",
+    )
+    .unwrap();
     run_git(temp.path(), &["init", "-q"]);
     run_git(temp.path(), &["config", "user.email", "trail@example.com"]);
     run_git(temp.path(), &["config", "user.name", "Trail Test"]);
-    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["add", "README.md", ".trailignore"]);
     run_git(temp.path(), &["commit", "-qm", "baseline"]);
     Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
 
-    let provider = tempfile::NamedTempFile::new().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let host_home = tempfile::tempdir().unwrap();
+    let provider = bin.path().join("claude");
     fs::write(
-        provider.path(),
-        "#!/bin/sh\nset -eu\nprintf 'lane change\\n' > LANE_ONLY.md\nif root=$(git rev-parse --show-toplevel 2>/dev/null); then\n  printf 'escaped\\n' > \"$root/ESCAPED.md\"\nfi\n",
+        &provider,
+        "#!/bin/sh\nset -eu\nprintf 'lane change\n' > LANE_ONLY.md\nif root=$(git rev-parse --show-toplevel 2>/dev/null); then\n  printf 'escaped\n' > \"$root/ESCAPED.md\"\nfi\n",
     )
     .unwrap();
-    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    let mut permissions = fs::metadata(&provider).unwrap().permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(provider.path(), permissions).unwrap();
+    fs::set_permissions(&provider, permissions).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
 
     let output = Command::new(trail_bin())
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
+        .env("PATH", path)
+        .env("HOME", host_home.path())
         .args([
             "agent",
             "start",
@@ -539,9 +678,7 @@ fn terminal_agent_native_cow_does_not_discover_or_write_the_parent_git_checkout(
             "containment",
             "--workdir-mode",
             "native-cow",
-            "--",
         ])
-        .arg(provider.path())
         .output()
         .unwrap();
     assert!(
@@ -557,9 +694,18 @@ fn terminal_agent_native_cow_does_not_discover_or_write_the_parent_git_checkout(
         "root baseline\n"
     );
     assert!(!temp.path().join("ESCAPED.md").exists());
+    assert!(!temp.path().join("ESCAPED_ORIGINAL.md").exists());
     assert_eq!(
         fs::read_to_string(workdir.join("LANE_ONLY.md")).unwrap(),
         "lane change\n"
+    );
+    assert_eq!(
+        report["containment"]["git_work_tree"],
+        workdir.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        report["containment"]["original_checkout_unchanged"],
+        cfg!(target_os = "macos")
     );
     assert!(report["recorded"]["changed_paths"]
         .as_array()

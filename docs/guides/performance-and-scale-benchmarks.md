@@ -122,9 +122,10 @@ scripts/cli-scale-bench.sh
 
 Framework adapters have a separate opt-in macOS qualification matrix. Each row
 fetches an exact upstream revision, uses the candidate Trail binary, and moves
-three native NFS lanes through a source edit, environment synchronization, and
-real framework check. The gate covers bbolt/Go, date-fns/pnpm, uuid/npm,
-httpx/Python virtual environments, and LevelDB/CMake:
+three transparent-COW lanes through deterministic production-and-test edits,
+environment synchronization, and real framework checks. The pinned matrix uses
+bbolt/Go, Polymarket's CLOB TypeScript client/pnpm, uuid/npm, tappy/Python, and
+LevelDB/CMake:
 
 ```sh
 TRAIL_BIN=/absolute/path/to/trail \
@@ -136,14 +137,20 @@ scripts/verify-real-framework-handoff.sh go
 Valid selectors are `go`, `pnpm`, `npm`, `python`, and `cmake`. The output
 and optional work directories must not exist. When omitted, the work directory
 defaults to `<evidence>.work` and remains outside the uploaded evidence set.
+macOS defaults to `nfs-cow`; prepared hosts can set
+`TRAIL_FRAMEWORK_WORKDIR_MODE=fuse-cow` or `dokan-cow` to qualify another
+transparent backend.
 `evidence.json` pins the repository/revision, three
 distinct source roots, active component keys, layer identities, cache
-namespaces, lane-private output identities, and SHA-256 digests of every raw
-Trail report. The checker requires each edit to checkpoint only `README.md`,
-each child to inherit its parent's active generation before editing, and every
-framework command to pass. Go additionally requires compatible-predecessor
-seeding with nonzero avoided bytes; npm/pnpm require one exact immutable layer;
-Python and CMake require three distinct writable-private outputs.
+namespaces, lane-private output contracts, and SHA-256 digests of every raw
+Trail report. The checker requires each edit to checkpoint only the expected
+framework production and test paths, B to start from A's semantic checkpoint,
+C to start from B's, and parent and edited semantics to pass. Go additionally
+requires compatible-predecessor seeding with nonzero avoided bytes; npm/pnpm
+require one exact immutable dependency layer; Python/CMake require fresh
+lane-private outputs with stable dependency/build identity. The CMake row also
+hashes affected and unaffected objects, requires selective recompilation, and
+links/runs a marker executable so stale output cannot pass.
 
 Dispatch `layered-workspaces.yml` with
 `run_real_framework_handoffs=true` to run all five rows on clean macOS hosts

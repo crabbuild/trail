@@ -4423,6 +4423,7 @@ impl Trail {
                         command,
                         Path::new(&view.mountpoint),
                         &process_root,
+                        &candidate_layout,
                     )?;
                     command_index += 1;
                 }
@@ -4514,6 +4515,7 @@ impl Trail {
         command_plan: &WorkspaceEnvironmentCommand,
         mountpoint: &Path,
         process_root: &Path,
+        candidate_layout: &ViewUpperLayout,
     ) -> Result<()> {
         let working_directory = if command_plan.working_directory.is_empty() {
             mountpoint.to_path_buf()
@@ -4537,10 +4539,23 @@ impl Trail {
                 command_plan.program
             )));
         }
+        let trusted_launcher_args =
+            if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
+                Some(self.materialize_mounted_command_args(
+                    plan,
+                    command_plan,
+                    process_root,
+                    candidate_layout,
+                )?)
+            } else {
+                None
+            };
         let (launcher, launcher_args) = match plan.sandbox_policy {
             WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin => (
                 command_plan.resolved_program.clone(),
-                command_plan.args.iter().map(OsString::from).collect(),
+                trusted_launcher_args.ok_or_else(|| {
+                    Error::Corrupt("trusted mounted initializer lost its arguments".to_string())
+                })?,
             ),
             WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted => {
                 // Reuse the native recipe sandbox with the candidate mount as
@@ -4605,18 +4620,31 @@ impl Trail {
             }
         };
         let mut command = Command::new(launcher);
+        let command_environment =
+            if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
+                command_plan
+                    .environment
+                    .iter()
+                    .map(|(name, value)| {
+                        materialize_mounted_output_value(plan, candidate_layout, value)
+                            .map(|value| (name.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?
+            } else {
+                command_plan.environment.clone()
+            };
         command
             .args(launcher_args)
             .current_dir(&working_directory)
             .env_clear()
-            .envs(&command_plan.environment)
+            .envs(command_environment)
             .env("HOME", &isolated_home)
             .env("TMPDIR", &isolated_tmp)
             .env("TMP", &isolated_tmp)
             .env("TEMP", &isolated_tmp)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin {
             command
                 .env("TRAIL_WORKSPACE", self.workspace_root())
@@ -4636,29 +4664,108 @@ impl Trail {
         for name in &command_plan.remove_environment {
             command.env_remove(name);
         }
+        let mut child = command.spawn().map_err(|err| {
+            Error::InvalidInput(format!(
+                "failed to launch mounted initializer `{}` for component `{}`: {err}",
+                command_plan.program, plan.component_id
+            ))
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            Error::Corrupt(format!(
+                "mounted initializer for component `{}` lost its diagnostic pipe",
+                plan.component_id
+            ))
+        })?;
+        let diagnostic = spawn_bounded_environment_command_diagnostic(stderr);
         let status =
             if plan.sandbox_policy == WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted {
-                run_supervised_mounted_plugin_process(&mut command).map_err(|err| {
+                wait_for_supervised_mounted_plugin_process(&mut child).map_err(|err| {
                     Error::InvalidInput(format!(
                         "failed to supervise mounted initializer `{}` for component `{}`: {err}",
                         command_plan.program, plan.component_id
                     ))
                 })?
             } else {
-                command.status().map_err(|err| {
-                    Error::InvalidInput(format!(
-                        "failed to launch mounted initializer `{}` for component `{}`: {err}",
-                        command_plan.program, plan.component_id
-                    ))
-                })?
+                child.wait()?
             };
+        let diagnostic = diagnostic
+            .join()
+            .map_err(|_| {
+                Error::Corrupt(format!(
+                    "mounted initialization diagnostic reader for component `{}` panicked",
+                    plan.component_id
+                ))
+            })?
+            .map_err(Error::Io)?;
         if !status.success() {
+            let diagnostic_text =
+                redact_sensitive_text(&String::from_utf8_lossy(&diagnostic.bytes));
+            let diagnostic_text = diagnostic_text.trim();
+            let details = if diagnostic_text.is_empty() {
+                String::new()
+            } else if diagnostic.truncated {
+                format!(": {diagnostic_text} [truncated]")
+            } else {
+                format!(": {diagnostic_text}")
+            };
             return Err(Error::InvalidInput(format!(
-                "mounted initialization for component `{}` failed with {status}; the previous environment generation remains active",
-                plan.component_id
+                "mounted initialization for component `{}` failed with {status}{details}; the previous environment generation remains active",
+                plan.component_id,
             )));
         }
         Ok(())
+    }
+
+    fn materialize_mounted_command_args(
+        &self,
+        plan: &WorkspaceEnvironmentPlan,
+        command: &WorkspaceEnvironmentCommand,
+        process_root: &Path,
+        candidate_layout: &ViewUpperLayout,
+    ) -> Result<Vec<OsString>> {
+        let input_root = process_root.join("resolution-inputs");
+        command
+            .args
+            .iter()
+            .map(|arg| {
+                if mounted_output_reference(arg).is_some() {
+                    return materialize_mounted_output_value(plan, candidate_layout, arg)
+                        .map(OsString::from);
+                }
+                let Some(source_path) = mounted_resolution_input_source(arg) else {
+                    return Ok(OsString::from(arg));
+                };
+                let input = plan
+                    .resolution_inputs
+                    .iter()
+                    .find(|input| input.source_path == source_path)
+                    .ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "component `{}` mounted initializer references missing resolution input `{source_path}`",
+                            plan.component_id
+                        ))
+                    })?;
+                let (snapshot, bytes) =
+                    self.artifact_resolution_snapshot_content_by_id(&input.snapshot_id)?;
+                if snapshot.content_sha256 != input.content_hash
+                    || snapshot.source_root != input.source_root
+                    || snapshot.component_id != plan.component_id
+                    || snapshot.adapter_identity != plan.adapter_identity
+                    || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != input.size_bytes
+                {
+                    return Err(Error::Corrupt(format!(
+                        "component `{}` mounted resolution input `{source_path}` changed after planning",
+                        plan.component_id
+                    )));
+                }
+                let path = safe_join(&input_root, source_path)?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_file_atomic(&path, &bytes, false)?;
+                Ok(path.into_os_string())
+            })
+            .collect()
     }
 
     fn writable_private_outputs_are_compatible(
@@ -6430,10 +6537,9 @@ fn read_bounded_resolver_pipe<R: Read>(
     })
 }
 
-fn run_supervised_mounted_plugin_process(
-    command: &mut Command,
+fn wait_for_supervised_mounted_plugin_process(
+    child: &mut std::process::Child,
 ) -> Result<std::process::ExitStatus> {
-    let mut child = command.spawn()?;
     let child_pid = child.id();
     let child_start_token = match process_start_token(child_pid) {
         Some(token) => token,
@@ -6506,6 +6612,67 @@ pub(crate) fn workspace_mounted_commands_identity(
         })
         .collect::<Vec<_>>();
     Ok(sha256_hex(&serde_json::to_vec(&commands)?))
+}
+
+const MOUNTED_RESOLUTION_INPUT_PREFIX: &str = "{trail-resolution-input:";
+const MOUNTED_OUTPUT_PREFIX: &str = "{trail-mounted-output:";
+
+pub(crate) fn mounted_resolution_input_placeholder(source_path: &str) -> String {
+    format!("{MOUNTED_RESOLUTION_INPUT_PREFIX}{source_path}}}")
+}
+
+fn mounted_resolution_input_source(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(MOUNTED_RESOLUTION_INPUT_PREFIX)
+        .and_then(|value| value.strip_suffix('}'))
+}
+
+pub(crate) fn mounted_output_placeholder(output_name: &str) -> String {
+    format!("{MOUNTED_OUTPUT_PREFIX}{output_name}}}")
+}
+
+pub(crate) fn mounted_output_relative_placeholder(
+    output_name: &str,
+    relative_path: &str,
+) -> String {
+    format!("{MOUNTED_OUTPUT_PREFIX}{output_name}:{relative_path}}}")
+}
+
+fn mounted_output_reference(value: &str) -> Option<(&str, Option<&str>)> {
+    let reference = value
+        .strip_prefix(MOUNTED_OUTPUT_PREFIX)
+        .and_then(|value| value.strip_suffix('}'))?;
+    Some(match reference.split_once(':') {
+        Some((output_name, relative_path)) => (output_name, Some(relative_path)),
+        None => (reference, None),
+    })
+}
+
+fn materialize_mounted_output_value(
+    plan: &WorkspaceEnvironmentPlan,
+    candidate_layout: &ViewUpperLayout,
+    value: &str,
+) -> Result<String> {
+    let Some((output_name, relative_path)) = mounted_output_reference(value) else {
+        return Ok(value.to_string());
+    };
+    let output = plan
+        .outputs
+        .iter()
+        .find(|output| output.name == output_name)
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "component `{}` mounted initializer references missing output `{output_name}`",
+                plan.component_id
+            ))
+        })?;
+    let class = environment_upper_class(&plan.kind)?;
+    let root = safe_join(candidate_layout.upper_for_class(class), &output.mount_path)?;
+    let path = match relative_path {
+        Some(relative_path) => safe_join(&root, relative_path)?,
+        None => root,
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn environment_upper_class(kind: &str) -> Result<ViewPathClass> {
