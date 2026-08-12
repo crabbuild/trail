@@ -65,110 +65,17 @@ impl Trail {
         right_root_id: &ObjectId,
         probes: &mut RenameLookupProbes,
     ) -> Result<Vec<FileDiffSummary>> {
-        let left_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, left_root_id)?;
-        let right_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, right_root_id)?;
-        let left_tree = root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
-        let right_tree = root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
-        let diffs = self
-            .root_prolly
-            .range_diff(&left_tree, &right_tree, &[], None)?;
-
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        let mut changed = Vec::new();
-        for diff in diffs {
-            match diff {
-                Diff::Added { key, val } => {
-                    added.push((path_from_key(key)?, from_cbor::<FileEntry>(&val)?));
-                }
-                Diff::Removed { key, val } => {
-                    removed.push((path_from_key(key)?, from_cbor::<FileEntry>(&val)?));
-                }
-                Diff::Changed { key, old, new } => {
-                    changed.push((
-                        path_from_key(key)?,
-                        from_cbor::<FileEntry>(&old)?,
-                        from_cbor::<FileEntry>(&new)?,
-                    ));
-                }
-            }
-        }
-
-        added.sort_by(|left, right| left.0.cmp(&right.0));
-        removed.sort_by(|left, right| left.0.cmp(&right.0));
-        changed.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut summaries = Vec::new();
-        let mut removed_by_identity = RenameMatchIndex::default();
-        for (path, entry) in &removed {
-            removed_by_identity.insert(path.clone(), entry.clone());
-        }
-
-        let mut consumed_removed = HashSet::new();
-        for (path, new_entry) in added {
-            probes.note_lookup();
-            let rename = removed_by_identity.take(&new_entry);
-            if let Some((old_path, old_entry)) = rename {
-                consumed_removed.insert(old_path.clone());
-                summaries.push(file_diff_summary(
-                    path,
-                    Some(old_path),
-                    FileChangeKind::Renamed,
-                    Some(old_entry.content_hash),
-                    Some(new_entry.content_hash),
-                ));
-                continue;
-            }
-
-            summaries.push(file_diff_summary(
-                path,
-                None,
-                FileChangeKind::Added,
-                None,
-                Some(new_entry.content_hash),
-            ));
-        }
-
-        for (path, old_entry) in removed {
-            if consumed_removed.contains(&path) {
-                continue;
-            }
-            summaries.push(file_diff_summary(
-                path,
-                None,
-                FileChangeKind::Deleted,
-                Some(old_entry.content_hash),
-                None,
-            ));
-        }
-
-        for (path, old_entry, new_entry) in changed {
-            if old_entry.content_hash == new_entry.content_hash
-                && old_entry.executable == new_entry.executable
-                && old_entry.kind == new_entry.kind
-            {
-                continue;
-            }
-            let kind = if old_entry.kind != new_entry.kind {
-                FileChangeKind::TypeChanged
-            } else {
-                FileChangeKind::Modified
-            };
-            summaries.push(file_diff_summary(
-                path,
-                None,
-                kind,
-                Some(old_entry.content_hash),
-                Some(new_entry.content_hash),
-            ));
-        }
-
-        summaries.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.old_path.cmp(&right.old_path))
-        });
-        Ok(summaries)
+        let mut patch_left = BTreeMap::new();
+        let mut patch_right = BTreeMap::new();
+        Ok(self
+            .diff_root_file_maps_indexed(
+                left_root_id,
+                right_root_id,
+                &mut patch_left,
+                &mut patch_right,
+                probes,
+            )?
+            .summaries)
     }
 
     pub(crate) fn diff_root_file_maps(
@@ -344,29 +251,36 @@ fn path_from_key(key: Vec<u8>) -> Result<String> {
     String::from_utf8(key).map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))
 }
 
-fn file_diff_summary(
-    path: String,
-    old_path: Option<String>,
-    kind: FileChangeKind,
-    before_hash: Option<String>,
-    after_hash: Option<String>,
-) -> FileDiffSummary {
-    FileDiffSummary {
-        path,
-        old_path,
-        kind,
-        before_hash,
-        after_hash,
-        additions: 0,
-        deletions: 0,
-        line_changes: Vec::new(),
-        patch: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_diff_summaries_include_text_line_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("example.txt"), "before\nkept\n").unwrap();
+        let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        fs::write(temp.path().join("example.txt"), "after\nkept\n").unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let record = db
+            .record(
+                Some("main"),
+                Some("replace line".into()),
+                Actor::human(),
+                false,
+            )
+            .unwrap();
+
+        let summaries = db
+            .diff_root_file_summaries(&init.root_id, &record.root_id)
+            .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].path, "example.txt");
+        assert_eq!(summaries[0].additions, 1);
+        assert_eq!(summaries[0].deletions, 1);
+    }
 
     #[test]
     fn root_diff_rename_matching_is_linear_for_same_content() {

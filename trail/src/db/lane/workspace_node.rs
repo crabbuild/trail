@@ -417,6 +417,19 @@ impl Trail {
         let node_version = tool_version("node")?;
         let node_tool = resolve_workspace_tool_executable("node")?;
         let manager_tool = resolve_workspace_tool_executable(&manager)?;
+        if manager == "pnpm"
+            && self
+                .root_file_entry(
+                    root_id,
+                    &join_repo_path(&package_root, "pnpm-workspace.yaml"),
+                )?
+                .is_some()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Node component `{}` is a pnpm workspace root; synchronize a supported leaf package with its own lockfile until the monorepo adapter is enabled",
+                display_package_root(&package_root)
+            )));
+        }
         if package_value.get("workspaces").is_some() {
             return Err(Error::InvalidInput(format!(
                 "Node component `{}` declares workspaces; synchronize a supported leaf package explicitly until the monorepo adapter is enabled",
@@ -1026,18 +1039,10 @@ mod tests {
         if resolve_workspace_tool_executable("node").is_ok()
             && resolve_workspace_tool_executable("pnpm").is_ok()
         {
-            let plan = db
+            let error = db
                 .plan_workspace_environment("node-workspace", "node", None)
-                .unwrap();
-            assert_eq!(
-                plan.commands[0].args,
-                [
-                    "install",
-                    "--ignore-workspace",
-                    "--frozen-lockfile",
-                    "--ignore-scripts"
-                ]
-            );
+                .unwrap_err();
+            assert!(error.to_string().contains("is a pnpm workspace root"));
         }
     }
 

@@ -142,6 +142,41 @@ impl Trail {
                 return Err(error);
             }
         };
+        if view.is_none() && !discovered.components.is_empty() {
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "discover_plan",
+                "succeeded",
+                None,
+                Some(serde_json::json!({
+                    "component_count": discovered.components.len(),
+                    "graph_nodes": 0,
+                    "graph_edges": 0,
+                })),
+            )?;
+            let error = Error::InvalidInput(format!(
+                "lane `{lane}` declares workspace environments but uses a materialized workdir; create the lane with `--workdir-mode auto` (or an explicit layered COW backend) before resolving or running its environment"
+            ));
+            self.push_managed_execution_phase(
+                &mut phases,
+                &branch.lane_id,
+                &execution_id,
+                surface,
+                &command_fingerprint,
+                "discover_plan",
+                "failed",
+                Some(&error.to_string()),
+                Some(serde_json::json!({
+                    "required_workdir_mode": "layered_cow",
+                    "recommended_workdir_mode": "auto",
+                })),
+            )?;
+            return Err(error);
+        }
         let resolution_pins = self.managed_execution_resolution_pins(&discovered)?;
         if let Some(unresolved) = resolution_pins
             .iter()
@@ -171,38 +206,6 @@ impl Trail {
                     "resolution_pins": resolution_pins,
                     "recovery_command": unresolved.recovery_command,
                 })),
-            )?;
-            return Err(error);
-        }
-        if view.is_none() && !discovered.components.is_empty() {
-            self.push_managed_execution_phase(
-                &mut phases,
-                &branch.lane_id,
-                &execution_id,
-                surface,
-                &command_fingerprint,
-                "discover_plan",
-                "succeeded",
-                None,
-                Some(serde_json::json!({
-                    "component_count": discovered.components.len(),
-                    "graph_nodes": 0,
-                    "graph_edges": 0,
-                })),
-            )?;
-            let error = Error::InvalidInput(format!(
-                "lane `{lane}` declares workspace environments but does not use a layered COW workdir"
-            ));
-            self.push_managed_execution_phase(
-                &mut phases,
-                &branch.lane_id,
-                &execution_id,
-                surface,
-                &command_fingerprint,
-                "sync_all",
-                "failed",
-                Some(&error.to_string()),
-                None,
             )?;
             return Err(error);
         }
@@ -525,7 +528,7 @@ impl Trail {
         {
             Ok(Some(result)) => result,
             Ok(None) => {
-                let environment = vec![
+                let mut environment = vec![
                     (
                         "TRAIL_WORKSPACE".to_string(),
                         self.workspace_root.to_string_lossy().into_owned(),
@@ -533,6 +536,24 @@ impl Trail {
                     ("TRAIL_LANE".to_string(), branch.lane_id.clone()),
                     ("TRAIL_SOURCE_ROOT".to_string(), head.root_id.0.clone()),
                 ];
+                if let Some(shadow) = self.ensure_materialized_lane_git_shadow(
+                    &branch.lane_id,
+                    &workdir,
+                    &head.root_id,
+                )? {
+                    environment.extend([
+                        ("GIT_DIR".to_string(), shadow.git_dir.clone()),
+                        ("GIT_WORK_TREE".to_string(), shadow.work_tree.clone()),
+                        (
+                            "GIT_INDEX_FILE".to_string(),
+                            Path::new(&shadow.git_dir)
+                                .join("index")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        ("TRAIL_GIT_SHADOW_HEAD".to_string(), shadow.pinned_head),
+                    ]);
+                }
                 (environment, Vec::new())
             }
             Err(error) => {
@@ -1864,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_preparation_requires_explicit_resolution_with_exact_recovery() {
+    fn managed_preparation_rejects_materialized_environment_before_resolution() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("Cargo.toml"),
@@ -1894,11 +1915,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains(
-            "managed execution requires explicit resolution for environment component `cargo-target-seed` (resolvable)"
+            "lane `needs-resolution` declares workspace environments but uses a materialized workdir"
         ));
-        assert!(error
-            .to_string()
-            .contains("trail env resolve component cargo-target-seed --lane needs-resolution"));
+        assert!(error.to_string().contains("--workdir-mode auto"));
+        assert!(!error.to_string().contains("trail env resolve"));
     }
 
     #[test]

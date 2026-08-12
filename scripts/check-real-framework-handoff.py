@@ -11,6 +11,16 @@ from typing import Any
 
 
 LANES = ("agent-a", "agent-b", "agent-c")
+SOURCE_PATHS = {
+    "go": ["version/version.go", "version/version_test.go"],
+    "pnpm": [
+        "src/constants.ts",
+        "tests/http-helpers/index.test.ts",
+    ],
+    "npm": ["src/test/version.test.ts", "src/version.ts"],
+    "python": ["src/tap/line.py", "tests/test_line.py"],
+    "cmake": ["util/hash.cc", "util/hash.h"],
+}
 
 
 def load_report(raw: Path, name: str) -> dict[str, Any]:
@@ -45,12 +55,17 @@ def check_evidence(
         raise AssertionError(f"unsupported framework {framework!r}")
     raw = evidence_dir / "raw"
     generations = [load_report(raw, f"generation-{lane}") for lane in LANES]
+    before_generations = [
+        load_report(raw, f"generation-before-edit-{lane}") for lane in LANES
+    ]
     syncs = [load_report(raw, f"sync-{lane}") for lane in LANES]
     spawns = [load_report(raw, f"spawn-{lane}") for lane in LANES]
+    prechecks = [load_report(raw, f"precheck-{lane}") for lane in LANES]
     edits = [load_report(raw, f"edit-{lane}") for lane in LANES]
     checks = [load_report(raw, f"check-{lane}") for lane in LANES]
     components = [select_component(generation, component_id) for generation in generations]
     workdirs = [spawn["workdir"] for spawn in spawns]
+    workdir_modes = [spawn.get("workdir_mode") for spawn in spawns]
 
     if not all(generation["state"] == "active" for generation in generations):
         raise AssertionError("all final generations must be active")
@@ -58,12 +73,26 @@ def check_evidence(
         raise AssertionError("A, B, and C must have distinct source roots")
     if len(set(workdirs)) != 3 or any(not Path(workdir).is_absolute() for workdir in workdirs):
         raise AssertionError("A, B, and C must have distinct absolute lane workdirs")
-    if not all(check["exit_code"] == 0 for check in checks):
-        raise AssertionError("every framework check must exit successfully")
+    if len(set(workdir_modes)) != 1 or workdir_modes[0] not in {
+        "fuse-cow",
+        "nfs-cow",
+        "dokan-cow",
+    }:
+        raise AssertionError(
+            f"A, B, and C must use one transparent-COW backend: {workdir_modes!r}"
+        )
+    if not all(report["exit_code"] == 0 for report in [*prechecks, *checks]):
+        raise AssertionError("every parent and edited framework check must exit successfully")
+    for lane, report in zip(LANES, [*prechecks], strict=True):
+        checkpoint = report["lifecycle"]["checkpoint"]
+        if checkpoint["source_paths"]:
+            raise AssertionError(
+                f"{lane} parent build checkpointed source paths: {checkpoint!r}"
+            )
     generated_dirty_paths = []
     for lane, edit in zip(LANES, edits, strict=True):
         checkpoint = edit["lifecycle"]["checkpoint"]
-        if checkpoint["source_paths"] != ["README.md"]:
+        if checkpoint["source_paths"] != SOURCE_PATHS[framework]:
             raise AssertionError(f"{lane} checkpointed unexpected source paths: {checkpoint!r}")
         generated_dirty = checkpoint["generated_dirty_paths"]
         if not isinstance(generated_dirty, int) or generated_dirty < 0:
@@ -71,6 +100,23 @@ def check_evidence(
                 f"{lane} reported invalid generated-path accounting: {checkpoint!r}"
             )
         generated_dirty_paths.append(generated_dirty)
+    for lane, report in zip(LANES, checks, strict=True):
+        checkpoint = report["lifecycle"]["checkpoint"]
+        if checkpoint["source_paths"]:
+            raise AssertionError(
+                f"{lane} edited build checkpointed source paths: {checkpoint!r}"
+            )
+
+    for child_index, child in enumerate(LANES[1:], start=1):
+        parent_operation = edits[child_index - 1]["lifecycle"]["checkpoint"]["operation"]
+        if spawns[child_index]["base_change"] != parent_operation:
+            raise AssertionError(
+                f"{child} did not start from its parent semantic checkpoint"
+            )
+    for lane, generation, edit in zip(LANES, generations, edits, strict=True):
+        checkpoint = edit["lifecycle"]["checkpoint"]
+        if generation["source_root"] != checkpoint["root_id"]:
+            raise AssertionError(f"{lane} final generation is not pinned to its edited source")
 
     cache_namespaces = [
         {cache["name"]: cache["namespace_id"] for cache in item["caches"]}
@@ -134,9 +180,7 @@ def check_evidence(
         if shared_outputs:
             if not isinstance(inheritance, dict) or inheritance.get("status") != "inherited":
                 raise AssertionError(f"{child} did not report inherited outputs: {inheritance!r}")
-            inherited = select_component(
-                load_report(raw, f"generation-before-edit-{child}"), component_id
-            )
+            inherited = select_component(before_generations[child_index], component_id)
             parent = select_component(parent_generation, component_id)
             if inherited["component_key"] != parent["component_key"]:
                 raise AssertionError(f"{child} did not inherit its parent component key")
@@ -167,6 +211,21 @@ def check_evidence(
                 raise AssertionError(
                     f"{child} did not require a fresh lane-private output: {decisions!r}"
                 )
+            before = select_component(before_generations[child_index], component_id)
+            parent = select_component(parent_generation, component_id)
+            if before["component_key"] != parent["component_key"]:
+                raise AssertionError(
+                    f"{child} private environment changed dependency identity before its edit"
+                )
+            if before["caches"] != parent["caches"]:
+                raise AssertionError(f"{child} private environment lost parent caches")
+
+    first_before = select_component(before_generations[0], component_id)
+    if framework == "go":
+        if first_before["component_key"] == components[0]["component_key"]:
+            raise AssertionError("Go source-sensitive vendor identity did not change after edit")
+    elif first_before["component_key"] != components[0]["component_key"]:
+        raise AssertionError("source-only edit changed dependency/build environment identity")
 
     raw_hashes = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -175,18 +234,13 @@ def check_evidence(
     expected_names = {
         "init.json",
         *(f"spawn-{lane}.json" for lane in LANES),
+        *(f"precheck-{lane}.json" for lane in LANES),
+        *(f"generation-before-edit-{lane}.json" for lane in LANES),
         *(f"edit-{lane}.json" for lane in LANES),
         *(f"sync-{lane}.json" for lane in LANES),
         *(f"check-{lane}.json" for lane in LANES),
         *(f"generation-{lane}.json" for lane in LANES),
     }
-    if shared_outputs:
-        expected_names.update(
-            {
-                "generation-before-edit-agent-b.json",
-                "generation-before-edit-agent-c.json",
-            }
-        )
     if set(raw_hashes) != expected_names:
         raise AssertionError(
             f"raw evidence set mismatch: missing={sorted(expected_names - set(raw_hashes))!r} "
@@ -194,11 +248,11 @@ def check_evidence(
         )
 
     return {
-        "schema": "trail.real-framework-handoff/v1",
+        "schema": "trail.real-framework-handoff/v2",
         "framework": framework,
         "repository": repository,
         "revision": revision,
-        "backend": "nfs-cow",
+        "backend": workdir_modes[0],
         "lanes": list(LANES),
         "workdirs": workdirs,
         "component_id": component_id,
@@ -210,9 +264,16 @@ def check_evidence(
         "generated_dirty_paths": generated_dirty_paths,
         "assertions": {
             "three_distinct_source_roots": True,
+            "each_child_spawned_from_parent_semantic_checkpoint": True,
             "shared_parent_generation_inherited_before_each_child_edit": shared_outputs,
             "private_outputs_reprovisioned_per_child_lane": not shared_outputs,
-            "exactly_one_readme_source_path_per_edit": True,
+            "exact_framework_source_and_test_paths_per_edit": True,
+            "parent_semantics_valid_before_each_edit": True,
+            "edited_semantics_valid_after_each_edit": True,
+            "dependency_identity_stable_for_source_independent_adapters": framework != "go",
+            "go_vendor_identity_tracks_source_sensitive_vendor_inputs": framework == "go",
+            "cmake_incremental_recompile_and_link_behavior_verified": framework == "cmake",
+            "stale_framework_output_rejected_by_lane_marker": True,
             "generated_paths_excluded_from_source_checkpoint": True,
             "all_framework_checks_passed": True,
             "framework_reuse_contract_passed": True,

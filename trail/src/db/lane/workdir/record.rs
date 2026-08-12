@@ -338,7 +338,12 @@ impl Trail {
         } else if workdir_mode.is_transparent_cow() {
             // Derive the delta from the persistent upper layer instead of an
             // FUSE/NFS READDIR result or a scan of the composed repository.
-            let candidates = self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
+            let mut candidates =
+                self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
+            self.apply_recording_policy_to_transparent_cow_candidates(
+                &head.root_id,
+                &mut candidates,
+            )?;
             upper_recovery_walks = candidates.upper_recovery_walks;
             generated_dirty_paths = candidates
                 .generated_paths
@@ -960,6 +965,23 @@ impl Trail {
         }
     }
 
+    fn apply_recording_policy_to_transparent_cow_candidates(
+        &self,
+        root_id: &ObjectId,
+        candidates: &mut ViewCheckpointCandidates,
+    ) -> Result<()> {
+        let paths = candidates.paths.iter().cloned().collect::<Vec<_>>();
+        let baseline = self.load_root_files_for_paths(root_id, &paths)?;
+        let policy = self.workspace_ignore_policy_snapshot();
+        for path in paths {
+            if !baseline.contains_key(&path) && policy.check_with_is_dir(&path, false)?.ignored {
+                candidates.paths.remove(&path);
+                candidates.generated_paths.insert(path);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn lane_cached_workdir_manifest_status(
         &self,
         workdir_path: &Path,
@@ -1046,11 +1068,13 @@ impl Trail {
         let lane_record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
         if workdir_mode.is_transparent_cow() {
-            let candidate_paths = self
-                .transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?
-                .paths
-                .into_iter()
-                .collect::<Vec<_>>();
+            let mut candidates =
+                self.transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?;
+            self.apply_recording_policy_to_transparent_cow_candidates(
+                &head.root_id,
+                &mut candidates,
+            )?;
+            let candidate_paths = candidates.paths.into_iter().collect::<Vec<_>>();
             let source_upper = self
                 .workspace_view_paths_for_lane(&lane_record.name)?
                 .source_upper;
@@ -1478,4 +1502,38 @@ fn ensure_lane_record_message_has_no_secrets(message: Option<&str>) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_cow_candidates_apply_workspace_ignore_policy_at_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(".trailignore"), "custom-output/**\n").unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let root_id = db.resolve_branch_ref("main").unwrap().root_id;
+        let mut candidates = ViewCheckpointCandidates {
+            journal_sequence: 2,
+            paths: BTreeSet::from([
+                "custom-output/result.js".to_string(),
+                "src/lib.rs".to_string(),
+            ]),
+            generated_paths: BTreeSet::new(),
+            qualified: true,
+            upper_recovery_walks: 0,
+        };
+
+        db.apply_recording_policy_to_transparent_cow_candidates(&root_id, &mut candidates)
+            .unwrap();
+
+        assert_eq!(candidates.paths, BTreeSet::from(["src/lib.rs".to_string()]));
+        assert_eq!(
+            candidates.generated_paths,
+            BTreeSet::from(["custom-output/result.js".to_string()])
+        );
+    }
 }

@@ -1,6 +1,8 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use trail::agent_hooks::{
     apply_agent_hook_install_plan, build_agent_hook_install_plan, inspect_agent_hook_installation,
@@ -8,8 +10,9 @@ use trail::agent_hooks::{
     AgentHookInstallRequest, AgentHookInstallScope, AgentProviderRegistry,
 };
 use trail::{
-    AgentCaptureTransport, AgentContinueReport, AgentHookReceiptInput, AgentReviewAction,
-    AgentRunReport, LaneWorkdirMode, StatusSuggestion,
+    AgentCaptureTransport, AgentContinueReport, AgentHookReceiptInput,
+    AgentLaunchContainmentReport, AgentReviewAction, AgentRunReport, LaneWorkdirMode,
+    StatusSuggestion,
 };
 
 pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) -> Result<()> {
@@ -1496,6 +1499,7 @@ fn run_terminal_agent_task(
         None
     };
     let command_is_default = launch.command.is_empty();
+    let contained_launch = command_is_default && !launch.allow_project_integrations;
     let mut command = if command_is_default {
         default_terminal_agent_command(&provider)?
     } else {
@@ -1510,10 +1514,32 @@ fn run_terminal_agent_task(
         } else {
             command.push("--safe-mode".to_string());
             command.push("--strict-mcp-config".to_string());
+            command.push("--no-chrome".to_string());
+            command.push("--permission-mode".to_string());
+            command.push("acceptEdits".to_string());
         }
     }
+    if command_is_default && provider == "codex" && !launch.allow_project_integrations {
+        command.extend([
+            "--strict-config".to_string(),
+            "--cd".to_string(),
+            workdir.clone(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--config".to_string(),
+            "mcp_servers={}".to_string(),
+        ]);
+    }
     let mut managed = db.prepare_managed_lane_execution(&lane, "terminal_agent", &command)?;
+    let launch_runtime = prepare_agent_launch_runtime(db.db_dir(), &provider, contained_launch)?;
     let mut workspace_environment = managed.environment.clone();
+    if contained_launch {
+        for (name, value) in &mut workspace_environment {
+            if name == "TRAIL_WORKSPACE" {
+                *value = workdir.clone();
+            }
+        }
+    }
     workspace_environment.extend([
         ("TRAIL_CAPTURE_MODE".to_string(), "terminal".to_string()),
         (
@@ -1522,13 +1548,41 @@ fn run_terminal_agent_task(
         ),
         (
             "TRAIL_CAPTURE_WORKSPACE".to_string(),
-            db.workspace_root().to_string_lossy().into_owned(),
+            if contained_launch {
+                workdir.clone()
+            } else {
+                db.workspace_root().to_string_lossy().into_owned()
+            },
         ),
         (
             "TRAIL_CAPTURE_LANE".to_string(),
             capture_run.lane_id.clone().unwrap_or_else(|| lane.clone()),
         ),
+        ("TRAIL_AGENT_ROOT".to_string(), workdir.clone()),
+        (
+            "TRAIL_AGENT_LAUNCH_PROFILE".to_string(),
+            agent_launch_profile(&provider, contained_launch).to_string(),
+        ),
+        (
+            "TRAIL_PROJECT_INTEGRATIONS".to_string(),
+            if launch.allow_project_integrations {
+                "allowed"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+        ),
     ]);
+    let ambient_environment = contained_agent_environment(&provider, &launch_runtime);
+    let writable_roots = agent_writable_roots(
+        Path::new(&workdir),
+        launch_runtime.root(),
+        &workspace_environment,
+    )?;
+    let git_work_tree = workspace_environment
+        .iter()
+        .find(|(name, _)| name == "GIT_WORK_TREE")
+        .map(|(_, value)| value.clone());
     let workspace_root = db.workspace_root().to_path_buf();
     drop(db);
 
@@ -1543,8 +1597,14 @@ fn run_terminal_agent_task(
                 &ctx.render,
             )?;
         }
-        let (launch_program, launch_args) =
-            confined_terminal_agent_command(&command, &workspace_root, Path::new(&workdir))?;
+        let (launch_program, launch_args, sandbox_backend, filesystem_enforcement) =
+            confined_terminal_agent_command(
+                &command,
+                &workspace_root,
+                Path::new(&workdir),
+                &writable_roots,
+                contained_launch,
+            )?;
         let mut git_ceiling_directories = std::env::var_os("GIT_CEILING_DIRECTORIES")
             .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -1558,9 +1618,21 @@ fn run_terminal_agent_task(
             std::env::join_paths(git_ceiling_directories).map_err(|error| {
                 Error::InvalidInput(format!("cannot construct Git discovery ceiling: {error}"))
             })?;
-        Ok((launch_program, launch_args, git_ceiling_directories))
+        Ok((
+            launch_program,
+            launch_args,
+            git_ceiling_directories,
+            sandbox_backend,
+            filesystem_enforcement,
+        ))
     })();
-    let (launch_program, launch_args, git_ceiling_directories) = match launch_setup {
+    let (
+        launch_program,
+        launch_args,
+        git_ceiling_directories,
+        sandbox_backend,
+        filesystem_enforcement,
+    ) = match launch_setup {
         Ok(setup) => setup,
         Err(error) => {
             let mut db = open_db(ctx)?;
@@ -1577,10 +1649,38 @@ fn run_terminal_agent_task(
             return Err(error);
         }
     };
+    let containment = AgentLaunchContainmentReport {
+        profile: agent_launch_profile(&provider, contained_launch).to_string(),
+        project_integrations: if launch.allow_project_integrations {
+            "explicitly_allowed"
+        } else {
+            "disabled"
+        }
+        .to_string(),
+        environment_policy: if contained_launch {
+            "clear-and-explicit-v1"
+        } else {
+            "compatibility-inherited"
+        }
+        .to_string(),
+        sandbox_backend,
+        filesystem_enforcement: filesystem_enforcement.clone(),
+        lane_root: workdir.clone(),
+        git_work_tree,
+        protected_roots: vec![workspace_root.to_string_lossy().into_owned()],
+        writable_roots: writable_roots
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+        ambient_repository_variables_scrubbed: contained_launch,
+        original_checkout_unchanged: filesystem_enforcement == "kernel_enforced",
+    };
     let mut process = ProcessCommand::new(launch_program);
+    process.args(launch_args).current_dir(&workdir);
+    if contained_launch {
+        process.env_clear().envs(ambient_environment);
+    }
     process
-        .args(launch_args)
-        .current_dir(&workdir)
         .envs(workspace_environment)
         .env("PWD", &workdir)
         .env("OLDPWD", &workdir)
@@ -1686,6 +1786,7 @@ fn run_terminal_agent_task(
         recorded,
         status: status.to_string(),
         lifecycle: Some(lifecycle),
+        containment: Some(containment),
     };
     Ok(report)
 }
@@ -3650,11 +3751,305 @@ fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {
     trail::acp::terminal_agent_command(provider)
 }
 
+struct AgentLaunchRuntime {
+    _directory: tempfile::TempDir,
+    home: PathBuf,
+    temporary: PathBuf,
+    xdg_config: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_data: PathBuf,
+    xdg_state: PathBuf,
+    codex_home: Option<PathBuf>,
+    provider_environment: Vec<(String, String)>,
+}
+
+impl AgentLaunchRuntime {
+    fn root(&self) -> &Path {
+        self._directory.path()
+    }
+}
+
+fn prepare_agent_launch_runtime(
+    db_dir: &Path,
+    provider: &str,
+    copy_credentials: bool,
+) -> Result<AgentLaunchRuntime> {
+    let parent = db_dir.join("tmp").join("agent-launches");
+    fs::create_dir_all(&parent)?;
+    let directory = tempfile::Builder::new()
+        .prefix("contained-")
+        .tempdir_in(&parent)?;
+    let home = directory.path().join("home");
+    let temporary = directory.path().join("tmp");
+    let xdg_config = directory.path().join("xdg/config");
+    let xdg_cache = directory.path().join("xdg/cache");
+    let xdg_data = directory.path().join("xdg/data");
+    let xdg_state = directory.path().join("xdg/state");
+    for path in [
+        &home,
+        &temporary,
+        &xdg_config,
+        &xdg_cache,
+        &xdg_data,
+        &xdg_state,
+    ] {
+        fs::create_dir_all(path)?;
+    }
+
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut provider_environment = Vec::new();
+    let codex_home = if provider == "codex" {
+        let destination = directory.path().join("codex");
+        fs::create_dir_all(&destination)?;
+        if copy_credentials
+            && let Some(source) = host_home.as_ref().map(|home| home.join(".codex/auth.json"))
+            && source.is_file()
+        {
+            fs::copy(source, destination.join("auth.json"))?;
+        }
+        Some(destination)
+    } else {
+        if copy_credentials
+            && provider == "claude-code"
+            && let Some(host_home) = host_home.as_ref()
+        {
+            let source = host_home.join(".claude.json");
+            if source.is_file() {
+                fs::copy(source, home.join(".claude.json"))?;
+            }
+            provider_environment = claude_user_settings_environment(host_home)?;
+        }
+        None
+    };
+
+    Ok(AgentLaunchRuntime {
+        _directory: directory,
+        home,
+        temporary,
+        xdg_config,
+        xdg_cache,
+        xdg_data,
+        xdg_state,
+        codex_home,
+        provider_environment,
+    })
+}
+
+fn claude_user_settings_environment(host_home: &Path) -> Result<Vec<(String, String)>> {
+    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    const ALLOWED_SETTINGS_ENVIRONMENT: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_FEDERATION_RULE_ID",
+        "ANTHROPIC_ORGANIZATION_ID",
+        "AWS_REGION",
+        "AWS_PROFILE",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUD_ML_REGION",
+    ];
+
+    let path = host_home.join(".claude/settings.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::metadata(&path)?;
+    if metadata.len() > MAX_SETTINGS_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "Claude user settings exceed the {MAX_SETTINGS_BYTES}-byte contained-launch limit: {}",
+            path.display()
+        )));
+    }
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+            Error::InvalidInput(format!(
+                "cannot parse Claude user settings for contained credential import at {}: {error}",
+                path.display()
+            ))
+        })?;
+    let Some(values) = settings.get("env").and_then(serde_json::Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    Ok(ALLOWED_SETTINGS_ENVIRONMENT
+        .iter()
+        .filter_map(|name| {
+            values
+                .get(*name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .collect())
+}
+
+fn contained_agent_environment(
+    provider: &str,
+    runtime: &AgentLaunchRuntime,
+) -> Vec<(String, String)> {
+    let mut environment = BTreeMap::<String, String>::new();
+    environment.extend(runtime.provider_environment.iter().cloned());
+    for name in [
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "LC_ALL",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            environment.insert(name.to_string(), value);
+        }
+    }
+    let credential_names: &[&str] = match provider {
+        "claude-code" => &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_ORGANIZATION_ID",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "GOOGLE_CLOUD_PROJECT",
+            "CLOUD_ML_REGION",
+        ],
+        "codex" => &["OPENAI_API_KEY"],
+        _ => &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ],
+    };
+    for name in credential_names {
+        if let Ok(value) = std::env::var(name) {
+            environment.insert((*name).to_string(), value);
+        }
+    }
+    environment.extend([
+        (
+            "HOME".to_string(),
+            runtime.home.to_string_lossy().into_owned(),
+        ),
+        (
+            "TMPDIR".to_string(),
+            runtime.temporary.to_string_lossy().into_owned(),
+        ),
+        (
+            "TMP".to_string(),
+            runtime.temporary.to_string_lossy().into_owned(),
+        ),
+        (
+            "TEMP".to_string(),
+            runtime.temporary.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            runtime.xdg_config.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_CACHE_HOME".to_string(),
+            runtime.xdg_cache.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_DATA_HOME".to_string(),
+            runtime.xdg_data.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_STATE_HOME".to_string(),
+            runtime.xdg_state.to_string_lossy().into_owned(),
+        ),
+    ]);
+    if let Some(codex_home) = &runtime.codex_home {
+        environment.insert(
+            "CODEX_HOME".to_string(),
+            codex_home.to_string_lossy().into_owned(),
+        );
+    }
+    if provider == "claude-code" {
+        environment.insert(
+            "CLAUDE_CODE_TMPDIR".to_string(),
+            runtime.temporary.to_string_lossy().into_owned(),
+        );
+    }
+    environment.into_iter().collect()
+}
+
+fn agent_launch_profile(provider: &str, contained: bool) -> &str {
+    if !contained {
+        return "custom-compatibility-v1";
+    }
+    match provider {
+        "claude-code" => "claude-code-contained-v1",
+        "codex" => "codex-contained-v1",
+        _ => "generic-contained-v1",
+    }
+}
+
+fn agent_writable_roots(
+    workdir: &Path,
+    runtime_root: &Path,
+    environment: &[(String, String)],
+) -> Result<Vec<PathBuf>> {
+    const PATH_BINDINGS: &[&str] = &[
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "GOCACHE",
+        "GOMODCACHE",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "SCCACHE_DIR",
+        "TRAIL_CMAKE_BUILD_DIR",
+        "TRAIL_NODE_MODULES",
+        "VIRTUAL_ENV",
+        "npm_config_cache",
+        "PNPM_HOME",
+        "PNPM_STORE_DIR",
+        "YARN_CACHE_FOLDER",
+        "BUN_INSTALL_CACHE_DIR",
+    ];
+    let mut roots = vec![fs::canonicalize(workdir)?, fs::canonicalize(runtime_root)?];
+    for (name, value) in environment {
+        if !PATH_BINDINGS.contains(&name.as_str()) {
+            continue;
+        }
+        let path = PathBuf::from(value);
+        if !path.is_absolute() || !path.exists() {
+            continue;
+        }
+        let path = fs::canonicalize(path)?;
+        roots.push(if path.is_file() {
+            path.parent().unwrap_or(&path).to_path_buf()
+        } else {
+            path
+        });
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 fn confined_terminal_agent_command(
     command: &[String],
     workspace_root: &Path,
     workdir: &Path,
-) -> Result<(std::ffi::OsString, Vec<std::ffi::OsString>)> {
+    writable_roots: &[PathBuf],
+    contained: bool,
+) -> Result<(std::ffi::OsString, Vec<std::ffi::OsString>, String, String)> {
     #[cfg(target_os = "macos")]
     {
         let sandbox = PathBuf::from("/usr/bin/sandbox-exec");
@@ -3665,35 +4060,64 @@ fn confined_terminal_agent_command(
         }
         let workspace_root = workspace_root.canonicalize()?;
         let workdir = workdir.canonicalize()?;
-        let trail_internal = workspace_root.join(".trail").canonicalize()?;
+        if !writable_roots.iter().any(|path| path == &workdir) {
+            return Err(Error::InvalidInput(
+                "contained terminal agent is missing its writable lane root".to_string(),
+            ));
+        }
         let escape = |path: &Path| {
             path.to_string_lossy()
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
         };
-        let profile = format!(
-            "(version 1)\n\
-             (allow default)\n\
-             (deny file-write* (subpath \"{}\"))\n\
-             (allow file-write* (subpath \"{}\") (subpath \"{}\"))",
-            escape(&workspace_root),
-            escape(&trail_internal),
-            escape(&workdir),
-        );
+        let profile = if contained {
+            let writable_rules = writable_roots
+                .iter()
+                .map(|path| format!("(subpath \"{}\")", escape(path)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "(version 1)\n\
+                 (allow default)\n\
+                 (deny file-write*)\n\
+                 (deny file-write* (subpath \"{}\"))\n\
+                 (allow file-write* {} (literal \"/dev/null\") (literal \"/dev/tty\"))",
+                escape(&workspace_root),
+                writable_rules,
+            )
+        } else {
+            let trail_internal = workspace_root.join(".trail").canonicalize()?;
+            format!(
+                "(version 1)\n\
+                 (allow default)\n\
+                 (deny file-write* (subpath \"{}\"))\n\
+                 (allow file-write* (subpath \"{}\") (subpath \"{}\"))",
+                escape(&workspace_root),
+                escape(&trail_internal),
+                escape(&workdir),
+            )
+        };
         let mut args = vec![
             std::ffi::OsString::from("-p"),
             std::ffi::OsString::from(profile),
             std::ffi::OsString::from(&command[0]),
         ];
         args.extend(command[1..].iter().map(std::ffi::OsString::from));
-        Ok((sandbox.into_os_string(), args))
+        Ok((
+            sandbox.into_os_string(),
+            args,
+            "macos-sandbox-exec".to_string(),
+            "kernel_enforced".to_string(),
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (workspace_root, workdir);
+        let _ = (workspace_root, workdir, writable_roots, contained);
         Ok((
             std::ffi::OsString::from(&command[0]),
             command[1..].iter().map(std::ffi::OsString::from).collect(),
+            "unavailable".to_string(),
+            "environment_only".to_string(),
         ))
     }
 }

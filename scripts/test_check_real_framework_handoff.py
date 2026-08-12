@@ -72,8 +72,19 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                 )
-                if framework in {"go", "pnpm", "npm"}:
-                    self.write_report(raw, f"generation-before-edit-{lane}", parent)
+                before = parent
+                if framework in {"python", "cmake"}:
+                    before = json.loads(json.dumps(parent))
+                    before["components"][0]["outputs"][0]["storage_identity"] = (
+                        f"private_before_{index}"
+                    )
+            else:
+                before = json.loads(json.dumps(generation))
+                before["source_root"] = "root-baseline"
+                if framework == "go":
+                    before["components"][0]["component_key"] = "key-baseline"
+                    before["components"][0]["layer_id"] = "layer-baseline"
+            self.write_report(raw, f"generation-before-edit-{lane}", before)
             decision = {
                 "component_id": component_id,
                 "decision_source": (
@@ -84,17 +95,44 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             self.write_report(raw, f"sync-{lane}", {"decisions": [decision]})
             self.write_report(
                 raw,
+                f"precheck-{lane}",
+                {
+                    "exit_code": 0,
+                    "lifecycle": {
+                        "checkpoint": {
+                            "source_paths": [],
+                            "generated_dirty_paths": index + 1,
+                        }
+                    },
+                },
+            )
+            self.write_report(
+                raw,
                 f"edit-{lane}",
                 {
                     "lifecycle": {
                         "checkpoint": {
-                            "source_paths": ["README.md"],
+                            "operation": f"change-{index}",
+                            "root_id": f"root-{index}",
+                            "source_paths": CHECKER.SOURCE_PATHS[framework],
                             "generated_dirty_paths": index + 1,
                         }
                     }
                 },
             )
-            self.write_report(raw, f"check-{lane}", {"exit_code": 0})
+            self.write_report(
+                raw,
+                f"check-{lane}",
+                {
+                    "exit_code": 0,
+                    "lifecycle": {
+                        "checkpoint": {
+                            "source_paths": [],
+                            "generated_dirty_paths": index + 1,
+                        }
+                    },
+                },
+            )
             inheritance = None
             if index:
                 if framework in {"go", "pnpm", "npm"}:
@@ -121,6 +159,8 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 {
                     "lane": lane,
                     "workdir": f"/workspace/{lane}",
+                    "workdir_mode": "nfs-cow",
+                    "base_change": "main" if not index else f"change-{index - 1}",
                     "environment_inheritance": inheritance,
                 },
             )
@@ -142,10 +182,9 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 self.assertEqual(evidence["framework"], framework)
                 self.assertTrue(evidence["assertions"]["framework_reuse_contract_passed"])
                 self.assertEqual(evidence["generated_dirty_paths"], [1, 2, 3])
-                expected_raw = 18 if framework in {"go", "pnpm", "npm"} else 16
-                self.assertEqual(len(evidence["raw_sha256"]), expected_raw)
+                self.assertEqual(len(evidence["raw_sha256"]), 22)
 
-    def test_rejects_an_edit_that_captures_more_than_the_readme(self):
+    def test_rejects_an_edit_that_captures_an_unexpected_path(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
             component_id = self.fixture(root, "pnpm")

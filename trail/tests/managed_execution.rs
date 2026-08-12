@@ -307,9 +307,8 @@ fn managed_preparation_failure_never_launches_the_command() {
             30,
         )
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not use a layered COW workdir"));
+    assert!(error.to_string().contains("uses a materialized workdir"));
+    assert!(error.to_string().contains("--workdir-mode auto"));
     assert!(!workdir.join("PREPARATION_RAN").exists());
 
     let phases = db
@@ -322,10 +321,9 @@ fn managed_preparation_failure_never_launches_the_command() {
         )
         .unwrap();
     assert!(phases.iter().any(|event| {
-        event
-            .payload
-            .as_ref()
-            .is_some_and(|payload| payload["phase"] == "sync_all" && payload["status"] == "failed")
+        event.payload.as_ref().is_some_and(|payload| {
+            payload["phase"] == "discover_plan" && payload["status"] == "failed"
+        })
     }));
     assert!(!phases.iter().any(|event| {
         event

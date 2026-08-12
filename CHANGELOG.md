@@ -12,11 +12,16 @@ All notable changes to Trail are documented in this file. Trail follows
   Cargo/npm defaults globally. Go, pnpm/npm/Yarn/Bun, Python, and CMake commands
   receive isolated framework-native caches and exact tool paths, while inactive
   frameworks no longer leak variables into the command.
-- Node dependency executables and CMake build trees now bind directly from the
+- Managed execution now rejects environment-bearing materialized lanes before
+  emitting an impossible resolution command and recommends a new
+  `--workdir-mode auto` lane. Layered workspace backends remain required for
+  managed dependency and build projections.
+- Node dependency executables, Python virtual environments, and CMake build trees now bind directly from the
   lane's generated upper, avoiding metadata-heavy build/dependency traversal
   through macOS NFS while preserving a mounted source path and lane-private
-  mutation. Python also exposes its path-correct interpreter through
-  `TRAIL_VENV_PYTHON`.
+  mutation. Python exposes the physical private environment through
+  `VIRTUAL_ENV`, `PATH`, and `TRAIL_VENV_PYTHON` while `.venv` remains visible
+  at its conventional lane path.
 - macOS NFS lane mounts now retain attributes and negative lookups for up to 60
   seconds within a mounted execution. Same-client mutations still invalidate
   cached entries and synchronous writes remain enabled, while unchanged Go and
@@ -24,10 +29,37 @@ All notable changes to Trail are documented in this file. Trail follows
 - Lane/root diff addition and deletion totals now come from the emitted text
   diff rather than stable-line identity churn, so statistics agree with the
   unified patch while line-identity inspection remains available separately.
-- Built-in Claude terminal tasks now start with project instructions, plugins,
-  hooks, MCP servers, skills, and agents disabled. The new
+- Built-in Claude and Codex terminal tasks now use contained launch profiles.
+  Claude disables project instructions, plugins, hooks, MCP servers, skills,
+  browser integration, and agents; Codex uses strict configuration, an explicit
+  lane root, workspace-write sandboxing, and an empty MCP map. Both receive an
+  isolated runtime home, an allowlisted environment, a lane Git shadow, and a
+  typed containment receipt. On macOS, `sandbox-exec` enforces declared writable
+  roots and protects the original checkout. The new
   `--allow-project-integrations` flag restores the previous project-integrated
-  launch explicitly; custom commands after `--` remain unchanged.
+  launch explicitly; custom commands after `--` remain unchanged. Contained
+  Claude launches now preserve its documented OAuth token, OAuth-token file
+  descriptor, API-key, and workload-identity variables without copying or
+  discovering host keychain secrets. Claude's internal temporary directory is
+  redirected into Trail's private launch runtime, and `acceptEdits` permits
+  noninteractive built-in edits without disabling Bash or other higher-risk
+  permission checks. An exact allowlist imports Claude credential and provider
+  endpoint variables from user-level settings without importing hooks,
+  plugins, permissions, or other project/global integrations; explicit process
+  variables take precedence.
+- Python `uv.lock` environments now select a checked `.python-version`
+  major/minor interpreter, install the frozen dependency set into a copy-based
+  lane-private venv, and report bounded redacted initializer diagnostics.
+  Hash-pinned `requirements.lock` and verified Trail-managed lock snapshots use
+  hash-required `uv pip sync`; unfrozen requirements and unsupported lock
+  formats fail with recovery guidance instead of producing an empty venv.
+- Transparent-COW checkpoints now apply `.trailignore` to newly created journal
+  candidates before source recording, and classify `dist-node` as generated
+  output. Ignored or conventional build artifacts no longer enter source merely
+  because they were first observed by the native change journal.
+- pnpm workspace roots now fail explicitly instead of attempting an incomplete
+  `--ignore-workspace` install. Independent non-workspace pnpm projects retain
+  frozen dependency-layer reuse.
 - Managed execution now scopes environment discovery and synchronization to
   the command's component root, projects a verified manifest-only Cargo lock
   snapshot only for the command, and removes it before checkpointing. Unrelated
@@ -65,9 +97,12 @@ All notable changes to Trail are documented in this file. Trail follows
 ### Added
 
 - Added an opt-in macOS real-framework qualification matrix for pinned bbolt,
-  date-fns, uuid, httpx, and LevelDB revisions. Each row produces checksummed
-  Agent A → B → C evidence for source-only handoff, parent-generation
-  inheritance, framework checks, cache/layer reuse, and lane-private outputs.
+  Polymarket CLOB TypeScript client, uuid, tappy, and LevelDB revisions. Each row
+  makes deterministic production-and-test source edits and produces checksummed
+  Agent A → B → C evidence for semantic ancestry, parent-generation
+  inheritance, real framework tests/builds, stable dependency identity,
+  cache/layer reuse, fresh lane-private outputs, incremental CMake recompilation,
+  stale-output rejection, and exact checkpoint paths.
 - Added deterministic 10k/100k/1M artifact and source scale matrices for
   1/5/20 lanes, fail-closed JSON evidence validation, and compositional
   owning-host NFS/FUSE/Dokan qualification that distinguishes mounted backend
@@ -113,8 +148,9 @@ All notable changes to Trail are documented in this file. Trail follows
   declarations remain external metadata, and repository v2 keeps its independent
   desired-key v2 identity.
 - Python environments can now bind an optional uv-generated, hash-bearing requirements
-  snapshot, warm a performance-only wheel/download cache, and still keep `.venv`, its
-  bytecode, and embedded path state entirely lane-private.
+  snapshot, warm a performance-only wheel/download cache, install that snapshot with
+  hash enforcement, and still keep `.venv`, its bytecode, and embedded path state
+  entirely lane-private.
 - `trail.environment/v2` framework fixtures now compose Next.js and Vite build/state
   components over the Node dependency component: `.next` and `.vite` remain lane-private,
   while validated Vite `dist` content can use an independently keyed immutable layer.

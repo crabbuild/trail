@@ -44,16 +44,55 @@ trail agent start aider
 trail agent start opencode
 ```
 
-Built-in Claude launches use Claude's safe mode and strict MCP configuration by
-default so repository hooks, plugins, instructions, skills, agents, and MCP
-servers cannot redirect work outside the lane. Opt in only for integrations
-that are independently path-contained:
+Built-in Claude and Codex launches use contained profiles by default. Claude
+uses safe mode, strict MCP configuration, no browser integration, an
+`acceptEdits` permission mode, and a private provider temp root. Codex
+uses strict configuration, an explicit lane `--cd`, workspace-write sandboxing,
+and an empty MCP map. Trail clears the inherited environment, restores only an
+allowlist plus provider credentials, gives the process an ephemeral HOME/XDG
+tree, rewrites Trail workspace variables to the lane, and binds Git to a
+lane-rooted shadow repository. Opt in only for project integrations that are
+independently path-contained:
+
+Claude's normal interactive login may be stored in host-scoped secure storage
+and is intentionally not copied into the ephemeral home. For unattended
+contained launches, configure one of Claude's explicit credential channels in
+your user-level `.claude/settings.json` or inject it through a secret manager:
+
+```sh
+CLAUDE_CODE_OAUTH_TOKEN="$(your-secret-manager read claude-oauth-token)" \
+  trail agent start claude-code
+```
+
+A long-lived token produced by `claude setup-token`, an Anthropic API key, or
+Claude's documented file-descriptor channel are portable alternatives. Trail
+preserves only the documented Claude credential variables after clearing the
+environment. It also imports only those credential and provider endpoint
+variables from the user-level `.claude/settings.json`; hooks, plugins,
+permissions, and other settings are not copied. Trail never reads a provider
+keychain or writes a token into the lane. Explicit process variables override
+user settings. Avoid placing literal secrets in shell history—prefer an
+environment manager or the file-descriptor channel for durable automation.
+
+`acceptEdits` permits Claude's built-in Edit tool inside the kernel-confined
+writable roots. Bash and other higher-risk tools retain Claude's normal
+permission checks; Trail does not use `--dangerously-skip-permissions` because
+the profile does not claim read or network isolation.
 
 ```sh
 trail agent start claude-code --allow-project-integrations
 ```
 
 An explicit custom command after `--` is never rewritten by Trail.
+
+On macOS, Trail additionally runs terminal agents under `sandbox-exec`: the
+lane, private environment outputs/caches, Git shadow, and ephemeral runtime are
+writable, while the original checkout is protected. Other hosts currently
+report `environment_only` rather than claiming kernel filesystem enforcement.
+The JSON `containment` receipt exposes the selected profile, integration and
+environment policy, sandbox backend, enforcement level, lane/Git roots,
+protected and writable roots, ambient-variable scrubbing, and whether original
+checkout immutability was kernel-enforced.
 
 The default `--workdir-mode auto` selects the host transparent COW backend when
 one is available, which lets environment-backed tasks use layered workspace
@@ -63,6 +102,11 @@ repository should be exposed as a mounted COW filesystem view explicitly:
 ```sh
 trail agent start codex --workdir-mode fuse-cow
 ```
+
+Materialized modes such as `native-cow` and `portable-copy` do not host managed
+environment layers. Trail rejects them before suggesting environment resolution
+and reports `--workdir-mode auto` as the recovery; retry the task in a new lane
+because an existing lane's workspace backend is immutable.
 
 For an unsupported terminal agent, pass the exact command after `--`:
 

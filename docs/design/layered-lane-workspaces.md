@@ -744,8 +744,8 @@ The workspace host does not inject Cargo or npm variables unconditionally.
 Each active built-in adapter declares its fixed policy values, resolved tools,
 cache namespace paths, and output paths. Go receives `GOMODCACHE`, `GOCACHE`,
 and `TRAIL_GO`; Node receives manager caches and a direct lane-private
-`TRAIL_NODE_MODULES`; Python receives its mounted `VIRTUAL_ENV` and
-`TRAIL_VENV_PYTHON`; CMake receives a direct writable-private
+`TRAIL_NODE_MODULES`; Python receives a direct lane-private `VIRTUAL_ENV`,
+`TRAIL_VENV_PYTHON`, and venv `PATH`; CMake receives a direct writable-private
 `TRAIL_CMAKE_BUILD_DIR`. Cargo retains direct private `CARGO_TARGET_DIR` and
 managed `CARGO_HOME`/compiler-cache bindings. Output bindings may bypass the
 mounted transport only for private-seeded, writable-private, or disposable

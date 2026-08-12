@@ -16,6 +16,8 @@ on:
       - "scripts/verify-real-framework-handoff.sh"
       - "scripts/check-real-framework-handoff.py"
       - "scripts/test_check_real_framework_handoff.py"
+      - "scripts/edit-real-framework-semantic.py"
+      - "scripts/test_edit_real_framework_semantic.py"
       - "scripts/verify-environment-adapter-plugin.sh"
       - "scripts/verify-artifact-adapter-conformance.sh"
       - "scripts/verify-artifact-real-tool-gates.sh"

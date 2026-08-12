@@ -945,14 +945,35 @@ impl Trail {
         if let Some(view) = self.lane_workspace_view(lane)? {
             return self.workspace_command_environment(&view, &head.root_id);
         }
-        Ok(vec![
+        let mut environment = vec![
             (
                 "TRAIL_WORKSPACE".to_string(),
                 self.workspace_root.to_string_lossy().into_owned(),
             ),
-            ("TRAIL_LANE".to_string(), branch.lane_id),
-            ("TRAIL_SOURCE_ROOT".to_string(), head.root_id.0),
-        ])
+            ("TRAIL_LANE".to_string(), branch.lane_id.clone()),
+            ("TRAIL_SOURCE_ROOT".to_string(), head.root_id.0.clone()),
+        ];
+        if let Some(workdir) = branch.workdir.as_deref()
+            && let Some(shadow) = self.ensure_materialized_lane_git_shadow(
+                &branch.lane_id,
+                Path::new(workdir),
+                &head.root_id,
+            )?
+        {
+            environment.extend([
+                ("GIT_DIR".to_string(), shadow.git_dir.clone()),
+                ("GIT_WORK_TREE".to_string(), shadow.work_tree.clone()),
+                (
+                    "GIT_INDEX_FILE".to_string(),
+                    Path::new(&shadow.git_dir)
+                        .join("index")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ("TRAIL_GIT_SHADOW_HEAD".to_string(), shadow.pinned_head),
+            ]);
+        }
+        Ok(environment)
     }
 
     fn run_workspace_command(
