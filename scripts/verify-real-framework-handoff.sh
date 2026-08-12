@@ -373,7 +373,7 @@ for lane in agent-a agent-b agent-c; do
     agent-b) expected=agent-a ;;
     agent-c) expected=agent-b ;;
   esac
-  if [[ $framework == uv && $lane == agent-a ]]; then
+  if [[ $lane == agent-a && -f $repository_root/uv.lock ]]; then
     uv_plan=$qualification_root/uv-prewarm-plan.json
     "$TRAIL_BIN" --format json env plan "$lane" --adapter python > "$uv_plan"
     uv_namespace=$(jq -er '.caches[] | select(.name == "python-downloads") | .namespace_id' "$uv_plan")

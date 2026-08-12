@@ -127,6 +127,17 @@ def check_evidence(
         raise AssertionError("each plan must record at least one executable identity")
     if any(tools != tool_identities[0] for tools in tool_identities[1:]):
         raise AssertionError("tool executable identities changed across source-only lanes")
+    uv_project_plans = [
+        any(
+            item.get("source_path") == "uv.lock"
+            for item in plan.get("inputs", [])
+            if isinstance(item, dict)
+        )
+        for plan in plans
+    ]
+    if len(set(uv_project_plans)) != 1:
+        raise AssertionError("Python install contract changed across source-only lanes")
+    uv_project = uv_project_plans[0]
     for lane, plan, before in zip(LANES, plans, before_generations, strict=True):
         if plan.get("component_id") != component_id:
             raise AssertionError(f"{lane} plan selected the wrong component")
@@ -226,7 +237,7 @@ def check_evidence(
         if not layer_ids[0] or len(set(layer_ids)) != 1:
             raise AssertionError("Node lanes did not reuse one exact dependency layer")
     else:
-        if framework == "uv":
+        if uv_project:
             if len(set(component_keys)) != 3:
                 raise AssertionError("uv project source edits must change private environment identity")
         elif len(set(component_keys)) != 1:
@@ -296,7 +307,7 @@ def check_evidence(
                 raise AssertionError(f"{child} private environment lost parent caches")
 
     first_before = select_component(before_generations[0], component_id)
-    if framework in {"go", "go-workspace", "uv"}:
+    if framework in {"go", "go-workspace"} or uv_project:
         if first_before["component_key"] == components[0]["component_key"]:
             raise AssertionError("source-sensitive environment identity did not change after edit")
     elif first_before["component_key"] != components[0]["component_key"]:
@@ -443,11 +454,12 @@ def check_evidence(
             "parent_semantics_valid_before_each_edit": True,
             "edited_semantics_valid_after_each_edit": True,
             "dependency_identity_stable_for_source_independent_adapters": framework
-            not in {"go", "go-workspace", "uv"},
+            not in {"go", "go-workspace"}
+            and not uv_project,
             "go_vendor_identity_tracks_source_sensitive_vendor_inputs": framework
             in {"go", "go-workspace"},
             "go_multi_module_workspace_graph_verified": framework == "go-workspace",
-            "uv_project_identity_tracks_source_authority": framework == "uv",
+            "uv_project_identity_tracks_source_authority": uv_project,
             "cmake_incremental_recompile_and_link_behavior_verified": framework
             in {"cmake", "cmake-modern"},
             "cmake_preset_ninja_ccache_private_output_verified": framework

@@ -16,7 +16,7 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
     def write_report(self, raw, name, value):
         (raw / f"{name}.json").write_text(json.dumps(value), encoding="utf-8")
 
-    def fixture(self, root, framework):
+    def fixture(self, root, framework, *, python_uv_project=False):
         raw = root / "raw"
         raw.mkdir()
         component_id = {
@@ -33,11 +33,10 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
         shared_key = "key-shared"
         shared_layer = "layer-shared"
         for index, lane in enumerate(CHECKER.LANES):
-            key = (
-                f"key-{index}"
-                if framework in {"go", "go-workspace", "uv"}
-                else shared_key
+            source_sensitive = framework in {"go", "go-workspace", "uv"} or (
+                framework == "python" and python_uv_project
             )
+            key = f"key-{index}" if source_sensitive else shared_key
             if framework in {"go", "go-workspace"}:
                 layer = f"layer-{index}"
                 storage = layer
@@ -89,9 +88,9 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             else:
                 before = json.loads(json.dumps(generation))
                 before["source_root"] = "root-baseline"
-                if framework in {"go", "go-workspace", "uv"}:
+                if source_sensitive:
                     before["components"][0]["component_key"] = "key-baseline"
-                    if framework != "uv":
+                    if framework in {"go", "go-workspace"}:
                         before["components"][0]["layer_id"] = "layer-baseline"
             self.write_report(raw, f"generation-before-edit-{lane}", before)
             self.write_report(
@@ -103,6 +102,12 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                     "component_key": before["components"][0]["component_key"],
                     "source_root": before["source_root"],
                     "tools": {"tool-executable": "sha256:tool"},
+                    "inputs": (
+                        [{"source_path": "uv.lock"}]
+                        if source_sensitive
+                        and framework not in {"go", "go-workspace"}
+                        else []
+                    ),
                     "outputs": before["components"][0]["outputs"],
                 },
             )
@@ -299,6 +304,26 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                     31 if framework in CHECKER.INVALIDATION_PATHS else 25,
                 )
 
+    def test_accepts_python_label_with_resolved_uv_project_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "python", python_uv_project=True)
+            evidence = CHECKER.check_evidence(
+                root,
+                "python",
+                "https://example.invalid/python-uv-project.git",
+                "b" * 40,
+                component_id,
+            )
+            self.assertTrue(
+                evidence["assertions"]["uv_project_identity_tracks_source_authority"]
+            )
+            self.assertFalse(
+                evidence["assertions"][
+                    "dependency_identity_stable_for_source_independent_adapters"
+                ]
+            )
+
     def test_rejects_missing_or_changed_tool_identity(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -308,6 +333,16 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             self.write_report(root / "raw", "plan-agent-b", plan)
             with self.assertRaisesRegex(AssertionError, "executable identity"):
                 CHECKER.check_evidence(root, "pnpm", "repo", "rev", component_id)
+
+    def test_rejects_python_install_contract_drift_between_lanes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "python")
+            plan = json.loads((root / "raw/plan-agent-b.json").read_text(encoding="utf-8"))
+            plan["inputs"] = [{"source_path": "uv.lock"}]
+            self.write_report(root / "raw", "plan-agent-b", plan)
+            with self.assertRaisesRegex(AssertionError, "install contract changed"):
+                CHECKER.check_evidence(root, "python", "repo", "rev", component_id)
 
     def test_rejects_node_policy_invalidation_that_reuses_stale_layer(self):
         with tempfile.TemporaryDirectory() as temp:
