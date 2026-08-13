@@ -17,8 +17,10 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
-- `trail install codex` and `trail install claude` now install an idempotent,
-  provider-neutral suite of five focused skills at user scope. `trail-lanes`
+- `trail install <agent>` now installs an idempotent, provider-neutral suite of
+  five focused skills at user scope for Codex, Claude Code, GitHub Copilot,
+  Gemini CLI, Cursor, Windsurf, Cline, Roo Code, Kilo Code, OpenCode, Amp, Kiro
+  CLI, and Qwen Code. `trail-lanes`
   covers concurrent work and shared immutable environments; `trail-workspace`
   covers recording and provenance; `trail-agent-tasks` covers managed agent
   review and Git handoff; `trail-integrations` covers CLI/MCP/ACP/hooks/HTTP;

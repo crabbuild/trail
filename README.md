@@ -540,7 +540,15 @@ Install Trail's focused skill suite for the coding agent you use:
 ```sh
 trail install codex
 trail install claude
+trail install cursor
+trail install copilot
+trail install gemini
 ```
+
+The supported targets are `codex`, `claude`, `copilot`, `gemini`, `cursor`,
+`windsurf`, `cline`, `roo`, `kilo`, `opencode`, `amp`, `kiro`, and `qwen`.
+Trail installs the same portable Agent Skills payload into each agent's native
+user-level discovery directory.
 
 The command installs five independently triggered skills at user scope:
 `trail-lanes`, `trail-workspace`, `trail-agent-tasks`, `trail-integrations`, and

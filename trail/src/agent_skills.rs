@@ -143,6 +143,18 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
 pub enum AgentSkillProvider {
     Codex,
     Claude,
+    Copilot,
+    Gemini,
+    Cursor,
+    Windsurf,
+    Cline,
+    Roo,
+    Kilo,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Amp,
+    Kiro,
+    Qwen,
 }
 
 impl AgentSkillProvider {
@@ -150,6 +162,17 @@ impl AgentSkillProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
+            Self::Windsurf => "windsurf",
+            Self::Cline => "cline",
+            Self::Roo => "roo",
+            Self::Kilo => "kilo",
+            Self::OpenCode => "opencode",
+            Self::Amp => "amp",
+            Self::Kiro => "kiro",
+            Self::Qwen => "qwen",
         }
     }
 }

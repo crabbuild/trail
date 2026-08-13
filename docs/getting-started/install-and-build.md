@@ -79,17 +79,24 @@ trail lane --help
 
 ## Install the Agent Skill Suite
 
-After installing the Trail binary, install its focused skills for Codex or
-Claude Code:
+After installing the Trail binary, install its focused skills for the coding
+agent you use:
 
 ```sh
 trail install codex
 trail install claude
+trail install cursor
+trail install copilot
+trail install gemini
 ```
 
-Codex receives each skill under `$CODEX_HOME/skills/<skill>` when `CODEX_HOME`
-is set, otherwise under `~/.codex/skills/<skill>`. Claude receives each one
-under `~/.claude/skills/<skill>`. Restart the agent so it loads the new skills.
+Supported targets are `codex`, `claude`, `copilot`, `gemini`, `cursor`,
+`windsurf`, `cline`, `roo`, `kilo`, `opencode`, `amp`, `kiro`, and `qwen`.
+Aliases include `claude-code`, `github-copilot`, `gemini-cli`, `roo-code`,
+`kilo-code`, `kiro-cli`, and `qwen-code`. See the
+[integration reference](../reference/cli/integrations-and-maintenance.md#install-agent-skills)
+for the exact user-level destination of every target. Restart the agent if it
+does not detect the new top-level skills directory in the current session.
 
 Re-running the command is idempotent and updates a Trail-owned installation.
 Trail refuses to overwrite local edits or an unmanaged directory unless
@@ -97,7 +104,7 @@ Trail refuses to overwrite local edits or an unmanaged directory unless
 
 ```sh
 trail install codex --dry-run
-trail install claude --dry-run
+trail install cursor --dry-run
 ```
 
 The suite contains five independently triggered skills:

@@ -234,7 +234,28 @@ mod tests {
 
     #[test]
     fn parses_agent_skill_installers() {
-        for provider in ["codex", "claude", "claude-code"] {
+        for provider in [
+            "codex",
+            "claude",
+            "claude-code",
+            "copilot",
+            "github-copilot",
+            "gemini",
+            "gemini-cli",
+            "cursor",
+            "windsurf",
+            "cline",
+            "roo",
+            "roo-code",
+            "kilo",
+            "kilo-code",
+            "opencode",
+            "amp",
+            "kiro",
+            "kiro-cli",
+            "qwen",
+            "qwen-code",
+        ] {
             let cli = Cli::try_parse_from(["trail", "install", provider])
                 .expect("agent skill install command should parse");
             let Command::Install(args) = cli.command else {
@@ -243,7 +264,7 @@ mod tests {
             assert!(!args.force);
             assert!(!args.dry_run);
         }
-        assert!(Cli::try_parse_from(["trail", "install", "cursor"]).is_err());
+        assert!(Cli::try_parse_from(["trail", "install", "aider"]).is_err());
     }
 
     #[test]

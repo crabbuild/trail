@@ -19,17 +19,38 @@ and apply.
 ## Install Agent Skills
 
 ```text
-trail install codex [--dry-run] [--force]
-trail install claude [--dry-run] [--force]
+trail install <agent> [--dry-run] [--force]
 ```
 
 This workspace-independent command installs Trail's provider-neutral skill
 suite at user scope:
 
-| Provider | Destination |
+| Agent argument | Native user-level destination |
 | --- | --- |
-| Codex | `$CODEX_HOME/skills/<skill>` or `~/.codex/skills/<skill>` |
-| Claude | `~/.claude/skills/<skill>` |
+| `codex` | `$CODEX_HOME/skills/<skill>` or `~/.codex/skills/<skill>` |
+| `claude` | `~/.claude/skills/<skill>` |
+| `copilot` | `~/.copilot/skills/<skill>` |
+| `gemini` | `~/.gemini/skills/<skill>` |
+| `cursor` | `~/.cursor/skills/<skill>` |
+| `windsurf` | `~/.codeium/windsurf/skills/<skill>` |
+| `cline` | `~/.cline/skills/<skill>` |
+| `roo` | `~/.roo/skills/<skill>` |
+| `kilo` | `~/.kilo/skills/<skill>` |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/skills/<skill>` or `~/.config/opencode/skills/<skill>` |
+| `amp` | `$XDG_CONFIG_HOME/agents/skills/<skill>` or `~/.config/agents/skills/<skill>` |
+| `kiro` | `~/.kiro/skills/<skill>` |
+| `qwen` | `~/.qwen/skills/<skill>` |
+
+Accepted product-name aliases are `claude-code`, `github-copilot`,
+`gemini-cli`, `roo-code`, `roocode`, `kilo-code`, `kilocode`, `open-code`,
+`kiro-cli`, and `qwen-code`.
+
+This list is intentionally based on native Agent Skills support: each target
+documents a user-level `SKILL.md` discovery directory and loads skill bodies on
+demand. Trail does not translate the suite into always-loaded rules for agents
+without that contract. That keeps the installation portable, preserves
+progressive disclosure, and avoids claiming support that cannot be tested as
+Agent Skills.
 
 | Skill | Focus |
 | --- | --- |

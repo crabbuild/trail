@@ -267,6 +267,49 @@ fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
 }
 
 #[test]
+fn agent_skill_install_supports_major_agent_user_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let xdg = home.path().join("xdg");
+    let cases = [
+        ("copilot", home.path().join(".copilot")),
+        ("gemini", home.path().join(".gemini")),
+        ("cursor", home.path().join(".cursor")),
+        ("windsurf", home.path().join(".codeium/windsurf")),
+        ("cline", home.path().join(".cline")),
+        ("roo", home.path().join(".roo")),
+        ("kilo", home.path().join(".kilo")),
+        ("opencode", xdg.join("opencode")),
+        ("amp", xdg.join("agents")),
+        ("kiro", home.path().join(".kiro")),
+        ("qwen", home.path().join(".qwen")),
+    ];
+
+    for (provider, root) in cases {
+        let output = Command::new(trail_bin())
+            .args(["--json", "install", provider])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider} skill install failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["provider"], provider);
+        assert_eq!(report["root"], serde_json::json!(root.join("skills")));
+        assert_eq!(report["skills"].as_array().unwrap().len(), 5);
+        assert!(root.join("skills/trail-lanes/SKILL.md").is_file());
+        assert!(root
+            .join("skills/trail-recovery/references/recovery-playbook.md")
+            .is_file());
+    }
+}
+
+#[test]
 fn agent_skill_install_refuses_local_edits_without_force() {
     let home = tempfile::tempdir().unwrap();
     let codex_root = home.path().join("codex-home");

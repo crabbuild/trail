@@ -7,6 +7,24 @@ pub(super) enum AgentSkillProviderArg {
     Codex,
     #[value(alias = "claude-code")]
     Claude,
+    #[value(alias = "github-copilot")]
+    Copilot,
+    #[value(alias = "gemini-cli")]
+    Gemini,
+    Cursor,
+    Windsurf,
+    Cline,
+    #[value(alias = "roo-code", alias = "roocode")]
+    Roo,
+    #[value(alias = "kilo-code", alias = "kilocode")]
+    Kilo,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
+    Amp,
+    #[value(alias = "kiro-cli")]
+    Kiro,
+    #[value(alias = "qwen-code")]
+    Qwen,
 }
 
 impl AgentSkillProviderArg {
@@ -14,6 +32,17 @@ impl AgentSkillProviderArg {
         match self {
             Self::Codex => AgentSkillProvider::Codex,
             Self::Claude => AgentSkillProvider::Claude,
+            Self::Copilot => AgentSkillProvider::Copilot,
+            Self::Gemini => AgentSkillProvider::Gemini,
+            Self::Cursor => AgentSkillProvider::Cursor,
+            Self::Windsurf => AgentSkillProvider::Windsurf,
+            Self::Cline => AgentSkillProvider::Cline,
+            Self::Roo => AgentSkillProvider::Roo,
+            Self::Kilo => AgentSkillProvider::Kilo,
+            Self::OpenCode => AgentSkillProvider::OpenCode,
+            Self::Amp => AgentSkillProvider::Amp,
+            Self::Kiro => AgentSkillProvider::Kiro,
+            Self::Qwen => AgentSkillProvider::Qwen,
         }
     }
 }
