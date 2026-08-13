@@ -70,5 +70,5 @@
 
 - [x] 11.1 Align Rust, CLI JSON, HTTP/OpenAPI, MCP, and SDK reports for any new approval/certification fields and add compatibility tests
 - [x] 11.2 Update README, adapter/environment design, lane guides, reference docs, security guidance, and changelog with certified versus recognized platform status
-- [ ] 11.3 Run formatting, workspace check/test/Clippy, adapter SDK, environment lifecycle, native backend, real-tool, and hosted certification gates
+- [x] 11.3 Run formatting, workspace check/test/Clippy, adapter SDK, environment lifecycle, native backend, real-tool, and hosted certification gates
 - [x] 11.4 Audit every spec scenario against authoritative evidence and leave no variant labeled certified without a passing platform gate
