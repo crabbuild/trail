@@ -20,7 +20,7 @@ impl AgentSkillProviderArg {
 
 #[derive(Args)]
 pub(super) struct InstallArgs {
-    /// Agent whose user-level skills directory should receive Trail's lane skill.
+    /// Agent whose user-level skills directory should receive Trail's skill suite.
     #[arg(value_enum)]
     pub(super) provider: AgentSkillProviderArg,
     /// Replace an unmanaged or locally edited Trail skill installation.

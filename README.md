@@ -535,18 +535,20 @@ Interactive Trail commands check for a newer stable release at most once every
 disable those background checks. JSON, NDJSON, quiet, CI, and non-terminal
 commands never emit update notices.
 
-Install Trail's focused lane-coordination skill for the coding agent you use:
+Install Trail's focused skill suite for the coding agent you use:
 
 ```sh
 trail install codex
 trail install claude
 ```
 
-The command installs one `trail-lanes` skill at user scope. It teaches agents
-how to reuse verified immutable environments across task lanes while keeping
-source and writable build state private. Restart the agent after installation.
-Trail intentionally does not install skills for its HTTP/MCP surfaces, storage
-maintenance, backups, or the high-level command that launches more agents.
+The command installs five independently triggered skills at user scope:
+`trail-lanes`, `trail-workspace`, `trail-agent-tasks`, `trail-integrations`, and
+`trail-recovery`. Together they cover concurrent lane work, ordinary recording
+and provenance, managed coding-agent tasks, MCP/ACP/hooks/HTTP integration, and
+safe diagnosis and recovery. Restart the agent after installation. Each skill
+stays narrow so an ordinary lane task does not load integration or maintenance
+instructions.
 
 The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
 macFUSE, and the Dokan driver are otherwise relevant only to their

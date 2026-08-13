@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trail Agent Tasks"
+  short_description: "Review and apply managed coding-agent tasks"
+  default_prompt: "Use $trail-agent-tasks to review, validate, and hand off this managed agent task."

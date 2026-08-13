@@ -1,0 +1,17 @@
+{
+  "skill_name": "trail-integrations",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Connect my ACP-capable editor to Trail so I keep the editor UX and Trail records each real turn and edit.",
+      "expected_output": "Chooses ACP relay, checks provider setup, preserves correlation and truthful capture, injects Trail MCP appropriately, and avoids fabricating messages or nesting a managed task.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Write a local service that retries Trail HTTP mutations and print the daemon token in debug logs for troubleshooting.",
+      "expected_output": "Uses authenticated loopback HTTP, idempotency keys and bounded structured payloads, refuses token logging, and keeps host/origin/auth checks enabled.",
+      "files": []
+    }
+  ]
+}

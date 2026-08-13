@@ -18,13 +18,14 @@ All notable changes to Trail are documented in this file. Trail follows
 ### Added
 
 - `trail install codex` and `trail install claude` now install an idempotent,
-  provider-neutral `trail-lanes` skill at user scope. The focused skill teaches
-  concurrent agents to inherit verified reusable environments from seed lanes
-  while retaining private writable state, and covers claims, managed execution,
-  recording, gates, handoff, readiness, and merge preparation without loading
-  operator-only Trail administration into agent context. The installer detects
-  local edits, supports dry-run JSON reports, and requires `--force` before
-  replacing drifted or unmanaged content.
+  provider-neutral suite of five focused skills at user scope. `trail-lanes`
+  covers concurrent work and shared immutable environments; `trail-workspace`
+  covers recording and provenance; `trail-agent-tasks` covers managed agent
+  review and Git handoff; `trail-integrations` covers CLI/MCP/ACP/hooks/HTTP;
+  and `trail-recovery` covers diagnosis and safe recovery. Independent triggers
+  keep unrelated capabilities out of ordinary agent context. The installer
+  inspects the complete suite for local edits, supports per-skill dry-run JSON
+  reports, and requires `--force` before replacing drifted or unmanaged content.
 
 - Environment support now includes contained Go multi-module workspaces, real frozen
   Yarn Classic and Bun handoffs, project-aware `uv sync --frozen`, and modern

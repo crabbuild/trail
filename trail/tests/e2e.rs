@@ -211,12 +211,17 @@ fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
     );
     let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["provider"], "codex");
-    assert_eq!(first["skill"], "trail-lanes");
-    assert_eq!(first["action"], "create");
+    let skills = first["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 5);
+    assert!(skills.iter().all(|skill| skill["action"] == "create"));
+    assert!(skills.iter().any(|skill| skill["skill"] == "trail-lanes"));
     let skill_path = codex_root.join("skills/trail-lanes/SKILL.md");
     assert!(fs::read_to_string(&skill_path)
         .unwrap()
         .contains("name: trail-lanes"));
+    assert!(codex_root
+        .join("skills/trail-workspace/references/branches-and-git.md")
+        .is_file());
 
     let repeated = Command::new(trail_bin())
         .args(["--json", "install", "codex"])
@@ -226,7 +231,11 @@ fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
         .unwrap();
     assert!(repeated.status.success());
     let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
-    assert_eq!(repeated["action"], "noop");
+    assert!(repeated["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|skill| skill["action"] == "noop"));
 
     let claude = Command::new(trail_bin())
         .args(["--json", "install", "claude"])
@@ -242,10 +251,18 @@ fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
     );
     let claude: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
     assert_eq!(claude["provider"], "claude");
-    assert_eq!(claude["action"], "create");
+    assert!(claude["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|skill| skill["action"] == "create"));
     assert!(home
         .path()
         .join(".claude/skills/trail-lanes/references/concurrent-agents.md")
+        .is_file());
+    assert!(home
+        .path()
+        .join(".claude/skills/trail-recovery/references/recovery-playbook.md")
         .is_file());
 }
 
@@ -289,7 +306,13 @@ fn agent_skill_install_refuses_local_edits_without_force() {
         .unwrap();
     assert!(forced.status.success());
     let forced: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
-    assert_eq!(forced["action"], "update");
+    let forced_lanes = forced["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["skill"] == "trail-lanes")
+        .unwrap();
+    assert_eq!(forced_lanes["action"], "update");
     assert!(fs::read_to_string(skill_path)
         .unwrap()
         .contains("name: trail-lanes"));

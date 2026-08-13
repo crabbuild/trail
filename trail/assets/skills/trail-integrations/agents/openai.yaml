@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trail Integrations"
+  short_description: "Connect Trail through MCP, ACP, hooks, or HTTP"
+  default_prompt: "Use $trail-integrations to connect this agent host or tool to Trail safely."

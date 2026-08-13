@@ -23,25 +23,32 @@ trail install codex [--dry-run] [--force]
 trail install claude [--dry-run] [--force]
 ```
 
-This workspace-independent command installs the provider-neutral `trail-lanes`
-skill at user scope:
+This workspace-independent command installs Trail's provider-neutral skill
+suite at user scope:
 
 | Provider | Destination |
 | --- | --- |
-| Codex | `$CODEX_HOME/skills/trail-lanes` or `~/.codex/skills/trail-lanes` |
-| Claude | `~/.claude/skills/trail-lanes` |
+| Codex | `$CODEX_HOME/skills/<skill>` or `~/.codex/skills/<skill>` |
+| Claude | `~/.claude/skills/<skill>` |
 
-The installed skill covers the agent-useful lane lifecycle: seed-lane
-environment reuse, isolated task lanes, path claims, managed commands,
-recording, durable gates, handoff, readiness, and merge preparation. It does
-not teach an agent to recursively launch another agent or administer Trail's
-daemon, MCP, backups, indexes, or storage.
+| Skill | Focus |
+| --- | --- |
+| `trail-lanes` | Concurrent lanes, shared immutable environments, private writable state, gates, readiness, and merge preparation |
+| `trail-workspace` | Recording, history, provenance, Trail branches, checkout, and explicit Git handoff |
+| `trail-agent-tasks` | Managed task launch, review, validation, handoff, recovery, readiness, and apply |
+| `trail-integrations` | Structured CLI, MCP, ACP relay, native hooks, and authenticated HTTP |
+| `trail-recovery` | Diagnosis, conflicts, rewind, fsck, backup, and safe recovery |
 
-The installer records a Trail ownership manifest and is idempotent. It refuses
-to replace an unmanaged directory or locally edited installed files. Use
-`--force` only after preserving intentional edits; use `--dry-run` to report
-the planned create, update, or no-op action without changing files. Restart the
-agent after a successful installation.
+The skills trigger independently. A lane worker is told not to recursively
+launch another managed agent task, while `trail-agent-tasks` exposes launching
+only when a user is explicitly operating the high-level task workflow.
+
+The installer records a Trail ownership manifest per skill and is idempotent.
+It inspects the complete suite before writing and refuses to replace an
+unmanaged directory or locally edited installed files. Use `--force` only after
+preserving intentional edits; use `--dry-run` to report each planned create,
+update, or no-op action without changing files. Restart the agent after a
+successful installation.
 
 ## Quick Start
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trail Recovery"
+  short_description: "Diagnose blockers and recover Trail state safely"
+  default_prompt: "Use $trail-recovery to diagnose this Trail failure and choose a safe recovery."

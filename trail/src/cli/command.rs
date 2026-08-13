@@ -107,7 +107,7 @@ impl PagerArg {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install Trail's focused lane skill for a supported coding agent.
+    /// Install Trail's focused skill suite for a supported coding agent.
     Install(InstallArgs),
     /// Initialize a new Trail workspace and default branch state.
     /// Use this once per repository to create `.trail`, default config,

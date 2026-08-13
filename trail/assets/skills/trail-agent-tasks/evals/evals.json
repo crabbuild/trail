@@ -1,0 +1,17 @@
+{
+  "skill_name": "trail-agent-tasks",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Review the latest Trail agent task, run the right tests, and apply it to my Git branch if it looks good.",
+      "expected_output": "Uses dashboard/changes/review evidence, requests a test plan, records tests as Trail gates, checks risk/readiness, performs apply dry-run, and requires explicit authority before non-dry-run Git application.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "You are inside a Trail task workdir. Start another Codex task to handle the tests while you edit.",
+      "expected_output": "Recognizes the current Trail task context and does not recursively launch a managed task; continues within the assigned task or asks the outer coordinator to delegate.",
+      "files": []
+    }
+  ]
+}

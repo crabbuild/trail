@@ -15,7 +15,7 @@ pub(super) fn handle_install_command(ctx: &RuntimeContext, args: &InstallArgs) -
         dry_run: args.dry_run,
     })?;
     render_semantic_report(
-        "Trail agent skill installation",
+        "Trail agent skills installation",
         &report,
         ctx.json,
         &ctx.render,

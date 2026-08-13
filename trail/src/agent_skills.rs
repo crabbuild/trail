@@ -23,7 +23,12 @@ struct BundledAsset {
     bytes: &'static [u8],
 }
 
-const BUNDLED_ASSETS: &[BundledAsset] = &[
+struct BundledSkill {
+    name: &'static str,
+    assets: &'static [BundledAsset],
+}
+
+const TRAIL_LANES_ASSETS: &[BundledAsset] = &[
     BundledAsset {
         relative_path: "SKILL.md",
         bytes: include_bytes!("../assets/skills/trail-lanes/SKILL.md"),
@@ -39,6 +44,97 @@ const BUNDLED_ASSETS: &[BundledAsset] = &[
     BundledAsset {
         relative_path: "references/worker-lifecycle.md",
         bytes: include_bytes!("../assets/skills/trail-lanes/references/worker-lifecycle.md"),
+    },
+];
+
+const TRAIL_WORKSPACE_ASSETS: &[BundledAsset] = &[
+    BundledAsset {
+        relative_path: "SKILL.md",
+        bytes: include_bytes!("../assets/skills/trail-workspace/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "agents/openai.yaml",
+        bytes: include_bytes!("../assets/skills/trail-workspace/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "references/record-and-provenance.md",
+        bytes: include_bytes!(
+            "../assets/skills/trail-workspace/references/record-and-provenance.md"
+        ),
+    },
+    BundledAsset {
+        relative_path: "references/branches-and-git.md",
+        bytes: include_bytes!("../assets/skills/trail-workspace/references/branches-and-git.md"),
+    },
+];
+
+const TRAIL_AGENT_TASKS_ASSETS: &[BundledAsset] = &[
+    BundledAsset {
+        relative_path: "SKILL.md",
+        bytes: include_bytes!("../assets/skills/trail-agent-tasks/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "agents/openai.yaml",
+        bytes: include_bytes!("../assets/skills/trail-agent-tasks/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "references/task-lifecycle.md",
+        bytes: include_bytes!("../assets/skills/trail-agent-tasks/references/task-lifecycle.md"),
+    },
+];
+
+const TRAIL_INTEGRATIONS_ASSETS: &[BundledAsset] = &[
+    BundledAsset {
+        relative_path: "SKILL.md",
+        bytes: include_bytes!("../assets/skills/trail-integrations/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "agents/openai.yaml",
+        bytes: include_bytes!("../assets/skills/trail-integrations/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "references/integration-surfaces.md",
+        bytes: include_bytes!(
+            "../assets/skills/trail-integrations/references/integration-surfaces.md"
+        ),
+    },
+];
+
+const TRAIL_RECOVERY_ASSETS: &[BundledAsset] = &[
+    BundledAsset {
+        relative_path: "SKILL.md",
+        bytes: include_bytes!("../assets/skills/trail-recovery/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "agents/openai.yaml",
+        bytes: include_bytes!("../assets/skills/trail-recovery/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "references/recovery-playbook.md",
+        bytes: include_bytes!("../assets/skills/trail-recovery/references/recovery-playbook.md"),
+    },
+];
+
+const BUNDLED_SKILLS: &[BundledSkill] = &[
+    BundledSkill {
+        name: TRAIL_LANES_SKILL,
+        assets: TRAIL_LANES_ASSETS,
+    },
+    BundledSkill {
+        name: "trail-workspace",
+        assets: TRAIL_WORKSPACE_ASSETS,
+    },
+    BundledSkill {
+        name: "trail-agent-tasks",
+        assets: TRAIL_AGENT_TASKS_ASSETS,
+    },
+    BundledSkill {
+        name: "trail-integrations",
+        assets: TRAIL_INTEGRATIONS_ASSETS,
+    },
+    BundledSkill {
+        name: "trail-recovery",
+        assets: TRAIL_RECOVERY_ASSETS,
     },
 ];
 
@@ -76,12 +172,18 @@ pub struct AgentSkillInstallRequest<'a> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AgentSkillInstallReport {
-    pub provider: AgentSkillProvider,
+pub struct AgentSkillInstallEntry {
     pub skill: String,
     pub path: PathBuf,
     pub action: AgentSkillInstallAction,
     pub files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSkillInstallReport {
+    pub provider: AgentSkillProvider,
+    pub root: PathBuf,
+    pub skills: Vec<AgentSkillInstallEntry>,
     pub dry_run: bool,
     pub restart_required: bool,
 }
@@ -95,7 +197,7 @@ struct InstallManifest {
     content_digest: String,
 }
 
-/// Install or update Trail's focused lane skill beneath a provider configuration root.
+/// Install or update Trail's focused skill suite beneath a provider configuration root.
 pub fn install_agent_skills(
     request: AgentSkillInstallRequest<'_>,
 ) -> Result<AgentSkillInstallReport> {
@@ -106,22 +208,49 @@ pub fn install_agent_skills(
         });
     }
     let skills_root = request.config_root.join("skills");
-    let target = skills_root.join(TRAIL_LANES_SKILL);
-    let desired_digest = bundled_digest();
-    let action = inspect_install_target(&target, request.provider, &desired_digest, request.force)?;
+    let mut planned = Vec::with_capacity(BUNDLED_SKILLS.len());
+    for skill in BUNDLED_SKILLS {
+        let target = skills_root.join(skill.name);
+        let desired_digest = bundled_digest(skill);
+        let action = inspect_install_target(
+            &target,
+            request.provider,
+            skill.name,
+            &desired_digest,
+            request.force,
+        )?;
+        planned.push((skill, target, desired_digest, action));
+    }
 
-    if !request.dry_run && action != AgentSkillInstallAction::Noop {
-        publish_installation(&skills_root, &target, request.provider, &desired_digest)?;
+    if !request.dry_run {
+        for (skill, target, desired_digest, action) in &planned {
+            if *action != AgentSkillInstallAction::Noop {
+                publish_installation(
+                    &skills_root,
+                    target,
+                    request.provider,
+                    skill,
+                    desired_digest,
+                )?;
+            }
+        }
     }
 
     Ok(AgentSkillInstallReport {
         provider: request.provider,
-        skill: TRAIL_LANES_SKILL.to_string(),
-        path: target,
-        action,
-        files: BUNDLED_ASSETS
-            .iter()
-            .map(|asset| asset.relative_path.to_string())
+        root: skills_root,
+        skills: planned
+            .into_iter()
+            .map(|(skill, path, _, action)| AgentSkillInstallEntry {
+                skill: skill.name.to_string(),
+                path,
+                action,
+                files: skill
+                    .assets
+                    .iter()
+                    .map(|asset| asset.relative_path.to_string())
+                    .collect(),
+            })
             .collect(),
         dry_run: request.dry_run,
         restart_required: true,
@@ -131,6 +260,7 @@ pub fn install_agent_skills(
 fn inspect_install_target(
     target: &Path,
     provider: AgentSkillProvider,
+    skill: &str,
     desired_digest: &str,
     force: bool,
 ) -> Result<AgentSkillInstallAction> {
@@ -165,7 +295,7 @@ fn inspect_install_target(
         let valid_owner = manifest.schema == INSTALL_SCHEMA
             && manifest.version == INSTALL_VERSION
             && manifest.provider == provider
-            && manifest.skill == TRAIL_LANES_SKILL;
+            && manifest.skill == skill;
         if !valid_owner && !force {
             return Err(Error::InvalidInput(format!(
                 "agent skill target `{}` has an incompatible Trail ownership manifest; rerun with --force to replace it",
@@ -221,13 +351,14 @@ fn publish_installation(
     skills_root: &Path,
     target: &Path,
     provider: AgentSkillProvider,
+    skill: &BundledSkill,
     desired_digest: &str,
 ) -> Result<()> {
     fs::create_dir_all(skills_root)?;
-    let stage = unique_sibling(skills_root, "stage");
+    let stage = unique_sibling(skills_root, skill.name, "stage");
     fs::create_dir(&stage)?;
     let result = (|| {
-        for asset in BUNDLED_ASSETS {
+        for asset in skill.assets {
             let path = stage.join(asset.relative_path);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -238,7 +369,7 @@ fn publish_installation(
             schema: INSTALL_SCHEMA.to_string(),
             version: INSTALL_VERSION,
             provider,
-            skill: TRAIL_LANES_SKILL.to_string(),
+            skill: skill.name.to_string(),
             content_digest: desired_digest.to_string(),
         };
         let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -250,7 +381,7 @@ fn publish_installation(
             return Ok(());
         }
 
-        let backup = unique_sibling(skills_root, "backup");
+        let backup = unique_sibling(skills_root, skill.name, "backup");
         fs::rename(target, &backup)?;
         if let Err(error) = fs::rename(&stage, target) {
             let _ = fs::rename(&backup, target);
@@ -265,13 +396,19 @@ fn publish_installation(
     result
 }
 
-fn bundled_digest() -> String {
-    digest_entries(BUNDLED_ASSETS.iter().map(|asset| {
-        (
-            asset.relative_path.as_bytes().to_vec(),
-            asset.bytes.to_vec(),
-        )
-    }))
+fn bundled_digest(skill: &BundledSkill) -> String {
+    let mut entries = skill
+        .assets
+        .iter()
+        .map(|asset| {
+            (
+                asset.relative_path.as_bytes().to_vec(),
+                asset.bytes.to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    digest_entries(entries)
 }
 
 fn installed_digest(root: &Path) -> Result<String> {
@@ -331,10 +468,10 @@ fn digest_entries(entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Stri
     hex::encode(digest.finalize())
 }
 
-fn unique_sibling(parent: &Path, purpose: &str) -> PathBuf {
+fn unique_sibling(parent: &Path, skill: &str, purpose: &str) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     parent.join(format!(
-        ".{TRAIL_LANES_SKILL}.{purpose}-{}-{sequence}",
+        ".{skill}.{purpose}-{}-{sequence}",
         std::process::id()
     ))
 }
@@ -355,26 +492,50 @@ mod tests {
         };
 
         let created = install_agent_skills(request()).unwrap();
-        assert_eq!(created.action, AgentSkillInstallAction::Create);
-        assert!(created.path.join("SKILL.md").is_file());
+        assert_eq!(created.skills.len(), BUNDLED_SKILLS.len());
+        assert!(created
+            .skills
+            .iter()
+            .all(|skill| skill.action == AgentSkillInstallAction::Create));
+        let lanes = created
+            .skills
+            .iter()
+            .find(|skill| skill.skill == TRAIL_LANES_SKILL)
+            .unwrap();
+        assert!(lanes.path.join("SKILL.md").is_file());
+        assert!(created
+            .root
+            .join("trail-workspace/references/record-and-provenance.md")
+            .is_file());
 
         let repeated = install_agent_skills(request()).unwrap();
-        assert_eq!(repeated.action, AgentSkillInstallAction::Noop);
+        assert!(repeated
+            .skills
+            .iter()
+            .all(|skill| skill.action == AgentSkillInstallAction::Noop));
 
-        fs::write(created.path.join("SKILL.md"), "managed older version\n").unwrap();
-        let manifest_path = created.path.join(INSTALL_MANIFEST);
+        fs::write(lanes.path.join("SKILL.md"), "managed older version\n").unwrap();
+        let manifest_path = lanes.path.join(INSTALL_MANIFEST);
         let mut manifest: InstallManifest =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest.content_digest = installed_digest(&created.path).unwrap();
+        manifest.content_digest = installed_digest(&lanes.path).unwrap();
         fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         let updated = install_agent_skills(request()).unwrap();
-        assert_eq!(updated.action, AgentSkillInstallAction::Update);
+        assert_eq!(
+            updated
+                .skills
+                .iter()
+                .find(|skill| skill.skill == TRAIL_LANES_SKILL)
+                .unwrap()
+                .action,
+            AgentSkillInstallAction::Update
+        );
 
-        fs::write(created.path.join("SKILL.md"), "local edit\n").unwrap();
+        fs::write(lanes.path.join("SKILL.md"), "local edit\n").unwrap();
         let error = install_agent_skills(request()).unwrap_err();
         assert!(error.to_string().contains("contains local edits"));
 
@@ -383,8 +544,13 @@ mod tests {
             ..request()
         })
         .unwrap();
-        assert_eq!(forced.action, AgentSkillInstallAction::Update);
-        assert!(fs::read_to_string(forced.path.join("SKILL.md"))
+        let forced_lanes = forced
+            .skills
+            .iter()
+            .find(|skill| skill.skill == TRAIL_LANES_SKILL)
+            .unwrap();
+        assert_eq!(forced_lanes.action, AgentSkillInstallAction::Update);
+        assert!(fs::read_to_string(forced_lanes.path.join("SKILL.md"))
             .unwrap()
             .contains("name: trail-lanes"));
     }
@@ -400,7 +566,10 @@ mod tests {
             dry_run: true,
         })
         .unwrap();
-        assert_eq!(report.action, AgentSkillInstallAction::Create);
+        assert!(report
+            .skills
+            .iter()
+            .all(|skill| skill.action == AgentSkillInstallAction::Create));
         assert!(report.dry_run);
         assert!(!config_root.exists());
     }
@@ -409,7 +578,7 @@ mod tests {
     fn force_can_replace_an_unmanaged_skill_directory() {
         let home = tempfile::tempdir().unwrap();
         let config_root = home.path().join(".claude");
-        let skill = config_root.join("skills/trail-lanes");
+        let skill = config_root.join("skills/trail-recovery");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), "unmanaged\n").unwrap();
 
@@ -421,6 +590,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("is not owned by Trail"));
+        assert!(!config_root.join("skills/trail-lanes").exists());
 
         let report = install_agent_skills(AgentSkillInstallRequest {
             provider: AgentSkillProvider::Claude,
@@ -429,7 +599,16 @@ mod tests {
             dry_run: false,
         })
         .unwrap();
-        assert_eq!(report.action, AgentSkillInstallAction::Update);
+        assert_eq!(
+            report
+                .skills
+                .iter()
+                .find(|entry| entry.skill == "trail-recovery")
+                .unwrap()
+                .action,
+            AgentSkillInstallAction::Update
+        );
         assert!(skill.join(INSTALL_MANIFEST).is_file());
+        assert!(config_root.join("skills/trail-lanes/SKILL.md").is_file());
     }
 }

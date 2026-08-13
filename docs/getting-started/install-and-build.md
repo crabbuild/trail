@@ -77,9 +77,9 @@ trail --help
 trail lane --help
 ```
 
-## Install the Agent Lane Skill
+## Install the Agent Skill Suite
 
-After installing the Trail binary, install its focused lane skill for Codex or
+After installing the Trail binary, install its focused skills for Codex or
 Claude Code:
 
 ```sh
@@ -87,10 +87,9 @@ trail install codex
 trail install claude
 ```
 
-Codex receives the skill under `$CODEX_HOME/skills/trail-lanes` when
-`CODEX_HOME` is set, otherwise under `~/.codex/skills/trail-lanes`. Claude
-receives it under `~/.claude/skills/trail-lanes`. Restart the agent so it loads
-the new skill.
+Codex receives each skill under `$CODEX_HOME/skills/<skill>` when `CODEX_HOME`
+is set, otherwise under `~/.codex/skills/<skill>`. Claude receives each one
+under `~/.claude/skills/<skill>`. Restart the agent so it loads the new skills.
 
 Re-running the command is idempotent and updates a Trail-owned installation.
 Trail refuses to overwrite local edits or an unmanaged directory unless
@@ -101,11 +100,21 @@ trail install codex --dry-run
 trail install claude --dry-run
 ```
 
-Only lane work is skillized: concurrent task isolation, reusable immutable
-environment artifacts, private writable state, claims, managed execution,
-recording, gates, handoff, readiness, and merge preparation. Operator-only
-agent launching, integrations, and workspace maintenance remain in the normal
-documentation instead of consuming every agent session's skill context.
+The suite contains five independently triggered skills:
+
+- `trail-lanes`: concurrent task isolation, reusable immutable environments,
+  private writable state, claims, gates, readiness, and merge preparation.
+- `trail-workspace`: recording, selective paths, history, provenance, Trail
+  branches, checkout previews, and explicit Git handoff.
+- `trail-agent-tasks`: high-level launch, review, validation, handoff, recovery,
+  readiness, and apply workflows for managed coding-agent tasks.
+- `trail-integrations`: structured CLI, MCP, ACP relay, native hooks, and the
+  authenticated local HTTP daemon.
+- `trail-recovery`: blockers, conflicts, rewind, doctor/fsck, backup, and safe
+  recovery without bypassing guardrails.
+
+The split keeps unrelated capability instructions out of ordinary agent
+context while making the useful Trail workflows discoverable when needed.
 
 If `$HOME/.cargo/bin` is not on your `PATH`, either add it or call the binary
 directly from that directory. For a project-local install, override `PREFIX`:
