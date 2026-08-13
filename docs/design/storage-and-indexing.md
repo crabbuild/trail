@@ -162,6 +162,11 @@ Trail uses prolly maps for:
 
 The design gives efficient range scans and diffs over sorted keys. Low-level inspection is exposed by `trail map range` and `trail map diff`, with map decoders for raw, path, file-index, text-order, and line-index map types.
 
+Schema v1 follows `prolly-store-sqlite` 0.4's node layout. Each stored node
+includes an explicit encoding discriminator so the backend can distinguish raw
+and compressed node bytes. Trail validates that column and the backend's exact
+table shape before opening an existing workspace.
+
 ## Worktree File Index
 
 `worktree_file_index` caches file metadata and hashes:

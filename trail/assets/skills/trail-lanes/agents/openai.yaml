@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trail Lanes"
+  short_description: "Coordinate isolated agents with shared Trail environments"
+  default_prompt: "Use $trail-lanes to coordinate this coding task in an isolated Trail lane."

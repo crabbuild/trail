@@ -194,6 +194,174 @@ fn cli_reports_package_version() {
 }
 
 #[test]
+fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_root = home.path().join("codex-home");
+    let first = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "Codex skill install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["provider"], "codex");
+    let skills = first["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 5);
+    assert!(skills.iter().all(|skill| skill["action"] == "create"));
+    assert!(skills.iter().any(|skill| skill["skill"] == "trail-lanes"));
+    let skill_path = codex_root.join("skills/trail-lanes/SKILL.md");
+    assert!(fs::read_to_string(&skill_path)
+        .unwrap()
+        .contains("name: trail-lanes"));
+    assert!(codex_root
+        .join("skills/trail-workspace/references/branches-and-git.md")
+        .is_file());
+
+    let repeated = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert!(repeated["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|skill| skill["action"] == "noop"));
+
+    let claude = Command::new(trail_bin())
+        .args(["--json", "install", "claude"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        claude.status.success(),
+        "Claude skill install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&claude.stdout),
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    let claude: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
+    assert_eq!(claude["provider"], "claude");
+    assert!(claude["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|skill| skill["action"] == "create"));
+    assert!(home
+        .path()
+        .join(".claude/skills/trail-lanes/references/concurrent-agents.md")
+        .is_file());
+    assert!(home
+        .path()
+        .join(".claude/skills/trail-recovery/references/recovery-playbook.md")
+        .is_file());
+}
+
+#[test]
+fn agent_skill_install_supports_major_agent_user_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let xdg = home.path().join("xdg");
+    let cases = [
+        ("copilot", home.path().join(".copilot")),
+        ("gemini", home.path().join(".gemini")),
+        ("cursor", home.path().join(".cursor")),
+        ("windsurf", home.path().join(".codeium/windsurf")),
+        ("cline", home.path().join(".cline")),
+        ("roo", home.path().join(".roo")),
+        ("kilo", home.path().join(".kilo")),
+        ("opencode", xdg.join("opencode")),
+        ("amp", xdg.join("agents")),
+        ("kiro", home.path().join(".kiro")),
+        ("qwen", home.path().join(".qwen")),
+    ];
+
+    for (provider, root) in cases {
+        let output = Command::new(trail_bin())
+            .args(["--json", "install", provider])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider} skill install failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["provider"], provider);
+        assert_eq!(report["root"], serde_json::json!(root.join("skills")));
+        assert_eq!(report["skills"].as_array().unwrap().len(), 5);
+        assert!(root.join("skills/trail-lanes/SKILL.md").is_file());
+        assert!(root
+            .join("skills/trail-recovery/references/recovery-playbook.md")
+            .is_file());
+    }
+}
+
+#[test]
+fn agent_skill_install_refuses_local_edits_without_force() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_root = home.path().join("codex-home");
+    let install = Command::new(trail_bin())
+        .args(["install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    let skill_path = codex_root.join("skills/trail-lanes/SKILL.md");
+    fs::write(&skill_path, "local skill edit\n").unwrap();
+
+    let refused = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("contains local edits"));
+    assert_eq!(
+        fs::read_to_string(&skill_path).unwrap(),
+        "local skill edit\n"
+    );
+
+    let forced = Command::new(trail_bin())
+        .args(["--json", "install", "codex", "--force"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(forced.status.success());
+    let forced: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    let forced_lanes = forced["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["skill"] == "trail-lanes")
+        .unwrap();
+    assert_eq!(forced_lanes["action"], "update");
+    assert!(fs::read_to_string(skill_path)
+        .unwrap()
+        .contains("name: trail-lanes"));
+}
+
+#[test]
 fn agent_default_provider_is_a_typed_workspace_config_value() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();

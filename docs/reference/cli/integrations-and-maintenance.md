@@ -16,6 +16,61 @@ For day-to-day code-agent work, start with the `agent` commands. They create
 fresh task lanes, keep agent work isolated, record checkpoints, and guide review
 and apply.
 
+## Install Agent Skills
+
+```text
+trail install <agent> [--dry-run] [--force]
+```
+
+This workspace-independent command installs Trail's provider-neutral skill
+suite at user scope:
+
+| Agent argument | Native user-level destination |
+| --- | --- |
+| `codex` | `$CODEX_HOME/skills/<skill>` or `~/.codex/skills/<skill>` |
+| `claude` | `~/.claude/skills/<skill>` |
+| `copilot` | `~/.copilot/skills/<skill>` |
+| `gemini` | `~/.gemini/skills/<skill>` |
+| `cursor` | `~/.cursor/skills/<skill>` |
+| `windsurf` | `~/.codeium/windsurf/skills/<skill>` |
+| `cline` | `~/.cline/skills/<skill>` |
+| `roo` | `~/.roo/skills/<skill>` |
+| `kilo` | `~/.kilo/skills/<skill>` |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/skills/<skill>` or `~/.config/opencode/skills/<skill>` |
+| `amp` | `$XDG_CONFIG_HOME/agents/skills/<skill>` or `~/.config/agents/skills/<skill>` |
+| `kiro` | `~/.kiro/skills/<skill>` |
+| `qwen` | `~/.qwen/skills/<skill>` |
+
+Accepted product-name aliases are `claude-code`, `github-copilot`,
+`gemini-cli`, `roo-code`, `roocode`, `kilo-code`, `kilocode`, `open-code`,
+`kiro-cli`, and `qwen-code`.
+
+This list is intentionally based on native Agent Skills support: each target
+documents a user-level `SKILL.md` discovery directory and loads skill bodies on
+demand. Trail does not translate the suite into always-loaded rules for agents
+without that contract. That keeps the installation portable, preserves
+progressive disclosure, and avoids claiming support that cannot be tested as
+Agent Skills.
+
+| Skill | Focus |
+| --- | --- |
+| `trail-lanes` | Concurrent lanes, shared immutable environments, private writable state, gates, readiness, and merge preparation |
+| `trail-workspace` | Recording, history, provenance, Trail branches, checkout, and explicit Git handoff |
+| `trail-agent-tasks` | Managed task launch, review, validation, handoff, recovery, readiness, and apply |
+| `trail-integrations` | Structured CLI, MCP, ACP relay, native hooks, and authenticated HTTP |
+| `trail-recovery` | Diagnosis, conflicts, rewind, fsck, backup, and safe recovery |
+
+The skills trigger independently. A lane worker is told not to recursively
+launch another managed agent task, while `trail-agent-tasks` exposes launching
+only when a user is explicitly operating the high-level task workflow.
+
+The installer records a Trail ownership manifest per skill and is idempotent.
+It inspects the complete suite before writing and refuses to replace an
+unmanaged directory or locally edited installed files. Use `--force` only after
+preserving intentional edits; use `--dry-run` to report each planned create,
+update, or no-op action without changing files. Restart the agent after a
+successful installation.
+
 ## Quick Start
 
 ### Set up an agent provider

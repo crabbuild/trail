@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trail Workspace"
+  short_description: "Record work and trace local provenance"
+  default_prompt: "Use $trail-workspace to record and inspect this local change safely."

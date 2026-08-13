@@ -77,6 +77,52 @@ trail --help
 trail lane --help
 ```
 
+## Install the Agent Skill Suite
+
+After installing the Trail binary, install its focused skills for the coding
+agent you use:
+
+```sh
+trail install codex
+trail install claude
+trail install cursor
+trail install copilot
+trail install gemini
+```
+
+Supported targets are `codex`, `claude`, `copilot`, `gemini`, `cursor`,
+`windsurf`, `cline`, `roo`, `kilo`, `opencode`, `amp`, `kiro`, and `qwen`.
+Aliases include `claude-code`, `github-copilot`, `gemini-cli`, `roo-code`,
+`kilo-code`, `kiro-cli`, and `qwen-code`. See the
+[integration reference](../reference/cli/integrations-and-maintenance.md#install-agent-skills)
+for the exact user-level destination of every target. Restart the agent if it
+does not detect the new top-level skills directory in the current session.
+
+Re-running the command is idempotent and updates a Trail-owned installation.
+Trail refuses to overwrite local edits or an unmanaged directory unless
+`--force` is explicit. Preview the action without writing files with:
+
+```sh
+trail install codex --dry-run
+trail install cursor --dry-run
+```
+
+The suite contains five independently triggered skills:
+
+- `trail-lanes`: concurrent task isolation, reusable immutable environments,
+  private writable state, claims, gates, readiness, and merge preparation.
+- `trail-workspace`: recording, selective paths, history, provenance, Trail
+  branches, checkout previews, and explicit Git handoff.
+- `trail-agent-tasks`: high-level launch, review, validation, handoff, recovery,
+  readiness, and apply workflows for managed coding-agent tasks.
+- `trail-integrations`: structured CLI, MCP, ACP relay, native hooks, and the
+  authenticated local HTTP daemon.
+- `trail-recovery`: blockers, conflicts, rewind, doctor/fsck, backup, and safe
+  recovery without bypassing guardrails.
+
+The split keeps unrelated capability instructions out of ordinary agent
+context while making the useful Trail workflows discoverable when needed.
+
 If `$HOME/.cargo/bin` is not on your `PATH`, either add it or call the binary
 directly from that directory. For a project-local install, override `PREFIX`:
 

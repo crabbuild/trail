@@ -10,9 +10,10 @@ type ProllySqliteTableStructure = (String, Vec<String>, Vec<ProllySqliteIndexStr
 
 const PROLLY_SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS prolly_nodes (
-    cid  BLOB PRIMARY KEY NOT NULL,
-    node BLOB NOT NULL
-) WITHOUT ROWID;
+    cid      BLOB PRIMARY KEY NOT NULL,
+    encoding INTEGER NOT NULL DEFAULT 0,
+    node     BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS prolly_hints (
     namespace BLOB NOT NULL,
     key       BLOB NOT NULL,

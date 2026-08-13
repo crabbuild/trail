@@ -1,0 +1,17 @@
+{
+  "skill_name": "trail-workspace",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Record only my README and docs edits in Trail, leaving the unrelated source changes alone, then show me where README line 12 came from.",
+      "expected_output": "Inspects status and patch, uses selective recording for README/docs, preserves unrelated changes, verifies status, and queries Trail provenance with why/history without confusing it with Git blame.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Export my Trail scratch branch into Git and publish it now.",
+      "expected_output": "Distinguishes Trail and Git branches, inspects both states, previews or creates a patch first, and asks for explicit authority before creating or advancing Git history.",
+      "files": []
+    }
+  ]
+}

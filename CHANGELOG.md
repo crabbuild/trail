@@ -17,6 +17,18 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ### Added
 
+- `trail install <agent>` now installs an idempotent, provider-neutral suite of
+  five focused skills at user scope for Codex, Claude Code, GitHub Copilot,
+  Gemini CLI, Cursor, Windsurf, Cline, Roo Code, Kilo Code, OpenCode, Amp, Kiro
+  CLI, and Qwen Code. `trail-lanes`
+  covers concurrent work and shared immutable environments; `trail-workspace`
+  covers recording and provenance; `trail-agent-tasks` covers managed agent
+  review and Git handoff; `trail-integrations` covers CLI/MCP/ACP/hooks/HTTP;
+  and `trail-recovery` covers diagnosis and safe recovery. Independent triggers
+  keep unrelated capabilities out of ordinary agent context. The installer
+  inspects the complete suite for local edits, supports per-skill dry-run JSON
+  reports, and requires `--force` before replacing drifted or unmanaged content.
+
 - Environment support now includes contained Go multi-module workspaces, real frozen
   Yarn Classic and Bun handoffs, project-aware `uv sync --frozen`, and modern
   CMake/Ninja/preset/toolchain/ccache/vcpkg planning. Node native addons and lifecycle
@@ -33,6 +45,13 @@ All notable changes to Trail are documented in this file. Trail follows
   through Rust, CLI JSON, HTTP, MCP, and OpenAPI.
 
 ### Fixed
+
+- Trail now pins `prolly-map` 0.6 and `prolly-store-sqlite` 0.4 together, so
+  the SQLite backend and Trail use the same `Store` trait and locked builds do
+  not resolve incompatible Prolly major-minor lines. This hardens schema v1 to
+  the 0.4 node layout with an explicit encoding column; workspaces created with
+  the earlier layout must be backed up and recreated with
+  `trail init --force --from-git`.
 
 - Managed lane commands now derive fixed policy, resolved executable, cache,
   and output bindings from each active environment adapter instead of injecting
