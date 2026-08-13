@@ -79,7 +79,10 @@ Trail stores Prolly tree nodes in `.trail/index/trail.sqlite`. The read-only
 CLI and then Podman. Explicit `docker` and `podman` values disable fallback.
 `colima` uses `runtime.colima_profile`, or a stable workspace-derived name when
 that value is empty, and targets its profile-specific Docker context without
-changing the active context. See [Use Colima for lane runtime services](cli/integrations-and-maintenance.md#use-colima-for-lane-runtime-services).
+changing the active context. Explicit setup reuses complete system tools or,
+on supported macOS hosts, installs a pinned and SHA-256-verified Trail-managed
+Colima/Lima/Docker CLI toolchain. Ordinary config, status, reconcile, HTTP, MCP,
+and daemon operations never download tools. See [Use Colima for lane runtime services](cli/integrations-and-maintenance.md#use-colima-for-lane-runtime-services).
 
 ## Lane Hardening Keys
 

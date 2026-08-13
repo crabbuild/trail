@@ -292,7 +292,9 @@ Resolve tools are open-world writes because a reviewed host-owned resolver may
 execute an exact external package-manager command. Runtime reconcile is also an
 open-world write: it resolves the configured Docker, Podman, or Colima provider
 and may autostart the selected Colima profile before creating lane resources.
-Provider setup/status reports remain CLI/Rust-only. Artifact space, inspection,
+It never downloads runtime tools; Trail-managed provisioning requires the
+explicit local CLI/Rust setup operation. Provider setup/status reports remain
+CLI/Rust-only. Artifact space, inspection,
 reachability, verification, and quarantine queries are guarded read-only calls.
 Quarantine resolution and source export are destructive writes because they
 change retained artifact policy or normal lane source state. Every tool returns

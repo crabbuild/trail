@@ -46,6 +46,7 @@ mod workspace_plugin;
 mod workspace_python;
 mod workspace_recipe;
 mod workspace_runtime;
+mod workspace_runtime_toolchain;
 mod workspace_view;
 
 #[cfg(debug_assertions)]

@@ -579,8 +579,13 @@ networks are removed after the replacement becomes healthy, while a volume remai
 long as an active generation references it. Docker and Podman are detected at
 reconciliation time. A workspace may instead select Colima: Trail uses a stable
 workspace-specific profile, starts it without host mounts or global context activation,
-and addresses every operation through the profile's explicit Docker context. Colima
-remains an external host provider rather than adapter authority, and Trail never deletes
+and addresses every operation through the profile's explicit Docker context. Explicit
+setup reuses complete system tools or provisions pinned, digest-verified Colima, Lima,
+and Docker CLI artifacts into a Trail-owned cache on supported macOS hosts. Ordinary
+reconciliation never downloads tools. Managed processes isolate `COLIMA_HOME`,
+`LIMA_HOME`, and `DOCKER_CONFIG` below Trail's user data directory and select Apple's
+`vz` backend. Colima remains an external host provider rather than adapter authority,
+and Trail never deletes
 the VM profile implicitly. Because the contained profile cannot safely bind arbitrary
 host paths into its Docker VM, file-secret services fail closed under Colima until a
 VM-safe broker exists. A missing pinned image is pulled by digest; Trail then

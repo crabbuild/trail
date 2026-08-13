@@ -13,7 +13,11 @@ All notable changes to Trail are documented in this file. Trail follows
   explicit Docker context on every operation, reports typed provider status,
   and leaves VM lifecycle outside implicit lane cleanup. Existing workspaces
   retain ambient Docker/Podman auto-detection. Colima file-secret mounts fail
-  closed until a VM-safe secret broker is available.
+  closed until a VM-safe secret broker is available. On macOS 13+ arm64/x86_64,
+  explicit setup requires no prior installation: Trail downloads pinned Colima
+  0.10.3, Lima 2.2.0, and Docker CLI 29.7.2 artifacts, verifies compiled
+  SHA-256 identities, retains their licenses, and atomically publishes them in
+  a Trail-owned cache. All non-setup provider operations remain network-free.
 
 ## [0.4.0] - 2026-08-12
 

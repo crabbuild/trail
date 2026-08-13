@@ -734,6 +734,10 @@ pub struct EnvironmentRuntimeProviderReport {
     pub autostart: bool,
     pub started: bool,
     pub containment: String,
+    #[serde(default)]
+    pub toolchain_source: String,
+    #[serde(default)]
+    pub toolchain_version: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -1788,6 +1792,10 @@ mod workdir_mode_tests {
             autostart: true,
             started: true,
             containment: "trail_no_host_mounts_v1".to_string(),
+            toolchain_source: "trail_managed".to_string(),
+            toolchain_version: Some(
+                "colima-0.10.3+lima-2.2.0+docker-29.7.2".to_string(),
+            ),
             reason: None,
         };
         let value = serde_json::to_value(&report).unwrap();
@@ -1801,6 +1809,8 @@ mod workdir_mode_tests {
                 "autostart": true,
                 "started": true,
                 "containment": "trail_no_host_mounts_v1",
+                "toolchain_source": "trail_managed",
+                "toolchain_version": "colima-0.10.3+lima-2.2.0+docker-29.7.2",
                 "reason": null
             })
         );

@@ -12,8 +12,10 @@ workspace accounting, and source export routes serialize the same public Rust
 report types used by CLI JSON/NDJSON and MCP structured content.
 Runtime reconciliation resolves the configured Docker, Podman, or Colima
 provider. With Colima autostart enabled, the existing reconcile route may start
-the configured profile before creating lane resources; provider setup/status
-reports themselves remain CLI/Rust-only.
+the configured profile before creating lane resources, but it never downloads
+runtime tools. Trail-managed provisioning is confined to the explicit local
+CLI/Rust setup operation; provider setup/status reports themselves remain
+CLI/Rust-only.
 Lane spawn reports include the shared layered-backend prerequisite report.
 
 The daemon serves JSON HTTP routes under `/v1`.

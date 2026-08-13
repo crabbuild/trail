@@ -232,7 +232,7 @@ pub(super) fn lane_paths() -> Value {
             ], None, "EnvironmentGenerationReportNullable", true)
         },
         "/v1/lanes/{lane_or_id}/environment/runtime/reconcile": {
-            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeReconcile", "Reconcile environment runtime", "Resolve the configured Docker, Podman, or explicit Colima provider; optionally start the selected Colima profile; then idempotently create or adopt declared lane-private OCI resources and wait for health.", vec![
+            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeReconcile", "Reconcile environment runtime", "Resolve the configured Docker, Podman, or explicit Colima provider without downloading tools; optionally start the selected Colima profile; then idempotently create or adopt declared lane-private OCI resources and wait for health.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], None, "EnvironmentGenerationReport", true)
         },

@@ -94,6 +94,7 @@ struct CliRuntimeProvider {
     prefix_args: Vec<String>,
     reject_file_secrets: bool,
     workspace_id: String,
+    colima_toolchain: Option<super::workspace_runtime_toolchain::ColimaToolchain>,
 }
 
 impl CliRuntimeProvider {
@@ -143,6 +144,7 @@ impl CliRuntimeProvider {
             prefix_args,
             reject_file_secrets,
             workspace_id: workspace_id.to_string(),
+            colima_toolchain: None,
         };
         let output = provider
             .command()
@@ -162,11 +164,24 @@ impl CliRuntimeProvider {
         config: &RuntimeConfig,
         workspace_id: &str,
     ) -> Result<(Self, EnvironmentRuntimeProviderReport)> {
+        let toolchain = super::workspace_runtime_toolchain::ColimaToolchain::resolve(false)?;
+        Self::detect_colima_with_toolchain(config, workspace_id, toolchain)
+    }
+
+    fn detect_colima_with_toolchain(
+        config: &RuntimeConfig,
+        workspace_id: &str,
+        toolchain: super::workspace_runtime_toolchain::ColimaToolchain,
+    ) -> Result<(Self, EnvironmentRuntimeProviderReport)> {
         let profile = configured_colima_profile(config, workspace_id)?;
         let context = colima_docker_context(&profile);
-        let colima = super::workspace_environment::resolve_workspace_tool_executable("colima")?;
-        let docker = super::workspace_environment::resolve_workspace_tool_executable("docker")?;
-        let running = colima_profile_running(&colima.path, &profile)?;
+        if !toolchain.state_is_ready() {
+            return Err(Error::InvalidInput(
+                "Trail's isolated Colima state is unavailable; run `trail env runtime setup colima`"
+                    .to_string(),
+            ));
+        }
+        let running = colima_profile_running(&toolchain, &profile)?;
         let mut started = false;
         if !running {
             if !config.colima_autostart {
@@ -174,15 +189,16 @@ impl CliRuntimeProvider {
                     "Colima profile `{profile}` is not running and runtime.colima_autostart is false; run `trail env runtime setup colima --profile {profile}` or start it explicitly"
                 )));
             }
-            start_contained_colima_profile(&colima.path, &profile)?;
+            start_contained_colima_profile(&toolchain, &profile)?;
             started = true;
         }
         let provider = Self {
             name: "colima".to_string(),
-            executable: docker.path,
+            executable: toolchain.docker.clone(),
             prefix_args: vec!["--context".to_string(), context.clone()],
             reject_file_secrets: true,
             workspace_id: workspace_id.to_string(),
+            colima_toolchain: Some(toolchain.clone()),
         };
         provider.verify_ready()?;
         Ok((
@@ -200,13 +216,19 @@ impl CliRuntimeProvider {
                     "externally_started_profile"
                 }
                 .to_string(),
+                toolchain_source: toolchain.source.to_string(),
+                toolchain_version: toolchain.version.clone(),
                 reason: None,
             },
         ))
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.executable);
+        let mut command = if let Some(toolchain) = &self.colima_toolchain {
+            toolchain.docker_command()
+        } else {
+            Command::new(&self.executable)
+        };
         command.args(&self.prefix_args);
         if !self.prefix_args.is_empty() {
             command.env_remove("DOCKER_HOST");
@@ -645,31 +667,24 @@ fn colima_docker_context(profile: &str) -> String {
     }
 }
 
-fn colima_profile_running(executable: &Path, profile: &str) -> Result<bool> {
-    let output = Command::new(executable)
+fn colima_profile_running(
+    toolchain: &super::workspace_runtime_toolchain::ColimaToolchain,
+    profile: &str,
+) -> Result<bool> {
+    let output = toolchain
+        .colima_command()
         .args(["--profile", profile, "status", "--json"])
         .output()?;
     Ok(output.status.success())
 }
 
-fn start_contained_colima_profile(executable: &Path, profile: &str) -> Result<()> {
-    let output = Command::new(executable)
-        .args([
-            "--profile",
-            profile,
-            "start",
-            "--runtime=docker",
-            "--mount=none",
-            "--activate=false",
-            "--ssh-config=false",
-            "--ssh-agent=false",
-            "--kubernetes=false",
-            "--network-address=false",
-            "--network-preferred-route=false",
-            "--port-forwarder=ssh",
-            "--save-config=true",
-        ])
-        .output()?;
+fn start_contained_colima_profile(
+    toolchain: &super::workspace_runtime_toolchain::ColimaToolchain,
+    profile: &str,
+) -> Result<()> {
+    let mut command = toolchain.colima_command();
+    command.args(contained_colima_start_args(profile, toolchain.managed_vz));
+    let output = command.output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -678,6 +693,31 @@ fn start_contained_colima_profile(executable: &Path, profile: &str) -> Result<()
             provider_output_diagnostic(&output)
         )))
     }
+}
+
+fn contained_colima_start_args(profile: &str, managed_vz: bool) -> Vec<String> {
+    let mut args = [
+        "--profile",
+        profile,
+        "start",
+        "--runtime=docker",
+        "--mount=none",
+        "--activate=false",
+        "--ssh-config=false",
+        "--ssh-agent=false",
+        "--kubernetes=false",
+        "--network-address=false",
+        "--network-preferred-route=false",
+        "--port-forwarder=ssh",
+        "--save-config=true",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if managed_vz {
+        args.push("--vm-type=vz".to_string());
+    }
+    args
 }
 
 impl Trail {
@@ -707,6 +747,8 @@ impl Trail {
                         autostart: false,
                         started: false,
                         containment: "ambient_cli_endpoint".to_string(),
+                        toolchain_source: "system".to_string(),
+                        toolchain_version: None,
                         reason: None,
                     },
                     Err(error) => EnvironmentRuntimeProviderReport {
@@ -717,6 +759,8 @@ impl Trail {
                         autostart: false,
                         started: false,
                         containment: "ambient_cli_endpoint".to_string(),
+                        toolchain_source: "unavailable".to_string(),
+                        toolchain_version: None,
                         reason: Some(error.to_string()),
                     },
                 })
@@ -725,10 +769,9 @@ impl Trail {
                 let profile =
                     configured_colima_profile(&self.config.runtime, &self.config.workspace.id.0)?;
                 let context = colima_docker_context(&profile);
-                let colima =
-                    match super::workspace_environment::resolve_workspace_tool_executable("colima")
-                    {
-                        Ok(tool) => tool,
+                let toolchain =
+                    match super::workspace_runtime_toolchain::ColimaToolchain::resolve(false) {
+                        Ok(toolchain) => toolchain,
                         Err(error) => {
                             return Ok(EnvironmentRuntimeProviderReport {
                                 provider: "colima".to_string(),
@@ -738,33 +781,40 @@ impl Trail {
                                 autostart: self.config.runtime.colima_autostart,
                                 started: false,
                                 containment: "not_verified".to_string(),
+                                toolchain_source: "unavailable".to_string(),
+                                toolchain_version: None,
                                 reason: Some(error.to_string()),
                             });
                         }
                     };
-                if let Err(error) =
-                    super::workspace_environment::resolve_workspace_tool_executable("docker")
-                {
+                if !toolchain.state_is_ready() {
                     return Ok(EnvironmentRuntimeProviderReport {
                         provider: "colima".to_string(),
-                        status: "unavailable".to_string(),
+                        status: "stopped".to_string(),
                         profile: Some(profile),
                         docker_context: Some(context),
                         autostart: self.config.runtime.colima_autostart,
                         started: false,
                         containment: "not_verified".to_string(),
-                        reason: Some(error.to_string()),
+                        toolchain_source: toolchain.source.to_string(),
+                        toolchain_version: toolchain.version.clone(),
+                        reason: Some(
+                            "Trail's isolated Colima state is absent; run `trail env runtime setup colima`"
+                                .to_string(),
+                        ),
                     });
                 }
-                let running = colima_profile_running(&colima.path, &profile)?;
+                let running = colima_profile_running(&toolchain, &profile)?;
                 let ready = if running {
-                    CliRuntimeProvider::detect_cli(
-                        "docker",
-                        "colima",
-                        vec!["--context".to_string(), context.clone()],
-                        true,
-                        &self.config.workspace.id.0,
-                    )
+                    CliRuntimeProvider {
+                        name: "colima".to_string(),
+                        executable: toolchain.docker.clone(),
+                        prefix_args: vec!["--context".to_string(), context.clone()],
+                        reject_file_secrets: true,
+                        workspace_id: self.config.workspace.id.0.clone(),
+                        colima_toolchain: Some(toolchain.clone()),
+                    }
+                    .verify_ready()
                     .is_ok()
                 } else {
                     false
@@ -789,6 +839,8 @@ impl Trail {
                         "not_verified"
                     }
                     .to_string(),
+                    toolchain_source: toolchain.source.to_string(),
+                    toolchain_version: toolchain.version.clone(),
                     reason: if ready {
                         None
                     } else if running {
@@ -819,15 +871,20 @@ impl Trail {
                 &self.config.workspace.id.0,
             )?);
         validate_colima_profile(&profile)?;
-        super::workspace_environment::resolve_workspace_tool_executable("colima")?;
-        super::workspace_environment::resolve_workspace_tool_executable("docker")?;
+        let toolchain = super::workspace_runtime_toolchain::ColimaToolchain::resolve(true)?;
+        toolchain.prepare_state()?;
 
         let mut desired = self.config.runtime.clone();
         desired.provider = "colima".to_string();
         desired.colima_profile = Some(profile.clone());
         desired.colima_autostart = start;
         let report = if start {
-            CliRuntimeProvider::detect_colima(&desired, &self.config.workspace.id.0)?.1
+            CliRuntimeProvider::detect_colima_with_toolchain(
+                &desired,
+                &self.config.workspace.id.0,
+                toolchain.clone(),
+            )?
+            .1
         } else {
             EnvironmentRuntimeProviderReport {
                 provider: "colima".to_string(),
@@ -837,6 +894,8 @@ impl Trail {
                 autostart: false,
                 started: false,
                 containment: "not_verified".to_string(),
+                toolchain_source: toolchain.source.to_string(),
+                toolchain_version: toolchain.version.clone(),
                 reason: Some("profile startup was disabled".to_string()),
             }
         };
@@ -1987,6 +2046,7 @@ mod tests {
             prefix_args: vec!["--context".to_string(), "colima-trail-test".to_string()],
             reject_file_secrets: true,
             workspace_id: db.config.workspace.id.0.clone(),
+            colima_toolchain: None,
         };
         let error = provider
             .create_container(
@@ -1999,6 +2059,25 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("VM-safe secret broker"));
+    }
+
+    #[test]
+    fn managed_colima_start_selects_vz_without_weakening_containment() {
+        let args = contained_colima_start_args("trail-managed", true);
+        for required in [
+            "--vm-type=vz",
+            "--mount=none",
+            "--activate=false",
+            "--ssh-config=false",
+            "--ssh-agent=false",
+            "--kubernetes=false",
+            "--network-address=false",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "missing {required}");
+        }
+        assert!(!contained_colima_start_args("trail-system", false)
+            .iter()
+            .any(|arg| arg == "--vm-type=vz"));
     }
 
     #[test]

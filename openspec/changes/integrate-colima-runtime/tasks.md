@@ -20,3 +20,13 @@
 
 - [x] 4.1 Update runtime reference/design documentation, README guidance where appropriate, and the changelog with setup, rollback, security limits, and prerequisites.
 - [x] 4.2 Run formatting, targeted runtime/config/CLI tests, workspace checks, and inspect the final diff without disturbing unrelated user changes.
+
+## 5. Trail-managed Colima distribution
+
+- [x] 5.1 Add platform-pinned Colima, Lima, and Docker CLI artifact manifests with immutable URLs, SHA-256 digests, size limits, and third-party notices.
+- [x] 5.2 Implement safe global cache/data paths, bounded download and archive validation, executable verification, receipts, atomic publication, and concurrent setup convergence.
+- [x] 5.3 Resolve a complete system toolchain first, fall back to an existing managed toolchain without network access, and provision only during explicit setup.
+- [x] 5.4 Isolate managed Colima/Docker state, select macOS `vz`, and report system versus Trail-managed toolchain identity.
+- [x] 5.5 Add failure, corruption, concurrency, fallback, and CLI contract tests without contacting upstream services.
+- [x] 5.6 Update documentation and changelog for zero-install setup, supported platforms, cache/state lifecycle, licenses, and offline behavior.
+- [x] 5.7 Validate OpenSpec, run formatting, targeted tests, workspace check/test/Clippy gates, and update the existing PR as a single coherent change.

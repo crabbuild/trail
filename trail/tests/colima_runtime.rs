@@ -33,6 +33,10 @@ fn fake_path(bin: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap()
 }
 
+fn write_fake_limactl(bin: &Path) {
+    write_executable(&bin.join("limactl"), "#!/bin/sh\nexit 0\n");
+}
+
 #[test]
 fn runtime_config_defaults_and_validates_provider_and_profile() {
     let workspace = initialize_workspace();
@@ -69,6 +73,7 @@ fn setup_starts_contained_colima_and_uses_only_its_explicit_context() {
     let fake = tempfile::tempdir().unwrap();
     let colima_log = fake.path().join("colima.log");
     let docker_log = fake.path().join("docker.log");
+    write_fake_limactl(fake.path());
     write_executable(
         &fake.path().join("colima"),
         &format!(
@@ -97,6 +102,7 @@ fn setup_starts_contained_colima_and_uses_only_its_explicit_context() {
             "trail-e2e",
         ])
         .env("PATH", fake_path(fake.path()))
+        .env("HOME", fake.path().join("home"))
         .env("DOCKER_HOST", "tcp://wrong.example.invalid:2375")
         .output()
         .unwrap();
@@ -112,6 +118,8 @@ fn setup_starts_contained_colima_and_uses_only_its_explicit_context() {
     assert_eq!(report["status"], "ready");
     assert_eq!(report["started"], true);
     assert_eq!(report["containment"], "trail_no_host_mounts_v1");
+    assert_eq!(report["toolchain_source"], "system");
+    assert_eq!(report["toolchain_version"], serde_json::Value::Null);
 
     let colima_args = fs::read_to_string(colima_log).unwrap();
     assert!(colima_args.contains("--profile trail-e2e status --json"));
@@ -145,6 +153,7 @@ fn setup_starts_contained_colima_and_uses_only_its_explicit_context() {
 fn failed_colima_preflight_does_not_publish_configuration() {
     let workspace = initialize_workspace();
     let fake = tempfile::tempdir().unwrap();
+    write_fake_limactl(fake.path());
     write_executable(
         &fake.path().join("colima"),
         "#!/bin/sh\ncase \" $* \" in\n  *' status '*) exit 1 ;;\n  *' start '*) echo 'injected startup failure' >&2; exit 7 ;;\nesac\nexit 2\n",
@@ -164,6 +173,7 @@ fn failed_colima_preflight_does_not_publish_configuration() {
             "trail-failure",
         ])
         .env("PATH", fake_path(fake.path()))
+        .env("HOME", fake.path().join("home"))
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -178,6 +188,7 @@ fn failed_colima_preflight_does_not_publish_configuration() {
 fn no_start_setup_is_explicitly_unverified_and_status_is_read_only() {
     let workspace = initialize_workspace();
     let fake = tempfile::tempdir().unwrap();
+    write_fake_limactl(fake.path());
     write_executable(&fake.path().join("colima"), "#!/bin/sh\nexit 1\n");
     write_executable(&fake.path().join("docker"), "#!/bin/sh\nexit 1\n");
 
@@ -195,6 +206,7 @@ fn no_start_setup_is_explicitly_unverified_and_status_is_read_only() {
             "--no-start",
         ])
         .env("PATH", fake_path(fake.path()))
+        .env("HOME", fake.path().join("home"))
         .output()
         .unwrap();
     assert!(setup.status.success());
@@ -202,11 +214,13 @@ fn no_start_setup_is_explicitly_unverified_and_status_is_read_only() {
     assert_eq!(setup["status"], "configured");
     assert_eq!(setup["autostart"], false);
     assert_eq!(setup["containment"], "not_verified");
+    assert_eq!(setup["toolchain_source"], "system");
 
     let status = Command::new(trail_bin())
         .current_dir(workspace.path())
         .args(["--format", "json", "env", "runtime", "provider", "status"])
         .env("PATH", fake_path(fake.path()))
+        .env("HOME", fake.path().join("home"))
         .output()
         .unwrap();
     assert!(status.status.success());

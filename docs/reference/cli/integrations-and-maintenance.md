@@ -362,7 +362,7 @@ Trail can address lane-private OCI services through a dedicated Colima Docker
 profile without changing the user's active Docker context:
 
 ```sh
-# Requires separately installed `colima` and `docker` executables.
+# On macOS 13+, Trail installs pinned runtime tools when needed.
 trail env runtime setup colima
 trail env runtime provider status
 
@@ -386,9 +386,31 @@ Docker with `--context colima-<profile>` on every operation and removes
 daemon, or other Colima profile cannot receive the lane resources. The special
 Colima profile `default` maps to Docker context `colima`.
 
-Use `--no-start` to validate that both executables exist and persist the
-selection without starting a VM. With that option, autostart remains disabled
-until setup is run again without it:
+Setup first reuses a complete system `colima`, `limactl`, and `docker`
+toolchain. If any member is absent on macOS 13 or newer (Apple Silicon or
+Intel), Trail downloads its pinned Colima, Lima, and Docker CLI releases into:
+
+```text
+~/Library/Caches/trail/runtime-tools/colima/<VERSIONS>/<PLATFORM>/
+```
+
+No Homebrew, administrator access, global `PATH` change, or Docker Desktop
+installation is required. Downloads occur only during the explicit setup
+operation. Each immutable version URL, archive size, SHA-256 digest, expected
+executable digest, and archive path is checked before atomic publication.
+Third-party notices and license texts remain in the installed tree. Status,
+reconcile, HTTP, MCP, and daemon operations never download or repair tools; if
+the cache is absent or corrupt they direct the user to run setup again.
+
+Managed provisioning currently targets macOS arm64/x86_64 hosts that can use
+Apple's `vz` backend. Linux and older macOS hosts may still use the provider,
+but must supply compatible `colima`, `limactl`, and `docker` executables (and
+their platform virtualization prerequisites). The Colima guest image is not
+stored in Trail or Git; Colima downloads and verifies it during first startup.
+
+Use `--no-start` to resolve or provision the complete toolchain and persist the
+selection without starting a VM or downloading its guest image. With that
+option, autostart remains disabled until setup is run again without it:
 
 ```sh
 trail env runtime setup colima --profile trail-ci --no-start
@@ -396,7 +418,10 @@ trail config set runtime.colima_autostart true
 ```
 
 The typed provider report contains `provider`, `status`, `profile`,
-`docker_context`, `autostart`, `started`, `containment`, and `reason`. Provider
+`docker_context`, `autostart`, `started`, `containment`, `toolchain_source`,
+`toolchain_version`, and `reason`. `toolchain_source` is `system`,
+`trail_managed`, or `unavailable`; managed reports include the complete pinned
+version identity. Provider
 setup/status and their provider report are currently workspace-local Rust and
 CLI operations, so no new OpenAPI route or schema is added for that report.
 HTTP and MCP retain their existing typed config and runtime-reconcile surfaces;
@@ -415,9 +440,11 @@ Because the contained profile has no host mounts, Trail rejects OCI services
 that require host file-secret bind mounts before container creation. Use a
 local Docker/Podman provider for those services until a VM-safe secret broker is
 available; do not work around the restriction by mounting the host home into
-the Colima profile. First startup can download a VM image and take several
-minutes. Trail does not install, update, stop, delete, or redistribute Colima,
-Lima, Docker, or their VM images.
+the Colima profile. Mutable managed state and Docker context metadata are
+isolated under `~/Library/Application Support/trail/runtime/`; removing or
+resetting that state is always explicit. First startup can download a VM image
+and take several minutes. Trail never implicitly updates, stops, or deletes a
+toolchain, profile, or VM image.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.
