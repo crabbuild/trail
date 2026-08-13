@@ -262,6 +262,44 @@ pub(super) enum EnvironmentRuntimeSubcommand {
     Reconcile(EnvironmentStatusArgs),
     /// Stop active containers while retaining their lane-private volumes and networks.
     Stop(EnvironmentStatusArgs),
+    /// Inspect the selected host runtime provider without starting it.
+    Provider(EnvironmentRuntimeProviderCommand),
+    /// Configure and optionally start a contained runtime provider.
+    Setup(EnvironmentRuntimeSetupCommand),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentRuntimeProviderCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentRuntimeProviderSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentRuntimeProviderSubcommand {
+    /// Show provider selection, readiness, context, and containment status.
+    Status,
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentRuntimeSetupCommand {
+    #[command(subcommand)]
+    pub(super) command: EnvironmentRuntimeSetupSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EnvironmentRuntimeSetupSubcommand {
+    /// Configure a dedicated Colima Docker profile for lane runtime services.
+    Colima(EnvironmentRuntimeSetupColimaArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EnvironmentRuntimeSetupColimaArgs {
+    /// Explicit Colima profile; defaults to a stable workspace-derived name.
+    #[arg(long)]
+    pub(super) profile: Option<String>,
+    /// Persist the provider without starting or verifying the profile endpoint.
+    #[arg(long)]
+    pub(super) no_start: bool,
 }
 
 #[derive(Args)]

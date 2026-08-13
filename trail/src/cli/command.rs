@@ -522,10 +522,55 @@ mod tests {
                 EnvironmentRuntimeSubcommand::Status(args) => ("status", args.lane),
                 EnvironmentRuntimeSubcommand::Reconcile(args) => ("reconcile", args.lane),
                 EnvironmentRuntimeSubcommand::Stop(args) => ("stop", args.lane),
+                EnvironmentRuntimeSubcommand::Provider(_)
+                | EnvironmentRuntimeSubcommand::Setup(_) => {
+                    panic!("expected lane runtime lifecycle command")
+                }
             };
             assert_eq!(actual, expected);
             assert_eq!(lane, "lane-a");
         }
+
+        let cli = Cli::try_parse_from(["trail", "env", "runtime", "provider", "status"])
+            .expect("runtime provider status should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Runtime(runtime),
+        }) = cli.command
+        else {
+            panic!("expected environment runtime command");
+        };
+        assert!(matches!(
+            runtime.command,
+            EnvironmentRuntimeSubcommand::Provider(EnvironmentRuntimeProviderCommand {
+                command: EnvironmentRuntimeProviderSubcommand::Status
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "trail",
+            "env",
+            "runtime",
+            "setup",
+            "colima",
+            "--profile",
+            "trail-ci",
+            "--no-start",
+        ])
+        .expect("Colima runtime setup should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Runtime(runtime),
+        }) = cli.command
+        else {
+            panic!("expected environment runtime command");
+        };
+        let EnvironmentRuntimeSubcommand::Setup(EnvironmentRuntimeSetupCommand {
+            command: EnvironmentRuntimeSetupSubcommand::Colima(args),
+        }) = runtime.command
+        else {
+            panic!("expected Colima runtime setup command");
+        };
+        assert_eq!(args.profile.as_deref(), Some("trail-ci"));
+        assert!(args.no_start);
     }
 
     #[test]

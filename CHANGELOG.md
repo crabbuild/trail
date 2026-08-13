@@ -5,6 +5,16 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Added
+
+- Lane-private OCI services can now use a first-class Colima provider through
+  `trail env runtime setup colima`. Trail creates or reuses a workspace-specific
+  profile without host mounts or global Docker-context activation, targets its
+  explicit Docker context on every operation, reports typed provider status,
+  and leaves VM lifecycle outside implicit lane cleanup. Existing workspaces
+  retain ambient Docker/Podman auto-detection. Colima file-secret mounts fail
+  closed until a VM-safe secret broker is available.
+
 ## [0.4.0] - 2026-08-12
 
 ### Added

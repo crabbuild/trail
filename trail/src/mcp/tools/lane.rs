@@ -435,7 +435,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.env_runtime_reconcile",
             "title": "Reconcile Environment Runtime",
-            "description": "Idempotently create or adopt declared lane-private OCI resources and wait for their health contracts.",
+            "description": "Resolve the configured Docker, Podman, or explicit Colima provider; optionally start the selected Colima profile; then idempotently create or adopt declared lane-private OCI resources and wait for health.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" }
             }), vec!["lane"])

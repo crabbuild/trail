@@ -10,6 +10,10 @@ the same fields serialized by Rust, CLI JSON/NDJSON, and MCP structured content.
 Artifact resolution, inspection, verification, quarantine, reachability,
 workspace accounting, and source export routes serialize the same public Rust
 report types used by CLI JSON/NDJSON and MCP structured content.
+Runtime reconciliation resolves the configured Docker, Podman, or Colima
+provider. With Colima autostart enabled, the existing reconcile route may start
+the configured profile before creating lane resources; provider setup/status
+reports themselves remain CLI/Rust-only.
 Lane spawn reports include the shared layered-backend prerequisite report.
 
 The daemon serves JSON HTTP routes under `/v1`.
@@ -125,6 +129,9 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve` | Resolve or reuse one pinned component snapshot. Body: `component`, optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve-all` | Resolve or reuse every incomplete component snapshot. Body: optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/source-export` | Export one declared generated-source subtree through normal lane source writes. Body: `component` and `export`. |
+| GET | `/v1/lanes/{lane_or_id}/environment/runtime/status` | Return persisted runtime state without contacting the configured provider. |
+| POST | `/v1/lanes/{lane_or_id}/environment/runtime/reconcile` | Resolve the configured provider, optionally autostart Colima, and reconcile lane-private OCI resources. |
+| POST | `/v1/lanes/{lane_or_id}/environment/runtime/stop` | Stop Trail-owned containers while retaining private networks and volumes. |
 
 Patch requests accept either native `edits` or compatibility `files`; provide
 one non-empty array, not both.

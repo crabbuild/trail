@@ -274,6 +274,9 @@ before non-dry-run apply.
 
 ## Lane Environments and Artifacts
 
+- `trail.env_runtime_status`
+- `trail.env_runtime_reconcile`
+- `trail.env_runtime_stop`
 - `trail.env_resolve`
 - `trail.env_resolve_all`
 - `trail.artifact_space`
@@ -286,7 +289,10 @@ before non-dry-run apply.
 - `trail.env_source_export`
 
 Resolve tools are open-world writes because a reviewed host-owned resolver may
-execute an exact external package-manager command. Artifact space, inspection,
+execute an exact external package-manager command. Runtime reconcile is also an
+open-world write: it resolves the configured Docker, Podman, or Colima provider
+and may autostart the selected Colima profile before creating lane resources.
+Provider setup/status reports remain CLI/Rust-only. Artifact space, inspection,
 reachability, verification, and quarantine queries are guarded read-only calls.
 Quarantine resolution and source export are destructive writes because they
 change retained artifact policy or normal lane source state. Every tool returns

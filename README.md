@@ -167,6 +167,9 @@ For example:
 trail lane spawn fix-login --from main
 trail env sync all fix-login       # optional prewarm; first managed execution also converges
 
+# Optional on macOS: use an isolated Colima profile for declared OCI services.
+trail env runtime setup colima
+
 # Work is isolated in the lane until it is reviewed and validated.
 trail lane record fix-login -m "Fix login validation"
 trail lane readiness fix-login

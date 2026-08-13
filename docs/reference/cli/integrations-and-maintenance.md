@@ -356,6 +356,69 @@ most recently used lane. Managed execution performs the same convergence
 automatically and records a skipped phase when the active generation is
 already current.
 
+### Use Colima for lane runtime services
+
+Trail can address lane-private OCI services through a dedicated Colima Docker
+profile without changing the user's active Docker context:
+
+```sh
+# Requires separately installed `colima` and `docker` executables.
+trail env runtime setup colima
+trail env runtime provider status
+
+# Reconcile explicitly, or let the first managed command do it.
+trail env runtime reconcile <LANE>
+trail env runtime stop <LANE>
+```
+
+The default profile name is stable and workspace-derived. Override it only with
+a contained profile dedicated to Trail:
+
+```sh
+trail env runtime setup colima --profile trail-my-project
+```
+
+Setup starts the profile with Docker, no host mounts, no SSH-agent forwarding,
+no generated host SSH configuration, no Kubernetes, no reachable bridged
+address, and no automatic Docker/Kubernetes context activation. Trail invokes
+Docker with `--context colima-<profile>` on every operation and removes
+`DOCKER_HOST` from that child process, so an ambient Docker Desktop, remote
+daemon, or other Colima profile cannot receive the lane resources. The special
+Colima profile `default` maps to Docker context `colima`.
+
+Use `--no-start` to validate that both executables exist and persist the
+selection without starting a VM. With that option, autostart remains disabled
+until setup is run again without it:
+
+```sh
+trail env runtime setup colima --profile trail-ci --no-start
+trail config set runtime.colima_autostart true
+```
+
+The typed provider report contains `provider`, `status`, `profile`,
+`docker_context`, `autostart`, `started`, `containment`, and `reason`. Provider
+setup/status and their provider report are currently workspace-local Rust and
+CLI operations, so no new OpenAPI route or schema is added for that report.
+HTTP and MCP retain their existing typed config and runtime-reconcile surfaces;
+after `runtime.provider=colima` is configured, reconciliation can start the
+profile and is classified as an open-world write.
+
+Trail never stops or deletes the Colima VM implicitly. Managed-execution cleanup
+stops only Trail-owned lane containers, while named volumes follow the existing
+lane runtime retention rules. To return to ambient Docker/Podman detection:
+
+```sh
+trail config set runtime.provider auto
+```
+
+Because the contained profile has no host mounts, Trail rejects OCI services
+that require host file-secret bind mounts before container creation. Use a
+local Docker/Podman provider for those services until a VM-safe secret broker is
+available; do not work around the restriction by mounting the host home into
+the Colima profile. First startup can download a VM image and take several
+minutes. Trail does not install, update, stop, delete, or redistribute Colima,
+Lima, Docker, or their VM images.
+
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.
 

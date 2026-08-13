@@ -726,6 +726,18 @@ pub struct EnvironmentRuntimeResourceReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentRuntimeProviderReport {
+    pub provider: String,
+    pub status: String,
+    pub profile: Option<String>,
+    pub docker_context: Option<String>,
+    pub autostart: bool,
+    pub started: bool,
+    pub containment: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentGenerationDependencyReport {
     pub component_id: String,
     pub component_key: String,
@@ -1764,6 +1776,38 @@ mod workdir_mode_tests {
         assert_eq!(value["status"], "ready");
         assert_eq!(value["reasons"], serde_json::json!([]));
         assert_eq!(value["recovery_actions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn runtime_provider_report_has_stable_explicit_fields() {
+        let report = EnvironmentRuntimeProviderReport {
+            provider: "colima".to_string(),
+            status: "ready".to_string(),
+            profile: Some("trail-workspace".to_string()),
+            docker_context: Some("colima-trail-workspace".to_string()),
+            autostart: true,
+            started: true,
+            containment: "trail_no_host_mounts_v1".to_string(),
+            reason: None,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "provider": "colima",
+                "status": "ready",
+                "profile": "trail-workspace",
+                "docker_context": "colima-trail-workspace",
+                "autostart": true,
+                "started": true,
+                "containment": "trail_no_host_mounts_v1",
+                "reason": null
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<EnvironmentRuntimeProviderReport>(value).unwrap(),
+            report
+        );
     }
 
     #[test]

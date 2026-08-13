@@ -576,8 +576,14 @@ health state, cleanup token, lifecycle owner, and timestamps. Containers and net
 are generation-scoped; a private data volume is scoped to the logical lane service so a
 healthy image rollout does not silently discard database state. Retired containers and
 networks are removed after the replacement becomes healthy, while a volume remains as
-long as an active generation references it. Docker and Podman are
-detected at reconciliation time. A missing pinned image is pulled by digest; Trail then
+long as an active generation references it. Docker and Podman are detected at
+reconciliation time. A workspace may instead select Colima: Trail uses a stable
+workspace-specific profile, starts it without host mounts or global context activation,
+and addresses every operation through the profile's explicit Docker context. Colima
+remains an external host provider rather than adapter authority, and Trail never deletes
+the VM profile implicitly. Because the contained profile cannot safely bind arbitrary
+host paths into its Docker VM, file-secret services fail closed under Colima until a
+VM-safe broker exists. A missing pinned image is pulled by digest; Trail then
 verifies the observed repository digest before creating anything. Existing names are
 adopted only when Trail ownership labels match exactly. A dead lifecycle owner is marked
 `orphaned` on reopen and safely inspected on the next reconcile.
