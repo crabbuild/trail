@@ -50,6 +50,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 
 - [Lane overview](lanes/overview.md)
 - [Lane work model](lanes/work-model.md)
+- [Colima-sandboxed lane execution](lanes/colima-sandboxed-execution.md)
 - [Spawn and materialize workdirs](lanes/spawn-and-materialize-workdirs.md)
 - [Structured patches](lanes/structured-patches.md)
 - [Sessions, turns, messages, and runs](lanes/sessions-turns-messages-and-runs.md)

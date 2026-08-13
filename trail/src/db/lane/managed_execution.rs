@@ -22,11 +22,17 @@ pub struct ManagedExecutionContext {
     pub workdir: PathBuf,
     pub environment: Vec<(String, String)>,
     pub environment_generation: Option<String>,
+    pub execution_backend: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) trace_id: Option<String>,
     projected_source_inputs: Vec<ManagedProjectedSourceInput>,
     preparation: ManagedExecutionPreparationReceipt,
     sealing_decisions: Vec<ManagedExecutionSealingDecision>,
     mount: Option<Box<dyn Any + Send>>,
     phases: Vec<ManagedExecutionPhaseReceipt>,
+    pub(crate) sandbox_finalization: Option<ManagedExecutionSandboxFinalizationReceipt>,
+    pub(crate) guest_manifest_path: Option<PathBuf>,
     #[cfg(test)]
     injected_disposal_error: Option<String>,
 }
@@ -37,6 +43,33 @@ struct ManagedProjectedSourceInput {
 }
 
 impl Trail {
+    pub(crate) fn set_managed_execution_sandbox_preparation(
+        &self,
+        context: &mut ManagedExecutionContext,
+        receipt: ManagedExecutionSandboxPreparationReceipt,
+    ) {
+        context.preparation.sandbox = Some(receipt);
+    }
+
+    pub(crate) fn set_managed_execution_sandbox_finalization(
+        &self,
+        context: &mut ManagedExecutionContext,
+        receipt: ManagedExecutionSandboxFinalizationReceipt,
+    ) {
+        context.sandbox_finalization = Some(receipt);
+    }
+
+    pub(crate) fn record_managed_execution_context_phase(
+        &self,
+        context: &mut ManagedExecutionContext,
+        phase: &str,
+        status: &str,
+        error: Option<&str>,
+        details: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.push_managed_context_phase(context, phase, status, error, details)
+    }
+
     #[doc(hidden)]
     pub fn prepare_managed_lane_execution(
         &self,
@@ -617,9 +650,14 @@ impl Trail {
             environment_generation: active_generation
                 .as_ref()
                 .map(|generation| generation.generation_id.clone()),
+            execution_backend: self.config.runtime.execution_backend.clone(),
+            session_id: None,
+            turn_id: None,
+            trace_id: None,
             projected_source_inputs,
             preparation: ManagedExecutionPreparationReceipt {
                 source_root: head.root_id.clone(),
+                execution_backend: self.config.runtime.execution_backend.clone(),
                 view_id: view.as_ref().map(|view| view.view_id.clone()),
                 view_generation: view.as_ref().map(|view| view.generation),
                 missing_resolution_policy: ManagedExecutionMissingResolutionPolicy::Explicit,
@@ -628,10 +666,13 @@ impl Trail {
                     .as_ref()
                     .map(|generation| generation.generation_id.clone()),
                 output_pins,
+                sandbox: None,
             },
             sealing_decisions,
             mount,
             phases,
+            sandbox_finalization: None,
+            guest_manifest_path: None,
             #[cfg(test)]
             injected_disposal_error: None,
         })
@@ -822,6 +863,15 @@ impl Trail {
                 (None, None, Some(code), Some(reason))
             }
         };
+        let guest_manifest_error =
+            super::workspace_guest_execution::finalize_guest_execution_manifest(
+                self,
+                &context,
+                checkpoint.as_ref(),
+                checkpoint_error.as_deref(),
+            )
+            .err()
+            .map(|error| error.to_string());
 
         let has_runtime = context.view.is_some()
             && self
@@ -933,10 +983,16 @@ impl Trail {
         } else {
             "skipped"
         };
+        let sandbox_cleanup_error = context
+            .sandbox_finalization
+            .as_ref()
+            .and_then(|receipt| receipt.cleanup_error.clone());
         let errors = checkpoint_error
             .iter()
             .chain(disposal_error.iter())
             .chain(unmount_error.iter())
+            .chain(sandbox_cleanup_error.iter())
+            .chain(guest_manifest_error.iter())
             .cloned()
             .collect::<Vec<_>>();
         let finalization = ManagedExecutionFinalizationReceipt {
@@ -949,12 +1005,16 @@ impl Trail {
             complete: errors.is_empty(),
             sealing_decisions,
             errors,
+            sandbox: context.sandbox_finalization,
         };
 
         ManagedExecutionLifecycleReport {
             execution_id: context.execution_id,
             surface: context.surface,
             command_fingerprint: context.command_fingerprint,
+            session_id: context.session_id,
+            turn_id: context.turn_id,
+            trace_id: context.trace_id,
             preparation: Some(context.preparation),
             environment_generation: context.environment_generation,
             checkpoint,

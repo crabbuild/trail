@@ -8,6 +8,10 @@ Use `trail config list`, `get`, and `set` to inspect and edit workspace config.
 | --- | --- | --- | --- |
 | `workspace.id` | string | yes | Generated workspace ID. |
 | `workspace.default_branch` | string | no | Existing branch ref segment. |
+| `runtime.provider` | string | no | `auto`, `docker`, `podman`, or `colima`. |
+| `runtime.execution_backend` | string | no | `host` (default) or `colima`; `colima` requires `runtime.provider=colima`. |
+| `runtime.colima_profile` | string | no | Empty for a workspace-derived profile, or 1-63 lowercase letters, digits, and interior hyphens. |
+| `runtime.colima_autostart` | bool | no | Start the selected Colima profile during runtime reconciliation. |
 | `recording.mode` | string | no | `save`, `manual`, `watch`. |
 | `recording.debounce_ms` | u64 | no | Unsigned integer, zero allowed. |
 | `recording.ignore_gitignored` | bool | no | Boolean parser values. |
@@ -69,6 +73,23 @@ False values:
 
 Trail stores Prolly tree nodes in `.trail/index/trail.sqlite`. The read-only
 `storage.prolly_backend` value remains in workspace config as a format marker.
+
+## Runtime Provider
+
+`runtime.provider=auto` preserves compatibility by probing the ambient Docker
+CLI and then Podman. Explicit `docker` and `podman` values disable fallback.
+`colima` uses `runtime.colima_profile`, or a stable workspace-derived name when
+that value is empty, and targets its profile-specific Docker context without
+changing the active context. Explicit setup reuses complete system tools or,
+on supported macOS hosts, installs a pinned and SHA-256-verified Trail-managed
+Colima/Lima/Docker CLI toolchain. Ordinary config, status, reconcile, HTTP, MCP,
+and daemon operations never download tools. See [Use Colima for lane runtime services](cli/integrations-and-maintenance.md#use-colima-for-lane-runtime-services).
+
+`runtime.execution_backend=colima` additionally sends managed lane commands and
+test/eval gates through the profile's Lima guest without a host mount. Setup
+must start and verify a Trail-contained profile before this value can be
+selected. The agent/coordinator remains on the host. See
+[Colima-sandboxed lane execution](../lanes/colima-sandboxed-execution.md).
 
 ## Lane Hardening Keys
 

@@ -107,6 +107,21 @@ pub enum Error {
     GitDeltaExportRequired(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("managed execution `{execution_id}` was cancelled")]
+    ExecutionCancelled { execution_id: String },
+    #[error("managed execution `{execution_id}` candidate validation failed: {reason}")]
+    ExecutionValidation {
+        execution_id: String,
+        reason: String,
+    },
+    #[error(
+        "managed execution `{execution_id}` infrastructure failed in phase `{phase}`: {reason}"
+    )]
+    ExecutionInfrastructure {
+        execution_id: String,
+        phase: String,
+        reason: String,
+    },
     #[error("native COW is unsupported for this source and destination")]
     CloneUnsupported,
     #[error("native COW source and destination are on different filesystems")]
@@ -168,6 +183,9 @@ impl Error {
             Error::GitWorktreeDirty(_) => "GIT_WORKTREE_DIRTY",
             Error::GitDeltaExportRequired(_) => "GIT_DELTA_EXPORT_REQUIRED",
             Error::InvalidInput(_) => "INVALID_INPUT",
+            Error::ExecutionCancelled { .. } => "EXECUTION_CANCELLED",
+            Error::ExecutionValidation { .. } => "EXECUTION_VALIDATION_FAILED",
+            Error::ExecutionInfrastructure { .. } => "EXECUTION_INFRASTRUCTURE_FAILED",
             Error::CloneUnsupported => "CLONE_UNSUPPORTED",
             Error::CloneCrossDevice => "CLONE_CROSS_DEVICE",
             Error::NativeCowSourceUnavailable => "NATIVE_COW_SOURCE_UNAVAILABLE",
@@ -215,6 +233,9 @@ impl Error {
             | Error::CloneUnsupported
             | Error::CloneCrossDevice
             | Error::NativeCowSourceUnavailable => 2,
+            Error::ExecutionCancelled { .. } => 17,
+            Error::ExecutionValidation { .. } => 18,
+            Error::ExecutionInfrastructure { .. } => 19,
             Error::DaemonUnavailable(_) => 11,
             Error::DaemonError { exit_code, .. } => *exit_code,
             _ => 1,

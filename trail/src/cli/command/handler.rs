@@ -492,25 +492,44 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
             "Promoted environment output",
             &db.promote_workspace_environment_output(&args.lane, &args.component, &args.output)?,
         ),
-        EnvironmentSubcommand::Runtime(runtime) => {
-            let generation = match runtime.command {
-                EnvironmentRuntimeSubcommand::Status(args) => db
-                    .active_environment_generation(&args.lane)?
-                    .ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "lane `{}` has no active environment generation",
-                            args.lane
-                        ))
-                    })?,
-                EnvironmentRuntimeSubcommand::Reconcile(args) => {
-                    db.reconcile_workspace_environment_runtime(&args.lane)?
+        EnvironmentSubcommand::Runtime(runtime) => match runtime.command {
+            EnvironmentRuntimeSubcommand::Status(args) => {
+                let generation =
+                    db.active_environment_generation(&args.lane)?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "lane `{}` has no active environment generation",
+                                args.lane
+                            ))
+                        })?;
+                render_specialist(ctx, "Environment runtime", &generation)
+            }
+            EnvironmentRuntimeSubcommand::Reconcile(args) => {
+                let generation = db.reconcile_workspace_environment_runtime(&args.lane)?;
+                render_specialist(ctx, "Environment runtime", &generation)
+            }
+            EnvironmentRuntimeSubcommand::Stop(args) => {
+                let generation = db.stop_workspace_environment_runtime(&args.lane)?;
+                render_specialist(ctx, "Environment runtime", &generation)
+            }
+            EnvironmentRuntimeSubcommand::Provider(provider) => match provider.command {
+                EnvironmentRuntimeProviderSubcommand::Status => render_specialist(
+                    ctx,
+                    "Environment runtime provider",
+                    &db.workspace_environment_runtime_provider_status()?,
+                ),
+            },
+            EnvironmentRuntimeSubcommand::Setup(setup) => match setup.command {
+                EnvironmentRuntimeSetupSubcommand::Colima(args) => {
+                    let report = db.setup_colima_workspace_environment_runtime_with_backend(
+                        args.execution_backend.as_deref(),
+                        args.profile.as_deref(),
+                        !args.no_start,
+                    )?;
+                    render_specialist(ctx, "Configured Colima runtime", &report)
                 }
-                EnvironmentRuntimeSubcommand::Stop(args) => {
-                    db.stop_workspace_environment_runtime(&args.lane)?
-                }
-            };
-            render_specialist(ctx, "Environment runtime", &generation)
-        }
+            },
+        },
     }
 }
 

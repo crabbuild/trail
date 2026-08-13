@@ -167,6 +167,10 @@ For example:
 trail lane spawn fix-login --from main
 trail env sync all fix-login       # optional prewarm; first managed execution also converges
 
+# Optional on macOS: provision tools and execute managed commands in the VM.
+trail env runtime setup colima --execution-backend colima
+trail lane exec fix-login --timeout-secs 900 -- cargo test
+
 # Work is isolated in the lane until it is reviewed and validated.
 trail lane record fix-login -m "Fix login validation"
 trail lane readiness fix-login

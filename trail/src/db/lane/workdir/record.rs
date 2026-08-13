@@ -1331,7 +1331,7 @@ impl Trail {
     }
 }
 
-fn lane_workdir_ignore_matcher(root: &Path) -> Result<ignore::gitignore::Gitignore> {
+pub(crate) fn lane_workdir_ignore_matcher(root: &Path) -> Result<ignore::gitignore::Gitignore> {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     for filename in [".trailignore", ".gitignore"] {
         let path = root.join(filename);

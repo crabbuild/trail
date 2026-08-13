@@ -21,6 +21,8 @@ pub struct TrailConfig {
     pub guardrails: GuardrailsConfig,
     #[serde(default = "default_workspace_views_config")]
     pub workspace_views: WorkspaceViewsConfig,
+    #[serde(default = "default_runtime_config")]
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -115,6 +117,18 @@ pub struct WorkspaceViewsConfig {
     pub prefetch_max_entries: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_runtime_provider")]
+    pub provider: String,
+    #[serde(default = "default_runtime_execution_backend")]
+    pub execution_backend: String,
+    #[serde(default)]
+    pub colima_profile: Option<String>,
+    #[serde(default = "default_colima_autostart")]
+    pub colima_autostart: bool,
+}
+
 fn default_storage_config() -> StorageConfig {
     StorageConfig {
         prolly_backend: default_prolly_backend(),
@@ -145,6 +159,27 @@ fn default_workspace_views_config() -> WorkspaceViewsConfig {
         prefetch_max_bytes: default_prefetch_bytes(),
         prefetch_max_entries: default_prefetch_entries(),
     }
+}
+
+fn default_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        provider: default_runtime_provider(),
+        execution_backend: default_runtime_execution_backend(),
+        colima_profile: None,
+        colima_autostart: default_colima_autostart(),
+    }
+}
+
+fn default_runtime_provider() -> String {
+    "auto".to_string()
+}
+
+fn default_runtime_execution_backend() -> String {
+    "host".to_string()
+}
+
+fn default_colima_autostart() -> bool {
+    true
 }
 
 fn default_prefetch_bytes() -> u64 {
@@ -282,6 +317,7 @@ impl TrailConfig {
             storage: default_storage_config(),
             guardrails: default_guardrails_config(),
             workspace_views: default_workspace_views_config(),
+            runtime: default_runtime_config(),
         }
     }
 }

@@ -269,6 +269,21 @@ fn handle_unix_connection(
             return Ok(false);
         }
     };
+    if is_long_running_lane_exec(&request, &db.config().runtime.execution_backend) {
+        let workspace = db.workspace_root().to_path_buf();
+        let auth = auth.clone();
+        let mut worker_stream = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let response = match Trail::open(&workspace) {
+                Ok(mut worker_db) => route::route_request(&mut worker_db, request, &auth),
+                Err(error) => route::error_response(&error),
+            };
+            let _ = worker_stream
+                .write_all(&response.to_http_bytes())
+                .and_then(|_| worker_stream.flush());
+        });
+        return Ok(false);
+    }
     #[cfg(debug_assertions)]
     let request_method = request.method.clone();
     #[cfg(debug_assertions)]
@@ -325,6 +340,20 @@ fn handle_connection(
         stream.flush()?;
         return Ok(());
     }
+    if is_long_running_lane_exec(&request, &db.config().runtime.execution_backend) {
+        let workspace = db.workspace_root().to_path_buf();
+        let auth = auth.clone();
+        std::thread::spawn(move || {
+            let response = match Trail::open(&workspace) {
+                Ok(mut worker_db) => route::route_request(&mut worker_db, request, &auth),
+                Err(error) => route::error_response(&error),
+            };
+            let _ = stream
+                .write_all(&response.to_http_bytes())
+                .and_then(|_| stream.flush());
+        });
+        return Ok(());
+    }
     #[cfg(debug_assertions)]
     let request_method = request.method.clone();
     #[cfg(debug_assertions)]
@@ -335,6 +364,15 @@ fn handle_connection(
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn is_long_running_lane_exec(request: &HttpRequest, execution_backend: &str) -> bool {
+    if execution_backend != "colima" || request.method != "POST" {
+        return false;
+    }
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    parts.len() == 4 && parts[0] == "v1" && parts[1] == "lanes" && parts[3] == "exec"
 }
 
 #[cfg(debug_assertions)]
@@ -824,6 +862,36 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::thread;
+
+    #[test]
+    fn only_blocking_lane_exec_is_dispatched_to_a_worker() {
+        let request = |method: &str, path: &str| HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        assert!(is_long_running_lane_exec(
+            &request("POST", "/v1/lanes/agent/exec"),
+            "colima"
+        ));
+        assert!(is_long_running_lane_exec(
+            &request("POST", "/v1/lanes/agent/exec?trace=true"),
+            "colima"
+        ));
+        assert!(!is_long_running_lane_exec(
+            &request("POST", "/v1/lanes/agent/exec/cancel"),
+            "colima"
+        ));
+        assert!(!is_long_running_lane_exec(
+            &request("GET", "/v1/lanes/agent/exec"),
+            "colima"
+        ));
+        assert!(!is_long_running_lane_exec(
+            &request("POST", "/v1/lanes/agent/exec"),
+            "host"
+        ));
+    }
 
     #[test]
     fn socket_line_reader_rejects_oversized_line_without_newline() {

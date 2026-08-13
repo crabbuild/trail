@@ -19,6 +19,7 @@ mod view_layout;
 
 pub(crate) use marker::materialized_lane_root_identity;
 pub(crate) use materialize::*;
+pub(crate) use record::lane_workdir_ignore_matcher;
 #[cfg(debug_assertions)]
 pub(crate) use record::{
     install_lane_record_after_c2_write_for_current_thread,

@@ -1242,6 +1242,10 @@ pub struct AgentLaunchContainmentReport {
     pub project_integrations: String,
     pub environment_policy: String,
     pub sandbox_backend: String,
+    #[serde(default = "default_agent_control_plane_backend")]
+    pub control_plane_backend: String,
+    #[serde(default = "default_agent_managed_command_backend")]
+    pub managed_command_backend: String,
     pub filesystem_enforcement: String,
     pub lane_root: String,
     pub git_work_tree: Option<String>,
@@ -1249,6 +1253,14 @@ pub struct AgentLaunchContainmentReport {
     pub writable_roots: Vec<String>,
     pub ambient_repository_variables_scrubbed: bool,
     pub original_checkout_unchanged: bool,
+}
+
+fn default_agent_control_plane_backend() -> String {
+    "host".to_string()
+}
+
+fn default_agent_managed_command_backend() -> String {
+    "host".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

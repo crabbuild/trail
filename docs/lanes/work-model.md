@@ -188,6 +188,14 @@ Trail Relay
 
 Without such a relay, the host or script must call Trail explicitly.
 
+When a host needs to execute repository code, it can call CLI/HTTP/MCP lane
+execution with the open turn id. Trail then attaches the managed lifecycle,
+checkpointed operation, and derived trace id to that turn. With the optional
+Colima backend, the host agent remains the control plane while the command runs
+inside a no-host-mount Lima guest; this changes containment, not the lane's
+branch/session/turn model. See
+[Colima-sandboxed lane execution](colima-sandboxed-execution.md).
+
 ## Two Ways to Change a Lane
 
 ### Structured Patch Flow

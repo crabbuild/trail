@@ -222,11 +222,22 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.lane_exec",
             "title": "Execute In Lane Workspace",
-            "description": "Mount a layered lane for one open-world command with isolated cache and target variables.",
+            "description": "Run one managed lane command through the workspace's configured host or no-mount Colima backend, then validate and checkpoint source changes with optional open-turn provenance.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" },
-                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "turn_id": { "type": "string" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 86400 }
             }), vec!["lane", "command"])
+        },
+        {
+            "name": "trail.lane_exec_cancel",
+            "title": "Cancel Lane Workspace Execution",
+            "description": "Cancel one Trail-owned Colima execution, terminate only its guest process group, skip candidate import, and retain a terminal receipt.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "execution_id": { "type": "string" }
+            }), vec!["lane"])
         },
         {
             "name": "trail.deps_status",
@@ -435,7 +446,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.env_runtime_reconcile",
             "title": "Reconcile Environment Runtime",
-            "description": "Idempotently create or adopt declared lane-private OCI resources and wait for their health contracts.",
+            "description": "Resolve the configured Docker, Podman, or explicit Colima provider without downloading tools; optionally start the selected Colima profile; then idempotently create or adopt declared lane-private OCI resources and wait for health.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" }
             }), vec!["lane"])

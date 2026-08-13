@@ -5,6 +5,40 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Trail's managed Colima runtime now keeps Lima VM state at the private,
+  socket-safe `~/.trail-lima/` path on macOS, avoiding startup failures when a
+  workspace-scoped profile exceeds the platform's Unix-domain socket limit.
+
+### Added
+
+- Lane-private OCI services can now use a first-class Colima provider through
+  `trail env runtime setup colima`. Trail creates or reuses a workspace-specific
+  profile without host mounts or global Docker-context activation, targets its
+  explicit Docker context on every operation, reports typed provider status,
+  and leaves VM lifecycle outside implicit lane cleanup. Existing workspaces
+  retain ambient Docker/Podman auto-detection. Colima file-secret mounts fail
+  closed until a VM-safe secret broker is available. On macOS 13+ arm64/x86_64,
+  explicit setup requires no prior installation: Trail downloads pinned Colima
+  0.10.3, Lima 2.2.0, and Docker CLI 29.7.2 artifacts, verifies compiled
+  SHA-256 identities, retains their licenses, and atomically publishes them in
+  a Trail-owned cache. All non-setup provider operations remain network-free.
+
+- Managed lane commands and test/eval gates can now select a no-host-mount
+  Colima/Lima execution backend. Trail deterministically projects bounded lane
+  state into an execution-scoped guest namespace, runs direct argv with a
+  bounded environment and timeout, validates and imports only source changes,
+  checkpoints non-zero and timed-out results, and cleans up without stopping
+  the profile. CLI, HTTP, MCP, OpenAPI, lifecycle receipts, turn provenance, and
+  doctor recovery diagnostics share the same contract; `host` remains the
+  compatibility default. CLI, HTTP, and MCP now also share an execution
+  cancellation operation that terminates only Trail's recorded guest process
+  group, skips candidate import, preserves unrelated profile processes, and
+  returns the distinct `EXECUTION_CANCELLED` category (CLI exit 17 / HTTP 409).
+  Candidate-validation and guest-infrastructure failures are likewise distinct
+  machine categories (CLI exits 18/19 and HTTP 422/503).
+
 ## [0.4.0] - 2026-08-12
 
 ### Added

@@ -39,6 +39,7 @@ mod workspace_cmake;
 mod workspace_environment;
 mod workspace_git;
 mod workspace_go;
+mod workspace_guest_execution;
 mod workspace_layer;
 mod workspace_node;
 mod workspace_oci;
@@ -46,6 +47,7 @@ mod workspace_plugin;
 mod workspace_python;
 mod workspace_recipe;
 mod workspace_runtime;
+mod workspace_runtime_toolchain;
 mod workspace_view;
 
 #[cfg(debug_assertions)]

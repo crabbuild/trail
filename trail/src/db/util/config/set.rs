@@ -155,6 +155,52 @@ pub(crate) fn set_config_value(
             config.guardrails.policy = value.to_string();
             Ok(())
         }
+        "runtime.provider" => match value {
+            "auto" | "docker" | "podman" | "colima" => {
+                if value != "colima" && config.runtime.execution_backend == "colima" {
+                    return Err(Error::InvalidInput(
+                        "runtime.provider cannot move away from colima while runtime.execution_backend is colima; set runtime.execution_backend to host first"
+                            .to_string(),
+                    ));
+                }
+                config.runtime.provider = value.to_string();
+                Ok(())
+            }
+            other => Err(Error::InvalidInput(format!(
+                "runtime.provider must be auto, docker, podman, or colima, got `{other}`"
+            ))),
+        },
+        "runtime.execution_backend" => match value {
+            "host" => {
+                config.runtime.execution_backend = value.to_string();
+                Ok(())
+            }
+            "colima" if config.runtime.provider == "colima" => {
+                config.runtime.execution_backend = value.to_string();
+                Ok(())
+            }
+            "colima" => Err(Error::InvalidInput(
+                "runtime.execution_backend colima requires runtime.provider colima; run `trail env runtime setup colima --execution-backend colima`"
+                    .to_string(),
+            )),
+            other => Err(Error::InvalidInput(format!(
+                "runtime.execution_backend must be host or colima, got `{other}`"
+            ))),
+        },
+        "runtime.colima_profile" => {
+            let profile = value.trim();
+            if profile.is_empty() {
+                config.runtime.colima_profile = None;
+                return Ok(());
+            }
+            validate_colima_profile(profile)?;
+            config.runtime.colima_profile = Some(profile.to_string());
+            Ok(())
+        }
+        "runtime.colima_autostart" => {
+            config.runtime.colima_autostart = parse_config_bool(key, value)?;
+            Ok(())
+        }
         "workspace_views.upper_logical_bytes" => {
             config.workspace_views.upper_logical_bytes = parse_config_u64(key, value, true)?;
             Ok(())
@@ -201,4 +247,20 @@ pub(crate) fn set_config_value(
         }
         _ => Err(Error::InvalidInput(format!("unknown config key `{key}`"))),
     }
+}
+
+pub(crate) fn validate_colima_profile(profile: &str) -> Result<()> {
+    if profile.len() > 63
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || profile.starts_with('-')
+        || profile.ends_with('-')
+    {
+        return Err(Error::InvalidInput(
+            "runtime.colima_profile must contain 1-63 lowercase ASCII letters, digits, or hyphens and cannot start or end with a hyphen"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

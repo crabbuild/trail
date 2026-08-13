@@ -182,6 +182,17 @@ fn default_update_source() -> String {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceExecRequest {
     pub(crate) command: Vec<String>,
+    #[serde(default)]
+    pub(crate) turn_id: Option<String>,
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceExecCancellationRequest {
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

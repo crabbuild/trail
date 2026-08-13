@@ -10,6 +10,12 @@ the same fields serialized by Rust, CLI JSON/NDJSON, and MCP structured content.
 Artifact resolution, inspection, verification, quarantine, reachability,
 workspace accounting, and source export routes serialize the same public Rust
 report types used by CLI JSON/NDJSON and MCP structured content.
+Runtime reconciliation resolves the configured Docker, Podman, or Colima
+provider. With Colima autostart enabled, the existing reconcile route may start
+the configured profile before creating lane resources, but it never downloads
+runtime tools. Trail-managed provisioning is confined to the explicit local
+CLI/Rust setup operation; provider setup/status reports themselves remain
+CLI/Rust-only.
 Lane spawn reports include the shared layered-backend prerequisite report.
 
 The daemon serves JSON HTTP routes under `/v1`.
@@ -116,6 +122,8 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/hydrate` | Hydrate sparse workdir paths. |
 | POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
+| POST | `/v1/lanes/{lane_or_id}/exec` | Run a managed command through the configured host or no-mount Colima backend and checkpoint validated source changes. |
+| POST | `/v1/lanes/{lane_or_id}/exec/cancel` | Cancel one owned Colima execution before candidate import; accepts optional `execution_id`. |
 | POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
 | POST | `/v1/lanes/{lane}/merge` | Dry-run or explicitly direct-merge this lane into body field `into`. |
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
@@ -125,6 +133,9 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve` | Resolve or reuse one pinned component snapshot. Body: `component`, optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve-all` | Resolve or reuse every incomplete component snapshot. Body: optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/source-export` | Export one declared generated-source subtree through normal lane source writes. Body: `component` and `export`. |
+| GET | `/v1/lanes/{lane_or_id}/environment/runtime/status` | Return persisted runtime state without contacting the configured provider. |
+| POST | `/v1/lanes/{lane_or_id}/environment/runtime/reconcile` | Resolve the configured provider, optionally autostart Colima, and reconcile lane-private OCI resources. |
+| POST | `/v1/lanes/{lane_or_id}/environment/runtime/stop` | Stop Trail-owned containers while retaining private networks and volumes. |
 
 Patch requests accept either native `edits` or compatibility `files`; provide
 one non-empty array, not both.
@@ -145,6 +156,26 @@ agent runs. The response includes `requested_workdir_mode`, resolved
 and `transparent_cow_available`.
 On macOS, `nfs-cow` reports `workdir_backend: "nfs"` and requires no
 macFUSE installation. On Windows, `dokan-cow` reports `workdir_backend: "dokan"`.
+
+`POST /v1/lanes/{lane_or_id}/exec` requires a non-empty `command` argv and
+accepts optional `turn_id` and `timeout_secs` (1 through 86400; Colima default
+3600). An open same-lane turn receives the checkpoint and session/turn/trace
+provenance. The response identifies the host/Colima execution backend,
+`succeeded`/`command_failed`/`timed_out` classification, lifecycle phases,
+projection/import receipts, checkpoint, and cleanup. Infrastructure and
+candidate-validation failures remain HTTP errors rather than command exits:
+`EXECUTION_VALIDATION_FAILED` uses 422 and
+`EXECUTION_INFRASTRUCTURE_FAILED` uses 503.
+The daemon dispatches this long-running route on a workspace-scoped worker so
+the same authenticated server can continue accepting status and cancellation
+requests while the execution is active.
+
+`POST /v1/lanes/{lane_or_id}/exec/cancel` accepts an optional `execution_id`.
+When omitted, exactly one cancellable execution must exist for the lane. A
+successful response records the prior phase, profile/instance, owned
+process-group termination, and namespace cleanup. The cancelled blocking
+request returns HTTP 409 with `EXECUTION_CANCELLED`; no candidate state is
+imported and unrelated profile processes are preserved.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.

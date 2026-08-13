@@ -246,6 +246,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.run_test"
         | "trail.run_eval"
         | "trail.lane_exec"
+        | "trail.lane_exec_cancel"
         | "trail.deps_sync"
         | "trail.env_sync"
         | "trail.env_sync_all"

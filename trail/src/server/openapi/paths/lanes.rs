@@ -232,7 +232,7 @@ pub(super) fn lane_paths() -> Value {
             ], None, "EnvironmentGenerationReportNullable", true)
         },
         "/v1/lanes/{lane_or_id}/environment/runtime/reconcile": {
-            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeReconcile", "Reconcile environment runtime", "Idempotently create or adopt declared lane-private OCI resources and wait for health.", vec![
+            "post": openapi_operation_with_response_schema("laneEnvironmentRuntimeReconcile", "Reconcile environment runtime", "Resolve the configured Docker, Podman, or explicit Colima provider without downloading tools; optionally start the selected Colima profile; then idempotently create or adopt declared lane-private OCI resources and wait for health.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], None, "EnvironmentGenerationReport", true)
         },
@@ -247,9 +247,14 @@ pub(super) fn lane_paths() -> Value {
             ], Some("WorkspaceCheckpointRequest"), "WorkspaceCheckpointReport", true)
         },
         "/v1/lanes/{lane_or_id}/exec": {
-            "post": openapi_operation_with_response_schema("laneWorkspaceExec", "Execute in lane workspace", "Discover, synchronize, reconcile, mount, execute, checkpoint source changes, dispose runtime artifacts, and unmount one managed lane command.", vec![
+            "post": openapi_operation_with_response_schema("laneWorkspaceExec", "Execute in lane workspace", "Discover, synchronize, reconcile, mount, execute through the configured host or no-mount Colima backend, validate and checkpoint source changes, dispose runtime artifacts, and unmount one managed lane command.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], Some("WorkspaceExecRequest"), "WorkspaceExecReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/exec/cancel": {
+            "post": openapi_operation_with_response_schema("laneWorkspaceExecCancel", "Cancel lane workspace execution", "Request cancellation of one Trail-owned Colima execution, terminate only its guest process group, skip candidate import, clean its namespace, and retain a terminal receipt.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("WorkspaceExecCancellationRequest"), "WorkspaceExecCancellationReport", true)
         },
         "/v1/lanes/{lane_or_id}/diff": {
             "get": openapi_operation("laneDiff", "Lane diff", "Show the diff from a lane branch base to head.", vec![

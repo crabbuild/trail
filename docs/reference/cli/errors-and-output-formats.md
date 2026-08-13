@@ -53,6 +53,11 @@ When JSON errors are enabled:
 | 12 | Operation not found. |
 | 13 | Ref not found. |
 | 14 | Ignored path. |
+| 15 | Workspace schema reinitialization required. |
+| 16 | Committed repair or changed-path reconciliation required. |
+| 17 | Managed execution cancelled. |
+| 18 | Managed execution candidate validation failed. |
+| 19 | Managed execution infrastructure failed. |
 
 ## Stable Error Codes
 
@@ -74,6 +79,9 @@ Examples include:
 - `DATABASE_CORRUPT`
 - `GIT_ERROR`
 - `INVALID_INPUT`
+- `EXECUTION_CANCELLED`
+- `EXECUTION_VALIDATION_FAILED`
+- `EXECUTION_INFRASTRUCTURE_FAILED`
 - `DAEMON_UNAVAILABLE`
 - `DAEMON_ERROR`
 
@@ -84,6 +92,9 @@ The HTTP daemon maps selected errors to:
 - `400`: invalid input, invalid path, ignored path.
 - `404`: missing ref, operation, or root.
 - `409`: conflict, dirty worktree, patch rejected, stale branch, or workspace lock.
+- `409`: managed execution cancelled.
+- `422`: managed execution candidate validation failed.
+- `503`: managed execution infrastructure failed.
 - `500`: other errors.
 
 ## Code Facts Used
@@ -92,4 +103,3 @@ The HTTP daemon maps selected errors to:
 - CLI rendering: `trail/src/cli/command/handler/errors.rs`
 - HTTP error responses: `trail/src/server/route/utils.rs`
 - Tests: `cli_json_errors_are_machine_readable`
-
