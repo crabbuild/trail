@@ -244,6 +244,34 @@ pub(crate) fn render_workspace_exec(
     render_document(&document, options)
 }
 
+pub(crate) fn render_workspace_exec_cancellation(
+    report: &WorkspaceExecCancellationReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    render_document(
+        &TerminalDocument::new(
+            format!("Cancelled managed execution {}", report.execution_id),
+            UiTone::Success,
+        )
+        .block(UiBlock::Metadata(vec![
+            ("Lane".to_string(), report.lane_id.clone()),
+            ("Previous phase".to_string(), report.phase_before.clone()),
+            ("Profile".to_string(), report.profile.clone()),
+            ("Lima instance".to_string(), report.lima_instance.clone()),
+            (
+                "Process group terminated".to_string(),
+                report.process_group_terminated.to_string(),
+            ),
+            ("Cleanup".to_string(), report.cleanup_status.clone()),
+        ])),
+        options,
+    )
+}
+
 pub(crate) fn render_workspace_mount(
     report: &WorkspaceMountReport,
     state: &str,

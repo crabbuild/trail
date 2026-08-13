@@ -377,12 +377,16 @@ commands should execute inside the Lima guest rather than on the host:
 ```sh
 trail env runtime setup colima --execution-backend colima
 trail lane exec <LANE> --timeout-secs 900 -- cargo test
+trail lane exec-cancel <LANE> [--execution-id <EXEC_ID>]
 ```
 
 The default remains `host`. Guest setup requires a running, preflighted profile;
 it cannot be combined with `--no-start`. See
 [Colima-sandboxed lane execution](../../lanes/colima-sandboxed-execution.md) for
 the projection/import protocol, agent workflow, guarantees, and recovery model.
+`exec-cancel` can be issued from another process. It terminates only the
+Trail-owned guest process group, prevents candidate import, and returns exit 17
+to the cancelled execution as `EXECUTION_CANCELLED`.
 
 The default profile name is stable and workspace-derived. Override it only with
 a contained profile dedicated to Trail:

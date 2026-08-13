@@ -190,6 +190,13 @@ pub(crate) struct WorkspaceExecRequest {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceExecCancellationRequest {
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DependencySyncRequest {
     #[serde(default)]
     pub(crate) path: Option<String>,

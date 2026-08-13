@@ -26,7 +26,12 @@ All notable changes to Trail are documented in this file. Trail follows
   checkpoints non-zero and timed-out results, and cleans up without stopping
   the profile. CLI, HTTP, MCP, OpenAPI, lifecycle receipts, turn provenance, and
   doctor recovery diagnostics share the same contract; `host` remains the
-  compatibility default.
+  compatibility default. CLI, HTTP, and MCP now also share an execution
+  cancellation operation that terminates only Trail's recorded guest process
+  group, skips candidate import, preserves unrelated profile processes, and
+  returns the distinct `EXECUTION_CANCELLED` category (CLI exit 17 / HTTP 409).
+  Candidate-validation and guest-infrastructure failures are likewise distinct
+  machine categories (CLI exits 18/19 and HTTP 422/503).
 
 ## [0.4.0] - 2026-08-12
 

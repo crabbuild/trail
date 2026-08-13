@@ -75,6 +75,8 @@ pub(super) enum LaneSubcommand {
     Space(LaneSpaceArgs),
     /// Mount a layered lane for one command with isolated cache/target variables.
     Exec(LaneExecArgs),
+    /// Cancel one owned Colima managed execution before guest changes are imported.
+    ExecCancel(LaneExecCancelArgs),
     /// Own a layered lane mount in the foreground until `lane unmount` requests teardown.
     Mount(LaneMountArgs),
     /// Ask the foreground mount owner to release a layered lane safely.
@@ -297,6 +299,14 @@ pub(super) struct LaneExecArgs {
     pub(super) timeout_secs: Option<u64>,
     #[arg(last = true, num_args = 1.., required = true)]
     pub(super) command: Vec<String>,
+}
+
+#[derive(Args)]
+pub(super) struct LaneExecCancelArgs {
+    pub(super) name: String,
+    /// Select one execution when a lane has multiple live managed commands.
+    #[arg(long)]
+    pub(super) execution_id: Option<String>,
 }
 
 #[derive(Args)]

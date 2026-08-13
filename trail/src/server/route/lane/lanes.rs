@@ -6,7 +6,8 @@ use crate::server::request_types::{
     DependencySyncRequest, EnvironmentPromoteRequest, EnvironmentResolveAllRequest,
     EnvironmentResolveRequest, EnvironmentSyncRequest, LaneClaimRequest, LaneReadFileRequest,
     LaneRecordRequest, LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest,
-    SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecRequest,
+    SyncWorkdirRequest, WorkspaceCheckpointRequest, WorkspaceExecCancellationRequest,
+    WorkspaceExecRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -178,6 +179,23 @@ pub(super) fn handle_lane_resources(
         reject_unexpected_body(request, "POST /v1/lanes/{lane_or_id}/repair-initialization")?;
         let lane = db.resolve_lane_handle(parts[2])?;
         let report = db.repair_lane_initialization(&lane)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "exec"
+        && parts[4] == "cancel"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: WorkspaceExecCancellationRequest = if request.body.is_empty() {
+            WorkspaceExecCancellationRequest::default()
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.cancel_lane_workspace_execution(&lane, body.execution_id.as_deref())?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

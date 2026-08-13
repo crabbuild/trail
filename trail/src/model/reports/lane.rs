@@ -1129,6 +1129,19 @@ pub struct WorkspaceExecReport {
     pub lifecycle: ManagedExecutionLifecycleReport,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceExecCancellationReport {
+    pub lane_id: String,
+    pub execution_id: String,
+    pub status: String,
+    pub phase_before: String,
+    pub profile: String,
+    pub lima_instance: String,
+    pub owner_was_live: bool,
+    pub process_group_terminated: bool,
+    pub cleanup_status: String,
+}
+
 fn default_workspace_exec_classification() -> String {
     "legacy_unclassified".to_string()
 }

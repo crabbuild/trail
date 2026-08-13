@@ -289,6 +289,37 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::ExecutionCancelled { execution_id } => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Managed execution was cancelled");
+            diagnostic.consequence = Some(format!(
+                "Execution `{execution_id}` stopped before guest changes were imported."
+            ));
+            diagnostic
+        }
+        Error::ExecutionValidation { execution_id, .. } => {
+            let mut diagnostic =
+                UiDiagnostic::new(err.code(), "Managed execution candidate failed validation");
+            diagnostic.consequence = Some(format!(
+                "Execution `{execution_id}` did not import or checkpoint guest candidate state."
+            ));
+            diagnostic
+        }
+        Error::ExecutionInfrastructure {
+            execution_id,
+            phase,
+            ..
+        } => {
+            let mut diagnostic =
+                UiDiagnostic::new(err.code(), "Managed execution infrastructure failed");
+            diagnostic.consequence = Some(format!(
+                "Execution `{execution_id}` stopped in `{phase}` and retained recovery evidence."
+            ));
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail doctor".to_string(),
+                reason: "Inspect guest runtime and recovery state before retrying.".to_string(),
+            });
+            diagnostic
+        }
         Error::CloneUnsupported | Error::CloneCrossDevice | Error::NativeCowSourceUnavailable => {
             let mut diagnostic = UiDiagnostic::new(err.code(), "Strict native COW is unavailable");
             diagnostic.consequence = Some(

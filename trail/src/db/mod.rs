@@ -2756,6 +2756,8 @@ pub(crate) struct CommandRunResult {
     success: bool,
     exit_code: Option<i32>,
     timed_out: bool,
+    cancelled: bool,
+    process_group_terminated: bool,
     duration_ms: u64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,

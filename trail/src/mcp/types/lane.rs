@@ -201,6 +201,15 @@ pub(crate) struct WorkspaceExecArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceExecCancellationArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DependencySyncArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,

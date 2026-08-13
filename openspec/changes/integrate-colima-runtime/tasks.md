@@ -49,13 +49,13 @@
 
 - [x] 8.1 Add a reusable execution-backend boundary beneath managed execution while preserving byte-for-byte compatible host behavior by default.
 - [x] 8.2 Translate provider-neutral runtime service allocations and allowed environment-generation bindings into verified guest-local bindings without passing host paths or the Docker socket.
-- [ ] 8.3 Enforce bounded duration, stdout/stderr, projection size, file size, entry count, and concurrency with distinct timeout, cancellation, command-exit, validation, and infrastructure results.
+- [x] 8.3 Enforce bounded duration, stdout/stderr, projection size, file size, entry count, and concurrency with distinct timeout, cancellation, command-exit, validation, and infrastructure results.
 - [x] 8.4 Integrate guest projection, execution, export, import, checkpoint, disposal, and cleanup into the existing managed-execution failure and finalization state machine.
 
 ## 9. Agent, gate, and public-interface integration
 
 - [x] 9.1 Route library and CLI lane execution through the selected backend and expose deterministic human, JSON, and NDJSON output.
-- [ ] 9.2 Align HTTP/OpenAPI and MCP `trail.lane_exec` request, response, cancellation, backend, lifecycle, and error semantics with the shared library operation.
+- [x] 9.2 Align HTTP/OpenAPI and MCP `trail.lane_exec` request, response, cancellation, backend, lifecycle, and error semantics with the shared library operation.
 - [x] 9.3 Route readiness and verification gate commands through the same backend and attach their evidence to the gate and lane provenance records.
 - [x] 9.4 Expose the guest managed-command capability to terminal and ACP agent workflows, associate session/turn/trace provenance, and report host control-plane versus guest data-plane containment honestly.
 
@@ -64,10 +64,10 @@
 - [x] 10.1 Extend preparation/finalization phases and receipts with toolchain, profile/instance, namespace, source/candidate digests, limits, service identities, exit classification, checkpoint, and cleanup fields.
 - [x] 10.2 Make guest process and namespace cleanup bounded, ownership-checked, and idempotent across every success and failure edge without stopping the Colima profile.
 - [x] 10.3 Add doctor/recovery reconciliation for interrupted projection, execution, export, import, checkpoint, and cleanup, failing closed on ambiguous or live guest ownership.
-- [ ] 10.4 Add adversarial redaction, path traversal, symlink escape, archive bomb, collision, secret, cancellation, crash, retry, and unrelated-profile preservation tests.
+- [x] 10.4 Add adversarial redaction, path traversal, symlink escape, archive bomb, collision, secret, cancellation, crash, retry, and unrelated-profile preservation tests.
 
 ## 11. Documentation and verification
 
 - [x] 11.1 Update the lane work-model, managed execution, environment runtime, CLI, HTTP, MCP, agent, security, recovery, and changelog documentation with setup, use cases, guarantees, boundaries, and rollback.
-- [ ] 11.2 Add host-compatibility and Colima guest protocol unit tests plus library, CLI, HTTP, MCP, gate, agent, checkpoint, recovery, and fault-injection integration coverage using fake local tools only.
-- [ ] 11.3 Validate OpenSpec, run formatting, targeted lane/runtime/managed-execution gates, workspace check/test/Clippy baselines, inspect the final diff, and update the existing single PR with verified and skipped evidence.
+- [x] 11.2 Add host-compatibility and Colima guest protocol unit tests plus library, CLI, HTTP, MCP, gate, agent, checkpoint, recovery, and fault-injection integration coverage using fake local tools only.
+- [x] 11.3 Validate OpenSpec, run formatting, targeted lane/runtime/managed-execution gates, workspace check/test/Clippy baselines, inspect the final diff, and update the existing single PR with verified and skipped evidence.

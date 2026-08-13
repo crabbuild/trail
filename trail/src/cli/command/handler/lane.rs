@@ -172,6 +172,12 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             )?;
             render_workspace_exec(&report, ctx.json, &ctx.render)
         }
+        LaneSubcommand::ExecCancel(args) => {
+            let db = open_db(ctx)?;
+            let report =
+                db.cancel_lane_workspace_execution(&args.name, args.execution_id.as_deref())?;
+            render_workspace_exec_cancellation(&report, ctx.json, &ctx.render)
+        }
         LaneSubcommand::Mount(args) => {
             let db = open_db(ctx)?;
             let _foreground = args.foreground;

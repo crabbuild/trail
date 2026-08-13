@@ -121,6 +121,13 @@ cleans an abandoned namespace only before candidate import. It fails closed for
 an interrupted execute/export/import/checkpoint boundary because discarding or
 reapplying state could overwrite lane work.
 
+For a live command, use `trail lane exec-cancel <LANE>` or select its event
+receipt with `--execution-id`. Cancellation is acknowledged only after the
+owned guest process group has stopped and candidate import has been skipped.
+If the owner process dies after the request, Trail validates the durable owner,
+terminates the same guest process group, and cleans only that execution's
+namespace.
+
 For an ambiguous receipt, inspect the lane workdir and history, checkpoint
 intentional source with `trail lane checkpoint <LANE>`, and retry after the
 state is understood. Do not edit `.trail/managed-executions`, delete a guest

@@ -251,6 +251,11 @@ pub(super) fn lane_paths() -> Value {
                 openapi_path_param("lane_or_id", "string")
             ], Some("WorkspaceExecRequest"), "WorkspaceExecReport", true)
         },
+        "/v1/lanes/{lane_or_id}/exec/cancel": {
+            "post": openapi_operation_with_response_schema("laneWorkspaceExecCancel", "Cancel lane workspace execution", "Request cancellation of one Trail-owned Colima execution, terminate only its guest process group, skip candidate import, clean its namespace, and retain a terminal receipt.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("WorkspaceExecCancellationRequest"), "WorkspaceExecCancellationReport", true)
+        },
         "/v1/lanes/{lane_or_id}/diff": {
             "get": openapi_operation("laneDiff", "Lane diff", "Show the diff from a lane branch base to head.", vec![
                 openapi_path_param("lane_or_id", "string"),

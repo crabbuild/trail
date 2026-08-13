@@ -320,6 +320,11 @@ CLI daemon routing can read the token from `--daemon-token`, `TRAIL_DAEMON_TOKEN
   returned path and symlink before mutation, and rejects concurrent host source
   edits. `.trail`, real Git state, host home, and the Docker socket never enter
   the guest projection.
+- Guest cancellation is an authenticated execution-scoped request. Trail
+  launches direct argv in a new guest process group, records its numeric owner
+  beneath the execution namespace, validates that receipt, sends TERM/KILL only
+  to the negative group ID, and refuses candidate import after cancellation.
+  It never uses a profile-wide stop as execution cleanup.
 - Secret-tainted output remains private and non-promotable even when its content
   would otherwise match a shared desired key.
 - Divergent ready content for one desired key and trust scope quarantines both

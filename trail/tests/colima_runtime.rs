@@ -106,6 +106,27 @@ fn lane_exec_cli_rejects_invalid_guest_timeout_before_launch() {
 }
 
 #[test]
+fn lane_exec_cancel_cli_has_structured_no_active_execution_result() {
+    let workspace = initialize_workspace();
+    let mut db = Trail::open(workspace.path()).unwrap();
+    db.spawn_lane("cancel-lane", Some("main"), false, None, None)
+        .unwrap();
+    drop(db);
+    let output = Command::new(trail_bin())
+        .current_dir(workspace.path())
+        .args(["--format", "json", "lane", "exec-cancel", "cancel-lane"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no matching cancellable"));
+}
+
+#[test]
 fn setup_starts_contained_colima_and_uses_only_its_explicit_context() {
     let workspace = initialize_workspace();
     let fake = tempfile::tempdir().unwrap();

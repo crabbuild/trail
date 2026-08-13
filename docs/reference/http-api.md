@@ -123,6 +123,7 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
 | POST | `/v1/lanes/{lane_or_id}/exec` | Run a managed command through the configured host or no-mount Colima backend and checkpoint validated source changes. |
+| POST | `/v1/lanes/{lane_or_id}/exec/cancel` | Cancel one owned Colima execution before candidate import; accepts optional `execution_id`. |
 | POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
 | POST | `/v1/lanes/{lane}/merge` | Dry-run or explicitly direct-merge this lane into body field `into`. |
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
@@ -162,7 +163,19 @@ accepts optional `turn_id` and `timeout_secs` (1 through 86400; Colima default
 provenance. The response identifies the host/Colima execution backend,
 `succeeded`/`command_failed`/`timed_out` classification, lifecycle phases,
 projection/import receipts, checkpoint, and cleanup. Infrastructure and
-candidate-validation failures remain HTTP errors rather than command exits.
+candidate-validation failures remain HTTP errors rather than command exits:
+`EXECUTION_VALIDATION_FAILED` uses 422 and
+`EXECUTION_INFRASTRUCTURE_FAILED` uses 503.
+The daemon dispatches this long-running route on a workspace-scoped worker so
+the same authenticated server can continue accepting status and cancellation
+requests while the execution is active.
+
+`POST /v1/lanes/{lane_or_id}/exec/cancel` accepts an optional `execution_id`.
+When omitted, exactly one cancellable execution must exist for the lane. A
+successful response records the prior phase, profile/instance, owned
+process-group termination, and namespace cleanup. The cancelled blocking
+request returns HTTP 409 with `EXECUTION_CANCELLED`; no candidate state is
+imported and unrelated profile processes are preserved.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.

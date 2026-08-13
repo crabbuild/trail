@@ -141,6 +141,11 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
                 args.timeout_secs,
             )?)
         }
+        "trail.lane_exec_cancel" => {
+            let args: WorkspaceExecCancellationArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.cancel_lane_workspace_execution(&lane, args.execution_id.as_deref())?)
+        }
         "trail.deps_status" => {
             let args: LaneHandleArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;

@@ -276,12 +276,21 @@ before non-dry-run apply.
 - `trail.lane_unmount`
 - `trail.lane_checkpoint`
 - `trail.lane_exec`
+- `trail.lane_exec_cancel`
 
 `trail.lane_exec` accepts a direct `command` argv plus optional open-lane
 `turn_id` and Colima `timeout_secs` (1 through 86400). It uses the workspace's
 configured execution backend and returns the shared managed lifecycle,
 checkpoint, sandbox, cleanup, and session/turn/trace provenance report. The
 Colima backend never exposes a host mount or Docker socket to the guest.
+
+`trail.lane_exec_cancel` accepts `lane` and an optional `execution_id`. It
+requests cancellation before terminating the exact Trail-owned guest process
+group, skips candidate import, cleans the execution namespace, and returns a
+typed cancellation receipt. The original `trail.lane_exec` call returns the
+structured `EXECUTION_CANCELLED` error. MCP stdio requests are ordered within a
+connection, so cancel a blocking call from a second Trail MCP session or an
+equivalent CLI/HTTP client.
 
 ## Lane Environments and Artifacts
 

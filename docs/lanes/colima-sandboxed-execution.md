@@ -93,6 +93,12 @@ trail lane exec fix-login --timeout-secs 900 -- cargo test
 # Associate the checkpoint with an existing open turn.
 trail lane exec fix-login --turn turn_... -- cargo test
 
+# From another terminal, cancel the lane's only live guest execution.
+trail lane exec-cancel fix-login
+
+# Select an execution when several commands are live.
+trail lane exec-cancel fix-login --execution-id exec_...
+
 # Return to compatible host execution.
 trail config set runtime.execution_backend host
 ```
@@ -105,11 +111,29 @@ recommended path for AI hosts: open a turn, call `trail.lane_exec` for command
 work, inspect its structured lifecycle/checkpoint result, run gates, then end
 the turn.
 
-The result distinguishes `succeeded`, `command_failed`, and `timed_out`.
+CLI `lane exec-cancel`, HTTP `POST /v1/lanes/{lane}/exec/cancel`, and MCP
+`trail.lane_exec_cancel` expose the same cancellation operation. The optional
+`execution_id` is required only when more than one cancellable execution is
+live for the lane. Trail writes the cancellation request before acting,
+terminates only that execution's recorded guest process group, skips candidate
+import, cleans its owned namespace, and retains `terminal_cancelled` evidence.
+The original blocking request returns `EXECUTION_CANCELLED` (CLI exit 17, HTTP
+409, and the same structured MCP error). Cancellation never stops the Colima
+profile or unrelated guest processes.
+HTTP lane execution is dispatched on a workspace-scoped daemon worker, leaving
+the authenticated listener responsive to the matching cancellation request.
+Because one MCP stdio connection processes requests in order, an agent cancels
+a blocking MCP execution from a second Trail MCP session (or through the CLI or
+HTTP endpoint). The cancellation operation and durable receipt are identical.
+
+The result distinguishes `succeeded`, `command_failed`, and `timed_out`;
+cancellation is a distinct structured error rather than a command exit.
 Non-zero and timed-out commands still proceed through candidate validation,
 source checkpointing, service disposal, namespace cleanup, and lane unmount.
-Infrastructure or validation failures are returned as Trail errors rather than
-being disguised as a command exit.
+Candidate validation and infrastructure failures are returned as distinct
+`EXECUTION_VALIDATION_FAILED` (CLI exit 18 / HTTP 422) and
+`EXECUTION_INFRASTRUCTURE_FAILED` (CLI exit 19 / HTTP 503) Trail errors rather
+than being disguised as command exits.
 
 ## Recovery and boundaries
 

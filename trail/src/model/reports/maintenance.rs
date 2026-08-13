@@ -147,7 +147,10 @@ impl StructuredErrorEnvelope {
             | crate::Error::ChangeLedgerReconcileRequired { .. }
             | crate::Error::CommittedRepairRequired { .. }
             | crate::Error::LaneInitializationConflict { .. }
-            | crate::Error::LaneInitializationInProgress { .. } => 409,
+            | crate::Error::LaneInitializationInProgress { .. }
+            | crate::Error::ExecutionCancelled { .. } => 409,
+            crate::Error::ExecutionValidation { .. } => 422,
+            crate::Error::ExecutionInfrastructure { .. } => 503,
             crate::Error::InvalidInput(_)
             | crate::Error::InvalidPath { .. }
             | crate::Error::IgnoredPath(_)
@@ -232,6 +235,25 @@ impl StructuredErrorEnvelope {
                 "holder_age_ms": holder_age_ms,
                 "operation_id": operation_id,
                 "retry_command": retry_command,
+            })),
+            crate::Error::ExecutionCancelled { execution_id } => Some(serde_json::json!({
+                "execution_id": execution_id,
+            })),
+            crate::Error::ExecutionValidation {
+                execution_id,
+                reason,
+            } => Some(serde_json::json!({
+                "execution_id": execution_id,
+                "reason": reason,
+            })),
+            crate::Error::ExecutionInfrastructure {
+                execution_id,
+                phase,
+                reason,
+            } => Some(serde_json::json!({
+                "execution_id": execution_id,
+                "phase": phase,
+                "reason": reason,
             })),
             _ => None,
         };
@@ -376,6 +398,48 @@ mod maintenance_tests {
             value["error"]["details"]["requested_fingerprint"],
             "sha256:requested"
         );
+    }
+
+    #[test]
+    fn managed_execution_outcomes_have_distinct_shared_contracts() {
+        for (error, code, status, exit) in [
+            (
+                crate::Error::ExecutionCancelled {
+                    execution_id: "exec_cancel".into(),
+                },
+                "EXECUTION_CANCELLED",
+                409,
+                17,
+            ),
+            (
+                crate::Error::ExecutionValidation {
+                    execution_id: "exec_validation".into(),
+                    reason: "unsafe candidate".into(),
+                },
+                "EXECUTION_VALIDATION_FAILED",
+                422,
+                18,
+            ),
+            (
+                crate::Error::ExecutionInfrastructure {
+                    execution_id: "exec_infrastructure".into(),
+                    phase: "guest_export".into(),
+                    reason: "runtime unavailable".into(),
+                },
+                "EXECUTION_INFRASTRUCTURE_FAILED",
+                503,
+                19,
+            ),
+        ] {
+            let value = serde_json::to_value(StructuredErrorEnvelope::from_error(&error)).unwrap();
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["status"], status);
+            assert_eq!(value["error"]["exit"], exit);
+            assert!(value["error"]["details"]["execution_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("exec_"));
+        }
     }
 
     #[test]

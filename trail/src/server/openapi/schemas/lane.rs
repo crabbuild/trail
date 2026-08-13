@@ -459,6 +459,22 @@ pub(super) fn lane_schemas() -> Value {
                 "lifecycle": { "$ref": "#/components/schemas/ManagedExecutionLifecycleReport" }
             }
         },
+        "WorkspaceExecCancellationReport": {
+            "type": "object",
+            "required": ["lane_id", "execution_id", "status", "phase_before", "profile", "lima_instance", "owner_was_live", "process_group_terminated", "cleanup_status"],
+            "additionalProperties": false,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "execution_id": { "type": "string" },
+                "status": { "type": "string", "enum": ["cancelled"] },
+                "phase_before": { "type": "string" },
+                "profile": { "type": "string" },
+                "lima_instance": { "type": "string" },
+                "owner_was_live": { "type": "boolean" },
+                "process_group_terminated": { "type": "boolean" },
+                "cleanup_status": { "type": "string", "enum": ["succeeded", "failed"] }
+            }
+        },
         "LaneTestReport": {
             "type": "object",
             "required": ["lane_id", "turn_id", "session_id", "workdir", "source_root", "command", "kind", "status", "success", "exit_code", "timed_out", "duration_ms", "stdout_object", "stderr_object", "stdout_bytes", "stderr_bytes", "stdout_preview", "stderr_preview", "stdout_truncated", "stderr_truncated", "started_event_id", "finished_event_id", "lifecycle"],
@@ -923,6 +939,13 @@ pub(super) fn lane_schemas() -> Value {
                 },
                 "turn_id": { "type": "string", "description": "Optional open lane turn receiving the checkpoint and session/turn/trace provenance." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Optional Colima guest command timeout; defaults to 3600 seconds." }
+            }
+        },
+        "WorkspaceExecCancellationRequest": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "execution_id": { "type": "string" }
             }
         },
         "DependencySyncRequest": {

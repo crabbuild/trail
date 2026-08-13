@@ -11825,6 +11825,19 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
             .unwrap()
             .contains("requires a command")
     );
+    let http_cancel_error = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/exec/cancel",
+            serde_json::json!({}),
+        ),
+    );
+    assert_eq!(http_cancel_error.status, 400);
+    assert_eq!(
+        http_cancel_error.body_json::<serde_json::Value>().unwrap()["error"]["code"],
+        "INVALID_INPUT"
+    );
 
     let http_sync_error = trail::server::handle_http_request(
         &mut db,
@@ -11978,6 +11991,17 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         mcp_update["result"]["structuredContent"]["source_ref"],
         "refs/branches/main"
     );
+    let mcp_cancel_error = mcp_call(
+        &mut db,
+        32,
+        "trail.lane_exec_cancel",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert_eq!(mcp_cancel_error["result"]["isError"], true);
+    assert_eq!(
+        mcp_cancel_error["result"]["structuredContent"]["error"]["code"],
+        "INVALID_INPUT"
+    );
 
     let http_adapters = trail::server::handle_http_request(
         &mut db,
@@ -12044,6 +12068,7 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         ("trail.lane_checkpoint", false, false, false),
         ("trail.lane_update", false, false, false),
         ("trail.lane_exec", false, false, true),
+        ("trail.lane_exec_cancel", false, false, true),
         ("trail.deps_sync", false, false, true),
         ("trail.env_adapters", true, false, false),
         ("trail.env_status", true, false, false),
@@ -12078,6 +12103,7 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         "/v1/lanes/{lane_or_id}/update",
         "/v1/lanes/{lane_or_id}/space",
         "/v1/lanes/{lane_or_id}/exec",
+        "/v1/lanes/{lane_or_id}/exec/cancel",
         "/v1/lanes/{lane_or_id}/dependencies",
         "/v1/lanes/{lane_or_id}/dependencies/sync",
         "/v1/lanes/{lane_or_id}/environment",

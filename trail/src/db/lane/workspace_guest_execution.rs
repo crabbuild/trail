@@ -20,6 +20,7 @@ const MAX_GUEST_MANIFESTS: usize = 4096;
 const MAX_RETAINED_TERMINAL_GUEST_MANIFESTS: usize = 256;
 const MAX_CONCURRENT_GUEST_EXECUTIONS: usize = 4;
 const GUEST_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const GUEST_CANCELLATION_WAIT: Duration = Duration::from_secs(30);
 pub(super) const DEFAULT_GUEST_COMMAND_TIMEOUT_SECS: u64 = 60 * 60;
 pub(super) const MAX_GUEST_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
@@ -78,7 +79,22 @@ struct GuestExecutionManifest {
     checkpoint_operation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancellation_requested_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancellation_completed_at: Option<i64>,
+    #[serde(default)]
+    process_group_terminated: bool,
     updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GuestCancellationRequest {
+    schema: u32,
+    execution_id: String,
+    lane_id: String,
+    requested_at: i64,
 }
 
 pub(super) fn preflight_colima_guest_execution(
@@ -170,12 +186,183 @@ impl Trail {
             command,
             timeout,
             &mut command_marked,
+            None,
         );
+        let result = result.map_err(|error| classify_guest_execution_error(context, error));
         if result.is_err() && !command_marked {
             let error = result.as_ref().err().map(ToString::to_string);
             self.mark_managed_lane_execution_command(context, "failed", error.as_deref(), None)?;
         }
         result
+    }
+
+    pub fn cancel_lane_workspace_execution(
+        &self,
+        lane: &str,
+        execution_id: Option<&str>,
+    ) -> Result<WorkspaceExecCancellationReport> {
+        let (manifest_path, mut manifest, phase_before, owner_was_live, request) = {
+            let _cancellation_fence =
+                Trail::with_write_lock_wait(GUEST_CANCELLATION_WAIT, || self.acquire_write_lock())?;
+            let branch = self.lane_branch(lane)?;
+            let directory = guest_manifest_directory(self)?;
+            let mut candidates = Vec::new();
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let manifest = read_guest_manifest(&path)?;
+                validate_guest_manifest_identity(self, &manifest)?;
+                if manifest.lane_id != branch.lane_id {
+                    continue;
+                }
+                if execution_id.is_some_and(|requested| requested != manifest.execution_id) {
+                    continue;
+                }
+                if guest_cancellation_is_terminal(&manifest) {
+                    if execution_id.is_some() {
+                        candidates.push((path, manifest));
+                    }
+                    continue;
+                }
+                if manifest.cancellation_completed_at.is_some() {
+                    candidates.push((path, manifest));
+                    continue;
+                }
+                if !guest_manifest_is_cancellable(&manifest) {
+                    if execution_id.is_some() {
+                        return Err(Error::InvalidInput(format!(
+                            "managed execution `{}` is in non-cancellable phase `{}`",
+                            manifest.execution_id, manifest.phase
+                        )));
+                    }
+                    continue;
+                }
+                candidates.push((path, manifest));
+            }
+            if candidates.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "lane `{lane}` has no matching cancellable Colima execution"
+                )));
+            }
+            if candidates.len() != 1 {
+                return Err(Error::InvalidInput(format!(
+                    "lane `{lane}` has {} matching Colima executions; pass --execution-id",
+                    candidates.len()
+                )));
+            }
+            let (manifest_path, manifest) = candidates.remove(0);
+            let phase_before = manifest.phase.clone();
+            let owner_was_live =
+                process_matches_start_token(manifest.owner_pid, &manifest.owner_start_token);
+            let request = if !guest_cancellation_is_terminal(&manifest) {
+                let request_path = guest_cancellation_path(self, &manifest.execution_id)?;
+                let request = if let Some(request) =
+                    read_guest_cancellation_request(&request_path, &manifest)?
+                {
+                    request
+                } else {
+                    let request = GuestCancellationRequest {
+                        schema: GUEST_MANIFEST_SCHEMA,
+                        execution_id: manifest.execution_id.clone(),
+                        lane_id: manifest.lane_id.clone(),
+                        requested_at: now_ts(),
+                    };
+                    write_file_atomic(&request_path, &serde_json::to_vec_pretty(&request)?, true)?;
+                    request
+                };
+                Some((request_path, request))
+            } else {
+                None
+            };
+            (
+                manifest_path,
+                manifest,
+                phase_before,
+                owner_was_live,
+                request,
+            )
+        };
+
+        if let Some((request_path, request)) = request {
+            let started = Instant::now();
+            while owner_was_live && started.elapsed() < GUEST_CANCELLATION_WAIT {
+                std::thread::sleep(Duration::from_millis(50));
+                manifest = read_guest_manifest(&manifest_path)?;
+                if guest_cancellation_is_terminal(&manifest) {
+                    break;
+                }
+                if !process_matches_start_token(manifest.owner_pid, &manifest.owner_start_token) {
+                    break;
+                }
+            }
+            if !guest_cancellation_is_terminal(&manifest)
+                && !process_matches_start_token(manifest.owner_pid, &manifest.owner_start_token)
+            {
+                let _cancellation_fence =
+                    Trail::with_write_lock_wait(GUEST_CANCELLATION_WAIT, || {
+                        self.acquire_write_lock()
+                    })?;
+                manifest = read_guest_manifest(&manifest_path)?;
+                if !guest_cancellation_is_terminal(&manifest) {
+                    let toolchain =
+                        super::workspace_runtime_toolchain::ColimaToolchain::resolve(false)?;
+                    let process_group_path = format!("{}/process-group", manifest.guest_namespace);
+                    manifest.process_group_terminated |= terminate_guest_process_group(
+                        &toolchain,
+                        &manifest.lima_instance,
+                        &process_group_path,
+                        false,
+                    )?;
+                    cleanup_guest_namespace(
+                        &toolchain,
+                        &manifest.lima_instance,
+                        &manifest.guest_namespace,
+                    )?;
+                    manifest
+                        .cancellation_requested_at
+                        .get_or_insert(request.requested_at);
+                    manifest
+                        .cancellation_completed_at
+                        .get_or_insert_with(now_ts);
+                    update_guest_manifest(
+                        &manifest_path,
+                        &mut manifest,
+                        "terminal_cancelled",
+                        None,
+                    )?;
+                    let _ = fs::remove_file(&request_path);
+                }
+            }
+            if !guest_cancellation_is_terminal(&manifest) {
+                return Err(Error::InvalidInput(format!(
+                    "cancellation and cleanup of managed execution `{}` were not acknowledged within {} seconds",
+                    manifest.execution_id,
+                    GUEST_CANCELLATION_WAIT.as_secs()
+                )));
+            }
+        }
+        Ok(WorkspaceExecCancellationReport {
+            lane_id: manifest.lane_id,
+            execution_id: manifest.execution_id,
+            status: "cancelled".to_string(),
+            phase_before,
+            profile: manifest.profile,
+            lima_instance: manifest.lima_instance,
+            owner_was_live,
+            process_group_terminated: manifest.process_group_terminated,
+            cleanup_status: if matches!(
+                manifest.phase.as_str(),
+                "cleanup_failed" | "terminal_failed"
+            ) {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .to_string(),
+        })
     }
 
     fn run_colima_lane_command_inner(
@@ -185,6 +372,7 @@ impl Trail {
         command: &[String],
         timeout: Option<Duration>,
         command_marked: &mut bool,
+        toolchain_override: Option<super::workspace_runtime_toolchain::ColimaToolchain>,
     ) -> Result<CommandRunResult> {
         if self.config.runtime.provider != "colima" {
             return Err(Error::InvalidInput(
@@ -196,20 +384,23 @@ impl Trail {
             &self.config.workspace.id.0,
         )?;
         let instance = super::workspace_runtime::colima_lima_instance(&profile);
-        let toolchain = super::workspace_runtime_toolchain::ColimaToolchain::resolve(false)?;
-        if !toolchain.state_is_ready() {
+        let test_override = toolchain_override.is_some();
+        let toolchain = match toolchain_override {
+            Some(toolchain) => toolchain,
+            None => super::workspace_runtime_toolchain::ColimaToolchain::resolve(false)?,
+        };
+        if !test_override && !toolchain.state_is_ready() {
             return Err(Error::InvalidInput(
                 "Trail's isolated Colima state is unavailable; run `trail env runtime setup colima --execution-backend colima`"
                     .to_string(),
             ));
         }
-        if !toolchain.contained_profile_verified(&profile) {
+        if !test_override && !toolchain.contained_profile_verified(&profile) {
             return Err(Error::InvalidInput(format!(
                 "Colima profile `{profile}` lacks Trail's no-host-mount containment receipt; stop it and rerun `trail env runtime setup colima --profile {profile} --execution-backend colima`"
             )));
         }
         preflight_colima_guest_execution(&toolchain, &profile)?;
-        recover_guest_execution_manifests(self, &toolchain, &profile, &instance)?;
 
         let limits = projection_limits(&self.config.workspace_views);
         let staging_root = self.db_dir.join("tmp/managed-execution");
@@ -217,7 +408,11 @@ impl Trail {
         let staging = tempfile::Builder::new()
             .prefix("colima-")
             .tempdir_in(&staging_root)?;
-        let projection = build_projection(Path::new(&view.mountpoint), staging.path(), limits)?;
+        let projection = build_projection(Path::new(&view.mountpoint), staging.path(), limits)
+            .map_err(|error| Error::ExecutionValidation {
+                execution_id: context.execution_id.clone(),
+                reason: redact_sensitive_text(&error.to_string()),
+            })?;
         let source_ignore = lane_workdir_ignore_matcher(Path::new(&view.mountpoint))?;
         let workspace_key = &sha256_hex(self.config.workspace.id.0.as_bytes())[..16];
         let guest_namespace = format!(
@@ -228,6 +423,7 @@ impl Trail {
         let guest_home = format!("{guest_namespace}/home");
         let guest_tmp = format!("{guest_namespace}/tmp");
         let manifest_path = guest_manifest_path(self, &context.execution_id)?;
+        let cancellation_path = guest_cancellation_path(self, &context.execution_id)?;
         let mut manifest = GuestExecutionManifest {
             schema: GUEST_MANIFEST_SCHEMA,
             execution_id: context.execution_id.clone(),
@@ -246,9 +442,19 @@ impl Trail {
             checkpoint_root: None,
             checkpoint_operation: None,
             error: None,
+            cancellation_requested_at: None,
+            cancellation_completed_at: None,
+            process_group_terminated: false,
             updated_at: now_ts(),
         };
-        write_guest_manifest(&manifest_path, &manifest)?;
+        {
+            // Recovery, admission, and publication share one workspace fence so
+            // concurrent callers cannot all observe the same free execution slot.
+            let _manifest_fence =
+                Trail::with_write_lock_wait(GUEST_PROTOCOL_TIMEOUT, || self.acquire_write_lock())?;
+            recover_guest_execution_manifests(self, &toolchain, &profile, &instance)?;
+            write_guest_manifest(&manifest_path, &manifest)?;
+        }
         context.guest_manifest_path = Some(manifest_path.clone());
         self.set_managed_execution_sandbox_preparation(
             context,
@@ -331,7 +537,32 @@ impl Trail {
                 &guest_args,
                 &guest_workspace,
                 timeout,
+                &cancellation_path,
+                &manifest,
             )?;
+            if run.cancelled {
+                let request = read_guest_cancellation_request(&cancellation_path, &manifest)?
+                    .ok_or_else(|| {
+                        Error::Corrupt(
+                            "managed guest command reported cancellation without a request"
+                                .to_string(),
+                        )
+                    })?;
+                manifest.cancellation_requested_at = Some(request.requested_at);
+                manifest.cancellation_completed_at = Some(now_ts());
+                manifest.process_group_terminated = run.process_group_terminated;
+                update_guest_manifest(&manifest_path, &mut manifest, "cancelled", None)?;
+                self.mark_managed_lane_execution_command(
+                    context,
+                    "cancelled",
+                    None,
+                    run.exit_code,
+                )?;
+                *command_marked = true;
+                return Err(Error::ExecutionCancelled {
+                    execution_id: context.execution_id.clone(),
+                });
+            }
             update_guest_manifest(&manifest_path, &mut manifest, "executed", None)?;
             self.mark_managed_lane_execution_command(
                 context,
@@ -342,6 +573,15 @@ impl Trail {
                 run.exit_code,
             )?;
             *command_marked = true;
+
+            if let Some(request) = read_guest_cancellation_request(&cancellation_path, &manifest)? {
+                manifest.cancellation_requested_at = Some(request.requested_at);
+                manifest.cancellation_completed_at = Some(now_ts());
+                update_guest_manifest(&manifest_path, &mut manifest, "cancelled", None)?;
+                return Err(Error::ExecutionCancelled {
+                    execution_id: context.execution_id.clone(),
+                });
+            }
 
             let candidate_archive = staging.path().join("candidate.tar");
             let candidate_file = File::create(&candidate_archive)?;
@@ -366,7 +606,11 @@ impl Trail {
                 &candidate_root,
                 limits,
                 &source_ignore,
-            )?;
+            )
+            .map_err(|error| Error::ExecutionValidation {
+                execution_id: context.execution_id.clone(),
+                reason: redact_sensitive_text(&error.to_string()),
+            })?;
             manifest.candidate_digest = Some(candidate.output_digest.clone());
             update_guest_manifest(&manifest_path, &mut manifest, "exported", None)?;
             self.record_managed_execution_context_phase(
@@ -380,13 +624,26 @@ impl Trail {
                 })),
             )?;
 
+            let _cancellation_fence =
+                Trail::with_write_lock_wait(GUEST_CANCELLATION_WAIT, || self.acquire_write_lock())?;
+            update_guest_manifest(&manifest_path, &mut manifest, "importing", None)?;
+            if let Some(request) = read_guest_cancellation_request(&cancellation_path, &manifest)? {
+                manifest.cancellation_requested_at = Some(request.requested_at);
+                manifest.cancellation_completed_at = Some(now_ts());
+                update_guest_manifest(&manifest_path, &mut manifest, "cancelled", None)?;
+                return Err(Error::ExecutionCancelled {
+                    execution_id: context.execution_id.clone(),
+                });
+            }
+
             let current =
                 source_snapshot_with_ignore(Path::new(&view.mountpoint), limits, &source_ignore)?;
             if current != projection.source_snapshot {
-                return Err(Error::InvalidInput(
-                    "lane source changed on the host while its Colima execution was running; refusing to overwrite concurrent work"
+                return Err(Error::ExecutionValidation {
+                    execution_id: context.execution_id.clone(),
+                    reason: "lane source changed on the host while its Colima execution was running; refusing to overwrite concurrent work"
                         .to_string(),
-                ));
+                });
             }
             let (imported_paths, removed_paths) = apply_candidate_source(
                 Path::new(&view.mountpoint),
@@ -443,6 +700,9 @@ impl Trail {
             cleanup_error.as_deref(),
             Some(serde_json::json!({"guest_namespace": guest_namespace})),
         );
+        if manifest.cancellation_completed_at.is_some() {
+            let _ = fs::remove_file(&cancellation_path);
+        }
 
         match execution_result {
             Ok((run, output_digest, imported_paths, removed_paths, unchanged)) => {
@@ -480,6 +740,28 @@ impl Trail {
                 }
             }
         }
+    }
+}
+
+fn classify_guest_execution_error(context: &ManagedExecutionContext, error: Error) -> Error {
+    if matches!(
+        &error,
+        Error::ExecutionCancelled { .. }
+            | Error::ExecutionValidation { .. }
+            | Error::ExecutionInfrastructure { .. }
+    ) {
+        return error;
+    }
+    let phase = context
+        .guest_manifest_path
+        .as_deref()
+        .and_then(|path| read_guest_manifest(path).ok())
+        .map(|manifest| manifest.phase)
+        .unwrap_or_else(|| "guest_prepare".to_string());
+    Error::ExecutionInfrastructure {
+        execution_id: context.execution_id.clone(),
+        phase,
+        reason: redact_sensitive_text(&error.to_string()),
     }
 }
 
@@ -571,7 +853,9 @@ pub(super) fn finalize_guest_execution_manifest(
         .sandbox_finalization
         .as_ref()
         .is_some_and(|receipt| receipt.cleanup_status == "failed");
-    let terminal_phase = if checkpoint.is_some() && checkpoint_error.is_none() && !cleanup_failed {
+    let terminal_phase = if manifest.cancellation_completed_at.is_some() && !cleanup_failed {
+        "terminal_cancelled"
+    } else if checkpoint.is_some() && checkpoint_error.is_none() && !cleanup_failed {
         "terminal_succeeded"
     } else {
         "terminal_failed"
@@ -596,6 +880,42 @@ fn guest_manifest_path(db: &Trail, execution_id: &str) -> Result<PathBuf> {
         ));
     }
     Ok(guest_manifest_directory(db)?.join(format!("{execution_id}.json")))
+}
+
+fn guest_cancellation_path(db: &Trail, execution_id: &str) -> Result<PathBuf> {
+    let _ = guest_manifest_path(db, execution_id)?;
+    Ok(guest_manifest_directory(db)?.join(format!("{execution_id}.cancel")))
+}
+
+fn read_guest_cancellation_request(
+    path: &Path,
+    manifest: &GuestExecutionManifest,
+) -> Result<Option<GuestCancellationRequest>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(metadata) => metadata,
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_GUEST_MANIFEST_BYTES
+    {
+        return Err(Error::Corrupt(format!(
+            "managed guest cancellation request `{}` is not a bounded regular file",
+            path.display()
+        )));
+    }
+    let request = serde_json::from_slice::<GuestCancellationRequest>(&fs::read(path)?)?;
+    if request.schema != GUEST_MANIFEST_SCHEMA
+        || request.execution_id != manifest.execution_id
+        || request.lane_id != manifest.lane_id
+    {
+        return Err(Error::Corrupt(format!(
+            "managed guest cancellation request `{}` does not match its execution receipt",
+            path.display()
+        )));
+    }
+    Ok(Some(request))
 }
 
 fn write_guest_manifest(path: &Path, manifest: &GuestExecutionManifest) -> Result<()> {
@@ -711,6 +1031,18 @@ fn recover_guest_execution_manifests(
             live = live.saturating_add(1);
             continue;
         }
+        let cancellation_path = guest_cancellation_path(db, &manifest.execution_id)?;
+        if let Some(request) = read_guest_cancellation_request(&cancellation_path, &manifest)? {
+            let process_group_path = format!("{}/process-group", manifest.guest_namespace);
+            manifest.process_group_terminated =
+                terminate_guest_process_group(toolchain, instance, &process_group_path, false)?;
+            cleanup_guest_namespace(toolchain, instance, manifest.guest_namespace.as_str())?;
+            manifest.cancellation_requested_at = Some(request.requested_at);
+            manifest.cancellation_completed_at = Some(now_ts());
+            update_guest_manifest(&path, &mut manifest, "terminal_cancelled", None)?;
+            fs::remove_file(cancellation_path)?;
+            continue;
+        }
         if !guest_manifest_is_safely_discardable(&manifest) {
             return Err(Error::InvalidInput(format!(
                 "managed guest execution `{}` was interrupted in phase `{}`; Trail preserved lane and candidate state and will not guess. Inspect the lane, run `trail lane checkpoint {}`, then retry or remove the recovered execution through doctor tooling",
@@ -732,8 +1064,28 @@ fn guest_manifest_is_safely_discardable(manifest: &GuestExecutionManifest) -> bo
     let imported = !manifest.imported_paths.is_empty() || !manifest.removed_paths.is_empty();
     matches!(
         manifest.phase.as_str(),
-        "creating" | "namespace_created" | "projected" | "executed" | "cleanup_failed"
+        "creating"
+            | "namespace_created"
+            | "projected"
+            | "executed"
+            | "cancelled"
+            | "cleanup_failed"
     ) || (manifest.phase == "cleaned" && !imported)
+}
+
+fn guest_manifest_is_cancellable(manifest: &GuestExecutionManifest) -> bool {
+    matches!(
+        manifest.phase.as_str(),
+        "creating" | "namespace_created" | "projected" | "executing" | "executed" | "exported"
+    )
+}
+
+fn guest_cancellation_is_terminal(manifest: &GuestExecutionManifest) -> bool {
+    manifest.cancellation_completed_at.is_some()
+        && matches!(
+            manifest.phase.as_str(),
+            "cleaned" | "cleanup_failed" | "terminal_cancelled" | "terminal_failed"
+        )
 }
 
 fn projection_limits(config: &WorkspaceViewsConfig) -> ProjectionLimits {
@@ -1278,14 +1630,24 @@ fn run_guest_command(
     guest_args: &[String],
     workdir: &str,
     timeout: Option<Duration>,
+    cancellation_path: &Path,
+    manifest: &GuestExecutionManifest,
 ) -> Result<CommandRunResult> {
     let started = Instant::now();
+    let process_group_path = format!("{}/process-group", manifest.guest_namespace);
     let mut process = toolchain.limactl_command();
     process
         .args(["shell", "--workdir", workdir, instance, "--"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    process.args([
+        "sh",
+        "-c",
+        "pidfile=$1; shift; setsid \"$@\" & child=$!; printf '%s\\n' \"$child\" > \"$pidfile\"; wait \"$child\"; status=$?; rm -f -- \"$pidfile\"; exit \"$status\"",
+        "trail-guest-launch",
+        &process_group_path,
+    ]);
     if let Some(timeout) = timeout {
         process.args([
             "timeout",
@@ -1309,7 +1671,27 @@ fn run_guest_command(
     let stderr_reader =
         std::thread::spawn(move || read_bounded_stream(stderr, MAX_GUEST_STDERR_BYTES));
     let host_deadline = timeout.map(|timeout| timeout.saturating_add(Duration::from_secs(15)));
-    let (status, host_timed_out) = wait_for_child(&mut child, started, host_deadline)?;
+    let mut cancelled = false;
+    let mut process_group_terminated = false;
+    let (status, host_timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if !cancelled && read_guest_cancellation_request(cancellation_path, manifest)?.is_some() {
+            cancelled = true;
+            process_group_terminated =
+                terminate_guest_process_group(toolchain, instance, &process_group_path, true)?;
+        }
+        if cancelled && started.elapsed() >= Duration::from_secs(15) {
+            let _ = child.kill();
+            break (child.wait()?, false);
+        }
+        if host_deadline.is_some_and(|deadline| started.elapsed() >= deadline) {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let stdout = stdout_reader
         .join()
         .map_err(|_| Error::Corrupt("managed guest stdout reader panicked".to_string()))??;
@@ -1322,10 +1704,134 @@ fn run_guest_command(
         success: status.success(),
         exit_code,
         timed_out: host_timed_out || guest_timed_out,
+        cancelled,
+        process_group_terminated,
         duration_ms: elapsed_ms(started.elapsed()),
         stdout,
         stderr,
     })
+}
+
+fn terminate_guest_process_group(
+    toolchain: &super::workspace_runtime_toolchain::ColimaToolchain,
+    instance: &str,
+    process_group_path: &str,
+    wait_for_receipt: bool,
+) -> Result<bool> {
+    let started = Instant::now();
+    let process_group = loop {
+        let result = run_guest_capture(
+            toolchain,
+            instance,
+            &[
+                "cat".to_string(),
+                "--".to_string(),
+                process_group_path.to_string(),
+            ],
+        )?;
+        if result.status.success() {
+            let value = String::from_utf8_lossy(&result.stdout).trim().to_string();
+            let process_group = value.parse::<u32>().map_err(|_| {
+                Error::Corrupt("managed guest process-group receipt is invalid".to_string())
+            })?;
+            if process_group <= 1 {
+                return Err(Error::Corrupt(
+                    "managed guest process-group receipt is unsafe".to_string(),
+                ));
+            }
+            break process_group;
+        }
+        if !wait_for_receipt || started.elapsed() >= Duration::from_secs(5) {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let negative_group = format!("-{process_group}");
+    let term = run_guest_status(
+        toolchain,
+        instance,
+        &[
+            "kill".to_string(),
+            "-TERM".to_string(),
+            "--".to_string(),
+            negative_group.clone(),
+        ],
+        None,
+        None,
+    )?;
+    if !term.status.success() {
+        return Ok(false);
+    }
+    let wait_started = Instant::now();
+    while wait_started.elapsed() < Duration::from_secs(2) {
+        let probe = run_guest_status(
+            toolchain,
+            instance,
+            &[
+                "kill".to_string(),
+                "-0".to_string(),
+                "--".to_string(),
+                negative_group.clone(),
+            ],
+            None,
+            None,
+        )?;
+        if !probe.status.success() {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = run_guest_status(
+        toolchain,
+        instance,
+        &[
+            "kill".to_string(),
+            "-KILL".to_string(),
+            "--".to_string(),
+            negative_group,
+        ],
+        None,
+        None,
+    )?;
+    Ok(true)
+}
+
+struct GuestCaptureResult {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn run_guest_capture(
+    toolchain: &super::workspace_runtime_toolchain::ColimaToolchain,
+    instance: &str,
+    guest_args: &[String],
+) -> Result<GuestCaptureResult> {
+    let mut process = toolchain.limactl_command();
+    process
+        .arg("shell")
+        .arg(instance)
+        .arg("--")
+        .args(guest_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = process.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Corrupt("managed guest capture did not expose stdout".to_string()))?;
+    let reader = std::thread::spawn(move || read_bounded_stream(stdout, 64));
+    let (status, timed_out) =
+        wait_for_child(&mut child, Instant::now(), Some(Duration::from_secs(10)))?;
+    let stdout = reader
+        .join()
+        .map_err(|_| Error::Corrupt("managed guest capture reader panicked".to_string()))??;
+    if timed_out {
+        return Err(Error::InvalidInput(
+            "managed guest process-group inspection timed out".to_string(),
+        ));
+    }
+    Ok(GuestCaptureResult { status, stdout })
 }
 
 fn wait_for_child(
@@ -1615,6 +2121,32 @@ fn guest_diagnostic(stderr: &[u8], stdout: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn guest_test_manifest(namespace: String) -> GuestExecutionManifest {
+        GuestExecutionManifest {
+            schema: GUEST_MANIFEST_SCHEMA,
+            execution_id: "exec_test".to_string(),
+            lane_id: "lane_test".to_string(),
+            profile: "trail-test".to_string(),
+            lima_instance: "colima-trail-test".to_string(),
+            guest_namespace: namespace,
+            staging_path: "/private/staging".to_string(),
+            owner_pid: std::process::id(),
+            owner_start_token: current_process_start_token(),
+            phase: "executing".to_string(),
+            input_digest: "input".to_string(),
+            candidate_digest: None,
+            imported_paths: Vec::new(),
+            removed_paths: Vec::new(),
+            checkpoint_root: None,
+            checkpoint_operation: None,
+            error: None,
+            cancellation_requested_at: None,
+            cancellation_completed_at: None,
+            process_group_terminated: false,
+            updated_at: 1,
+        }
+    }
+
     #[cfg(unix)]
     fn write_executable(path: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -1624,11 +2156,42 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[cfg(unix)]
+    fn write_fake_setsid(root: &Path) {
+        write_executable(
+            &root.join("setsid"),
+            "#!/usr/bin/env python3\nimport os, sys\nos.setsid()\nos.execvp(sys.argv[1], sys.argv[1:])\n",
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_limactl_script() -> &'static str {
+        "#!/bin/sh\n[ \"$1\" = shell ] || exit 91\nshift\nif [ \"$1\" = --workdir ]; then workdir=$2; shift 2; fi\nshift\n[ \"$1\" = -- ] || exit 92\nshift\n[ -z \"$workdir\" ] || cd \"$workdir\" || exit 93\nPATH=\"$(dirname \"$0\"):$PATH\"\nCOPYFILE_DISABLE=1\nexport PATH COPYFILE_DISABLE\nexec \"$@\"\n"
+    }
+
     #[test]
     fn guest_diagnostic_is_bounded() {
         let diagnostic = guest_diagnostic(&vec![b'x'; MAX_GUEST_DIAGNOSTIC_BYTES + 20], &[]);
         assert!(diagnostic.ends_with(" [truncated]"));
         assert!(diagnostic.len() <= MAX_GUEST_DIAGNOSTIC_BYTES + " [truncated]".len());
+    }
+
+    #[test]
+    fn guest_manifest_errors_are_redacted_before_durable_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("manifest.json");
+        let mut manifest = guest_test_manifest("/tmp/trail-executions/test/exec_test".to_string());
+        write_guest_manifest(&path, &manifest).unwrap();
+        update_guest_manifest(
+            &path,
+            &mut manifest,
+            "cleanup_failed",
+            Some("request failed with token=supersecret"),
+        )
+        .unwrap();
+        let durable = fs::read_to_string(path).unwrap();
+        assert!(!durable.contains("supersecret"));
+        assert!(durable.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1842,15 +2405,14 @@ mod tests {
     fn fake_limactl_protocol_preserves_direct_command_arguments() {
         let root = tempfile::tempdir().unwrap();
         let limactl = root.path().join("limactl");
-        write_executable(
-            &limactl,
-            "#!/bin/sh\n[ \"$1\" = shell ] || exit 91\nshift\nif [ \"$1\" = --workdir ]; then workdir=$2; shift 2; fi\nshift\n[ \"$1\" = -- ] || exit 92\nshift\ncd \"$workdir\" || exit 93\nexec \"$@\"\n",
-        );
+        write_executable(&limactl, fake_limactl_script());
+        write_fake_setsid(root.path());
         let toolchain =
             super::super::workspace_runtime_toolchain::ColimaToolchain::for_guest_protocol_test(
                 limactl,
                 root.path(),
             );
+        let manifest = guest_test_manifest(root.path().to_string_lossy().into_owned());
         let run = run_guest_command(
             &toolchain,
             "colima-test",
@@ -1860,6 +2422,8 @@ mod tests {
             ],
             root.path().to_str().unwrap(),
             None,
+            &root.path().join("exec_test.cancel"),
+            &manifest,
         )
         .unwrap();
         assert!(run.success);
@@ -1868,6 +2432,72 @@ mod tests {
             "literal;$(touch should-not-exist)\n"
         );
         assert!(!root.path().join("should-not-exist").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_only_owned_guest_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let limactl = root.path().join("limactl");
+        write_executable(&limactl, fake_limactl_script());
+        write_fake_setsid(root.path());
+        let toolchain =
+            super::super::workspace_runtime_toolchain::ColimaToolchain::for_guest_protocol_test(
+                limactl,
+                root.path(),
+            );
+        let manifest = guest_test_manifest(root.path().to_string_lossy().into_owned());
+        let cancellation_path = root.path().join("exec_test.cancel");
+        let started_path = root.path().join("started");
+        let completed_path = root.path().join("completed");
+        let request_path = cancellation_path.clone();
+        let request_manifest = manifest.clone();
+        let started_for_request = started_path.clone();
+        let requester = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started_for_request.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(started_for_request.exists());
+            let request = GuestCancellationRequest {
+                schema: GUEST_MANIFEST_SCHEMA,
+                execution_id: request_manifest.execution_id,
+                lane_id: request_manifest.lane_id,
+                requested_at: now_ts(),
+            };
+            write_file_atomic(
+                &request_path,
+                &serde_json::to_vec_pretty(&request).unwrap(),
+                true,
+            )
+            .unwrap();
+        });
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let run = run_guest_command(
+            &toolchain,
+            "colima-test",
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "touch \"$1\"; sleep 30; touch \"$2\"".to_string(),
+                "trail-cancel-test".to_string(),
+                started_path.to_string_lossy().into_owned(),
+                completed_path.to_string_lossy().into_owned(),
+            ],
+            root.path().to_str().unwrap(),
+            None,
+            &cancellation_path,
+            &manifest,
+        )
+        .unwrap();
+        requester.join().unwrap();
+        assert!(run.cancelled);
+        assert!(run.process_group_terminated);
+        assert!(!run.success);
+        assert!(!completed_path.exists());
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
     }
 
     #[test]
@@ -1890,6 +2520,9 @@ mod tests {
             checkpoint_root: None,
             checkpoint_operation: None,
             error: None,
+            cancellation_requested_at: None,
+            cancellation_completed_at: None,
+            process_group_terminated: false,
             updated_at: 1,
         };
         assert!(guest_manifest_is_safely_discardable(&manifest));
@@ -1929,6 +2562,9 @@ mod tests {
             checkpoint_root: None,
             checkpoint_operation: None,
             error: None,
+            cancellation_requested_at: None,
+            cancellation_completed_at: None,
+            process_group_terminated: false,
             updated_at: 1,
         };
         let path = guest_manifest_path(&db, execution_id).unwrap();
@@ -1941,6 +2577,130 @@ mod tests {
         assert!(path.exists(), "doctor must remain read-only");
     }
 
+    #[test]
+    fn public_cancellation_report_reopens_terminal_receipt_by_execution_id() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), "root\n").unwrap();
+        Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(root.path()).unwrap();
+        let lane = db
+            .spawn_lane("cancel-lane", Some("main"), false, None, None)
+            .unwrap();
+        let execution_id = "exec_cancelled";
+        let workspace_hash = &sha256_hex(db.config.workspace.id.0.as_bytes())[..16];
+        let mut manifest = guest_test_manifest(format!(
+            "{GUEST_EXECUTION_ROOT}/{workspace_hash}/{execution_id}"
+        ));
+        manifest.execution_id = execution_id.to_string();
+        manifest.lane_id = lane.lane_id.clone();
+        manifest.phase = "terminal_cancelled".to_string();
+        manifest.cancellation_requested_at = Some(1);
+        manifest.cancellation_completed_at = Some(2);
+        manifest.process_group_terminated = true;
+        write_guest_manifest(&guest_manifest_path(&db, execution_id).unwrap(), &manifest).unwrap();
+
+        let report = db
+            .cancel_lane_workspace_execution("cancel-lane", Some(execution_id))
+            .unwrap();
+        assert_eq!(report.execution_id, execution_id);
+        assert_eq!(report.status, "cancelled");
+        assert!(report.process_group_terminated);
+        assert_eq!(report.cleanup_status, "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_guest_full_protocol_imports_source_and_cleans_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), "root\n").unwrap();
+        Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(root.path()).unwrap();
+        let lane = db
+            .spawn_lane("guest-protocol", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(lane.workdir.unwrap());
+        let view = LaneWorkspaceViewReport {
+            view_id: "view_fake_guest".to_string(),
+            lane_id: lane.lane_id,
+            base_change: lane.base_change,
+            base_root: db.get_ref("refs/lanes/guest-protocol").unwrap().root_id,
+            backend: "fake".to_string(),
+            mountpoint: workdir.to_string_lossy().into_owned(),
+            source_upper: workdir.to_string_lossy().into_owned(),
+            generated_upper: workdir.join("target").to_string_lossy().into_owned(),
+            scratch_upper: workdir.join(".scratch").to_string_lossy().into_owned(),
+            meta_dir: workdir.join(".meta").to_string_lossy().into_owned(),
+            journal_path: workdir.join(".journal").to_string_lossy().into_owned(),
+            generation: 1,
+            checkpoint_seq: 0,
+            checkpoint_root: None,
+            status: "ready".to_string(),
+            owner_pid: None,
+            owner_start_token: None,
+            heartbeat_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.config.runtime.provider = "colima".to_string();
+        db.config.runtime.execution_backend = "colima".to_string();
+        db.config.runtime.colima_profile = Some("trail-test".to_string());
+        let mut context = db
+            .prepare_managed_lane_execution("guest-protocol", "lane_exec", &["/bin/sh".to_string()])
+            .unwrap();
+        let fake = tempfile::tempdir().unwrap();
+        let limactl = fake.path().join("limactl");
+        write_executable(&limactl, fake_limactl_script());
+        write_fake_setsid(fake.path());
+        let toolchain =
+            super::super::workspace_runtime_toolchain::ColimaToolchain::for_guest_protocol_test(
+                limactl,
+                fake.path(),
+            );
+        let mut marked = false;
+        let run = db
+            .run_colima_lane_command_inner(
+                &mut context,
+                &view,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf guest > guest-source.txt; mkdir -p target; printf generated > target/build.bin"
+                        .to_string(),
+                ],
+                None,
+                &mut marked,
+                Some(toolchain),
+            )
+            .unwrap();
+        assert!(run.success);
+        assert!(marked);
+        assert_eq!(
+            fs::read_to_string(workdir.join("guest-source.txt")).unwrap(),
+            "guest"
+        );
+        assert!(!workdir.join("target/build.bin").exists());
+        let manifest_path = context.guest_manifest_path.clone().unwrap();
+        let manifest = read_guest_manifest(&manifest_path).unwrap();
+        assert_eq!(manifest.phase, "cleaned");
+        assert!(manifest.guest_namespace.starts_with(GUEST_EXECUTION_ROOT));
+        assert!(!Path::new(&manifest.guest_namespace).exists());
+        let lifecycle = db.finalize_managed_lane_execution(
+            context,
+            Some("Fake guest protocol checkpoint".to_string()),
+        );
+        assert!(lifecycle
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .source_paths
+            .iter()
+            .any(|path| path == "guest-source.txt"));
+        assert_eq!(
+            read_guest_manifest(&manifest_path).unwrap().phase,
+            "terminal_succeeded"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn recovery_discards_safe_owned_namespace_and_preserves_unrelated_profile() {
@@ -1949,7 +2709,10 @@ mod tests {
         Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
         let db = Trail::open(root.path()).unwrap();
         let limactl = root.path().join("limactl");
-        write_executable(&limactl, "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &limactl,
+            "#!/bin/sh\ncase \" $* \" in *' cat -- '*) exit 1 ;; esac\nexit 0\n",
+        );
         let toolchain =
             super::super::workspace_runtime_toolchain::ColimaToolchain::for_guest_protocol_test(
                 limactl,
@@ -1959,6 +2722,7 @@ mod tests {
         let workspace_hash = &sha256_hex(db.config.workspace.id.0.as_bytes())[..16];
         for (execution_id, profile, phase) in [
             ("exec_safe", "trail-test", "projected"),
+            ("exec_cancel", "trail-test", "executing"),
             ("exec_other", "other-profile", "exported"),
         ] {
             let manifest = GuestExecutionManifest {
@@ -1979,10 +2743,27 @@ mod tests {
                 checkpoint_root: None,
                 checkpoint_operation: None,
                 error: None,
+                cancellation_requested_at: None,
+                cancellation_completed_at: None,
+                process_group_terminated: false,
                 updated_at: 1,
             };
             write_guest_manifest(&guest_manifest_path(&db, execution_id).unwrap(), &manifest)
                 .unwrap();
+            if execution_id == "exec_cancel" {
+                let request = GuestCancellationRequest {
+                    schema: GUEST_MANIFEST_SCHEMA,
+                    execution_id: execution_id.to_string(),
+                    lane_id: "lane".to_string(),
+                    requested_at: 2,
+                };
+                write_file_atomic(
+                    &guest_cancellation_path(&db, execution_id).unwrap(),
+                    &serde_json::to_vec_pretty(&request).unwrap(),
+                    true,
+                )
+                .unwrap();
+            }
         }
 
         recover_guest_execution_manifests(&db, &toolchain, "trail-test", "colima-trail-test")
@@ -1993,6 +2774,15 @@ mod tests {
                 .phase,
             "terminal_recovered_discarded"
         );
+        assert_eq!(
+            read_guest_manifest(&guest_manifest_path(&db, "exec_cancel").unwrap())
+                .unwrap()
+                .phase,
+            "terminal_cancelled"
+        );
+        assert!(!guest_cancellation_path(&db, "exec_cancel")
+            .unwrap()
+            .exists());
         assert_eq!(
             read_guest_manifest(&guest_manifest_path(&db, "exec_other").unwrap())
                 .unwrap()

@@ -231,6 +231,15 @@ pub(super) fn tools() -> Value {
             }), vec!["lane", "command"])
         },
         {
+            "name": "trail.lane_exec_cancel",
+            "title": "Cancel Lane Workspace Execution",
+            "description": "Cancel one Trail-owned Colima execution, terminate only its guest process group, skip candidate import, and retain a terminal receipt.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "execution_id": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
             "name": "trail.deps_status",
             "title": "Dependency Environment Status",
             "description": "Show expected, attached, ready, stale, building, or failed workspace environments for one lane.",
