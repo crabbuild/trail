@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "trail"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anstyle",
  "async-trait",
@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "trail-environment-adapter-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
