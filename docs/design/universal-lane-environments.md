@@ -582,9 +582,11 @@ workspace-specific profile, starts it without host mounts or global context acti
 and addresses every operation through the profile's explicit Docker context. Explicit
 setup reuses complete system tools or provisions pinned, digest-verified Colima, Lima,
 and Docker CLI artifacts into a Trail-owned cache on supported macOS hosts. Ordinary
-reconciliation never downloads tools. Managed processes isolate `COLIMA_HOME`,
-`LIMA_HOME`, and `DOCKER_CONFIG` below Trail's user data directory and select Apple's
-`vz` backend. Colima remains an external host provider rather than adapter authority,
+reconciliation never downloads tools. Managed processes isolate `COLIMA_HOME` and
+`DOCKER_CONFIG` below Trail's user data directory. On macOS, `LIMA_HOME` uses the
+private, shorter `~/.trail-lima/` root so workspace-scoped profiles stay within the
+platform's Unix-domain socket path limit. Managed tools select Apple's `vz` backend.
+Colima remains an external host provider rather than adapter authority,
 and Trail never deletes
 the VM profile implicitly. Because the contained profile cannot safely bind arbitrary
 host paths into its Docker VM, file-secret services fail closed under Colima until a

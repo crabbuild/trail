@@ -460,10 +460,12 @@ that require host file-secret bind mounts before container creation. Use a
 local Docker/Podman provider for those services until a VM-safe secret broker is
 available; do not work around the restriction by mounting the host home into
 the Colima profile. Mutable managed state and Docker context metadata are
-isolated under `~/Library/Application Support/trail/runtime/`; removing or
-resetting that state is always explicit. First startup can download a VM image
-and take several minutes. Trail never implicitly updates, stops, or deletes a
-toolchain, profile, or VM image.
+isolated under `~/Library/Application Support/trail/runtime/`. On macOS, Lima's
+VM state uses the shorter `~/.trail-lima/` root so its generated SSH socket
+remains below the platform's Unix-domain socket path limit; Trail creates it as
+a private user directory. Removing or resetting either location is always
+explicit. First startup can download a VM image and take several minutes. Trail
+never implicitly updates, stops, or deletes a toolchain, profile, or VM image.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.

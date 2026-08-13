@@ -408,32 +408,51 @@ fn managed_cache_root() -> Result<PathBuf> {
 
 fn colima_state_paths() -> Result<ColimaStatePaths> {
     #[cfg(target_os = "macos")]
-    let data_root = std::env::var_os("HOME")
+    let state = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support/trail/runtime"));
+        .map(|home| macos_colima_state_roots(&home));
     #[cfg(target_os = "windows")]
-    let data_root = std::env::var_os("LOCALAPPDATA")
+    let state = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .map(|root| root.join("trail/runtime"));
+        .map(|root| {
+            let data_root = root.join("trail/runtime");
+            let lima_home = data_root.join("colima/_lima");
+            (data_root, lima_home)
+        });
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let data_root = std::env::var_os("XDG_DATA_HOME")
+    let state = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .map(|home| home.join(".local/share"))
         })
-        .map(|root| root.join("trail/runtime"));
-    let data_root = data_root.ok_or_else(|| {
+        .map(|root| {
+            let data_root = root.join("trail/runtime");
+            let lima_home = data_root.join("colima/_lima");
+            (data_root, lima_home)
+        });
+    let (data_root, lima_home) = state.ok_or_else(|| {
         Error::InvalidInput("cannot resolve Trail's user data directory".to_string())
     })?;
     let colima_home = data_root.join("colima");
     Ok(ColimaStatePaths {
-        lima_home: colima_home.join("_lima"),
+        lima_home,
         docker_config: data_root.join("docker"),
         colima_cache: data_root.join("cache/colima"),
         colima_home,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_colima_state_roots(home: &Path) -> (PathBuf, PathBuf) {
+    (
+        home.join("Library/Application Support/trail/runtime"),
+        // Lima appends the instance name plus a randomized SSH socket suffix
+        // to LIMA_HOME. Keeping that root below Application Support exceeds
+        // macOS's 104-byte AF_UNIX limit for Trail's workspace-scoped names.
+        home.join(".trail-lima"),
+    )
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -1111,6 +1130,26 @@ mod tests {
         assert_eq!(
             safe_archive_path(Path::new("./bin/limactl")).unwrap(),
             Path::new("bin/limactl")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lima_home_leaves_room_for_workspace_profile_socket() {
+        let home = Path::new("/Users/abcdefghijklmnopqrstuvwxyzabcde");
+        let (data_root, lima_home) = macos_colima_state_roots(home);
+        let socket = lima_home
+            .join("colima-trail-0123456789ab")
+            .join("ssh.sock.1234567890123456");
+
+        assert_eq!(
+            data_root,
+            home.join("Library/Application Support/trail/runtime")
+        );
+        assert!(
+            socket.as_os_str().len() < 104,
+            "representative Lima SSH socket must fit macOS AF_UNIX: {}",
+            socket.display()
         );
     }
 }

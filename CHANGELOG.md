@@ -5,6 +5,12 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Trail's managed Colima runtime now keeps Lima VM state at the private,
+  socket-safe `~/.trail-lima/` path on macOS, avoiding startup failures when a
+  workspace-scoped profile exceeds the platform's Unix-domain socket limit.
+
 ### Added
 
 - Lane-private OCI services can now use a first-class Colima provider through
