@@ -30,7 +30,7 @@ ignore.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 notify.workspace = true
-prolly = { package = "prolly-map", version = "0.5.0" }
+prolly = { package = "prolly-map", version = "0.6.0" }
 prolly-store-sqlite = "0.4.0"
 rayon.workspace = true
 reqwest.workspace = true

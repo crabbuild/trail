@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 mod acp_args;
 mod agent_args;
+mod agent_skill_args;
 mod collaboration_args;
 mod environment_args;
 mod handler;
@@ -16,6 +17,7 @@ mod worktree_args;
 
 use acp_args::*;
 use agent_args::*;
+use agent_skill_args::*;
 use collaboration_args::*;
 use environment_args::*;
 use inspect_args::*;
@@ -105,6 +107,8 @@ impl PagerArg {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install Trail's focused lane skill for a supported coding agent.
+    Install(InstallArgs),
     /// Initialize a new Trail workspace and default branch state.
     /// Use this once per repository to create `.trail`, default config,
     /// `.trailignore`, and baseline root metadata.
@@ -226,6 +230,20 @@ mod tests {
             panic!("expected upgrade command");
         };
         assert!(args.check);
+    }
+
+    #[test]
+    fn parses_agent_skill_installers() {
+        for provider in ["codex", "claude", "claude-code"] {
+            let cli = Cli::try_parse_from(["trail", "install", provider])
+                .expect("agent skill install command should parse");
+            let Command::Install(args) = cli.command else {
+                panic!("expected install command");
+            };
+            assert!(!args.force);
+            assert!(!args.dry_run);
+        }
+        assert!(Cli::try_parse_from(["trail", "install", "cursor"]).is_err());
     }
 
     #[test]

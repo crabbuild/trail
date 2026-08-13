@@ -20,7 +20,9 @@ The Trail index lives under:
 The `prolly` crate is re-exported from the `trail` crate and is used for map roots and content-addressed tree structures.
 
 Prolly tree nodes are stored in SQLite alongside Trail metadata for refs,
-operations, derived indexes, and workspace bookkeeping.
+operations, derived indexes, and workspace bookkeeping. The schema records the
+node encoding used by `prolly-store-sqlite` 0.4, allowing raw and compressed
+nodes to coexist without changing their content identities.
 
 ## Derived Indexes
 

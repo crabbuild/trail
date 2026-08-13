@@ -194,6 +194,108 @@ fn cli_reports_package_version() {
 }
 
 #[test]
+fn agent_skill_install_commands_are_workspace_independent_and_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_root = home.path().join("codex-home");
+    let first = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "Codex skill install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["provider"], "codex");
+    assert_eq!(first["skill"], "trail-lanes");
+    assert_eq!(first["action"], "create");
+    let skill_path = codex_root.join("skills/trail-lanes/SKILL.md");
+    assert!(fs::read_to_string(&skill_path)
+        .unwrap()
+        .contains("name: trail-lanes"));
+
+    let repeated = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["action"], "noop");
+
+    let claude = Command::new(trail_bin())
+        .args(["--json", "install", "claude"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        claude.status.success(),
+        "Claude skill install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&claude.stdout),
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    let claude: serde_json::Value = serde_json::from_slice(&claude.stdout).unwrap();
+    assert_eq!(claude["provider"], "claude");
+    assert_eq!(claude["action"], "create");
+    assert!(home
+        .path()
+        .join(".claude/skills/trail-lanes/references/concurrent-agents.md")
+        .is_file());
+}
+
+#[test]
+fn agent_skill_install_refuses_local_edits_without_force() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_root = home.path().join("codex-home");
+    let install = Command::new(trail_bin())
+        .args(["install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    let skill_path = codex_root.join("skills/trail-lanes/SKILL.md");
+    fs::write(&skill_path, "local skill edit\n").unwrap();
+
+    let refused = Command::new(trail_bin())
+        .args(["--json", "install", "codex"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("contains local edits"));
+    assert_eq!(
+        fs::read_to_string(&skill_path).unwrap(),
+        "local skill edit\n"
+    );
+
+    let forced = Command::new(trail_bin())
+        .args(["--json", "install", "codex", "--force"])
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_root)
+        .output()
+        .unwrap();
+    assert!(forced.status.success());
+    let forced: serde_json::Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert_eq!(forced["action"], "update");
+    assert!(fs::read_to_string(skill_path)
+        .unwrap()
+        .contains("name: trail-lanes"));
+}
+
+#[test]
 fn agent_default_provider_is_a_typed_workspace_config_value() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();

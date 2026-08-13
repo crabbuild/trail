@@ -22,6 +22,7 @@ mod daemon_start;
 mod daemon_start;
 mod errors;
 mod inspect;
+mod install;
 mod lane;
 mod maintenance;
 mod parsing;
@@ -125,6 +126,7 @@ fn run(cli: Cli) -> Result<()> {
         ));
     }
     match &command {
+        Command::Install(args) => return install::handle_install_command(&ctx, args),
         Command::Upgrade(args) => return upgrade::handle_upgrade_command(&ctx, args),
         Command::UpdateCheckBackground => {
             upgrade::handle_background_update_check();
@@ -147,6 +149,9 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     match command {
+        Command::Install(_) => {
+            unreachable!("agent skill installation is handled before daemon routing")
+        }
         Command::Init(args) => {
             let workspace = ctx
                 .workspace
@@ -210,7 +215,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mcp => maintenance::handle_mcp_command(&ctx),
         Command::Doctor => maintenance::handle_doctor_command(&ctx),
         Command::Upgrade(_) | Command::UpdateCheckBackground => {
-            unreachable!("workspace-independent update commands are handled before daemon routing")
+            unreachable!("workspace-independent commands are handled before daemon routing")
         }
         Command::Backup(backup) => maintenance::handle_backup_command(&ctx, backup),
         Command::Fsck => maintenance::handle_fsck_command(&ctx),

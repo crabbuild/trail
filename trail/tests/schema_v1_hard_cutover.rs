@@ -368,7 +368,21 @@ fn missing_or_changed_prolly_schema_is_rejected_without_mutation() {
         SchemaFixture::with_sql(|conn| {
             conn.execute_batch("DROP TABLE prolly_hints;").unwrap();
         }),
-        SchemaFixture::mutated_master_sql("prolly_nodes", "node BLOB NOT NULL", "node BLOB"),
+        SchemaFixture::with_sql(|conn| {
+            conn.execute_batch(
+                "DROP TABLE prolly_nodes;
+                 CREATE TABLE prolly_nodes (
+                     cid  BLOB PRIMARY KEY NOT NULL,
+                     node BLOB NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        }),
+        SchemaFixture::mutated_master_sql(
+            "prolly_nodes",
+            "node     BLOB NOT NULL",
+            "node     BLOB",
+        ),
     ];
 
     for fixture in fixtures {

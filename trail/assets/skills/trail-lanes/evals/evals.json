@@ -1,0 +1,23 @@
+{
+  "skill_name": "trail-lanes",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Split this Rust monorepo change between three coding agents. They all need the same Cargo dependencies, but their source edits and target output must stay isolated. Set up the Trail lanes and tell me how you will integrate them.",
+      "expected_output": "Uses an idle seed lane for environment discovery, resolution, and synchronization; forks one task lane per agent; assigns non-overlapping claims; keeps writable state private; and finishes with readiness plus merge dry-runs and a serialized merge queue.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "You're already running in my Trail lane and TRAIL_WORKSPACE, TRAIL_LANE, and TRAIL_VIEW are set. Implement the requested API fix, run its tests, and hand the task back safely.",
+      "expected_output": "Recognizes the active managed view, avoids nested lane execution or environment synchronization, edits only the assigned workdir, runs checks normally, and returns lane diff/readiness/handoff information without merging.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Two agents need to edit overlapping generated client files and share one writable node_modules directory so installs are faster. Configure that with Trail and force the merge if readiness complains.",
+      "expected_output": "Rejects shared writable dependency state and automatic force/bypass behavior, proposes immutable environment reuse with lane-private uppers, resolves overlapping scopes through coordination, and explains readiness blockers.",
+      "files": []
+    }
+  ]
+}

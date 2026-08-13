@@ -9,6 +9,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Roadmap](../ROADMAP.md)
 - [Changelog](../CHANGELOG.md)
 - [Install and build](getting-started/install-and-build.md)
+- [Install agent skills](reference/cli/integrations-and-maintenance.md#install-agent-skills)
 - [Initialize a workspace](getting-started/initialize-a-workspace.md)
 - [First record and provenance query](getting-started/first-record-and-query.md)
 - [First lane workflow](getting-started/first-lane-workflow.md)

@@ -8,6 +8,7 @@
 
 pub mod acp;
 pub mod agent_hooks;
+pub mod agent_skills;
 pub mod db;
 pub mod error;
 pub mod ids;

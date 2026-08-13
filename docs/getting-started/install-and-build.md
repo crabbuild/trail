@@ -77,6 +77,36 @@ trail --help
 trail lane --help
 ```
 
+## Install the Agent Lane Skill
+
+After installing the Trail binary, install its focused lane skill for Codex or
+Claude Code:
+
+```sh
+trail install codex
+trail install claude
+```
+
+Codex receives the skill under `$CODEX_HOME/skills/trail-lanes` when
+`CODEX_HOME` is set, otherwise under `~/.codex/skills/trail-lanes`. Claude
+receives it under `~/.claude/skills/trail-lanes`. Restart the agent so it loads
+the new skill.
+
+Re-running the command is idempotent and updates a Trail-owned installation.
+Trail refuses to overwrite local edits or an unmanaged directory unless
+`--force` is explicit. Preview the action without writing files with:
+
+```sh
+trail install codex --dry-run
+trail install claude --dry-run
+```
+
+Only lane work is skillized: concurrent task isolation, reusable immutable
+environment artifacts, private writable state, claims, managed execution,
+recording, gates, handoff, readiness, and merge preparation. Operator-only
+agent launching, integrations, and workspace maintenance remain in the normal
+documentation instead of consuming every agent session's skill context.
+
 If `$HOME/.cargo/bin` is not on your `PATH`, either add it or call the binary
 directly from that directory. For a project-local install, override `PREFIX`:
 
