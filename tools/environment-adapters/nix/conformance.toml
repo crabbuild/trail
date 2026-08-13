@@ -1,0 +1,8 @@
+schema = "trail.environment-adapter-conformance/v1"
+adapter = "trail-examples/nix@1"
+identity_authorities = ["flake.nix", "flake.lock", "trail.nix.toml"]
+external_artifacts = ["nix-builder", "package", "check"]
+private_outputs = [".trail-nix-profile", ".trail-nix-state"]
+network = "deny"
+process = "metadata-only"
+validation = "nix build/check --offline --no-write-lock-file against a pure locked flake in the pinned OCI builder"

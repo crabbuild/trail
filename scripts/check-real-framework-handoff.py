@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,10 @@ from typing import Any
 LANES = ("agent-a", "agent-b", "agent-c")
 SOURCE_PATHS = {
     "go": ["version/version.go", "version/version_test.go"],
+    "go-workspace": ["common/must.go", "common/must_test.go"],
+    "yarn": ["index.js", "test.js"],
+    "bun": ["src/app.ts", "tests/app.test.ts"],
+    "uv": ["src/pyprojectx/__init__.py", "tests/unit/test_trail_qualification.py"],
     "pnpm": [
         "src/constants.ts",
         "tests/http-helpers/index.test.ts",
@@ -20,6 +25,11 @@ SOURCE_PATHS = {
     "npm": ["src/test/version.test.ts", "src/version.ts"],
     "python": ["src/tap/line.py", "tests/test_line.py"],
     "cmake": ["util/hash.cc", "util/hash.h"],
+    "cmake-modern": ["examples/minimal.cpp"],
+}
+INVALIDATION_PATHS = {
+    "yarn": [".yarnrc"],
+    "bun": ["bunfig.toml"],
 }
 
 
@@ -44,6 +54,34 @@ def select_component(generation: dict[str, Any], component_id: str) -> dict[str,
     return matches[0]
 
 
+def verify_sealed_evidence(evidence_dir: Path) -> dict[str, Any]:
+    """Recompute canonical evidence from raw reports and reject any drift."""
+    evidence_path = evidence_dir / "evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if not isinstance(evidence, dict):
+        raise AssertionError("evidence.json is not a JSON object")
+    if evidence.get("schema") != "trail.ecosystem-certification/v1":
+        raise AssertionError(f"unsupported evidence schema: {evidence.get('schema')!r}")
+    expected = check_evidence(
+        evidence_dir,
+        evidence.get("framework"),
+        evidence.get("repository"),
+        evidence.get("revision"),
+        evidence.get("component_id"),
+    )
+    if evidence != expected:
+        mismatches = sorted(
+            key
+            for key in set(evidence) | set(expected)
+            if evidence.get(key) != expected.get(key)
+        )
+        raise AssertionError(
+            "sealed evidence does not match authoritative raw reports: "
+            f"fields={mismatches!r}"
+        )
+    return evidence
+
+
 def check_evidence(
     evidence_dir: Path,
     framework: str,
@@ -51,7 +89,18 @@ def check_evidence(
     revision: str,
     component_id: str,
 ) -> dict[str, Any]:
-    if framework not in {"go", "pnpm", "npm", "python", "cmake"}:
+    if framework not in {
+        "go",
+        "go-workspace",
+        "yarn",
+        "bun",
+        "uv",
+        "pnpm",
+        "npm",
+        "python",
+        "cmake",
+        "cmake-modern",
+    }:
         raise AssertionError(f"unsupported framework {framework!r}")
     raw = evidence_dir / "raw"
     generations = [load_report(raw, f"generation-{lane}") for lane in LANES]
@@ -59,6 +108,7 @@ def check_evidence(
         load_report(raw, f"generation-before-edit-{lane}") for lane in LANES
     ]
     syncs = [load_report(raw, f"sync-{lane}") for lane in LANES]
+    plans = [load_report(raw, f"plan-{lane}") for lane in LANES]
     spawns = [load_report(raw, f"spawn-{lane}") for lane in LANES]
     prechecks = [load_report(raw, f"precheck-{lane}") for lane in LANES]
     edits = [load_report(raw, f"edit-{lane}") for lane in LANES]
@@ -69,6 +119,32 @@ def check_evidence(
 
     if not all(generation["state"] == "active" for generation in generations):
         raise AssertionError("all final generations must be active")
+    adapter_identities = [plan.get("adapter_identity") for plan in plans]
+    if len(set(adapter_identities)) != 1 or not adapter_identities[0]:
+        raise AssertionError(f"adapter identity changed or is missing: {adapter_identities!r}")
+    tool_identities = [plan.get("tools") for plan in plans]
+    if any(not isinstance(tools, dict) or not tools for tools in tool_identities):
+        raise AssertionError("each plan must record at least one executable identity")
+    if any(tools != tool_identities[0] for tools in tool_identities[1:]):
+        raise AssertionError("tool executable identities changed across source-only lanes")
+    uv_project_plans = [
+        any(
+            item.get("source_path") == "uv.lock"
+            for item in plan.get("inputs", [])
+            if isinstance(item, dict)
+        )
+        for plan in plans
+    ]
+    if len(set(uv_project_plans)) != 1:
+        raise AssertionError("Python install contract changed across source-only lanes")
+    uv_project = uv_project_plans[0]
+    for lane, plan, before in zip(LANES, plans, before_generations, strict=True):
+        if plan.get("component_id") != component_id:
+            raise AssertionError(f"{lane} plan selected the wrong component")
+        if plan.get("source_root") != before.get("source_root"):
+            raise AssertionError(f"{lane} plan is not pinned to its pre-edit source root")
+        if not isinstance(plan.get("component_key"), str) or not plan["component_key"]:
+            raise AssertionError(f"{lane} plan omitted its canonical component key")
     if len({generation["source_root"] for generation in generations}) != 3:
         raise AssertionError("A, B, and C must have distinct source roots")
     if len(set(workdirs)) != 3 or any(not Path(workdir).is_absolute() for workdir in workdirs):
@@ -137,7 +213,7 @@ def check_evidence(
     if any(not storage for storage in output_storage):
         raise AssertionError("each lane must report at least one output")
 
-    if framework == "go":
+    if framework in {"go", "go-workspace"}:
         if len(set(component_keys)) != 3:
             raise AssertionError("Go source edits must produce exact distinct component keys")
         if not all(layer_ids) or len(set(layer_ids)) != 3:
@@ -155,13 +231,16 @@ def check_evidence(
                 raise AssertionError(f"{lane} did not seed from its predecessor: {decision!r}")
             if not isinstance(decision["bytes_avoided"], int) or decision["bytes_avoided"] <= 0:
                 raise AssertionError(f"{lane} avoided no predecessor bytes: {decision!r}")
-    elif framework in {"pnpm", "npm"}:
+    elif framework in {"yarn", "bun", "pnpm", "npm"}:
         if len(set(component_keys)) != 1:
             raise AssertionError("Node dependency identity changed after source-only edits")
         if not layer_ids[0] or len(set(layer_ids)) != 1:
             raise AssertionError("Node lanes did not reuse one exact dependency layer")
     else:
-        if len(set(component_keys)) != 1:
+        if uv_project:
+            if len(set(component_keys)) != 3:
+                raise AssertionError("uv project source edits must change private environment identity")
+        elif len(set(component_keys)) != 1:
             raise AssertionError("private environment identity changed after source-only edits")
         if layer_ids != [None, None, None]:
             raise AssertionError("Python/CMake private outputs must not publish shared layers")
@@ -172,7 +251,14 @@ def check_evidence(
         ):
             raise AssertionError("Python/CMake outputs must use private storage contracts")
 
-    shared_outputs = framework in {"go", "pnpm", "npm"}
+    shared_outputs = framework in {
+        "go",
+        "go-workspace",
+        "yarn",
+        "bun",
+        "pnpm",
+        "npm",
+    }
     for child_index, (child, parent_generation) in enumerate(
         zip(LANES[1:], generations[:-1], strict=True), start=1
     ):
@@ -221,11 +307,59 @@ def check_evidence(
                 raise AssertionError(f"{child} private environment lost parent caches")
 
     first_before = select_component(before_generations[0], component_id)
-    if framework == "go":
+    if framework in {"go", "go-workspace"} or uv_project:
         if first_before["component_key"] == components[0]["component_key"]:
-            raise AssertionError("Go source-sensitive vendor identity did not change after edit")
+            raise AssertionError("source-sensitive environment identity did not change after edit")
     elif first_before["component_key"] != components[0]["component_key"]:
         raise AssertionError("source-only edit changed dependency/build environment identity")
+
+    invalidation = None
+    if framework in INVALIDATION_PATHS:
+        invalidation_spawn = load_report(raw, "spawn-invalidation")
+        invalidation_before_report = load_report(raw, "generation-before-invalidation")
+        invalidation_edit = load_report(raw, "invalidation-edit")
+        invalidation_sync = load_report(raw, "sync-invalidation")
+        invalidation_check = load_report(raw, "check-invalidation")
+        invalidation_generation = load_report(raw, "generation-invalidation")
+        invalidation_before = select_component(invalidation_before_report, component_id)
+        invalidation_after = select_component(invalidation_generation, component_id)
+        if invalidation_spawn["base_change"] != edits[-1]["lifecycle"]["checkpoint"]["operation"]:
+            raise AssertionError("invalidation lane did not start from Agent C")
+        checkpoint = invalidation_edit["lifecycle"]["checkpoint"]
+        if checkpoint["source_paths"] != INVALIDATION_PATHS[framework]:
+            raise AssertionError(f"invalidation changed unexpected source paths: {checkpoint!r}")
+        if invalidation_generation["source_root"] != checkpoint["root_id"]:
+            raise AssertionError("invalidation generation is not pinned to its policy edit")
+        if invalidation_before["component_key"] != components[-1]["component_key"]:
+            raise AssertionError("invalidation lane did not inherit Agent C's component")
+        if invalidation_after["component_key"] == invalidation_before["component_key"]:
+            raise AssertionError("manager policy invalidation reused a stale component key")
+        if not invalidation_after["layer_id"] or invalidation_after["layer_id"] == invalidation_before["layer_id"]:
+            raise AssertionError("manager policy invalidation reused a stale dependency layer")
+        if invalidation_after["caches"] != invalidation_before["caches"]:
+            raise AssertionError("manager policy invalidation lost correctness-neutral caches")
+        if invalidation_check["exit_code"] != 0:
+            raise AssertionError("invalidated dependency layer failed semantic validation")
+        if invalidation_check["lifecycle"]["checkpoint"]["source_paths"]:
+            raise AssertionError("invalidation validation checkpointed unexpected source")
+        decisions = [
+            item
+            for item in invalidation_sync["decisions"]
+            if item["component_id"] == component_id
+        ]
+        if len(decisions) != 1:
+            raise AssertionError(f"invalidation has unexpected decisions: {decisions!r}")
+        invalidation = {
+            "lane": "invalidation",
+            "source_root": invalidation_generation["source_root"],
+            "policy_paths": INVALIDATION_PATHS[framework],
+            "before_component_key": invalidation_before["component_key"],
+            "after_component_key": invalidation_after["component_key"],
+            "before_layer_id": invalidation_before["layer_id"],
+            "after_layer_id": invalidation_after["layer_id"],
+            "cache_namespaces_preserved": True,
+            "semantic_check_passed": True,
+        }
 
     raw_hashes = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -238,30 +372,79 @@ def check_evidence(
         *(f"generation-before-edit-{lane}.json" for lane in LANES),
         *(f"edit-{lane}.json" for lane in LANES),
         *(f"sync-{lane}.json" for lane in LANES),
+        *(f"plan-{lane}.json" for lane in LANES),
         *(f"check-{lane}.json" for lane in LANES),
         *(f"generation-{lane}.json" for lane in LANES),
     }
+    if framework in INVALIDATION_PATHS:
+        expected_names.update(
+            {
+                "spawn-invalidation.json",
+                "generation-before-invalidation.json",
+                "invalidation-edit.json",
+                "sync-invalidation.json",
+                "check-invalidation.json",
+                "generation-invalidation.json",
+            }
+        )
     if set(raw_hashes) != expected_names:
         raise AssertionError(
             f"raw evidence set mismatch: missing={sorted(expected_names - set(raw_hashes))!r} "
             f"extra={sorted(set(raw_hashes) - expected_names)!r}"
         )
 
+    lane_ancestry = []
+    validations = []
+    for lane, spawn, edit, precheck, check in zip(
+        LANES, spawns, edits, prechecks, checks, strict=True
+    ):
+        checkpoint = edit["lifecycle"]["checkpoint"]
+        lane_ancestry.append(
+            {
+                "lane": lane,
+                "base_change": spawn["base_change"],
+                "checkpoint_operation": checkpoint["operation"],
+                "checkpoint_root": checkpoint["root_id"],
+            }
+        )
+        validations.append(
+            {
+                "lane": lane,
+                "parent_exit_code": precheck["exit_code"],
+                "edited_exit_code": check["exit_code"],
+            }
+        )
+
     return {
-        "schema": "trail.real-framework-handoff/v2",
+        "schema": "trail.ecosystem-certification/v1",
         "framework": framework,
         "repository": repository,
         "revision": revision,
+        "distribution": {
+            "kind": "built-in",
+            "adapter_identity": adapter_identities[0],
+            "package_digest": None,
+        },
+        "platform": {
+            "operating_system": platform.system().lower(),
+            "architecture": platform.machine().lower(),
+            "workspace_backend": workdir_modes[0],
+        },
         "backend": workdir_modes[0],
         "lanes": list(LANES),
+        "lane_ancestry": lane_ancestry,
+        "validations": validations,
         "workdirs": workdirs,
         "component_id": component_id,
+        "adapter_identity": adapter_identities[0],
+        "tool_identities": tool_identities[0],
         "source_roots": [generation["source_root"] for generation in generations],
         "component_keys": component_keys,
         "layer_ids": layer_ids,
         "cache_namespaces": cache_namespaces,
         "output_storage": output_storage,
         "generated_dirty_paths": generated_dirty_paths,
+        "invalidation": invalidation,
         "assertions": {
             "three_distinct_source_roots": True,
             "each_child_spawned_from_parent_semantic_checkpoint": True,
@@ -270,13 +453,23 @@ def check_evidence(
             "exact_framework_source_and_test_paths_per_edit": True,
             "parent_semantics_valid_before_each_edit": True,
             "edited_semantics_valid_after_each_edit": True,
-            "dependency_identity_stable_for_source_independent_adapters": framework != "go",
-            "go_vendor_identity_tracks_source_sensitive_vendor_inputs": framework == "go",
-            "cmake_incremental_recompile_and_link_behavior_verified": framework == "cmake",
+            "dependency_identity_stable_for_source_independent_adapters": framework
+            not in {"go", "go-workspace"}
+            and not uv_project,
+            "go_vendor_identity_tracks_source_sensitive_vendor_inputs": framework
+            in {"go", "go-workspace"},
+            "go_multi_module_workspace_graph_verified": framework == "go-workspace",
+            "uv_project_identity_tracks_source_authority": uv_project,
+            "cmake_incremental_recompile_and_link_behavior_verified": framework
+            in {"cmake", "cmake-modern"},
+            "cmake_preset_ninja_ccache_private_output_verified": framework
+            == "cmake-modern",
             "stale_framework_output_rejected_by_lane_marker": True,
             "generated_paths_excluded_from_source_checkpoint": True,
             "all_framework_checks_passed": True,
             "framework_reuse_contract_passed": True,
+            "manager_policy_invalidation_published_new_exact_layer": framework
+            in INVALIDATION_PATHS,
         },
         "raw_sha256": raw_hashes,
     }
@@ -284,12 +477,28 @@ def check_evidence(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify an existing evidence.json against its authoritative raw reports",
+    )
     parser.add_argument("evidence_dir", type=Path)
-    parser.add_argument("framework")
-    parser.add_argument("repository")
-    parser.add_argument("revision")
-    parser.add_argument("component_id")
+    parser.add_argument("framework", nargs="?")
+    parser.add_argument("repository", nargs="?")
+    parser.add_argument("revision", nargs="?")
+    parser.add_argument("component_id", nargs="?")
     args = parser.parse_args()
+    if args.verify:
+        evidence = verify_sealed_evidence(args.evidence_dir)
+        print(json.dumps(evidence, indent=2, sort_keys=True))
+        return 0
+    missing = [
+        name
+        for name in ("framework", "repository", "revision", "component_id")
+        if getattr(args, name) is None
+    ]
+    if missing:
+        parser.error(f"sealing evidence requires: {', '.join(missing)}")
     evidence = check_evidence(
         args.evidence_dir,
         args.framework,
@@ -299,6 +508,7 @@ def main() -> int:
     )
     encoded = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
     (args.evidence_dir / "evidence.json").write_text(encoded, encoding="utf-8")
+    verify_sealed_evidence(args.evidence_dir)
     print(encoded, end="")
     return 0
 

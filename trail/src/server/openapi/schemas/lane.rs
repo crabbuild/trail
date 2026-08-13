@@ -1195,12 +1195,14 @@ pub(super) fn lane_schemas() -> Value {
         },
         "EnvironmentPlanReport": {
             "type": "object",
-            "required": ["source_root", "component_id", "adapter_identity", "kind", "component_key", "dependencies", "dependency_edges", "caches", "external_artifacts", "runtime_resources", "inputs", "tools", "commands", "outputs", "output_path", "mount_path", "portability_scope", "capabilities"],
+            "required": ["source_root", "component_id", "adapter_identity", "adapter_implementation_version", "adapter_distribution_digest", "kind", "component_key", "dependencies", "dependency_edges", "caches", "external_artifacts", "runtime_resources", "inputs", "tools", "commands", "outputs", "output_path", "mount_path", "portability_scope", "capabilities"],
             "additionalProperties": false,
             "properties": {
                 "source_root": { "type": "string" },
                 "component_id": { "type": "string" },
                 "adapter_identity": { "type": "string" },
+                "adapter_implementation_version": { "type": "string" },
+                "adapter_distribution_digest": { "type": "string" },
                 "kind": { "type": "string" },
                 "component_key": { "type": "string" },
                 "dependencies": { "type": "array", "items": { "type": "string" } },

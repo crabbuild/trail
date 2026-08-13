@@ -127,6 +127,13 @@ impl From<AdapterPlan> for ProposedPluginPlan {
 impl ProposedPluginPlan {
     fn from_v2(plan: AdapterPlanV2) -> Result<Self> {
         let metadata_only = !plan.external_artifacts.is_empty();
+        let external_outputs_are_private_state = plan.outputs.iter().all(|output| {
+            output.policy == AdapterOutputPolicy::WritablePrivate
+                && output.reuse == AdapterReuseMode::None
+                && output.scope == AdapterSharingScope::Lane
+                && output.publish == AdapterPublicationTrigger::Never
+                && output.gate.is_none()
+        });
         if (!metadata_only && plan.actions.is_empty()) || plan.actions.len() > 9 {
             return Err(Error::InvalidInput(
                 "adapter protocol-v2 filesystem plan must declare between one and nine actions"
@@ -137,10 +144,10 @@ impl ProposedPluginPlan {
             && (plan.kind != "external"
                 || !plan.actions.is_empty()
                 || !plan.caches.is_empty()
-                || !plan.outputs.is_empty())
+                || !external_outputs_are_private_state)
         {
             return Err(Error::InvalidInput(
-                "adapter protocol-v2 external-artifact plan must use kind `external` and cannot mix actions, caches, or filesystem outputs"
+                "adapter protocol-v2 external-artifact plan must use kind `external`, cannot mix actions or caches, and permits only lane-scoped writable-private never-published companion outputs"
                     .to_string(),
             ));
         }
@@ -1474,9 +1481,16 @@ impl Trail {
         }
         let component_root = normalize_plugin_component_root(component_root)?;
         match protocol {
-            PROTOCOL_V1 if plan.command.is_none() || !plan.mounted_commands.is_empty() => {
+            PROTOCOL_V1
+                if plan.command.is_none()
+                    || !plan.mounted_commands.is_empty()
+                    || plan
+                        .command
+                        .as_ref()
+                        .is_some_and(|command| command.process_tree) =>
+            {
                 return Err(Error::InvalidInput(format!(
-                    "adapter `{}` returned protocol-v2 actions in a v1 plan",
+                    "adapter `{}` returned protocol-v2 actions or process-tree authority in a v1 plan",
                     plugin.manifest.adapter.canonical_identity
                 )));
             }
@@ -1498,6 +1512,17 @@ impl Trail {
                     plugin.manifest.adapter.canonical_identity
                 )));
             }
+            PROTOCOL_V2
+                if plan
+                    .mounted_commands
+                    .iter()
+                    .any(|command| command.process_tree || !command.identity_args.is_empty()) =>
+            {
+                return Err(Error::InvalidInput(format!(
+                    "adapter `{}` requested process-tree authority for a mounted action; it is available only to staging actions",
+                    plugin.manifest.adapter.canonical_identity
+                )));
+            }
             PROTOCOL_V2 => {}
             other => {
                 return Err(Error::InvalidInput(format!(
@@ -1508,6 +1533,10 @@ impl Trail {
         }
 
         let cache_contract = serde_json::to_string(&plan.caches)?;
+        let process_tree = plan
+            .command
+            .as_ref()
+            .is_some_and(|command| command.process_tree);
         let (normalized_caches, cache_environment) = self.normalize_environment_plugin_caches(
             plugin,
             protocol,
@@ -1518,6 +1547,20 @@ impl Trail {
             .iter()
             .map(|cache| cache.name.clone())
             .collect::<Vec<_>>();
+        let cache_argument_paths = normalized_caches
+            .iter()
+            .map(|cache| (cache.name.as_str(), cache.storage_path.as_path()))
+            .collect::<BTreeMap<_, _>>();
+        let host_java_environment = if process_tree {
+            host_process_tree_java_environment(
+                plan.command
+                    .as_ref()
+                    .map(|command| command.program.as_str()),
+                &plugin.manifest.adapter.canonical_identity,
+            )?
+        } else {
+            BTreeMap::new()
+        };
 
         let normalize_command = |command: &trail_environment_adapter_sdk::AdapterCommand,
                                  mounted: bool|
@@ -1526,11 +1569,16 @@ impl Trail {
                 || command.program.contains('\\')
                 || super::workspace_recipe::is_shell_program(&command.program)
                 || command.args.len() > 4096
-                || command.args.iter().any(|argument| {
-                    argument.len() > 128 * 1024
-                        || argument.contains('\0')
-                        || contains_sensitive_text(argument)
-                })
+                || command.identity_args.len() > 16
+                || command
+                    .args
+                    .iter()
+                    .chain(&command.identity_args)
+                    .any(|argument| {
+                        argument.len() > 128 * 1024
+                            || argument.contains('\0')
+                            || contains_sensitive_text(argument)
+                    })
             {
                 return Err(Error::InvalidInput(format!(
                     "adapter `{}` proposed a shell, path-qualified executable, or invalid argument",
@@ -1553,6 +1601,16 @@ impl Trail {
             }
             let mut environment = command.environment.clone();
             if !mounted {
+                for (name, value) in &host_java_environment {
+                    if environment.insert(name.clone(), value.clone()).is_some() {
+                        return Err(Error::InvalidInput(format!(
+                            "adapter `{}` attempted to override host-owned environment variable `{name}`",
+                            plugin.manifest.adapter.canonical_identity
+                        )));
+                    }
+                }
+            }
+            if !mounted {
                 for (name, value) in &cache_environment {
                     if environment.insert(name.clone(), value.clone()).is_some() {
                         return Err(Error::InvalidInput(format!(
@@ -1571,12 +1629,24 @@ impl Trail {
             } else {
                 format!("project/{working_repository_path}")
             };
+            let args = command
+                .args
+                .iter()
+                .map(|argument| {
+                    materialize_plugin_cache_argument(
+                        argument,
+                        &cache_argument_paths,
+                        mounted,
+                        &plugin.manifest.adapter.canonical_identity,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok((
                 WorkspaceEnvironmentCommand {
                     program: command.program.clone(),
                     resolved_program: tool.path,
                     executable_identity: tool.identity,
-                    args: command.args.clone(),
+                    args,
                     working_directory,
                     environment,
                     remove_environment: Vec::new(),
@@ -1594,6 +1664,31 @@ impl Trail {
             .as_ref()
             .map(|command| normalize_command(command, false))
             .transpose()?;
+        let mut tool_identity_environment = plan
+            .command
+            .as_ref()
+            .map(|command| command.environment.clone())
+            .unwrap_or_default();
+        for (name, value) in &host_java_environment {
+            tool_identity_environment.insert(name.clone(), value.clone());
+        }
+        let staging_version_identity = if let Some(command) = &plan.command {
+            if command.identity_args.is_empty() {
+                None
+            } else {
+                let tool = super::workspace_environment::resolve_workspace_tool_executable(
+                    &command.program,
+                )?;
+                Some(plugin_tool_version_identity(
+                    &tool.path,
+                    &command.identity_args,
+                    &tool_identity_environment,
+                    &plugin.manifest.adapter.canonical_identity,
+                )?)
+            }
+        } else {
+            None
+        };
         let normalized_mounted_commands = plan
             .mounted_commands
             .iter()
@@ -1658,9 +1753,17 @@ impl Trail {
                 plugin.manifest.adapter.canonical_identity
             )));
         }
-        if !plan.external_artifacts.is_empty() && !plan.outputs.is_empty() {
+        if !plan.external_artifacts.is_empty()
+            && plan.outputs.iter().any(|output| {
+                output.policy != AdapterOutputPolicy::WritablePrivate
+                    || output.reuse != AdapterReuseMode::None
+                    || output.scope != AdapterSharingScope::Lane
+                    || output.publish != AdapterPublicationTrigger::Never
+                    || output.gate.is_some()
+            })
+        {
             return Err(Error::InvalidInput(format!(
-                "adapter `{}` cannot mix external artifacts with filesystem outputs",
+                "adapter `{}` external artifacts permit only lane-scoped writable-private never-published companion outputs",
                 plugin.manifest.adapter.canonical_identity
             )));
         }
@@ -1860,7 +1963,10 @@ impl Trail {
             );
             layer_inputs.insert(
                 "capability_contract".to_string(),
-                if runtime_resources
+                if !outputs.is_empty() {
+                    "plugin-plan:bounded-pinned-bytes;action:none;fs-read:none;fs-write:host-created-lane-private-companion-state;process:none;network:none;shell:none;scripts:none;secrets:none;authority:external-identity-only"
+                        .to_string()
+                } else if runtime_resources
                     .iter()
                     .any(|resource| !resource.secrets.is_empty())
                 {
@@ -1907,6 +2013,18 @@ impl Trail {
             layer_inputs.insert(
                 "capability_contract".to_string(),
                 "plugin-plan:bounded-pinned-bytes;fs-read:declared-inputs;fs-write:declared-outputs+isolated-home+tmp;process:exact-host-resolved-executable;child-exec:deny;network:deny;shell:deny;scripts:deny;secrets:deny"
+                    .to_string(),
+            );
+        }
+        if process_tree {
+            layer_inputs.insert(
+                "process_tree_contract".to_string(),
+                "native-sandboxed;outbound-network-deny;macos-local-bind-and-receive;committed-direct-validation-task;cache-independent-tool-identity;isolated-staging-enumeration;isolated-java-tmp;verified-host-java-home;verified-process-tree-tool-root;macos-system-shell-selector;cache-ancestor-metadata;declared-outputs-and-caches-only;deterministic-build-mtime-2000-v16;protocol-v2"
+                    .to_string(),
+            );
+            layer_inputs.insert(
+                "capability_contract".to_string(),
+                "plugin-plan:bounded-pinned-bytes;fs-read:declared-inputs;fs-write:declared-outputs+host-cache+isolated-home+tmp;process:sandboxed-tree;network:deny;shell:tool-managed;secrets:deny"
                     .to_string(),
             );
         }
@@ -1959,6 +2077,49 @@ impl Trail {
                 format!("staging-executable:{}", command.program)
             };
             tool_versions.insert(name, command.executable_identity.clone());
+            if let Some(version) = &staging_version_identity {
+                tool_versions.insert(
+                    format!("staging-version:{}", command.program),
+                    version.clone(),
+                );
+            }
+            if let Some(java_home) = command.environment.get("JAVA_HOME") {
+                let java = canonical_java_executable(
+                    Path::new(java_home),
+                    &plugin.manifest.adapter.canonical_identity,
+                )?;
+                tool_versions.insert(
+                    "host-executable:java".to_string(),
+                    super::workspace_environment::workspace_tool_identity_for_path(&java)?,
+                );
+                tool_versions.insert(
+                    "host-version:java".to_string(),
+                    plugin_tool_version_identity(
+                        &java,
+                        &["--version".to_string()],
+                        &BTreeMap::new(),
+                        &plugin.manifest.adapter.canonical_identity,
+                    )?,
+                );
+                let javac = canonical_java_tool(
+                    Path::new(java_home),
+                    "javac",
+                    &plugin.manifest.adapter.canonical_identity,
+                )?;
+                tool_versions.insert(
+                    "host-executable:javac".to_string(),
+                    super::workspace_environment::workspace_tool_identity_for_path(&javac)?,
+                );
+                tool_versions.insert(
+                    "host-version:javac".to_string(),
+                    plugin_tool_version_identity(
+                        &javac,
+                        &["--version".to_string()],
+                        &BTreeMap::new(),
+                        &plugin.manifest.adapter.canonical_identity,
+                    )?,
+                );
+            }
         }
         for (index, (command, _)) in normalized_mounted_commands.iter().enumerate() {
             tool_versions.insert(
@@ -1986,7 +2147,9 @@ impl Trail {
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
                 portability_scope: portability_scope.to_string(),
-                strategy: if !external_artifacts.is_empty() {
+                strategy: if !external_artifacts.is_empty() && !outputs.is_empty() {
+                    "isolated-plugin-external-artifact-private-state-plan-v2"
+                } else if !external_artifacts.is_empty() {
                     "isolated-plugin-external-artifact-plan-v2"
                 } else if protocol == PROTOCOL_V1 {
                     "isolated-plugin-plan-v1"
@@ -2007,7 +2170,9 @@ impl Trail {
             caches: normalized_caches,
             external_artifacts,
             runtime_resources,
-            sandbox_policy: if protocol == PROTOCOL_V2 && !normalized_mounted_commands.is_empty() {
+            sandbox_policy: if process_tree {
+                WorkspaceEnvironmentSandboxPolicy::RestrictedPluginProcessTree
+            } else if protocol == PROTOCOL_V2 && !normalized_mounted_commands.is_empty() {
                 WorkspaceEnvironmentSandboxPolicy::RestrictedPluginMounted
             } else if protocol == PROTOCOL_V2 && has_plugin_caches {
                 WorkspaceEnvironmentSandboxPolicy::RestrictedPluginStaging
@@ -2018,6 +2183,205 @@ impl Trail {
             stale_reason: plan.stale_reason,
         })
     }
+}
+
+fn plugin_tool_version_identity(
+    program: &Path,
+    args: &[String],
+    environment: &BTreeMap<String, String>,
+    adapter_identity: &str,
+) -> Result<String> {
+    const MAX_CAPTURE: usize = 64 * 1024;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` tool identity command could not launch: {error}"
+        ))
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Corrupt("tool identity command lost stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Corrupt("tool identity command lost stderr".to_string()))?;
+    let stdout = spawn_bounded_reader(stdout, MAX_CAPTURE);
+    let stderr = spawn_bounded_reader(stderr, MAX_CAPTURE);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::InvalidInput(format!(
+                "adapter `{adapter_identity}` tool identity command timed out"
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| Error::Corrupt("tool identity stdout reader panicked".to_string()))??;
+    let stderr = stderr
+        .join()
+        .map_err(|_| Error::Corrupt("tool identity stderr reader panicked".to_string()))??;
+    if stdout.overflow || stderr.overflow || !status.success() {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` tool identity command failed or exceeded 64 KiB"
+        )));
+    }
+    if stdout.bytes.is_empty() && stderr.bytes.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` tool identity output was empty"
+        )));
+    }
+    let mut identity = Vec::with_capacity(stdout.bytes.len() + stderr.bytes.len() + 1);
+    identity.extend_from_slice(&stdout.bytes);
+    identity.push(0);
+    identity.extend_from_slice(&stderr.bytes);
+    if contains_sensitive_text(&String::from_utf8_lossy(&identity)) {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` tool identity output was sensitive"
+        )));
+    }
+    Ok(format!("sha256:{}", sha256_hex(&identity)))
+}
+
+fn host_process_tree_java_environment(
+    program: Option<&str>,
+    adapter_identity: &str,
+) -> Result<BTreeMap<String, String>> {
+    if !matches!(program, Some("bazel" | "gradle" | "mvn" | "maven")) {
+        return Ok(BTreeMap::new());
+    }
+    let java_home = match std::env::var_os("JAVA_HOME") {
+        Some(java_home) => fs::canonicalize(PathBuf::from(java_home)).map_err(|error| {
+            Error::InvalidInput(format!(
+                "adapter `{adapter_identity}` requires a valid system-managed JAVA_HOME: {error}"
+            ))
+        })?,
+        None => {
+            let java = super::workspace_environment::resolve_workspace_tool_executable("java")?;
+            let java = fs::canonicalize(&java.path).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "adapter `{adapter_identity}` could not resolve the selected Java executable: {error}"
+                ))
+            })?;
+            java_toolchain_home(&java).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "adapter `{adapter_identity}` selected Java executable `{}` without a toolchain home",
+                    java.display()
+                ))
+            })?
+        }
+    };
+    let approved_roots = ["/Library", "/opt", "/usr", "/nix/store"];
+    #[cfg(windows)]
+    let approved = java_home.is_absolute();
+    #[cfg(not(windows))]
+    let approved = approved_roots
+        .iter()
+        .any(|root| java_home.starts_with(root));
+    if !approved {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` JAVA_HOME `{}` is not under an approved system toolchain root ({})",
+            java_home.display(),
+            approved_roots.join(", ")
+        )));
+    }
+    let _ = canonical_java_executable(&java_home, adapter_identity)?;
+    Ok(BTreeMap::from([(
+        "JAVA_HOME".to_string(),
+        java_home.to_string_lossy().into_owned(),
+    )]))
+}
+
+fn java_toolchain_home(java: &Path) -> Option<PathBuf> {
+    // `/usr/bin/java` is Apple's launcher, not a JDK-owned executable. Treating
+    // `/usr` as JAVA_HOME causes the launcher to recurse instead of identifying
+    // the concrete toolchain selected by the operator.
+    #[cfg(target_os = "macos")]
+    if java == Path::new("/usr/bin/java") {
+        return None;
+    }
+    java.parent().and_then(Path::parent).map(Path::to_path_buf)
+}
+
+fn canonical_java_executable(java_home: &Path, adapter_identity: &str) -> Result<PathBuf> {
+    canonical_java_tool(java_home, "java", adapter_identity)
+}
+
+fn canonical_java_tool(java_home: &Path, tool: &str, adapter_identity: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let executable = java_home.join(format!("bin/{tool}.exe"));
+    #[cfg(not(windows))]
+    let executable = java_home.join(format!("bin/{tool}"));
+    let executable = fs::canonicalize(&executable).map_err(|error| {
+        Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` JAVA_HOME has no runnable `{tool}` executable: {error}"
+        ))
+    })?;
+    if !executable.starts_with(java_home) || !executable.is_file() {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` JAVA_HOME `{tool}` executable escapes its toolchain root"
+        )));
+    }
+    Ok(executable)
+}
+
+fn materialize_plugin_cache_argument(
+    argument: &str,
+    caches: &BTreeMap<&str, &Path>,
+    mounted: bool,
+    adapter_identity: &str,
+) -> Result<String> {
+    const PREFIX: &str = "{trail-cache:";
+    let Some(start) = argument.find(PREFIX) else {
+        return Ok(argument.to_string());
+    };
+    if mounted || argument[start + PREFIX.len()..].contains(PREFIX) {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` used an invalid or mounted cache argument binding"
+        )));
+    }
+    let name_start = start + PREFIX.len();
+    let end = argument[name_start..]
+        .find('}')
+        .map(|offset| name_start + offset)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "adapter `{adapter_identity}` returned an unterminated cache argument binding"
+            ))
+        })?;
+    let name = &argument[name_start..end];
+    let path = caches.get(name).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` references undeclared argument cache `{name}`"
+        ))
+    })?;
+    let mut materialized = String::with_capacity(argument.len() + path.to_string_lossy().len());
+    materialized.push_str(&argument[..start]);
+    materialized.push_str(&path.to_string_lossy());
+    materialized.push_str(&argument[end + 1..]);
+    if materialized.contains(PREFIX) {
+        return Err(Error::InvalidInput(format!(
+            "adapter `{adapter_identity}` returned more than one cache argument binding"
+        )));
+    }
+    Ok(materialized)
 }
 
 fn spawn_bounded_reader(
@@ -3021,7 +3385,7 @@ fn canonicalize_and_validate_package(package: &mut AdapterPackageManifest) -> Re
     }
     if !matches!(
         package.adapter.kind.as_str(),
-        "dependency" | "compiler-results" | "generated"
+        "dependency" | "compiler-results" | "generated" | "external"
     ) {
         return Err(Error::InvalidInput(format!(
             "adapter `{}` declares unsupported kind `{}`",
@@ -3335,6 +3699,17 @@ mod tests {
     use super::*;
     use crate::ids::{ArtifactEnvelopeId, ArtifactTreeId};
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn java_toolchain_home_is_derived_from_the_selected_path_executable() {
+        assert_eq!(
+            java_toolchain_home(Path::new("/opt/jdk/Contents/Home/bin/java")),
+            Some(PathBuf::from("/opt/jdk/Contents/Home"))
+        );
+        assert_eq!(java_toolchain_home(Path::new("java")), None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(java_toolchain_home(Path::new("/usr/bin/java")), None);
+    }
 
     fn plugin_with_protocols(protocols: &[&str]) -> InstalledEnvironmentPlugin {
         InstalledEnvironmentPlugin {
@@ -3820,6 +4195,34 @@ mod tests {
             )
             .unwrap();
         }
+        let stateful = AdapterPlanV2::builder("nix-store", "external")
+            .identity_input("flake.lock")
+            .external_artifact(AdapterExternalArtifact::verified_external(
+                "package",
+                "nix-store",
+                "/nix/store/example-package",
+                digest,
+                "linux/aarch64",
+            ))
+            .output(AdapterOutput::writable_private(
+                "profile",
+                "trail-nix-profile",
+                ".trail-nix-profile",
+            ))
+            .stale_reason("Nix immutable identity or private profile contract changed")
+            .build()
+            .unwrap();
+        let normalized = ProposedPluginPlan::from_v2(stateful).unwrap();
+        assert_eq!(normalized.external_artifacts.len(), 1);
+        assert_eq!(normalized.outputs.len(), 1);
+        assert_eq!(
+            normalized.outputs[0].policy,
+            AdapterOutputPolicy::WritablePrivate
+        );
+        assert_eq!(
+            normalized.outputs[0].publish,
+            AdapterPublicationTrigger::Never
+        );
         let mut secret_like = normalized.external_artifacts[0].clone();
         secret_like.reference = "store://objects/token=credential".to_string();
         assert!(
@@ -3897,6 +4300,70 @@ mod tests {
             .contains("secret-like data"));
     }
 
+    #[test]
+    fn plugin_cache_arguments_are_exactly_declared_and_staging_only() {
+        let cache_root = Path::new("/trail/cache/root");
+        let caches = BTreeMap::from([("repository", cache_root)]);
+        assert_eq!(
+            materialize_plugin_cache_argument(
+                "--repository=/prefix/{trail-cache:repository}/suffix",
+                &caches,
+                false,
+                "example/test@1",
+            )
+            .unwrap(),
+            format!("--repository=/prefix/{}/suffix", cache_root.display())
+        );
+        for invalid in [
+            "{trail-cache:missing}",
+            "{trail-cache:repository",
+            "{trail-cache:repository}/{trail-cache:repository}",
+        ] {
+            assert!(
+                materialize_plugin_cache_argument(invalid, &caches, false, "example/test@1",)
+                    .is_err()
+            );
+        }
+        assert!(materialize_plugin_cache_argument(
+            "{trail-cache:repository}",
+            &caches,
+            true,
+            "example/test@1",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mounted cache argument"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_tool_identity_is_stable_and_sensitive_to_version_output() {
+        let first = plugin_tool_version_identity(
+            Path::new("/bin/echo"),
+            &["version-one".to_string()],
+            &BTreeMap::new(),
+            "example/test@1",
+        )
+        .unwrap();
+        let repeated = plugin_tool_version_identity(
+            Path::new("/bin/echo"),
+            &["version-one".to_string()],
+            &BTreeMap::new(),
+            "example/test@1",
+        )
+        .unwrap();
+        let changed = plugin_tool_version_identity(
+            Path::new("/bin/echo"),
+            &["version-two".to_string()],
+            &BTreeMap::new(),
+            "example/test@1",
+        )
+        .unwrap();
+        assert_eq!(first, repeated);
+        assert_ne!(first, changed);
+        assert!(valid_sha256_digest(&first));
+    }
+
     fn write_test_package(root: &Path, identity: &str) {
         let executable = root.join("adapter-test");
         fs::write(&executable, b"test adapter executable\n").unwrap();
@@ -3955,6 +4422,24 @@ max_response_bytes = 1048576
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn plugin_package_accepts_external_metadata_kind() {
+        let package = tempfile::tempdir().unwrap();
+        write_test_package(package.path(), "example/external@1");
+        let manifest_path = package.path().join(PLUGIN_PACKAGE_MANIFEST);
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        fs::write(
+            &manifest_path,
+            manifest.replace("kind = \"generated\"", "kind = \"external\""),
+        )
+        .unwrap();
+        let mut package: AdapterPackageManifest =
+            toml::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+
+        canonicalize_and_validate_package(&mut package).unwrap();
+        assert_eq!(package.adapter.kind, "external");
     }
 
     fn sign_test_package(root: &Path, signing_key: &SigningKey, publisher: &str) -> PathBuf {

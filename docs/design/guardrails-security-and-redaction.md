@@ -50,6 +50,15 @@ Repository v2 and adapter v3 requests may narrow a certified profile but cannot
 widen it. V1/v2 adapters keep their legacy authority and cannot obtain v3
 resolution, source-export, or attestation privileges through omitted fields.
 
+Provider-owned external artifacts are untrusted claims until their complete typed
+identity passes host validation. Protocol-v2 plans cannot combine them with actions or
+caches and cannot relabel a generic store reference as an OCI image. Their only optional
+filesystem state is a layerless, lane-scoped `writable_private` directory with no reuse,
+gate, or publication; Trail creates it without executing the adapter. Nix qualification
+additionally binds a pinned lock digest, pure/locked marker, digest-pinned builder image,
+exact store paths, platform, and NAR SHA-256 digests. Trail never treats a marker as
+authority to fetch, execute, access a host store, or clean provider content.
+
 Secret bytes are never key material. A phase that receives a secret is tainted;
 its output must remain lane private and cannot enter shared CAS, a reusable
 materialization, an attestation, or a source export. Candidate ingestion also

@@ -10,7 +10,7 @@ die() {
   exit 64
 }
 
-[[ $# == 1 ]] || die "usage: $0 <go|pnpm|npm|python|cmake>"
+[[ $# == 1 ]] || die "usage: $0 <go|go-workspace|yarn|bun|pnpm|npm|python|uv|cmake|cmake-modern>"
 framework=$1
 : "${TRAIL_BIN:?set TRAIL_BIN to the candidate Trail executable}"
 : "${TRAIL_FRAMEWORK_EVIDENCE_DIR:?set TRAIL_FRAMEWORK_EVIDENCE_DIR to a new output directory}"
@@ -38,6 +38,24 @@ case "$framework" in
     component_selector=go-vendor
     component_id=go-vendor
     ;;
+  go-workspace)
+    repository=https://github.com/oxia-db/oxia.git
+    revision=8494f2a8bc4a36d5a93cd1c4101639be7a040163
+    component_selector=go-vendor-workspace
+    component_id=go-vendor
+    ;;
+  yarn)
+    repository=https://github.com/jonschlinkert/is-odd.git
+    revision=b8fc75839e341f23e2d7cb2d4b6a173ccbc1e364
+    component_selector=node
+    component_id=node
+    ;;
+  bun)
+    repository=https://github.com/nozomio-labs/nia-cli.git
+    revision=3ebf0b0bb62ff6a73d630232b2b03c8bde30fe86
+    component_selector=node
+    component_id=node
+    ;;
   pnpm)
     repository=https://github.com/Polymarket/clob-client-v2.git
     revision=f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69
@@ -56,11 +74,27 @@ case "$framework" in
     component_selector=python
     component_id=python-venv
     ;;
+  uv)
+    repository=https://github.com/pyprojectx/pyprojectx.git
+    revision=e615df93474fdd7b1c5d798c8d521499b3f87c42
+    component_selector=python
+    component_id=python-venv
+    ;;
   cmake)
     repository=https://github.com/google/leveldb.git
     revision=7ee830d02b623e8ffe0b95d59a74db1e58da04c5
     component_selector=cmake-build
     component_id=cmake-build
+    ;;
+  cmake-modern)
+    repository=https://github.com/CLIUtils/CLI11.git
+    revision=60492bddb50422f32cfa33c1365b96ebee4205ca
+    component_selector=cmake-build
+    component_id=cmake-build
+    : "${TRAIL_CMAKE_CONFIGURE_PRESET:=dev}"
+    export TRAIL_CMAKE_CONFIGURE_PRESET
+    command -v ninja >/dev/null || die "cmake-modern qualification requires Ninja"
+    command -v ccache >/dev/null || die "cmake-modern qualification requires ccache"
     ;;
   *) die "unsupported framework: $framework" ;;
 esac
@@ -96,12 +130,39 @@ run_edit() {
 run_framework_precheck() {
   local lane=$1
   local expected=$2
+  local go_package
   case "$framework" in
-    go)
+    go|go-workspace)
+      if [[ $framework == go ]]; then
+        go_package=./version
+      else
+        go_package=./common
+      fi
       run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
         'set -eu
-         "$1" "$2" verify go "$3"
-         exec "$TRAIL_GO" test ./version 1>&2' \
+         "$1" "$2" verify "$3" "$4"
+         exec "$TRAIL_GO" test "$5" 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$framework" "$expected" \
+        "$go_package"
+      ;;
+    yarn)
+      run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify yarn "$3"
+         if test "$3" = baseline; then
+           exec "$TRAIL_YARN" mocha test.js --grep "should return true if the number is odd" 1>&2
+         fi
+         exec "$TRAIL_YARN" mocha test.js --grep "Trail qualification marker" 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
+    bun)
+      run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify bun "$3"
+         if test "$3" = baseline; then
+           exec "$TRAIL_BUN" test tests/setup.test.ts 1>&2
+         fi
+         exec "$TRAIL_BUN" test tests/app.test.ts -t "Trail qualification marker" 1>&2' \
         trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
     pnpm)
@@ -134,6 +195,17 @@ run_framework_precheck() {
          exec "$TRAIL_VENV_PYTHON" -m pytest -q tests/test_line.py -k trail_qualification_marker 1>&2' \
         trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
+    uv)
+      run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify uv "$3"
+         "$TRAIL_VENV_PYTHON" -c '\''import importlib.metadata; importlib.metadata.distribution("pyprojectx")'\''
+         if test "$3" = baseline; then
+           exec "$TRAIL_VENV_PYTHON" -m pytest -q tests/unit/test_cli.py -k test_parse_args 1>&2
+         fi
+         exec "$TRAIL_VENV_PYTHON" -m pytest -q tests/unit/test_trail_qualification.py 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
     cmake)
       run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
         'set -eu
@@ -147,18 +219,57 @@ run_framework_precheck() {
          shasum -a 256 "$status_object" | awk "{print \$1}" > "$TRAIL_CMAKE_BUILD_DIR/trail-status-before.sha256"' \
         trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
+    cmake-modern)
+      run_json "precheck-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify cmake-modern "$3"
+         "$TRAIL_CMAKE" --preset "$TRAIL_CMAKE_CONFIGURE_PRESET" -B "$TRAIL_CMAKE_MOUNTED_BUILD_DIR" -DCLI11_BUILD_TESTS=OFF -DCLI11_BUILD_EXAMPLES=ON 1>&2
+         "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_MOUNTED_BUILD_DIR" --target minimal --parallel 2 1>&2
+         minimal_object=$(find "$TRAIL_CMAKE_BUILD_DIR" -path "*CMakeFiles/minimal.dir/minimal.cpp.o" -print -quit)
+         precompile_object=$(find "$TRAIL_CMAKE_BUILD_DIR" -path "*CMakeFiles/CLI11.dir/Precompile.cpp.o" -print -quit)
+         test -n "$minimal_object" && test -n "$precompile_object"
+         shasum -a 256 "$minimal_object" | awk "{print \$1}" > "$TRAIL_CMAKE_BUILD_DIR/trail-minimal-before.sha256"
+         shasum -a 256 "$precompile_object" | awk "{print \$1}" > "$TRAIL_CMAKE_BUILD_DIR/trail-precompile-before.sha256"
+         if test "$3" != baseline; then
+           strings "$TRAIL_CMAKE_BUILD_DIR/examples/minimal" | grep -F "$3" >/dev/null
+           test "$("$TRAIL_CCACHE" --print-stats | awk "\$1 == \"direct_cache_hit\" {print \$2}")" -gt 0
+         fi' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
   esac
 }
 
 run_framework_check() {
   local lane=$1
+  local expected=${2:-$lane}
+  local go_package
   case "$framework" in
-    go)
+    go|go-workspace)
+      if [[ $framework == go ]]; then
+        go_package=./version
+      else
+        go_package=./common
+      fi
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
         'set -eu
-         "$1" "$2" verify go "$3"
-         exec "$TRAIL_GO" test ./version -run "^TestTrailQualificationMarker$" -count=1 1>&2' \
-        trail "$python3_bin" "$SEMANTIC_EDITOR" "$lane"
+         "$1" "$2" verify "$3" "$4"
+         exec "$TRAIL_GO" test "$5" -run "^TestTrailQualificationMarker$" -count=1 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$framework" "$expected" \
+        "$go_package"
+      ;;
+    yarn)
+      run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify yarn "$3"
+         exec "$TRAIL_YARN" mocha test.js --grep "Trail qualification marker" 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
+    bun)
+      run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify bun "$3"
+         exec "$TRAIL_BUN" test tests/app.test.ts -t "Trail qualification marker" 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
     pnpm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
@@ -167,7 +278,7 @@ run_framework_check() {
          "$TRAIL_PNPM" exec tsc --noEmit 1>&2
          "$TRAIL_PNPM" run build 1>&2
          exec "$TRAIL_PNPM" exec vitest run tests/http-helpers/index.test.ts -t "Trail qualification marker" 1>&2' \
-        trail "$python3_bin" "$SEMANTIC_EDITOR" "$lane"
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
     npm)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
@@ -175,7 +286,7 @@ run_framework_check() {
          "$1" "$2" verify npm "$3"
          "$TRAIL_NPM" run build -- --no-pack 1>&2
          exec "$TRAIL_NODE" --test --enable-source-maps dist-node/test/version.test.js 1>&2' \
-        trail "$python3_bin" "$SEMANTIC_EDITOR" "$lane"
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
     python)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
@@ -183,7 +294,15 @@ run_framework_check() {
          "$1" "$2" verify python "$3"
          "$TRAIL_VENV_PYTHON" -m compileall -q src/tap
          exec "$TRAIL_VENV_PYTHON" -m pytest -q tests/test_line.py -k trail_qualification_marker 1>&2' \
-        trail "$python3_bin" "$SEMANTIC_EDITOR" "$lane"
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
+    uv)
+      run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify uv "$3"
+         "$TRAIL_VENV_PYTHON" -c '\''import importlib.metadata; importlib.metadata.distribution("pyprojectx")'\''
+         exec "$TRAIL_VENV_PYTHON" -m pytest -q tests/unit/test_trail_qualification.py 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
     cmake)
       run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
@@ -210,7 +329,27 @@ int main() { return std::string(leveldb::TrailQualificationMarker()) == "$3" ? 0
 EOF
          c++ -std=c++11 -I. "$TRAIL_CMAKE_BUILD_DIR/trail-check.cc" "$TRAIL_CMAKE_BUILD_DIR/libleveldb.a" -pthread -o "$TRAIL_CMAKE_BUILD_DIR/trail-check"
          exec "$TRAIL_CMAKE_BUILD_DIR/trail-check"' \
-        trail "$python3_bin" "$SEMANTIC_EDITOR" "$lane"
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
+      ;;
+    cmake-modern)
+      run_json "check-$lane" lane exec "$lane" -- /bin/sh -c \
+        'set -eu
+         "$1" "$2" verify cmake-modern "$3"
+         rebuild_log="$TRAIL_CMAKE_BUILD_DIR/trail-rebuild.log"
+         "$TRAIL_CMAKE" --build "$TRAIL_CMAKE_MOUNTED_BUILD_DIR" --target minimal --parallel 2 >"$rebuild_log" 2>&1
+         cat "$rebuild_log" >&2
+         grep "minimal.cpp.o" "$rebuild_log" >/dev/null
+         if grep "Precompile.cpp.o" "$rebuild_log" >/dev/null; then
+           echo "unaffected Precompile.cpp was recompiled" >&2
+           exit 1
+         fi
+         minimal_object=$(find "$TRAIL_CMAKE_BUILD_DIR" -path "*CMakeFiles/minimal.dir/minimal.cpp.o" -print -quit)
+         precompile_object=$(find "$TRAIL_CMAKE_BUILD_DIR" -path "*CMakeFiles/CLI11.dir/Precompile.cpp.o" -print -quit)
+         test "$(shasum -a 256 "$minimal_object" | awk "{print \$1}")" != "$(cat "$TRAIL_CMAKE_BUILD_DIR/trail-minimal-before.sha256")"
+         test "$(shasum -a 256 "$precompile_object" | awk "{print \$1}")" = "$(cat "$TRAIL_CMAKE_BUILD_DIR/trail-precompile-before.sha256")"
+         strings "$TRAIL_CMAKE_BUILD_DIR/examples/minimal" | grep -F "$3" >/dev/null
+         exec "$TRAIL_CMAKE_BUILD_DIR/examples/minimal" --help 1>&2' \
+        trail "$python3_bin" "$SEMANTIC_EDITOR" "$expected"
       ;;
   esac
 }
@@ -234,6 +373,18 @@ for lane in agent-a agent-b agent-c; do
     agent-b) expected=agent-a ;;
     agent-c) expected=agent-b ;;
   esac
+  if [[ $lane == agent-a && -f $repository_root/uv.lock ]]; then
+    uv_plan=$qualification_root/uv-prewarm-plan.json
+    "$TRAIL_BIN" --format json env plan "$lane" --adapter python > "$uv_plan"
+    uv_namespace=$(jq -er '.caches[] | select(.name == "python-downloads") | .namespace_id' "$uv_plan")
+    uv_cache=$repository_root/.trail/cache/namespaces/$uv_namespace/uv
+    mkdir -p "$uv_cache"
+    UV_CACHE_DIR=$uv_cache \
+      UV_PROJECT_ENVIRONMENT=$qualification_root/uv-prewarm-venv \
+      UV_NO_PROGRESS=1 \
+      uv sync --frozen --no-progress
+  fi
+  run_json "plan-$lane" env plan "$lane" --adapter "$component_selector"
   run_framework_precheck "$lane" "$expected"
   run_json "generation-before-edit-$lane" env generation "$lane"
   run_edit "$lane"
@@ -243,6 +394,17 @@ for lane in agent-a agent-b agent-c; do
   run_json "generation-$lane" env generation "$lane"
   previous=$lane
 done
+
+if [[ $framework == yarn || $framework == bun ]]; then
+  run_json spawn-invalidation lane spawn invalidation --from agent-c --workdir-mode "$workdir_mode"
+  run_json generation-before-invalidation env generation invalidation
+  run_json invalidation-edit lane exec invalidation -- \
+    "$python3_bin" "$SEMANTIC_EDITOR" invalidate "$framework" agent-c
+  run_json sync-invalidation env sync component "$component_id" \
+    --adapter "$component_selector" --lane invalidation
+  run_framework_check invalidation agent-c
+  run_json generation-invalidation env generation invalidation
+fi
 
 python3 "$SCRIPT_DIR/check-real-framework-handoff.py" \
   "$TRAIL_FRAMEWORK_EVIDENCE_DIR" "$framework" "$repository" "$revision" "$component_id"

@@ -22,7 +22,7 @@ static NODE_WORKSPACE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
         name: "node",
         contract_major: 1,
         implementation_version: env!("CARGO_PKG_VERSION"),
-        distribution_digest: "builtin:node-plan-v2",
+        distribution_digest: "builtin:node-plan-v3",
         selectors: &["trail/node@1", "node"],
         kind: "dependency",
         layer_adapter_name: "node",
@@ -127,6 +127,45 @@ const NODE_OUTPUT_COMMAND_BINDINGS: &[WorkspaceEnvironmentOutputCommandBinding] 
     },
 ];
 
+const NODE_LIFECYCLE_POLICY_FILE: &str = "trail-node-lifecycle.json";
+const MAX_NODE_LIFECYCLE_SOURCE_FILES: usize = 4_096;
+const MAX_NODE_LIFECYCLE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeLifecyclePolicyV1 {
+    version: u32,
+    manager: String,
+    lock_sha256: String,
+    packages: Vec<String>,
+    scripts: Vec<NodeLifecycleScriptV1>,
+    capabilities: NodeLifecycleCapabilitiesV1,
+    outputs: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeLifecycleScriptV1 {
+    package: String,
+    phase: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeLifecycleCapabilitiesV1 {
+    network: String,
+    native_toolchain: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ApprovedNodeLifecycle {
+    path: String,
+    entry: FileEntry,
+    digest: String,
+    script: String,
+    outputs: Vec<String>,
+}
+
 impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
     fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
         &NODE_WORKSPACE_ADAPTER_METADATA
@@ -176,12 +215,64 @@ impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
         if node_component_is_descendant_of_locked_workspace(db, source_root, &root)? {
             return Ok(None);
         }
-        for (name, _) in supported_lockfiles() {
-            if db
-                .root_file_entry(source_root, &join_repo_path(&root, name))?
-                .is_some()
-            {
+        let package_path = join_repo_path(&root, "package.json");
+        let package_entry = db
+            .root_file_entry(source_root, &package_path)?
+            .ok_or_else(|| Error::Corrupt(format!("Node manifest `{package_path}` disappeared")))?;
+        let package_bytes = db.materialize_entry_bytes(&package_entry)?;
+        let package: serde_json::Value =
+            serde_json::from_slice(&package_bytes).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "Node manifest `{package_path}` is malformed JSON: {error}"
+                ))
+            })?;
+        if let Err(error) = validate_node_modules_layout(db, source_root, &root, &package) {
+            return Ok(Some(WorkspaceEnvironmentAdapterProposal::blocked(
+                EnvironmentProposalReasonReport {
+                    code: "node_layout_unsupported".to_string(),
+                    message: error.to_string(),
+                },
+                EnvironmentRecoveryActionReport {
+                    code: "choose_supported_node_modules_layout".to_string(),
+                    description:
+                        "Use a single-package node_modules project with a matching supported lockfile"
+                            .to_string(),
+                    command: None,
+                },
+            )));
+        }
+        match select_node_source_lock(db, source_root, &root, &package) {
+            Ok(Some(lock)) => {
+                if let Err(error) = validate_source_node_lock(db, &lock) {
+                    return Ok(Some(WorkspaceEnvironmentAdapterProposal::blocked(
+                        EnvironmentProposalReasonReport {
+                            code: "node_lock_unsupported".to_string(),
+                            message: error.to_string(),
+                        },
+                        EnvironmentRecoveryActionReport {
+                            code: "regenerate_supported_lock".to_string(),
+                            description: "Regenerate the lockfile with the selected supported package manager without changing dependency intent".to_string(),
+                            command: None,
+                        },
+                    )));
+                }
                 return Ok(Some(WorkspaceEnvironmentAdapterProposal::ready()));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(Some(WorkspaceEnvironmentAdapterProposal::blocked(
+                    EnvironmentProposalReasonReport {
+                        code: "node_lock_ambiguous".to_string(),
+                        message: error.to_string(),
+                    },
+                    EnvironmentRecoveryActionReport {
+                        code: "select_one_package_manager".to_string(),
+                        description:
+                            "Declare one packageManager and retain only its authoritative lockfile"
+                                .to_string(),
+                        command: None,
+                    },
+                )));
             }
         }
         let spec = match node_resolution_spec(db, source_root, &root) {
@@ -335,14 +426,9 @@ impl Trail {
         let package_projection = self.project_entry_file(&package_entry)?;
         let package_text = fs::read_to_string(package_projection)?;
         let package_value: serde_json::Value = serde_json::from_str(&package_text)?;
-        let mut selected = None;
-        for (name, manager) in supported_lockfiles() {
-            let path = join_repo_path(&package_root, name);
-            if let Some(entry) = self.root_file_entry(root_id, &path)? {
-                selected = Some((path, manager.to_string(), entry));
-                break;
-            }
-        }
+        validate_node_modules_layout(self, root_id, &package_root, &package_value)?;
+        let selected = select_node_source_lock(self, root_id, &package_root, &package_value)?;
+        let selected_for_lifecycle = selected.clone();
         let component_id = NODE_WORKSPACE_ADAPTER.component_id(&package_root)?;
         let (
             lock_path,
@@ -352,13 +438,14 @@ impl Trail {
             source_lock_entry,
             resolution_inputs,
             source_projection,
-        ) = if let Some((lock_path, manager, lock_entry)) = selected {
+        ) = if let Some(lock) = selected {
+            validate_source_node_lock(self, &lock)?;
             (
-                lock_path,
-                manager,
-                lock_entry.content_hash.clone(),
+                lock.path,
+                lock.manager.to_string(),
+                lock.entry.content_hash.clone(),
                 "source".to_string(),
-                Some(lock_entry),
+                Some(lock.entry),
                 Vec::new(),
                 None,
             )
@@ -417,6 +504,28 @@ impl Trail {
         let node_version = tool_version("node")?;
         let node_tool = resolve_workspace_tool_executable("node")?;
         let manager_tool = resolve_workspace_tool_executable(&manager)?;
+        validate_declared_package_manager_version(&package_value, &manager, &manager_version)?;
+        let lifecycle_policy_path = join_repo_path(&package_root, NODE_LIFECYCLE_POLICY_FILE);
+        let lifecycle_policy_present = self
+            .root_file_entry(root_id, &lifecycle_policy_path)?
+            .is_some();
+        let approved_lifecycle = match selected_for_lifecycle.as_ref() {
+            Some(lock) => approved_node_lifecycle(
+                self,
+                root_id,
+                &package_root,
+                &package_value,
+                &manager,
+                &manager_version,
+                lock,
+            )?,
+            None if lifecycle_policy_present => {
+                return Err(Error::InvalidInput(format!(
+                    "Node lifecycle approval `{lifecycle_policy_path}` requires a committed source lockfile"
+                )));
+            }
+            None => None,
+        };
         if manager == "pnpm"
             && self
                 .root_file_entry(
@@ -430,26 +539,9 @@ impl Trail {
                 display_package_root(&package_root)
             )));
         }
-        if package_value.get("workspaces").is_some() {
-            return Err(Error::InvalidInput(format!(
-                "Node component `{}` declares workspaces; synchronize a supported leaf package explicitly until the monorepo adapter is enabled",
-                display_package_root(&package_root)
-            )));
-        }
-        if contains_local_node_dependency(&package_value) {
-            return Err(Error::InvalidInput(format!(
-                "Node component `{}` contains file:, link:, or workspace: dependencies that cannot be represented by an isolated node_modules layer",
-                display_package_root(&package_root)
-            )));
-        }
-        if manager == "yarn"
-            && (!manager_version.starts_with('1')
-                || self
-                    .root_file_entry(root_id, &join_repo_path(&package_root, ".yarnrc.yml"))?
-                    .is_some())
-        {
+        if manager == "yarn" && !manager_version.starts_with("1.") {
             return Err(Error::InvalidInput(
-                "Yarn Berry/PnP layouts are not node_modules layers; use Yarn Classic or wait for the PnP adapter"
+                "Yarn Berry is not a supported node_modules contract; Trail's built-in adapter currently requires Yarn Classic 1.x"
                     .to_string(),
             ));
         }
@@ -461,6 +553,7 @@ impl Trail {
             ".npmrc",
             ".yarnrc",
             "pnpmfile.cjs",
+            "bunfig.toml",
             ".node-version",
             ".nvmrc",
         ] {
@@ -470,7 +563,10 @@ impl Trail {
             }
         }
         let implementation_version = env!("CARGO_PKG_VERSION").to_string();
-        let distribution_digest = "builtin:node-plan-v2".to_string();
+        let distribution_digest = "builtin:node-plan-v3".to_string();
+        if let Some(approval) = &approved_lifecycle {
+            files.insert(approval.path.clone(), approval.entry.clone());
+        }
         let mut key_inputs = files
             .iter()
             .map(|(path, entry)| (path.clone(), entry.content_hash.clone()))
@@ -489,24 +585,84 @@ impl Trail {
             "command_environment".to_string(),
             "npm_config_cache=cache:package-manager/npm;PNPM_HOME=cache:package-manager/pnpm-home;PNPM_STORE_DIR=cache:package-manager/pnpm-store;YARN_CACHE_FOLDER=cache:package-manager/yarn;BUN_INSTALL_CACHE_DIR=cache:package-manager/bun;TRAIL_NODE=tool:node;TRAIL_NPM=tool?:npm;TRAIL_PNPM=tool?:pnpm;TRAIL_YARN=tool?:yarn;TRAIL_BUN=tool?:bun;TRAIL_NODE_MODULES=direct:node_modules;NODE_PATH=direct:node_modules;PATH+=direct:node_modules/.bin+tool-dirs".to_string(),
         );
+        let mut lifecycle_tools = BTreeMap::new();
+        let mut lifecycle_environment = BTreeMap::new();
+        if let Some(approval) = &approved_lifecycle {
+            let script_text = package_value
+                .get("scripts")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|scripts| scripts.get(&approval.script))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Corrupt("approved Node script disappeared".to_string()))?;
+            if !approved_node_native_script(script_text) {
+                return Err(Error::InvalidInput(format!(
+                    "approved Node lifecycle script `{}` must be a single literal `node-gyp rebuild` command without shell operators",
+                    approval.script
+                )));
+            }
+            let node_abi = node_expression("process.versions.modules")?;
+            let node_installation = fs::canonicalize(&node_tool.path)?
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .ok_or_else(|| {
+                    Error::InvalidInput("Node executable has no installation root".to_string())
+                })?;
+            let node_headers = node_installation.join("include/node");
+            let node_headers_identity = node_header_tree_identity(&node_headers)?;
+            let compiler = resolve_workspace_tool_executable("cc")?;
+            let compiler_version = tool_version_path(&compiler.path)?;
+            let python = resolve_workspace_tool_executable("python3")?;
+            let make = resolve_workspace_tool_executable("make")?;
+            key_inputs.insert(
+                "lifecycle:approval_sha256".to_string(),
+                approval.digest.clone(),
+            );
+            key_inputs.insert("lifecycle:approval_path".to_string(), approval.path.clone());
+            key_inputs.insert("lifecycle:source_root".to_string(), root_id.0.clone());
+            key_inputs.insert("lifecycle:script".to_string(), approval.script.clone());
+            key_inputs.insert("lifecycle:outputs".to_string(), approval.outputs.join("\0"));
+            key_inputs.insert("lifecycle:network".to_string(), "deny".to_string());
+            lifecycle_tools.extend([
+                ("node-abi".to_string(), node_abi),
+                ("node-headers".to_string(), node_headers_identity),
+                ("native-compiler".to_string(), compiler_version),
+                ("native-compiler-executable".to_string(), compiler.identity),
+                ("native-make-executable".to_string(), make.identity),
+                ("native-python-executable".to_string(), python.identity),
+            ]);
+            lifecycle_environment.insert("npm_config_offline".to_string(), "true".to_string());
+            lifecycle_environment.insert("npm_config_audit".to_string(), "false".to_string());
+            lifecycle_environment.insert("npm_config_fund".to_string(), "false".to_string());
+            lifecycle_environment.insert(
+                "npm_config_nodedir".to_string(),
+                node_installation.to_string_lossy().into_owned(),
+            );
+        }
+        let mut tool_versions = BTreeMap::from([
+            ("node".to_string(), node_version),
+            (manager.clone(), manager_version),
+            ("node-executable".to_string(), node_tool.identity),
+            (
+                format!("{manager}-executable"),
+                manager_tool.identity.clone(),
+            ),
+        ]);
+        tool_versions.extend(lifecycle_tools);
         let key = WorkspaceLayerKeyV1 {
             kind: "dependency".to_string(),
             adapter: "node".to_string(),
             adapter_version: 1,
             inputs: key_inputs,
-            tool_versions: BTreeMap::from([
-                ("node".to_string(), node_version),
-                (manager.clone(), manager_version),
-                ("node-executable".to_string(), node_tool.identity),
-                (
-                    format!("{manager}-executable"),
-                    manager_tool.identity.clone(),
-                ),
-            ]),
+            tool_versions,
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             portability_scope: "platform-architecture-node-abi".to_string(),
-            strategy: format!("{manager}-frozen-ignore-scripts-v1"),
+            strategy: if approved_lifecycle.is_some() {
+                format!("{manager}-frozen-approved-native-lifecycle-v1")
+            } else {
+                format!("{manager}-frozen-ignore-scripts-v1")
+            },
         };
         let project = "project".to_string();
         let cache = self.declare_workspace_environment_cache(
@@ -528,7 +684,7 @@ impl Trail {
             ]),
         )?;
         let cache_root = &cache.storage_path;
-        let environment = BTreeMap::from([
+        let mut environment = BTreeMap::from([
             (
                 "npm_config_cache".to_string(),
                 cache_root.join("npm").to_string_lossy().into_owned(),
@@ -541,7 +697,16 @@ impl Trail {
                 "PNPM_STORE_DIR".to_string(),
                 cache_root.join("pnpm-store").to_string_lossy().into_owned(),
             ),
+            (
+                "YARN_CACHE_FOLDER".to_string(),
+                cache_root.join("yarn").to_string_lossy().into_owned(),
+            ),
+            (
+                "BUN_INSTALL_CACHE_DIR".to_string(),
+                cache_root.join("bun").to_string_lossy().into_owned(),
+            ),
         ]);
+        environment.extend(lifecycle_environment);
         let args = match manager.as_str() {
             "npm" => vec!["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
             "pnpm" => vec![
@@ -550,8 +715,18 @@ impl Trail {
                 "--frozen-lockfile",
                 "--ignore-scripts",
             ],
-            "yarn" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
-            "bun" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
+            "yarn" => vec![
+                "install",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+                "--non-interactive",
+            ],
+            "bun" => vec![
+                "install",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+                "--no-progress",
+            ],
             other => {
                 return Err(Error::InvalidInput(format!(
                     "unsupported Node package manager `{other}`"
@@ -561,6 +736,38 @@ impl Trail {
         .into_iter()
         .map(str::to_string)
         .collect();
+        let lifecycle_enabled = approved_lifecycle.is_some();
+        let source_projection = if lifecycle_enabled {
+            let mut file_count = 0usize;
+            let mut source_bytes = 0u64;
+            self.visit_root_file_entries(root_id, &[], |path, entry| {
+                file_count = file_count.checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("Node lifecycle source count overflowed".to_string())
+                })?;
+                source_bytes = source_bytes.checked_add(entry.size_bytes).ok_or_else(|| {
+                    Error::InvalidInput("Node lifecycle source size overflowed".to_string())
+                })?;
+                if file_count > MAX_NODE_LIFECYCLE_SOURCE_FILES
+                    || source_bytes > MAX_NODE_LIFECYCLE_SOURCE_BYTES
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "approved Node lifecycle source exceeds {} files or {} bytes",
+                        MAX_NODE_LIFECYCLE_SOURCE_FILES, MAX_NODE_LIFECYCLE_SOURCE_BYTES
+                    )));
+                }
+                if path == ".trail" || path.starts_with(".trail/") {
+                    return Err(Error::InvalidPath {
+                        path,
+                        reason: "Trail private state cannot enter a lifecycle source closure"
+                            .to_string(),
+                    });
+                }
+                Ok(())
+            })?;
+            Some((root_id.clone(), "project".to_string()))
+        } else {
+            source_projection
+        };
         let inputs = if source_projection.is_some() {
             Vec::new()
         } else {
@@ -581,6 +788,81 @@ impl Trail {
         } else {
             format!("{package_root}/node_modules")
         };
+        let project_root = if package_root.is_empty() {
+            project.clone()
+        } else {
+            format!("{project}/{package_root}")
+        };
+        let mut outputs = vec![WorkspaceEnvironmentOutput {
+            name: "modules".to_string(),
+            output_path: format!("{project_root}/node_modules"),
+            mount_path,
+            policy: if lifecycle_enabled {
+                WorkspaceEnvironmentOutputPolicy::WritablePrivate
+            } else {
+                WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+            },
+            reuse: if lifecycle_enabled {
+                EnvironmentReuseMode::None
+            } else {
+                EnvironmentReuseMode::Exact
+            },
+            scope: if lifecycle_enabled {
+                EnvironmentSharingScope::Lane
+            } else {
+                EnvironmentSharingScope::Workspace
+            },
+            publish: if lifecycle_enabled {
+                EnvironmentPublicationTrigger::Never
+            } else {
+                EnvironmentPublicationTrigger::OnSync
+            },
+            gate: None,
+            create_if_missing: true,
+        }];
+        if let Some(approval) = &approved_lifecycle {
+            for (index, relative) in approval.outputs.iter().enumerate() {
+                outputs.push(WorkspaceEnvironmentOutput {
+                    name: format!("lifecycle-output-{index}"),
+                    output_path: format!("{project_root}/{relative}"),
+                    mount_path: join_repo_path(&package_root, relative),
+                    policy: WorkspaceEnvironmentOutputPolicy::WritablePrivate,
+                    reuse: EnvironmentReuseMode::None,
+                    scope: EnvironmentSharingScope::Lane,
+                    publish: EnvironmentPublicationTrigger::Never,
+                    gate: None,
+                    create_if_missing: true,
+                });
+            }
+        }
+        let install_command = WorkspaceEnvironmentCommand {
+            program: manager.clone(),
+            resolved_program: manager_tool.path.clone(),
+            executable_identity: manager_tool.identity.clone(),
+            args,
+            working_directory: project_root.clone(),
+            environment: environment.clone(),
+            remove_environment: Vec::new(),
+            cache_names: vec![cache.name.clone()],
+        };
+        let lifecycle_command =
+            approved_lifecycle
+                .as_ref()
+                .map(|approval| WorkspaceEnvironmentCommand {
+                    program: manager.clone(),
+                    resolved_program: manager_tool.path.clone(),
+                    executable_identity: manager_tool.identity.clone(),
+                    args: vec![
+                        "run-script".to_string(),
+                        approval.script.clone(),
+                        "--ignore-scripts".to_string(),
+                        "--offline".to_string(),
+                    ],
+                    working_directory: project_root.clone(),
+                    environment: environment.clone(),
+                    remove_environment: Vec::new(),
+                    cache_names: vec![cache.name.clone()],
+                });
         Ok(WorkspaceEnvironmentPlan {
             component_id,
             adapter_identity: NODE_WORKSPACE_ADAPTER.identity().to_string(),
@@ -595,33 +877,26 @@ impl Trail {
             resolution_inputs,
             construction_seed: None,
             source_projection,
-            pre_commands: Vec::new(),
-            command: Some(WorkspaceEnvironmentCommand {
-                program: manager,
-                resolved_program: manager_tool.path,
-                executable_identity: manager_tool.identity,
-                args,
-                working_directory: project.clone(),
-                environment,
-                remove_environment: Vec::new(),
-                cache_names: vec![cache.name.clone()],
-            }),
+            pre_commands: if lifecycle_enabled {
+                vec![install_command.clone()]
+            } else {
+                Vec::new()
+            },
+            command: if lifecycle_enabled {
+                lifecycle_command
+            } else {
+                Some(install_command)
+            },
             mounted_commands: Vec::new(),
             caches: vec![cache],
             external_artifacts: Vec::new(),
             runtime_resources: Vec::new(),
-            sandbox_policy: WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin,
-            outputs: vec![WorkspaceEnvironmentOutput {
-                name: "modules".to_string(),
-                output_path: format!("{project}/node_modules"),
-                mount_path,
-                policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
-                reuse: EnvironmentReuseMode::Exact,
-                scope: EnvironmentSharingScope::Workspace,
-                publish: EnvironmentPublicationTrigger::OnSync,
-                gate: None,
-                create_if_missing: true,
-            }],
+            sandbox_policy: if lifecycle_enabled {
+                WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+            } else {
+                WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin
+            },
+            outputs,
             stale_reason:
                 "package, lockfile, Node runtime, package manager, or adapter policy changed"
                     .to_string(),
@@ -698,6 +973,393 @@ fn node_component_is_descendant_of_locked_workspace(
     Ok(false)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeclaredNodeManager {
+    name: String,
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeSourceLock {
+    path: String,
+    manager: &'static str,
+    entry: FileEntry,
+}
+
+fn approved_node_lifecycle(
+    db: &Trail,
+    source_root: &ObjectId,
+    package_root: &str,
+    package: &serde_json::Value,
+    manager: &str,
+    manager_version: &str,
+    lock: &NodeSourceLock,
+) -> Result<Option<ApprovedNodeLifecycle>> {
+    let path = join_repo_path(package_root, NODE_LIFECYCLE_POLICY_FILE);
+    let Some(entry) = db.root_file_entry(source_root, &path)? else {
+        return Ok(None);
+    };
+    if entry.size_bytes > 64 * 1024 {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` exceeds 64 KiB"
+        )));
+    }
+    let bytes = db.materialize_entry_bytes(&entry)?;
+    let policy: NodeLifecyclePolicyV1 = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` is malformed: {error}"
+        ))
+    })?;
+    if policy.version != 1 {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` uses unsupported version {}; expected 1",
+            policy.version
+        )));
+    }
+    if manager != "npm" {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` currently supports only exact npm installs; `{manager}` remains script-disabled"
+        )));
+    }
+    let expected_manager = format!("{manager}@{}", manager_version.trim_start_matches('v'));
+    if policy.manager != expected_manager {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` selects manager `{}` but Trail resolved `{expected_manager}`",
+            policy.manager
+        )));
+    }
+    let lock_bytes = db.materialize_entry_bytes(&lock.entry)?;
+    let lock_sha256 = sha256_hex(&lock_bytes);
+    if policy.lock_sha256 != lock_sha256
+        || policy.lock_sha256.len() != 64
+        || !policy
+            .lock_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` does not match the exact SHA-256 of `{}`",
+            lock.path
+        )));
+    }
+    if policy.capabilities.network != "deny" || !policy.capabilities.native_toolchain {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` must declare capabilities.network = \"deny\" and native_toolchain = true"
+        )));
+    }
+    let lock_document: serde_json::Value =
+        serde_json::from_slice(&lock_bytes).map_err(|error| {
+            Error::InvalidInput(format!(
+                "approved Node lifecycle lock `{}` is malformed: {error}",
+                lock.path
+            ))
+        })?;
+    let node_gyp = lock_document
+        .pointer("/packages/node_modules~1node-gyp")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Node lifecycle approval `{path}` requires lock-pinned `node-gyp`"
+            ))
+        })?;
+    let node_gyp_version = node_gyp
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::InvalidInput("locked node-gyp has no version".to_string()))?;
+    let node_gyp_integrity = node_gyp
+        .get("integrity")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::InvalidInput("locked node-gyp has no integrity".to_string()))?;
+    let expected_package = format!("node-gyp@{node_gyp_version}#{node_gyp_integrity}");
+    if policy.packages != [expected_package.clone()] {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` must select exactly locked package `{expected_package}`"
+        )));
+    }
+    if policy.scripts.len() != 1
+        || policy.scripts[0].package != "."
+        || !matches!(
+            policy.scripts[0].phase.as_str(),
+            "preinstall" | "install" | "postinstall"
+        )
+    {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` must select exactly one root preinstall, install, or postinstall script"
+        )));
+    }
+    let script = policy.scripts[0].phase.clone();
+    let declared_script = package
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|scripts| scripts.get(&script))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if declared_script.is_none() {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` selects missing or empty root script `{script}`"
+        )));
+    }
+    if policy.outputs.is_empty() || policy.outputs.len() > 8 {
+        return Err(Error::InvalidInput(format!(
+            "Node lifecycle approval `{path}` must declare between 1 and 8 private output directories"
+        )));
+    }
+    let mut outputs = BTreeSet::new();
+    for output in policy.outputs {
+        let output = normalize_relative_path(&output)?;
+        if output == "node_modules"
+            || output == "package.json"
+            || output == NODE_LIFECYCLE_POLICY_FILE
+            || output == lock.path
+            || output.starts_with("node_modules/")
+        {
+            return Err(Error::InvalidInput(format!(
+                "Node lifecycle approval `{path}` contains reserved output `{output}`"
+            )));
+        }
+        let source_path = join_repo_path(package_root, &output);
+        let mut tracked = false;
+        db.visit_root_file_entries(source_root, std::slice::from_ref(&source_path), |_, _| {
+            tracked = true;
+            Ok(())
+        })?;
+        if tracked {
+            return Err(Error::InvalidInput(format!(
+                "Node lifecycle output `{source_path}` overlaps committed source"
+            )));
+        }
+        if !outputs.insert(output.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "Node lifecycle approval `{path}` repeats output `{output}`"
+            )));
+        }
+    }
+    Ok(Some(ApprovedNodeLifecycle {
+        path,
+        entry,
+        digest: sha256_hex(&bytes),
+        script,
+        outputs: outputs.into_iter().collect(),
+    }))
+}
+
+fn declared_node_manager(package: &serde_json::Value) -> Result<Option<DeclaredNodeManager>> {
+    let Some(identity) = package
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let (name, raw_version) = identity
+        .split_once('@')
+        .map_or((identity, None), |(name, version)| (name, Some(version)));
+    if !matches!(name, "npm" | "pnpm" | "yarn" | "bun") {
+        return Err(Error::InvalidInput(format!(
+            "Node packageManager `{identity}` is unsupported; expected npm, pnpm, yarn, or bun"
+        )));
+    }
+    let version = raw_version
+        .map(|version| version.split_once('+').map_or(version, |(base, _)| base))
+        .filter(|version| !version.is_empty())
+        .map(str::to_string);
+    if identity.contains('@') && version.is_none() {
+        return Err(Error::InvalidInput(format!(
+            "Node packageManager `{identity}` has an empty version"
+        )));
+    }
+    Ok(Some(DeclaredNodeManager {
+        name: name.to_string(),
+        version,
+    }))
+}
+
+fn select_node_source_lock(
+    db: &Trail,
+    source_root: &ObjectId,
+    package_root: &str,
+    package: &serde_json::Value,
+) -> Result<Option<NodeSourceLock>> {
+    let declared = declared_node_manager(package)?;
+    let mut locks = Vec::new();
+    for (name, manager) in supported_lockfiles() {
+        let path = join_repo_path(package_root, name);
+        if let Some(entry) = db.root_file_entry(source_root, &path)? {
+            locks.push(NodeSourceLock {
+                path,
+                manager,
+                entry,
+            });
+        }
+    }
+    if locks.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(declared) = declared.as_ref() {
+        let mismatched = locks
+            .iter()
+            .filter(|lock| lock.manager != declared.name)
+            .map(|lock| lock.path.as_str())
+            .collect::<Vec<_>>();
+        let matching = locks
+            .iter()
+            .filter(|lock| lock.manager == declared.name)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "packageManager selects `{}` but the repository lockfile(s) belong to another manager: {}",
+                declared.name,
+                mismatched.join(", ")
+            )));
+        }
+        locks.retain(|lock| lock.manager == declared.name);
+    } else {
+        let managers = locks
+            .iter()
+            .map(|lock| lock.manager)
+            .collect::<BTreeSet<_>>();
+        if managers.len() > 1 {
+            return Err(Error::InvalidInput(format!(
+                "Node component `{}` contains lockfiles for multiple package managers ({}); declare packageManager and retain one authoritative manager lock",
+                display_package_root(package_root),
+                managers.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+
+    if locks.len() > 1 && locks[0].manager != "npm" {
+        return Err(Error::InvalidInput(format!(
+            "Node component `{}` contains multiple `{}` lock authorities ({}); retain exactly one",
+            display_package_root(package_root),
+            locks[0].manager,
+            locks
+                .iter()
+                .map(|lock| lock.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    // npm-shrinkwrap.json intentionally precedes package-lock.json and is npm's
+    // published lock authority when both are present.
+    Ok(locks.into_iter().next())
+}
+
+fn validate_declared_package_manager_version(
+    package: &serde_json::Value,
+    selected_manager: &str,
+    installed_version: &str,
+) -> Result<()> {
+    let Some(declared) = declared_node_manager(package)? else {
+        return Ok(());
+    };
+    if declared.name != selected_manager {
+        return Err(Error::InvalidInput(format!(
+            "packageManager selects `{}` but Trail selected `{selected_manager}`",
+            declared.name
+        )));
+    }
+    if let Some(version) = declared.version
+        && version != installed_version
+    {
+        return Err(Error::InvalidInput(format!(
+            "packageManager requires `{selected_manager}@{version}` but the resolved executable reports `{installed_version}`; activate the exact manager version before synchronizing"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_node_modules_layout(
+    db: &Trail,
+    source_root: &ObjectId,
+    package_root: &str,
+    package: &serde_json::Value,
+) -> Result<()> {
+    if package.get("workspaces").is_some() {
+        return Err(Error::InvalidInput(format!(
+            "Node component `{}` declares workspaces; synchronize a supported leaf package explicitly until the monorepo adapter is enabled",
+            display_package_root(package_root)
+        )));
+    }
+    if contains_local_node_dependency(package) {
+        return Err(Error::InvalidInput(format!(
+            "Node component `{}` contains file:, link:, or workspace: dependencies that cannot be represented by an isolated node_modules layer",
+            display_package_root(package_root)
+        )));
+    }
+
+    let yarn_requested = declared_node_manager(package)?
+        .is_some_and(|manager| manager.name == "yarn")
+        || db
+            .root_file_entry(source_root, &join_repo_path(package_root, "yarn.lock"))?
+            .is_some();
+    if !yarn_requested {
+        return Ok(());
+    }
+    for marker in [".yarnrc.yml", ".pnp.js", ".pnp.cjs"] {
+        if db
+            .root_file_entry(source_root, &join_repo_path(package_root, marker))?
+            .is_some()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Yarn Berry/PnP marker `{marker}` is unsupported by Trail's node_modules adapter; use Yarn Classic without PnP"
+            )));
+        }
+    }
+    if package
+        .get("installConfig")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|config| config.get("pnp"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Err(Error::InvalidInput(
+            "Yarn Classic Plug'n'Play selected by package.json installConfig.pnp is unsupported by Trail's node_modules adapter"
+                .to_string(),
+        ));
+    }
+    let yarnrc_path = join_repo_path(package_root, ".yarnrc");
+    if let Some(entry) = db.root_file_entry(source_root, &yarnrc_path)? {
+        let text = String::from_utf8(db.materialize_entry_bytes(&entry)?).map_err(|_| {
+            Error::InvalidInput(format!("Yarn configuration `{yarnrc_path}` is not UTF-8"))
+        })?;
+        if text.lines().any(|line| {
+            let normalized = line.trim().to_ascii_lowercase();
+            normalized.contains("pnp")
+                && !normalized.ends_with(" false")
+                && !normalized.ends_with("=false")
+        }) {
+            return Err(Error::InvalidInput(format!(
+                "Yarn configuration `{yarnrc_path}` selects or ambiguously configures Plug'n'Play; Trail requires an explicit node_modules layout"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_node_lock(db: &Trail, lock: &NodeSourceLock) -> Result<()> {
+    let bytes = db.materialize_entry_bytes(&lock.entry)?;
+    if lock.path.ends_with("bun.lockb") {
+        if bytes.is_empty() {
+            return Err(Error::InvalidInput(
+                "Bun binary lockfile bun.lockb is empty".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    let lock_name = supported_lockfiles()
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| lock.path.ends_with(name))
+        .ok_or_else(|| Error::Corrupt(format!("unknown Node lock path `{}`", lock.path)))?;
+    validate_node_lock_snapshot(
+        &NodeResolutionSpec {
+            manager: lock.manager,
+            lock_name,
+        },
+        &bytes,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NodeResolutionSpec {
     manager: &'static str,
@@ -730,11 +1392,10 @@ fn node_resolution_spec(
 }
 
 fn node_resolution_spec_from_package(package: &serde_json::Value) -> Result<NodeResolutionSpec> {
-    let manager = package
-        .get("packageManager")
-        .and_then(serde_json::Value::as_str)
-        .map(|identity| identity.split_once('@').map_or(identity, |(name, _)| name))
-        .unwrap_or("npm");
+    let declared = declared_node_manager(package)?;
+    let manager = declared
+        .as_ref()
+        .map_or("npm", |manager| manager.name.as_str());
     match manager {
         "npm" => Ok(NodeResolutionSpec {
             manager: "npm",
@@ -857,13 +1518,23 @@ fn validate_node_lock_snapshot(spec: &NodeResolutionSpec, bytes: &[u8]) -> Resul
             let text = std::str::from_utf8(bytes).map_err(|_| {
                 Error::InvalidInput("Trail-managed Yarn lock snapshot is not UTF-8".to_string())
             })?;
-            if !text.contains("yarn lockfile v1") && !text.contains("__metadata:") {
+            if text.contains("__metadata:") || !text.contains("yarn lockfile v1") {
                 return Err(Error::InvalidInput(
-                    "Trail-managed Yarn lock snapshot has no recognized format marker".to_string(),
+                    "Trail's built-in Node adapter requires a Yarn Classic v1 lockfile; Yarn Berry/PnP locks are unsupported"
+                        .to_string(),
                 ));
             }
         }
-        "bun" => {}
+        "bun" => {
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                Error::InvalidInput("Trail-managed Bun text lock snapshot is not UTF-8".to_string())
+            })?;
+            if !text.contains("lockfileVersion") {
+                return Err(Error::InvalidInput(
+                    "Trail-managed Bun text lock snapshot has no lockfileVersion".to_string(),
+                ));
+            }
+        }
         other => {
             return Err(Error::InvalidInput(format!(
                 "Trail-managed Node lock snapshot uses unsupported manager `{other}`"
@@ -932,6 +1603,123 @@ fn tool_version(tool: &str) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn tool_version_path(tool: &Path) -> Result<String> {
+    let output = Command::new(tool)
+        .arg("--version")
+        .output()
+        .map_err(|err| {
+            Error::InvalidInput(format!(
+                "required tool `{}` is unavailable: {err}",
+                tool.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(Error::InvalidInput(format!(
+            "`{} --version` failed with {}",
+            tool.display(),
+            output.status
+        )));
+    }
+    let text = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    Ok(String::from_utf8_lossy(text).trim().to_string())
+}
+
+fn node_expression(expression: &str) -> Result<String> {
+    let output = Command::new("node")
+        .args(["-p", expression])
+        .output()
+        .map_err(|err| {
+            Error::InvalidInput(format!("required tool `node` is unavailable: {err}"))
+        })?;
+    if !output.status.success() {
+        return Err(Error::InvalidInput(format!(
+            "`node -p {expression}` failed with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn approved_node_native_script(script: &str) -> bool {
+    let mut words = script.split_ascii_whitespace();
+    if words.next() != Some("node-gyp") || words.next() != Some("rebuild") {
+        return false;
+    }
+    words.all(|word| {
+        !word.is_empty()
+            && word.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'=' | b':')
+            })
+            && !word.starts_with('/')
+            && !word.split('/').any(|segment| segment == "..")
+    })
+}
+
+fn node_header_tree_identity(root: &Path) -> Result<String> {
+    const MAX_FILES: usize = 4_096;
+    const MAX_BYTES: u64 = 96 * 1024 * 1024;
+    let root = fs::canonicalize(root).map_err(|error| {
+        Error::InvalidInput(format!(
+            "Node development headers are unavailable at `{}`: {error}",
+            root.display()
+        ))
+    })?;
+    if !root.join("node.h").is_file() {
+        return Err(Error::InvalidInput(format!(
+            "Node development headers at `{}` have no node.h",
+            root.display()
+        )));
+    }
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+        let entry = entry.map_err(|error| Error::InvalidInput(error.to_string()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::InvalidInput(format!(
+                "Node development headers contain symlink `{}`",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_file() {
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .map_err(|_| Error::Corrupt("Node header walk escaped its root".to_string()))?
+                .to_string_lossy()
+                .into_owned();
+            files.push((relative, entry.path().to_path_buf(), metadata.len()));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let total = files.iter().try_fold(0u64, |total, (_, _, size)| {
+        total
+            .checked_add(*size)
+            .ok_or_else(|| Error::InvalidInput("Node header size overflowed".to_string()))
+    })?;
+    if files.len() > MAX_FILES || total > MAX_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "Node development headers exceed {MAX_FILES} files or {MAX_BYTES} bytes"
+        )));
+    }
+    let mut identity = Vec::new();
+    for (relative, path, size) in files {
+        identity.extend_from_slice(relative.as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(size.to_string().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(sha256_hex(&fs::read(path)?).as_bytes());
+        identity.push(0);
+    }
+    Ok(sha256_hex(&identity))
 }
 
 fn join_repo_path(root: &str, name: &str) -> String {
@@ -1098,6 +1886,319 @@ mod tests {
     }
 
     #[test]
+    fn yarn_and_bun_plans_bind_frozen_manager_specific_contracts() {
+        if resolve_workspace_tool_executable("node").is_err() {
+            return;
+        }
+        let cases = [
+            (
+                "yarn",
+                "yarn.lock",
+                "# yarn lockfile v1\n",
+                "yarn-frozen-ignore-scripts-v1",
+                "YARN_CACHE_FOLDER",
+                "yarn",
+                "--non-interactive",
+            ),
+            (
+                "bun",
+                "bun.lock",
+                "{\n  \"lockfileVersion\": 1\n}\n",
+                "bun-frozen-ignore-scripts-v1",
+                "BUN_INSTALL_CACHE_DIR",
+                "bun",
+                "--no-progress",
+            ),
+        ];
+        for (
+            manager,
+            lock_name,
+            lock_contents,
+            strategy,
+            cache_environment,
+            cache_relative,
+            manager_flag,
+        ) in cases
+        {
+            if resolve_workspace_tool_executable(manager).is_err() {
+                continue;
+            }
+            let workspace = tempfile::tempdir().unwrap();
+            let manager_version = tool_version(manager).unwrap();
+            fs::write(
+                workspace.path().join("package.json"),
+                format!(
+                    r#"{{"name":"trail-{manager}-plan","version":"1.0.0","private":true,"packageManager":"{manager}@{manager_version}"}}"#
+                ),
+            )
+            .unwrap();
+            fs::write(workspace.path().join(lock_name), lock_contents).unwrap();
+            if manager == "bun" {
+                fs::write(
+                    workspace.path().join("bunfig.toml"),
+                    "[install]\nignoreScripts = true\n",
+                )
+                .unwrap();
+            }
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.get_ref("refs/branches/main").unwrap().root_id;
+            let plan = db.node_environment_plan(&source_root, "").unwrap();
+            assert_eq!(plan.layer_key.strategy, strategy);
+            assert_eq!(
+                plan.layer_key.tool_versions[manager], manager_version,
+                "manager identity must be exact"
+            );
+            let command = plan.command.as_ref().unwrap();
+            assert!(command.args.iter().any(|arg| arg == "--frozen-lockfile"));
+            assert!(command.args.iter().any(|arg| arg == "--ignore-scripts"));
+            assert!(command.args.iter().any(|arg| arg == manager_flag));
+            assert_eq!(
+                Path::new(&command.environment[cache_environment]),
+                plan.caches[0].storage_path.join(cache_relative)
+            );
+            assert_eq!(
+                plan.outputs[0].policy,
+                WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate
+            );
+            if manager == "bun" {
+                assert!(plan
+                    .inputs
+                    .iter()
+                    .any(|input| input.source_path == "bunfig.toml"));
+            }
+        }
+    }
+
+    #[test]
+    fn yarn_pnp_and_ambiguous_manager_authority_fail_during_discovery() {
+        let cases = [
+            (
+                r#"{"name":"pnp","packageManager":"yarn@1.22.22","installConfig":{"pnp":true}}"#,
+                vec![("yarn.lock", "# yarn lockfile v1\n")],
+                None,
+                "Plug'n'Play",
+            ),
+            (
+                r#"{"name":"berry","packageManager":"yarn@4.9.2"}"#,
+                vec![("yarn.lock", "__metadata:\n  version: 8\n")],
+                Some((".yarnrc.yml", "nodeLinker: pnp\n")),
+                "Berry/PnP",
+            ),
+            (
+                r#"{"name":"ambiguous"}"#,
+                vec![
+                    ("yarn.lock", "# yarn lockfile v1\n"),
+                    (
+                        "package-lock.json",
+                        r#"{"name":"ambiguous","lockfileVersion":3,"packages":{}}"#,
+                    ),
+                ],
+                None,
+                "multiple package managers",
+            ),
+        ];
+        for (package, locks, config, expected) in cases {
+            let workspace = tempfile::tempdir().unwrap();
+            fs::write(workspace.path().join("package.json"), package).unwrap();
+            for (name, contents) in locks {
+                fs::write(workspace.path().join(name), contents).unwrap();
+            }
+            if let Some((name, contents)) = config {
+                fs::write(workspace.path().join(name), contents).unwrap();
+            }
+            Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let db = Trail::open(workspace.path()).unwrap();
+            let source_root = db.get_ref("refs/branches/main").unwrap().root_id;
+            let proposal = NODE_WORKSPACE_ADAPTER
+                .propose(&db, &source_root, "")
+                .unwrap()
+                .unwrap();
+            assert_eq!(proposal.status, EnvironmentComponentProposalStatus::Blocked);
+            assert!(
+                proposal.reasons[0].message.contains(expected),
+                "unexpected proposal: {proposal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_declaration_must_match_lock_and_executable() {
+        let package: serde_json::Value = serde_json::from_str(
+            r#"{"name":"fixture","packageManager":"bun@1.2.3+sha512.deadbeef"}"#,
+        )
+        .unwrap();
+        assert!(
+            validate_declared_package_manager_version(&package, "yarn", "1.22.22")
+                .unwrap_err()
+                .to_string()
+                .contains("Trail selected")
+        );
+        assert!(
+            validate_declared_package_manager_version(&package, "bun", "1.2.4")
+                .unwrap_err()
+                .to_string()
+                .contains("requires `bun@1.2.3`")
+        );
+        validate_declared_package_manager_version(&package, "bun", "1.2.3").unwrap();
+    }
+
+    #[test]
+    fn approved_native_lifecycle_is_exact_private_and_identity_bearing() {
+        for tool in ["node", "npm", "cc", "python3", "make"] {
+            if resolve_workspace_tool_executable(tool).is_err() {
+                return;
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let npm_version = tool_version("npm").unwrap();
+        let package = format!(
+            r#"{{"name":"trail-native-addon","version":"1.0.0","private":true,"packageManager":"npm@{npm_version}","scripts":{{"install":"node-gyp rebuild"}},"devDependencies":{{"node-gyp":"10.3.1"}}}}"#
+        );
+        let integrity = "sha512-dGVzdC1ub2RlLWd5cC1pbnRlZ3JpdHk=";
+        let lock = format!(
+            r#"{{"name":"trail-native-addon","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"trail-native-addon","version":"1.0.0","hasInstallScript":true,"devDependencies":{{"node-gyp":"10.3.1"}}}},"node_modules/node-gyp":{{"version":"10.3.1","integrity":"{integrity}","dev":true,"bin":{{"node-gyp":"bin/node-gyp.js"}}}}}}}}"#
+        );
+        fs::write(workspace.path().join("package.json"), package).unwrap();
+        fs::write(workspace.path().join("package-lock.json"), &lock).unwrap();
+        fs::write(workspace.path().join("binding.gyp"), "{\"targets\":[]}").unwrap();
+        let policy = serde_json::json!({
+            "version": 1,
+            "manager": format!("npm@{npm_version}"),
+            "lock_sha256": sha256_hex(lock.as_bytes()),
+            "packages": [format!("node-gyp@10.3.1#{integrity}")],
+            "scripts": [{"package": ".", "phase": "install"}],
+            "capabilities": {"network": "deny", "native_toolchain": true},
+            "outputs": ["build"]
+        });
+        fs::write(
+            workspace.path().join(NODE_LIFECYCLE_POLICY_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.get_ref("refs/branches/main").unwrap().root_id;
+        let plan = db.node_environment_plan(&source_root, "").unwrap();
+        assert_eq!(
+            plan.sandbox_policy,
+            WorkspaceEnvironmentSandboxPolicy::ApprovedLifecycle
+        );
+        assert_eq!(
+            plan.layer_key.strategy,
+            "npm-frozen-approved-native-lifecycle-v1"
+        );
+        assert!(plan
+            .layer_key
+            .inputs
+            .contains_key("lifecycle:approval_sha256"));
+        assert!(plan.layer_key.tool_versions.contains_key("node-abi"));
+        assert!(plan
+            .layer_key
+            .tool_versions
+            .contains_key("native-compiler-executable"));
+        assert_eq!(plan.pre_commands.len(), 1);
+        assert!(plan.pre_commands[0]
+            .args
+            .iter()
+            .any(|arg| arg == "--ignore-scripts"));
+        assert_eq!(plan.command.as_ref().unwrap().args[0], "run-script");
+        assert!(plan.outputs.iter().all(|output| {
+            output.policy == WorkspaceEnvironmentOutputPolicy::WritablePrivate
+                && output.scope == EnvironmentSharingScope::Lane
+                && output.reuse == EnvironmentReuseMode::None
+        }));
+        assert_eq!(
+            plan.source_projection,
+            Some((source_root, "project".to_string()))
+        );
+    }
+
+    #[test]
+    fn approved_native_script_rejects_shell_and_transitive_lifecycle_escape() {
+        for rejected in [
+            "node-gyp rebuild && curl attacker.invalid",
+            "npm rebuild",
+            "node-gyp rebuild; npm run postinstall",
+            "node-gyp rebuild ../../escape",
+            "node-gyp configure",
+        ] {
+            assert!(
+                !approved_node_native_script(rejected),
+                "accepted `{rejected}`"
+            );
+        }
+        for accepted in ["node-gyp rebuild", "node-gyp rebuild --debug"] {
+            assert!(
+                approved_node_native_script(accepted),
+                "rejected `{accepted}`"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_native_lifecycle_never_runs_lock_pinned_transitive_scripts() {
+        for tool in ["node", "npm", "cc", "python3", "make"] {
+            if resolve_workspace_tool_executable(tool).is_err() {
+                return;
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let npm_version = tool_version("npm").unwrap();
+        let package = format!(
+            r#"{{"name":"trail-native-addon","version":"1.0.0","private":true,"packageManager":"npm@{npm_version}","scripts":{{"install":"node-gyp rebuild"}},"devDependencies":{{"node-gyp":"10.3.1","hostile-transitive":"1.0.0"}}}}"#
+        );
+        let integrity = "sha512-dGVzdC1ub2RlLWd5cC1pbnRlZ3JpdHk=";
+        let hostile_integrity = "sha512-aG9zdGlsZS10cmFuc2l0aXZlLWluc3RhbGw=";
+        let lock = format!(
+            r#"{{"name":"trail-native-addon","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{{"":{{"name":"trail-native-addon","version":"1.0.0","hasInstallScript":true,"devDependencies":{{"node-gyp":"10.3.1","hostile-transitive":"1.0.0"}}}},"node_modules/node-gyp":{{"version":"10.3.1","integrity":"{integrity}","dev":true,"bin":{{"node-gyp":"bin/node-gyp.js"}}}},"node_modules/hostile-transitive":{{"version":"1.0.0","integrity":"{hostile_integrity}","dev":true,"hasInstallScript":true}}}}}}"#
+        );
+        fs::write(workspace.path().join("package.json"), package).unwrap();
+        fs::write(workspace.path().join("package-lock.json"), &lock).unwrap();
+        fs::write(workspace.path().join("binding.gyp"), "{\"targets\":[]}").unwrap();
+        let policy = serde_json::json!({
+            "version": 1,
+            "manager": format!("npm@{npm_version}"),
+            "lock_sha256": sha256_hex(lock.as_bytes()),
+            "packages": [format!("node-gyp@10.3.1#{integrity}")],
+            "scripts": [{"package": ".", "phase": "install"}],
+            "capabilities": {"network": "deny", "native_toolchain": true},
+            "outputs": ["build"]
+        });
+        fs::write(
+            workspace.path().join(NODE_LIFECYCLE_POLICY_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let source_root = db.get_ref("refs/branches/main").unwrap().root_id;
+        let plan = db.node_environment_plan(&source_root, "").unwrap();
+        assert!(plan.pre_commands.iter().all(|command| {
+            command
+                .args
+                .iter()
+                .any(|argument| argument == "--ignore-scripts")
+                && !command
+                    .args
+                    .iter()
+                    .any(|argument| argument == "hostile-transitive")
+        }));
+        let lifecycle = plan.command.unwrap();
+        assert_eq!(
+            lifecycle.args,
+            vec![
+                "run-script".to_string(),
+                "install".to_string(),
+                "--ignore-scripts".to_string(),
+                "--offline".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn manifest_only_npm_uses_managed_lock_and_preserves_seed_cache_isolation() {
         if !Command::new("npm")
             .arg("--version")
@@ -1111,11 +2212,14 @@ mod tests {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();
-        let package = r#"{"name":"trail-managed-node-lock","version":"1.0.0","private":true,"packageManager":"npm@10.0.0"}"#;
-        fs::write(workspace.path().join("package.json"), package).unwrap();
+        let npm_version = tool_version("npm").unwrap();
+        let package = format!(
+            r#"{{"name":"trail-managed-node-lock","version":"1.0.0","private":true,"packageManager":"npm@{npm_version}"}}"#
+        );
+        fs::write(workspace.path().join("package.json"), &package).unwrap();
 
         let resolver = tempfile::tempdir().unwrap();
-        fs::write(resolver.path().join("package.json"), package).unwrap();
+        fs::write(resolver.path().join("package.json"), &package).unwrap();
         let generated = Command::new("npm")
             .args([
                 "install",

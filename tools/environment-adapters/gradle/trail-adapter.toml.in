@@ -1,0 +1,25 @@
+schema = "trail.environment-adapter-package/v1"
+
+[adapter]
+canonical_identity = "trail-examples/gradle@1"
+implementation_version = "1.2.0"
+selectors = ["gradle", "trail-examples/gradle@1"]
+kind = "compiler-results"
+layer_adapter_name = "gradle"
+discovery_markers = ["trail.gradle.toml"]
+protocols = ["trail.environment-adapter/v2"]
+supported_operating_systems = ["linux", "macos"]
+supported_architectures = ["aarch64", "x86_64"]
+stability = "experimental"
+description = "Offline Gradle build plan with verified tool identity, committed trailTest task, private project state, and host cache"
+
+[executable]
+path = "ecosystem-build-adapter"
+sha256 = "sha256:@EXECUTABLE_SHA256@"
+
+[permissions]
+read_patterns = ["*", "**/*"]
+max_input_files = 100000
+max_input_bytes = 8388608
+timeout_ms = 30000
+max_response_bytes = 4194304

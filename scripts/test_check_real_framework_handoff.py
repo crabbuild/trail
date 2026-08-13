@@ -16,11 +16,15 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
     def write_report(self, raw, name, value):
         (raw / f"{name}.json").write_text(json.dumps(value), encoding="utf-8")
 
-    def fixture(self, root, framework):
+    def fixture(self, root, framework, *, python_uv_project=False):
         raw = root / "raw"
         raw.mkdir()
         component_id = {
             "go": "go-vendor",
+            "go-workspace": "go-vendor",
+            "yarn": "node",
+            "bun": "node",
+            "uv": "python-venv",
             "pnpm": "node",
             "npm": "node",
             "python": "python-venv",
@@ -29,12 +33,15 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
         shared_key = "key-shared"
         shared_layer = "layer-shared"
         for index, lane in enumerate(CHECKER.LANES):
-            key = f"key-{index}" if framework == "go" else shared_key
-            if framework == "go":
+            source_sensitive = framework in {"go", "go-workspace", "uv"} or (
+                framework == "python" and python_uv_project
+            )
+            key = f"key-{index}" if source_sensitive else shared_key
+            if framework in {"go", "go-workspace"}:
                 layer = f"layer-{index}"
                 storage = layer
                 output_name = "vendor"
-            elif framework in {"pnpm", "npm"}:
+            elif framework in {"yarn", "bun", "pnpm", "npm"}:
                 layer = shared_layer
                 storage = layer
                 output_name = "node_modules"
@@ -81,16 +88,37 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             else:
                 before = json.loads(json.dumps(generation))
                 before["source_root"] = "root-baseline"
-                if framework == "go":
+                if source_sensitive:
                     before["components"][0]["component_key"] = "key-baseline"
-                    before["components"][0]["layer_id"] = "layer-baseline"
+                    if framework in {"go", "go-workspace"}:
+                        before["components"][0]["layer_id"] = "layer-baseline"
             self.write_report(raw, f"generation-before-edit-{lane}", before)
+            self.write_report(
+                raw,
+                f"plan-{lane}",
+                {
+                    "adapter_identity": f"trail/{framework}@1",
+                    "component_id": component_id,
+                    "component_key": before["components"][0]["component_key"],
+                    "source_root": before["source_root"],
+                    "tools": {"tool-executable": "sha256:tool"},
+                    "inputs": (
+                        [{"source_path": "uv.lock"}]
+                        if source_sensitive
+                        and framework not in {"go", "go-workspace"}
+                        else []
+                    ),
+                    "outputs": before["components"][0]["outputs"],
+                },
+            )
             decision = {
                 "component_id": component_id,
                 "decision_source": (
-                    "compatible_predecessor_seed" if framework == "go" else "active_binding"
+                    "compatible_predecessor_seed"
+                    if framework in {"go", "go-workspace"}
+                    else "active_binding"
                 ),
-                "bytes_avoided": 100 if framework == "go" else 0,
+                "bytes_avoided": 100 if framework in {"go", "go-workspace"} else 0,
             }
             self.write_report(raw, f"sync-{lane}", {"decisions": [decision]})
             self.write_report(
@@ -135,7 +163,14 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             )
             inheritance = None
             if index:
-                if framework in {"go", "pnpm", "npm"}:
+                if framework in {
+                    "go",
+                    "go-workspace",
+                    "yarn",
+                    "bun",
+                    "pnpm",
+                    "npm",
+                }:
                     inheritance = {
                         "status": "inherited",
                         "reason": None,
@@ -165,10 +200,88 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                 },
             )
         self.write_report(raw, "init", {"initialized": True})
+        if framework in CHECKER.INVALIDATION_PATHS:
+            final_generation = json.loads(
+                (raw / "generation-agent-c.json").read_text(encoding="utf-8")
+            )
+            self.write_report(raw, "generation-before-invalidation", final_generation)
+            invalidated = json.loads(json.dumps(final_generation))
+            invalidated["source_root"] = "root-invalidation"
+            invalidated["components"][0]["component_key"] = "key-invalidation"
+            invalidated["components"][0]["layer_id"] = "layer-invalidation"
+            invalidated["components"][0]["outputs"][0]["storage_identity"] = (
+                "layer-invalidation"
+            )
+            self.write_report(raw, "generation-invalidation", invalidated)
+            self.write_report(
+                raw,
+                "spawn-invalidation",
+                {
+                    "lane": "invalidation",
+                    "workdir": "/workspace/invalidation",
+                    "workdir_mode": "nfs-cow",
+                    "base_change": "change-2",
+                    "environment_inheritance": {
+                        "status": "inherited",
+                        "reason": None,
+                        "outputs": [],
+                    },
+                },
+            )
+            self.write_report(
+                raw,
+                "invalidation-edit",
+                {
+                    "lifecycle": {
+                        "checkpoint": {
+                            "operation": "change-invalidation",
+                            "root_id": "root-invalidation",
+                            "source_paths": CHECKER.INVALIDATION_PATHS[framework],
+                            "generated_dirty_paths": 0,
+                        }
+                    }
+                },
+            )
+            self.write_report(
+                raw,
+                "sync-invalidation",
+                {
+                    "decisions": [
+                        {
+                            "component_id": component_id,
+                            "decision_source": "constructed",
+                            "bytes_avoided": 0,
+                        }
+                    ]
+                },
+            )
+            self.write_report(
+                raw,
+                "check-invalidation",
+                {
+                    "exit_code": 0,
+                    "lifecycle": {
+                        "checkpoint": {
+                            "source_paths": [],
+                            "generated_dirty_paths": 0,
+                        }
+                    },
+                },
+            )
         return component_id
 
     def test_accepts_each_framework_contract(self):
-        for framework in ("go", "pnpm", "npm", "python", "cmake"):
+        for framework in (
+            "go",
+            "go-workspace",
+            "yarn",
+            "bun",
+            "uv",
+            "pnpm",
+            "npm",
+            "python",
+            "cmake",
+        ):
             with self.subTest(framework=framework), tempfile.TemporaryDirectory() as temp:
                 root = pathlib.Path(temp)
                 component_id = self.fixture(root, framework)
@@ -180,9 +293,75 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
                     component_id,
                 )
                 self.assertEqual(evidence["framework"], framework)
+                self.assertEqual(evidence["schema"], "trail.ecosystem-certification/v1")
+                self.assertEqual(evidence["distribution"]["kind"], "built-in")
+                self.assertEqual(len(evidence["lane_ancestry"]), 3)
+                self.assertEqual(len(evidence["validations"]), 3)
                 self.assertTrue(evidence["assertions"]["framework_reuse_contract_passed"])
                 self.assertEqual(evidence["generated_dirty_paths"], [1, 2, 3])
-                self.assertEqual(len(evidence["raw_sha256"]), 22)
+                self.assertEqual(
+                    len(evidence["raw_sha256"]),
+                    31 if framework in CHECKER.INVALIDATION_PATHS else 25,
+                )
+
+    def test_accepts_python_label_with_resolved_uv_project_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "python", python_uv_project=True)
+            evidence = CHECKER.check_evidence(
+                root,
+                "python",
+                "https://example.invalid/python-uv-project.git",
+                "b" * 40,
+                component_id,
+            )
+            self.assertTrue(
+                evidence["assertions"]["uv_project_identity_tracks_source_authority"]
+            )
+            self.assertFalse(
+                evidence["assertions"][
+                    "dependency_identity_stable_for_source_independent_adapters"
+                ]
+            )
+
+    def test_rejects_missing_or_changed_tool_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "pnpm")
+            plan = json.loads((root / "raw/plan-agent-b.json").read_text(encoding="utf-8"))
+            plan["tools"] = {}
+            self.write_report(root / "raw", "plan-agent-b", plan)
+            with self.assertRaisesRegex(AssertionError, "executable identity"):
+                CHECKER.check_evidence(root, "pnpm", "repo", "rev", component_id)
+
+    def test_rejects_python_install_contract_drift_between_lanes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "python")
+            plan = json.loads((root / "raw/plan-agent-b.json").read_text(encoding="utf-8"))
+            plan["inputs"] = [{"source_path": "uv.lock"}]
+            self.write_report(root / "raw", "plan-agent-b", plan)
+            with self.assertRaisesRegex(AssertionError, "install contract changed"):
+                CHECKER.check_evidence(root, "python", "repo", "rev", component_id)
+
+    def test_rejects_node_policy_invalidation_that_reuses_stale_layer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "yarn")
+            before = json.loads(
+                (root / "raw/generation-before-invalidation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            after = json.loads(
+                (root / "raw/generation-invalidation.json").read_text(encoding="utf-8")
+            )
+            after["components"][0]["component_key"] = before["components"][0][
+                "component_key"
+            ]
+            self.write_report(root / "raw", "generation-invalidation", after)
+            with self.assertRaisesRegex(AssertionError, "reused a stale component key"):
+                CHECKER.check_evidence(root, "yarn", "repo", "rev", component_id)
 
     def test_rejects_an_edit_that_captures_an_unexpected_path(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -219,6 +398,59 @@ class RealFrameworkHandoffCheckerTests(unittest.TestCase):
             self.write_report(root / "raw", "spawn-agent-b", report)
             with self.assertRaisesRegex(AssertionError, "unexpectedly inherited"):
                 CHECKER.check_evidence(root, "python", "repo", "rev", component_id)
+
+    def test_rejects_changed_cache_namespace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "cmake")
+            generation = json.loads(
+                (root / "raw/generation-agent-b.json").read_text(encoding="utf-8")
+            )
+            generation["components"][0]["caches"][0]["namespace_id"] = "cache-stale"
+            self.write_report(root / "raw", "generation-agent-b", generation)
+            with self.assertRaisesRegex(AssertionError, "cache namespace"):
+                CHECKER.check_evidence(root, "cmake", "repo", "rev", component_id)
+
+    def test_rejects_wrong_child_ancestry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "npm")
+            spawn = json.loads(
+                (root / "raw/spawn-agent-c.json").read_text(encoding="utf-8")
+            )
+            spawn["base_change"] = "change-unrelated"
+            self.write_report(root / "raw", "spawn-agent-c", spawn)
+            with self.assertRaisesRegex(AssertionError, "did not start from its parent"):
+                CHECKER.check_evidence(root, "npm", "repo", "rev", component_id)
+
+    def test_rejects_sealed_evidence_after_raw_report_tampering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "go-workspace")
+            evidence = CHECKER.check_evidence(root, "go-workspace", "repo", "rev", component_id)
+            (root / "evidence.json").write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            CHECKER.verify_sealed_evidence(root)
+            check = json.loads(
+                (root / "raw/check-agent-c.json").read_text(encoding="utf-8")
+            )
+            check["diagnostic"] = "tampered after sealing"
+            self.write_report(root / "raw", "check-agent-c", check)
+            with self.assertRaisesRegex(AssertionError, "authoritative raw reports"):
+                CHECKER.verify_sealed_evidence(root)
+
+    def test_rejects_tampered_canonical_identity_field(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            component_id = self.fixture(root, "bun")
+            evidence = CHECKER.check_evidence(root, "bun", "repo", "rev", component_id)
+            evidence["component_keys"][1] = "forged-key"
+            (root / "evidence.json").write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(AssertionError, "authoritative raw reports"):
+                CHECKER.verify_sealed_evidence(root)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+schema = "trail.environment-adapter-conformance/v1"
+adapter = "trail-examples/maven@1"
+identity_authorities = ["pom.xml", ".mvn/wrapper/maven-wrapper.properties", "settings.xml", "trail.maven.toml"]
+cache_only = ["repository"]
+private_outputs = ["target", "logs"]
+network = "deny"
+process = "native-sandboxed-tree"
+validation = "mvn --offline clean test with a separate durable log and the conventional target directory declared as the private output"

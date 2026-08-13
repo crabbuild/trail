@@ -11831,6 +11831,7 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
             "trail/cmake-build@1",
             "trail/command@1",
             "trail/go-vendor@1",
+            "trail/go-vendor@2",
             "trail/node@1",
             "trail/oci-image@1",
             "trail/python-venv@1",
@@ -12370,6 +12371,14 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
     assert_eq!(http_plan.status, 200);
     let plan: serde_json::Value = http_plan.body_json().unwrap();
     assert_eq!(plan["component_id"], "oci-images");
+    assert_eq!(
+        plan["adapter_implementation_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        plan["adapter_distribution_digest"],
+        "builtin:pinned-oci-image-plan-v1"
+    );
     assert_eq!(plan["kind"], "external");
     assert!(plan["outputs"].as_array().unwrap().is_empty());
     assert!(plan["commands"].as_array().unwrap().is_empty());
@@ -12391,6 +12400,24 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
         ),
         plan
     );
+    let mcp_plan = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_plan",
+                "arguments": {
+                    "lane": "oci-surfaces",
+                    "adapter": "trail/oci-image@1"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_plan["result"]["isError"], false);
+    assert_eq!(mcp_plan["result"]["structuredContent"], plan);
 
     let sync = trail::server::handle_http_request(
         &mut db,
@@ -12462,6 +12489,19 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
             .iter()
             .any(|field| field == "external_artifacts")
     );
+    for field in [
+        "adapter_implementation_version",
+        "adapter_distribution_digest",
+    ] {
+        assert!(
+            openapi["components"]["schemas"]["EnvironmentPlanReport"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == field),
+            "missing required plan identity field {field}"
+        );
+    }
 }
 
 #[test]
@@ -12619,7 +12659,7 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
     assert_eq!(status[0]["status"], "ready");
     assert_eq!(
         status[0]["adapter"]["distribution_digest"],
-        "builtin:node-plan-v2"
+        "builtin:node-plan-v3"
     );
 
     let generation = trail::server::handle_http_request(
@@ -13458,7 +13498,7 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
     assert_eq!(status[0]["status"], "ready");
     assert_eq!(
         status[0]["adapter"]["distribution_digest"],
-        "builtin:node-plan-v2"
+        "builtin:node-plan-v3"
     );
 }
 

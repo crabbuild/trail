@@ -1,0 +1,9 @@
+schema = "trail.environment-adapter-conformance/v1"
+adapter = "trail-examples/gradle@1"
+identity_authorities = ["gradle/wrapper/gradle-wrapper.properties", "gradle.lockfile", "libs.versions.toml", "settings.gradle", "settings.gradle.kts", "trail.gradle.toml"]
+cache_only = ["user-home"]
+private_outputs = ["build", ".gradle"]
+daemon = "deny"
+network = "deny"
+process = "native-sandboxed-tree"
+validation = "gradle --offline --no-daemon build trailTest"

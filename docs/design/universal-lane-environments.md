@@ -627,8 +627,10 @@ Conformance fixtures also cover ecosystems that have no built-in adapter. A
 Maven/Gradle-like checksum graph plus private build state and an unknown custom generator
 compile through repository v2. Bazel/Nix-like content stores compile through the generic
 plugin `verified_external` identity: Trail records provider/reference/digest/platform
-metadata but creates no layer, cache, runtime, or cleanup claim. These are compositions
-of common contracts, not framework switches in the lane backend.
+metadata but creates no layer, cache, runtime, or cleanup claim. Such a plan may pair
+the immutable external identity with layerless lane-private client state (for example a
+Nix profile), but only with no reuse or publication and with no adapter action. These are
+compositions of common contracts, not framework switches in the lane backend.
 
 Each lane pins a generation independently. Syncing lane A cannot change the active
 generation, private upper, services, or secret handles of lane B. A new artifact may be
@@ -885,6 +887,11 @@ HTTP, MCP, CLI JSON, and Rust APIs expose the same stable identifiers, lifecycle
 policy decisions, stale reasons, operation links, and redaction rules. Long-running
 build, verification, and runtime operations use Trail operations with progress events
 and cancellation rather than blocking opaque requests.
+
+`EnvironmentPlanReport` includes both `adapter_implementation_version` and
+`adapter_distribution_digest`. Automation must bind both values before accepting a plan:
+the canonical adapter identity alone does not prove which executable/package bytes
+produced it. CLI JSON, HTTP, MCP structured content, and OpenAPI expose the same fields.
 
 The shared Rust operation layer now exposes artifact inspection, attach/sample/full/
 reproducibility-evidence verification, quarantine list/show/resolve, bounded content

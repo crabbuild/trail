@@ -5,13 +5,33 @@ All notable changes to Trail are documented in this file. Trail follows
 
 ## [Unreleased]
 
+### Added
+
+- Environment support now includes contained Go multi-module workspaces, real frozen
+  Yarn Classic and Bun handoffs, project-aware `uv sync --frozen`, and modern
+  CMake/Ninja/preset/toolchain/ccache/vcpkg planning. Node native addons and lifecycle
+  scripts require an exact committed deny-by-default approval with platform/toolchain
+  identity and sandboxed output bounds.
+- Versioned experimental Bazel, Gradle, Maven, and Nix adapter packages exercise the
+  common protocol-v2 host lifecycle. Nix records pure locked `/nix/store` results and a
+  digest-pinned builder as provider-owned immutable identities while Trail creates only
+  lane-private profile/state; it never copies the store or executes Nix in the adapter.
+- Canonical ecosystem certification evidence now binds repository/tool/distribution
+  identities, A → B → C ancestry, deterministic plans, caches/private outputs,
+  semantic validations, identity invalidation, and hashes of every raw report. Public
+  environment plans expose adapter implementation and distribution digests consistently
+  through Rust, CLI JSON, HTTP, MCP, and OpenAPI.
+
 ### Fixed
 
 - Managed lane commands now derive fixed policy, resolved executable, cache,
   and output bindings from each active environment adapter instead of injecting
   Cargo/npm defaults globally. Go, pnpm/npm/Yarn/Bun, Python, and CMake commands
   receive isolated framework-native caches and exact tool paths, while inactive
-  frameworks no longer leak variables into the command.
+  frameworks no longer leak variables into the command. Cargo-managed commands
+  also discard inherited profile, target, wrapper, and Rust-flag overrides before
+  applying the pinned lane policy, so compatible dependency fingerprints remain
+  reusable across lanes.
 - Managed execution now rejects environment-bearing materialized lanes before
   emitting an impossible resolution command and recommends a new
   `--workdir-mode auto` lane. Layered workspace backends remain required for

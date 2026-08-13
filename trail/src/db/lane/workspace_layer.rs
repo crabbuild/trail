@@ -4159,12 +4159,22 @@ impl Trail {
                     activation.component_id
                 )));
             }
-            if (!activation.external_artifacts.is_empty()
-                || !activation.runtime_resources.is_empty())
-                && (layer.is_some() || !activation.outputs.is_empty())
+            let external_outputs_are_private_state = activation.outputs.iter().all(|output| {
+                output.policy == EnvironmentOutputPolicy::WritablePrivate
+                    && output.reuse == EnvironmentReuseMode::None
+                    && output.scope == EnvironmentSharingScope::Lane
+                    && output.publish == EnvironmentPublicationTrigger::Never
+                    && output.gate.is_none()
+            });
+            if (layer.is_some()
+                && (!activation.external_artifacts.is_empty()
+                    || !activation.runtime_resources.is_empty()))
+                || (!activation.runtime_resources.is_empty() && !activation.outputs.is_empty())
+                || (!activation.external_artifacts.is_empty()
+                    && !external_outputs_are_private_state)
             {
                 return Err(Error::InvalidInput(format!(
-                    "environment component `{}` mixes external/runtime resources with filesystem layer outputs",
+                    "environment component `{}` permits runtime resources only without outputs and external artifacts only with layerless lane-private never-published state",
                     activation.component_id
                 )));
             }
@@ -6809,6 +6819,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_artifacts_activate_only_with_layerless_private_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "external-private",
+            Some("main"),
+            if cfg!(target_os = "macos") {
+                LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
+            } else {
+                LaneWorkdirMode::FuseCow
+            },
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let canonical_key = WorkspaceLayerKeyV1 {
+            kind: "external".to_string(),
+            adapter: "nix".to_string(),
+            adapter_version: 1,
+            inputs: BTreeMap::from([("flake.lock".to_string(), "lock-digest".to_string())]),
+            tool_versions: BTreeMap::new(),
+            platform: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            portability_scope: "host".to_string(),
+            strategy: "external-private-state-test".to_string(),
+        };
+        let expected_key = db.workspace_layer_cache_key(&canonical_key).unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        let activation = EnvironmentLayerActivation {
+            layer_id: None,
+            outputs: vec![EnvironmentLayerOutputActivation {
+                name: "profile".to_string(),
+                mount_path: ".trail-nix-profile".to_string(),
+                policy: EnvironmentOutputPolicy::WritablePrivate,
+                reuse: EnvironmentReuseMode::None,
+                scope: EnvironmentSharingScope::Lane,
+                publish: EnvironmentPublicationTrigger::Never,
+                gate: None,
+                binding_identity: "private-nix-profile".to_string(),
+                manifest_object_id: None,
+                publication_id: None,
+                private_seed: Some(seed.path().to_path_buf()),
+                layer_subpath: String::new(),
+            }],
+            component_id: "external-build.nix".to_string(),
+            adapter_identity: "trail-examples/nix@1".to_string(),
+            adapter_version: 1,
+            implementation_version: "1.0.0".to_string(),
+            distribution_digest: format!("sha256:{}", "d".repeat(64)),
+            kind: "external".to_string(),
+            dependencies: Vec::new(),
+            caches: Vec::new(),
+            external_artifacts: vec![EnvironmentExternalArtifactReport {
+                name: "package".to_string(),
+                artifact_type: "verified_external".to_string(),
+                provider: "nix".to_string(),
+                reference: "/nix/store/11111111111111111111111111111111-package".to_string(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                platform: "linux/arm64".to_string(),
+                cleanup_owner: "external".to_string(),
+            }],
+            runtime_resources: Vec::new(),
+            expected_key,
+            canonical_key,
+        };
+
+        db.replace_declared_workspace_layers("external-private", std::slice::from_ref(&activation))
+            .unwrap();
+        let generation = db
+            .active_environment_generation("external-private")
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation.components[0].external_artifacts.len(), 1);
+        assert!(generation.components[0].layer_id.is_none());
+        assert_eq!(
+            generation.components[0].outputs[0].policy,
+            EnvironmentOutputPolicy::WritablePrivate
+        );
+
+        let mut unsafe_activation = activation;
+        unsafe_activation.outputs[0].publish = EnvironmentPublicationTrigger::Manual;
+        let error = db
+            .replace_declared_workspace_layers(
+                "external-private",
+                std::slice::from_ref(&unsafe_activation),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lane-private never-published state"));
+    }
+
     #[derive(Clone, Copy)]
     struct ArtifactConformanceProfile {
         producer_family: &'static str,
@@ -7540,7 +7650,7 @@ validation = "path-contract"
                 "INSERT INTO environment_component_states(
                      view_id,component_id,adapter_identity,adapter_version,implementation_version,
                      distribution_digest,kind,expected_key,attached_key,status,reason,updated_at)
-                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v2',
+                 VALUES('parent-view','node','trail/node@1',1,?1,'builtin:node-plan-v3',
                         'dependency',?2,?2,'ready',NULL,1)",
                 params![env!("CARGO_PKG_VERSION"), &layer.cache_key],
             )
@@ -7596,7 +7706,7 @@ validation = "path-contract"
         db.conn
             .execute(
                 "UPDATE environment_component_states
-                 SET distribution_digest='builtin:node-plan-v2'
+                 SET distribution_digest='builtin:node-plan-v3'
                  WHERE view_id='parent-view' AND component_id='node'",
                 [],
             )

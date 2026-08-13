@@ -43,6 +43,14 @@ const PYTHON_RESOLUTION_FILES: [&str; 6] = [
     "requirements.lock",
     "requirements.txt",
 ];
+const MAX_UV_PYPROJECT_BYTES: u64 = 1024 * 1024;
+const MAX_UV_GRAPH_REFERENCES: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UvProjectAuthority {
+    project_name: String,
+    references: Vec<String>,
+}
 
 static PYTHON_VENV_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
     WorkspaceEnvironmentAdapterMetadata {
@@ -335,6 +343,26 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
             None if managed_resolution => Some(PythonInstallContract::ManagedHashedRequirements),
             None => None,
         };
+        let uv_project_authority = if install_contract == Some(PythonInstallContract::UvLock) {
+            Some(validate_uv_project_authority(
+                db,
+                source_root,
+                &component_root,
+            )?)
+        } else {
+            None
+        };
+        if let Some(authority) = &uv_project_authority {
+            key_inputs.insert("uv_source_root".to_string(), source_root.0.clone());
+            key_inputs.insert(
+                "uv_project_name".to_string(),
+                authority.project_name.clone(),
+            );
+            key_inputs.insert(
+                "uv_graph_authority".to_string(),
+                sha256_hex(authority.references.join("\0").as_bytes()),
+            );
+        }
         let uv = install_contract
             .map(|_| resolve_workspace_tool_executable("uv"))
             .transpose()?;
@@ -473,7 +501,8 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 PythonInstallContract::UvLock => vec![
                     "sync".to_string(),
                     "--frozen".to_string(),
-                    "--no-install-project".to_string(),
+                    "--offline".to_string(),
+                    "--no-progress".to_string(),
                     "--no-python-downloads".to_string(),
                     "--active".to_string(),
                 ],
@@ -535,10 +564,55 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                         "VIRTUAL_ENV".to_string(),
                         mounted_output_placeholder("venv"),
                     ),
+                    (
+                        "UV_PROJECT_ENVIRONMENT".to_string(),
+                        mounted_output_placeholder("venv"),
+                    ),
                 ]),
                 remove_environment: Vec::new(),
                 cache_names: Vec::new(),
             });
+            if let Some(authority) = &uv_project_authority {
+                mounted_commands.push(WorkspaceEnvironmentCommand {
+                    program: "uv".to_string(),
+                    resolved_program: uv.path.clone(),
+                    executable_identity: uv.identity.clone(),
+                    args: vec![
+                        "run".to_string(),
+                        "--frozen".to_string(),
+                        "--offline".to_string(),
+                        "--no-sync".to_string(),
+                        "python".to_string(),
+                        "-c".to_string(),
+                        "import importlib.metadata,sys; importlib.metadata.distribution(sys.argv[1])"
+                            .to_string(),
+                        authority.project_name.clone(),
+                    ],
+                    working_directory: component_root.clone(),
+                    environment: BTreeMap::from([
+                        (
+                            "UV_CACHE_DIR".to_string(),
+                            download_cache
+                                .storage_path
+                                .join("uv")
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        ("UV_NO_PROGRESS".to_string(), "1".to_string()),
+                        ("UV_PYTHON_DOWNLOADS".to_string(), "never".to_string()),
+                        (
+                            "VIRTUAL_ENV".to_string(),
+                            mounted_output_placeholder("venv"),
+                        ),
+                        (
+                            "UV_PROJECT_ENVIRONMENT".to_string(),
+                            mounted_output_placeholder("venv"),
+                        ),
+                    ]),
+                    remove_environment: Vec::new(),
+                    cache_names: Vec::new(),
+                });
+            }
         }
         key_inputs.insert(
             "mounted_action".to_string(),
@@ -567,7 +641,7 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                 platform: std::env::consts::OS.to_string(),
                 architecture: std::env::consts::ARCH.to_string(),
                 portability_scope: "lane-private-host-python".to_string(),
-                strategy: "python-venv-private-direct-init-v5".to_string(),
+                strategy: "python-venv-private-direct-init-v6".to_string(),
             },
             inputs,
             resolution_inputs,
@@ -600,6 +674,139 @@ impl WorkspaceEnvironmentAdapter for PythonVenvAdapter {
                     .to_string(),
         })
     }
+}
+
+fn validate_uv_project_authority(
+    db: &Trail,
+    source_root: &ObjectId,
+    component_root: &str,
+) -> Result<UvProjectAuthority> {
+    let path = join_python_path(component_root, "pyproject.toml");
+    let entry = db.root_file_entry(source_root, &path)?.ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "uv.lock component `{}` requires pyproject.toml",
+            display_python_root(component_root)
+        ))
+    })?;
+    if entry.size_bytes > MAX_UV_PYPROJECT_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "uv project metadata `{path}` exceeds {MAX_UV_PYPROJECT_BYTES} bytes"
+        )));
+    }
+    let bytes = db.materialize_entry_bytes(&entry)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::InvalidInput(format!("uv project metadata `{path}` is not UTF-8")))?;
+    let document = toml::from_str::<toml::Value>(text).map_err(|error| {
+        Error::InvalidInput(format!(
+            "uv project metadata `{path}` is malformed TOML: {error}"
+        ))
+    })?;
+    let project_name = document
+        .get("project")
+        .and_then(toml::Value::as_table)
+        .and_then(|project| project.get("name"))
+        .and_then(toml::Value::as_str)
+        .filter(|name| !name.is_empty() && name.len() <= 256)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "uv project metadata `{path}` requires one bounded [project].name"
+            ))
+        })?
+        .to_string();
+    let mut references = vec![format!("project:{project_name}")];
+    if let Some(uv) = document
+        .get("tool")
+        .and_then(|tool| tool.get("uv"))
+        .and_then(toml::Value::as_table)
+    {
+        if let Some(workspace) = uv.get("workspace").and_then(toml::Value::as_table) {
+            for field in ["members", "exclude"] {
+                if let Some(values) = workspace.get(field) {
+                    let values = values.as_array().ok_or_else(|| {
+                        Error::InvalidInput(format!("tool.uv.workspace.{field} must be an array"))
+                    })?;
+                    for value in values {
+                        let value = value.as_str().ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "tool.uv.workspace.{field} entries must be strings"
+                            ))
+                        })?;
+                        validate_uv_contained_reference(component_root, value, true)?;
+                        references.push(format!("workspace:{field}:{value}"));
+                    }
+                }
+            }
+        }
+        if let Some(sources) = uv.get("sources").and_then(toml::Value::as_table) {
+            for (name, source) in sources {
+                let source_values = source
+                    .as_array()
+                    .map_or_else(|| vec![source], |values| values.iter().collect());
+                for source in source_values {
+                    if let Some(path) = source
+                        .as_table()
+                        .and_then(|table| table.get("path"))
+                        .and_then(toml::Value::as_str)
+                    {
+                        validate_uv_contained_reference(component_root, path, false)?;
+                        references.push(format!("source:{name}:{path}"));
+                    }
+                    if source
+                        .as_table()
+                        .and_then(|table| table.get("workspace"))
+                        .and_then(toml::Value::as_bool)
+                        == Some(true)
+                    {
+                        references.push(format!("source:{name}:workspace"));
+                    }
+                }
+            }
+        }
+    }
+    if references.len() > MAX_UV_GRAPH_REFERENCES {
+        return Err(Error::InvalidInput(format!(
+            "uv project graph exceeds {MAX_UV_GRAPH_REFERENCES} references"
+        )));
+    }
+    references.sort();
+    references.dedup();
+    Ok(UvProjectAuthority {
+        project_name,
+        references,
+    })
+}
+
+fn validate_uv_contained_reference(
+    component_root: &str,
+    reference: &str,
+    allow_glob: bool,
+) -> Result<()> {
+    if reference.is_empty() || reference.len() > 4096 {
+        return Err(Error::InvalidInput(
+            "uv workspace/source path is empty or oversized".to_string(),
+        ));
+    }
+    let prefix = if allow_glob {
+        reference
+            .find(['*', '?', '['])
+            .map_or(reference, |index| &reference[..index])
+            .trim_end_matches('/')
+    } else {
+        reference
+    };
+    if prefix.is_empty() && reference.starts_with(['*', '?', '[']) {
+        return Err(Error::InvalidInput(
+            "uv workspace glob must have a contained literal prefix".to_string(),
+        ));
+    }
+    let joined = join_python_path(component_root, prefix);
+    normalize_relative_path(&joined).map_err(|error| {
+        Error::InvalidInput(format!(
+            "uv workspace/source path `{reference}` escapes component `{}`: {error}",
+            display_python_root(component_root)
+        ))
+    })?;
+    Ok(())
 }
 
 fn python_source_resolution(
@@ -1178,11 +1385,18 @@ mod tests {
         let plan = db
             .plan_workspace_environment("python", "trail/python-venv@1", None)
             .unwrap();
-        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(plan.commands.len(), 3);
         assert_eq!(plan.commands[0].phase, "mounted_initialization");
         assert_eq!(plan.commands[1].phase, "mounted_initialization");
         assert_eq!(plan.commands[1].program, "uv");
         assert!(plan.commands[1].args.iter().any(|arg| arg == "--frozen"));
+        assert!(plan.commands[1].args.iter().any(|arg| arg == "--offline"));
+        assert!(!plan.commands[1]
+            .args
+            .iter()
+            .any(|arg| arg == "--no-install-project"));
+        assert_eq!(plan.commands[2].program, "uv");
+        assert!(plan.commands[2].args.iter().any(|arg| arg == "--no-sync"));
         #[cfg(target_os = "macos")]
         assert_eq!(
             plan.commands[0].args,
@@ -1243,6 +1457,73 @@ mod tests {
             .generated_upper
             .join(".venv/pyvenv.cfg")
             .is_file());
+    }
+
+    #[test]
+    fn uv_project_authority_is_bounded_contained_and_source_sensitive() {
+        if resolve_python_executable().is_err() || resolve_workspace_tool_executable("uv").is_err()
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("packages/member/src/member")).unwrap();
+        fs::write(
+            workspace.path().join("pyproject.toml"),
+            "[project]\nname = \"uv-root\"\nversion = \"0.1.0\"\n\n[tool.uv.workspace]\nmembers = [\"packages/*\"]\n\n[tool.uv.sources]\nmember = { workspace = true }\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("uv.lock"), "version = 1\n").unwrap();
+        fs::write(
+            workspace.path().join("packages/member/pyproject.toml"),
+            "[project]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .path()
+                .join("packages/member/src/member/__init__.py"),
+            "VALUE = 1\n",
+        )
+        .unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let first_root = db.get_ref("refs/branches/main").unwrap().root_id;
+        let authority = validate_uv_project_authority(&db, &first_root, "").unwrap();
+        assert_eq!(authority.project_name, "uv-root");
+        assert!(authority
+            .references
+            .contains(&"workspace:members:packages/*".to_string()));
+        let first = PYTHON_VENV_ADAPTER.plan(&db, &first_root, "").unwrap();
+        assert_eq!(first.layer_key.inputs["uv_source_root"], first_root.0);
+
+        fs::write(
+            workspace
+                .path()
+                .join("packages/member/src/member/__init__.py"),
+            "VALUE = 2\n",
+        )
+        .unwrap();
+        db.record(
+            Some("main"),
+            Some("change uv member source".to_string()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+        let second_root = db.get_ref("refs/branches/main").unwrap().root_id;
+        let second = PYTHON_VENV_ADAPTER.plan(&db, &second_root, "").unwrap();
+        assert_ne!(first.layer_key, second.layer_key);
+
+        for reference in ["../outside", "/absolute"] {
+            assert!(validate_uv_contained_reference("", reference, false)
+                .unwrap_err()
+                .to_string()
+                .contains("escapes"));
+        }
+        assert!(validate_uv_contained_reference("", "*", true)
+            .unwrap_err()
+            .to_string()
+            .contains("literal prefix"));
     }
 
     #[test]
@@ -1416,9 +1697,9 @@ mod tests {
             let direct_venv = paths.generated_upper.join(component).join(".venv");
             assert!(venv.join("pyvenv.cfg").is_file());
             #[cfg(windows)]
-            let executable = venv.join("Scripts/python.exe");
+            let executable = direct_venv.join("Scripts/python.exe");
             #[cfg(not(windows))]
-            let executable = venv.join("bin/python");
+            let executable = direct_venv.join("bin/python");
             let prefix = Command::new(executable)
                 .args(["-c", "import sys; print(sys.prefix)"])
                 .output()

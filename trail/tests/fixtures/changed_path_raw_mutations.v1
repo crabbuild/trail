@@ -264,6 +264,7 @@ reviewed|db/lane/workspace_environment.rs|drop|fs::remove_file|2
 reviewed|db/lane/workspace_environment.rs|environment_cache_namespace_has_live_leases|fs::remove_dir|1
 reviewed|db/lane/workspace_environment.rs|environment_cache_namespace_has_live_leases|fs::remove_file|1
 reviewed|db/lane/workspace_environment.rs|execute_workspace_environment_plan_in_directory|fs::create_dir_all|2
+reviewed|db/lane/workspace_environment.rs|execute_workspace_environment_plan_in_directory|OpenOptions::write|1
 reviewed|db/lane/workspace_environment.rs|initialize_mounted_workspace_environment_plans|fs::create_dir_all|1
 reviewed|db/lane/workspace_environment.rs|initialize_mounted_workspace_environment_plans|fs::remove_dir_all|1
 reviewed|db/lane/workspace_environment.rs|execute_reviewed_builtin_resolution_plan|fs::create_dir_all|5
@@ -277,6 +278,7 @@ reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_inpu
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_input|fs::set_permissions|1
 reviewed|db/lane/workspace_environment.rs|materialize_workspace_environment_input|OpenOptions::write|1
 reviewed|db/lane/workspace_environment.rs|materialize_mounted_command_args|fs::create_dir_all|1
+reviewed|db/lane/workspace_environment.rs|normalize_process_tree_output_symlinks|fs::remove_file|1
 reviewed|db/lane/workspace_environment.rs|workspace_environment_staging_parent_path_fallback|fs::create_dir_all|2
 reviewed|db/lane/workspace_environment.rs|run_mounted_workspace_environment_command|fs::copy|1
 reviewed|db/lane/workspace_environment.rs|run_mounted_workspace_environment_command|fs::create_dir_all|3

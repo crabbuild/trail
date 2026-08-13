@@ -181,7 +181,7 @@ A layered lane keeps two kinds of state separate:
   readiness, merge, and Git export can preserve them.
 - Framework artifacts are dependency installs, compiler targets, bundles,
   generated caches, and other tool output. Trail discovers them through Cargo,
-  Node, Next.js, Vite, repository v2, or adapter-v3 contracts; they do not enter
+  Go, Node, Python, CMake, repository v2, or adapter-plugin contracts; they do not enter
   source history unless an explicit declared source export is authorized.
 
 The reusable artifact path is content addressed. Discovery reads source markers
@@ -207,6 +207,15 @@ Node components receive package-manager caches plus a direct private
 `VIRTUAL_ENV`, venv `PATH`, and `TRAIL_VENV_PYTHON`; and CMake components receive a direct lane-private
 `TRAIL_CMAKE_BUILD_DIR`. Inactive frameworks inject no cache, tool, or output
 variables into the command.
+
+The built-ins cover Go modules and contained `go.work` graphs, npm/pnpm/Yarn
+Classic/Bun frozen installs, hash-locked and `uv.lock` Python projects, and
+CMake/Ninja/presets/ccache with pinned vcpkg manifest authority. Yarn Berry/PnP,
+unfrozen Python inputs, unsafe CMake includes, and unapproved Node lifecycle scripts
+fail closed. Experimental protocol-v2 example packages locally qualify Bazel, Gradle,
+Maven, and Nix without adding framework-specific execution paths to Trail core; see
+[ecosystem environment certification](docs/lanes/ecosystem-environment-certification.md)
+for exact platform evidence and pending hosted gates.
 
 ```sh
 trail env discover fix-login

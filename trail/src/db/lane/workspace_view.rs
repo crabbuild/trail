@@ -984,6 +984,16 @@ impl Trail {
     ) -> Result<i32> {
         let environment = self.workspace_command_environment(view, source_root)?;
         let mut process = Command::new(&command[0]);
+        if environment
+            .iter()
+            .any(|(name, _)| name == "CARGO_TARGET_DIR")
+        {
+            for (name, _) in std::env::vars_os() {
+                if managed_cargo_host_environment_is_untrusted(&name) {
+                    process.env_remove(name);
+                }
+            }
+        }
         process
             .args(&command[1..])
             .current_dir(&view.mountpoint)
@@ -1175,10 +1185,17 @@ impl Trail {
                 continue;
             }
             for binding in adapter.command_bindings() {
+                let value = if binding.value
+                    == super::workspace_environment::WORKSPACE_COMMAND_BINDING_MOUNTPOINT
+                {
+                    view.mountpoint.clone()
+                } else {
+                    binding.value.to_string()
+                };
                 insert_workspace_command_binding(
                     &mut bindings,
                     binding.environment,
-                    binding.value.to_string(),
+                    value,
                     &component_id,
                 )?;
             }
@@ -2105,6 +2122,26 @@ fn command_available(command: &str) -> bool {
         })
 }
 
+fn managed_cargo_host_environment_is_untrusted(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.starts_with("CARGO_BUILD_")
+        || name.starts_with("CARGO_PROFILE_")
+        || name.starts_with("CARGO_TARGET_")
+        || matches!(
+            name,
+            "CARGO_ENCODED_RUSTFLAGS"
+                | "CARGO_INCREMENTAL"
+                | "RUSTC"
+                | "RUSTC_WRAPPER"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "RUSTDOC"
+                | "RUSTDOCFLAGS"
+                | "RUSTFLAGS"
+        )
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DirectoryUsage {
     logical_bytes: u64,
@@ -2214,6 +2251,24 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn managed_cargo_execution_rejects_host_build_policy_overrides() {
+        for name in [
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+            "CARGO_INCREMENTAL",
+            "RUSTC_WRAPPER",
+            "RUSTFLAGS",
+        ] {
+            assert!(managed_cargo_host_environment_is_untrusted(name.as_ref()));
+        }
+        for name in ["CARGO_HOME", "CARGO_NET_OFFLINE", "PATH", "RUSTUP_HOME"] {
+            assert!(!managed_cargo_host_environment_is_untrusted(name.as_ref()));
+        }
+    }
 
     #[test]
     fn checkpoint_crash_helper() {

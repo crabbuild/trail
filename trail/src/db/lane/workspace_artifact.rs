@@ -6485,7 +6485,9 @@ fn validate_artifact_secret_policy(
     let sensitive = match relative_path {
         Some(path) if policy == ArtifactSecretPolicy::LockedPublicDependencies => {
             is_secret_bearing_artifact_path(path)
-                && (contains_private_key || contains_sensitive_text(text))
+                && (contains_private_key
+                    || contains_sensitive_text(text)
+                        && !artifact_sensitive_values_are_placeholders(text))
         }
         Some(path) => {
             contains_private_key
@@ -6502,6 +6504,41 @@ fn validate_artifact_secret_policy(
         )));
     }
     Ok(())
+}
+
+fn artifact_sensitive_values_are_placeholders(text: &str) -> bool {
+    let mut found_sensitive_assignment = false;
+    for line in text.lines() {
+        if !contains_sensitive_text(line) {
+            continue;
+        }
+        let Some((_, value)) = line.split_once('=') else {
+            return false;
+        };
+        if !is_environment_secret_placeholder(value.trim()) {
+            return false;
+        }
+        found_sensitive_assignment = true;
+    }
+    found_sensitive_assignment
+}
+
+fn is_environment_secret_placeholder(value: &str) -> bool {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    let Some(name) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
 }
 
 fn is_secret_bearing_artifact_path(path: &str) -> bool {
@@ -8186,6 +8223,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("private.key"));
+
+        validate_artifact_secret_policy(
+            b"//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n",
+            Some("nerf-dart/.npmrc"),
+            ArtifactSecretPolicy::LockedPublicDependencies,
+        )
+        .unwrap();
+        for (bytes, policy) in [
+            (
+                b"//registry.npmjs.org/:_authToken=npm_real_secret\n".as_slice(),
+                ArtifactSecretPolicy::LockedPublicDependencies,
+            ),
+            (
+                b"//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n".as_slice(),
+                ArtifactSecretPolicy::Strict,
+            ),
+        ] {
+            let error =
+                validate_artifact_secret_policy(bytes, Some("package/.npmrc"), policy).unwrap_err();
+            assert!(error.to_string().contains("secret material"));
+        }
     }
 
     #[cfg(unix)]

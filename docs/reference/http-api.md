@@ -2,6 +2,9 @@
 
 Environment sync reports include per-component cache decisions, storage
 identity, rebuild reason, exact changed identity edges, and byte accounting.
+Environment plan responses require `adapter_identity`,
+`adapter_implementation_version`, and `adapter_distribution_digest`; these are
+the same fields serialized by Rust, CLI JSON/NDJSON, and MCP structured content.
 `POST /v1/lanes/{lane_or_id}/environment/promote` accepts `component` and
 `output` and returns the durable publication and successor-generation report.
 Artifact resolution, inspection, verification, quarantine, reachability,
@@ -118,6 +121,7 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
+| GET | `/v1/lanes/{lane_or_id}/environment/plan` | Return the normalized component plan and exact adapter implementation/distribution identity. |
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve` | Resolve or reuse one pinned component snapshot. Body: `component`, optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/resolve-all` | Resolve or reuse every incomplete component snapshot. Body: optional `path` and `refresh`. |
 | POST | `/v1/lanes/{lane_or_id}/environment/source-export` | Export one declared generated-source subtree through normal lane source writes. Body: `component` and `export`. |
