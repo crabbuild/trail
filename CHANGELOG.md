@@ -14,6 +14,7 @@ All notable changes to Trail are documented in this file. Trail follows
 ### Fixed
 
 - Release metadata and version bump housekeeping.
+- Release publishing path triggered for macOS/Linux/Windows via the automated workflow.
 
 ### Added
 
