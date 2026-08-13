@@ -300,6 +300,9 @@ pub(super) struct EnvironmentRuntimeSetupColimaArgs {
     /// Persist the provider without starting or verifying the profile endpoint.
     #[arg(long)]
     pub(super) no_start: bool,
+    /// Select where managed lane commands run after setup.
+    #[arg(long, value_parser = ["host", "colima"])]
+    pub(super) execution_backend: Option<String>,
 }
 
 #[derive(Args)]

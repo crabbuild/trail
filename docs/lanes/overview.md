@@ -140,6 +140,13 @@ The same receipt shape is used by exec, test, eval, terminal-agent, and
 materialized ACP execution; older serialized lifecycle reports remain valid
 with both receipts absent.
 
+When `runtime.execution_backend=colima`, command and gate execution adds
+no-mount guest projection, export, import, and cleanup phases to this lifecycle.
+The host remains the authoritative lane/checkpoint and agent control plane. A
+CLI `--turn` or HTTP/MCP `turn_id` associates the command checkpoint and
+session/turn/trace provenance with an open lane turn. See
+[Colima-sandboxed lane execution](colima-sandboxed-execution.md).
+
 Omitting `--workdir-mode` creates a lazy `auto` layered lane on a qualified
 native transparent backend. Spawn does not copy source or execute ecosystem
 tools. The first managed command converges the desired environment; exact

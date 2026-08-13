@@ -157,11 +157,34 @@ pub(crate) fn set_config_value(
         }
         "runtime.provider" => match value {
             "auto" | "docker" | "podman" | "colima" => {
+                if value != "colima" && config.runtime.execution_backend == "colima" {
+                    return Err(Error::InvalidInput(
+                        "runtime.provider cannot move away from colima while runtime.execution_backend is colima; set runtime.execution_backend to host first"
+                            .to_string(),
+                    ));
+                }
                 config.runtime.provider = value.to_string();
                 Ok(())
             }
             other => Err(Error::InvalidInput(format!(
                 "runtime.provider must be auto, docker, podman, or colima, got `{other}`"
+            ))),
+        },
+        "runtime.execution_backend" => match value {
+            "host" => {
+                config.runtime.execution_backend = value.to_string();
+                Ok(())
+            }
+            "colima" if config.runtime.provider == "colima" => {
+                config.runtime.execution_backend = value.to_string();
+                Ok(())
+            }
+            "colima" => Err(Error::InvalidInput(
+                "runtime.execution_backend colima requires runtime.provider colima; run `trail env runtime setup colima --execution-backend colima`"
+                    .to_string(),
+            )),
+            other => Err(Error::InvalidInput(format!(
+                "runtime.execution_backend must be host or colima, got `{other}`"
             ))),
         },
         "runtime.colima_profile" => {

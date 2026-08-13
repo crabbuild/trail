@@ -201,16 +201,28 @@ impl CliRuntimeProvider {
             colima_toolchain: Some(toolchain.clone()),
         };
         provider.verify_ready()?;
+        if started {
+            toolchain.record_contained_profile(&profile)?;
+        } else if config.execution_backend == "colima"
+            && !toolchain.contained_profile_verified(&profile)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Colima profile `{profile}` is running without Trail's no-host-mount containment receipt; stop that profile and rerun `trail env runtime setup colima --profile {profile} --execution-backend colima`"
+            )));
+        }
+        let containment_verified = toolchain.contained_profile_verified(&profile);
         Ok((
             provider,
             EnvironmentRuntimeProviderReport {
                 provider: "colima".to_string(),
+                execution_backend: config.execution_backend.clone(),
                 status: "ready".to_string(),
-                profile: Some(profile),
+                profile: Some(profile.clone()),
+                lima_instance: Some(colima_lima_instance(&profile)),
                 docker_context: Some(context),
                 autostart: config.colima_autostart,
                 started,
-                containment: if started {
+                containment: if containment_verified {
                     "trail_no_host_mounts_v1"
                 } else {
                     "externally_started_profile"
@@ -650,7 +662,10 @@ impl RuntimeProvider for CliRuntimeProvider {
     }
 }
 
-fn configured_colima_profile(config: &RuntimeConfig, workspace_id: &str) -> Result<String> {
+pub(super) fn configured_colima_profile(
+    config: &RuntimeConfig,
+    workspace_id: &str,
+) -> Result<String> {
     if let Some(profile) = config.colima_profile.as_deref() {
         validate_colima_profile(profile)?;
         return Ok(profile.to_string());
@@ -660,6 +675,14 @@ fn configured_colima_profile(config: &RuntimeConfig, workspace_id: &str) -> Resu
 }
 
 fn colima_docker_context(profile: &str) -> String {
+    if profile == "default" {
+        "colima".to_string()
+    } else {
+        format!("colima-{profile}")
+    }
+}
+
+pub(super) fn colima_lima_instance(profile: &str) -> String {
     if profile == "default" {
         "colima".to_string()
     } else {
@@ -741,8 +764,10 @@ impl Trail {
                 Ok(match detected {
                     Ok(provider) => EnvironmentRuntimeProviderReport {
                         provider: provider.name,
+                        execution_backend: self.config.runtime.execution_backend.clone(),
                         status: "ready".to_string(),
                         profile: None,
+                        lima_instance: None,
                         docker_context: None,
                         autostart: false,
                         started: false,
@@ -753,8 +778,10 @@ impl Trail {
                     },
                     Err(error) => EnvironmentRuntimeProviderReport {
                         provider: configured.to_string(),
+                        execution_backend: self.config.runtime.execution_backend.clone(),
                         status: "unavailable".to_string(),
                         profile: None,
+                        lima_instance: None,
                         docker_context: None,
                         autostart: false,
                         started: false,
@@ -775,8 +802,10 @@ impl Trail {
                         Err(error) => {
                             return Ok(EnvironmentRuntimeProviderReport {
                                 provider: "colima".to_string(),
+                                execution_backend: self.config.runtime.execution_backend.clone(),
                                 status: "unavailable".to_string(),
-                                profile: Some(profile),
+                                profile: Some(profile.clone()),
+                                lima_instance: Some(colima_lima_instance(&profile)),
                                 docker_context: Some(context),
                                 autostart: self.config.runtime.colima_autostart,
                                 started: false,
@@ -790,8 +819,10 @@ impl Trail {
                 if !toolchain.state_is_ready() {
                     return Ok(EnvironmentRuntimeProviderReport {
                         provider: "colima".to_string(),
+                        execution_backend: self.config.runtime.execution_backend.clone(),
                         status: "stopped".to_string(),
-                        profile: Some(profile),
+                        profile: Some(profile.clone()),
+                        lima_instance: Some(colima_lima_instance(&profile)),
                         docker_context: Some(context),
                         autostart: self.config.runtime.colima_autostart,
                         started: false,
@@ -819,9 +850,13 @@ impl Trail {
                 } else {
                     false
                 };
+                let containment_verified = toolchain.contained_profile_verified(&profile);
+                let execution_ready =
+                    self.config.runtime.execution_backend != "colima" || containment_verified;
                 Ok(EnvironmentRuntimeProviderReport {
                     provider: "colima".to_string(),
-                    status: if ready {
+                    execution_backend: self.config.runtime.execution_backend.clone(),
+                    status: if ready && execution_ready {
                         "ready"
                     } else if running {
                         "unavailable"
@@ -829,11 +864,14 @@ impl Trail {
                         "stopped"
                     }
                     .to_string(),
-                    profile: Some(profile),
+                    profile: Some(profile.clone()),
+                    lima_instance: Some(colima_lima_instance(&profile)),
                     docker_context: Some(context),
                     autostart: self.config.runtime.colima_autostart,
                     started: false,
-                    containment: if ready {
+                    containment: if containment_verified {
+                        "trail_no_host_mounts_v1"
+                    } else if ready {
                         "externally_started_profile"
                     } else {
                         "not_verified"
@@ -841,7 +879,12 @@ impl Trail {
                     .to_string(),
                     toolchain_source: toolchain.source.to_string(),
                     toolchain_version: toolchain.version.clone(),
-                    reason: if ready {
+                    reason: if ready && !execution_ready {
+                        Some(
+                            "the running profile lacks Trail's no-host-mount containment receipt; stop it and rerun Colima setup before guest execution"
+                                .to_string(),
+                        )
+                    } else if ready {
                         None
                     } else if running {
                         Some(
@@ -864,6 +907,15 @@ impl Trail {
         profile: Option<&str>,
         start: bool,
     ) -> Result<EnvironmentRuntimeProviderReport> {
+        self.setup_colima_workspace_environment_runtime_with_backend(None, profile, start)
+    }
+
+    pub fn setup_colima_workspace_environment_runtime_with_backend(
+        &mut self,
+        execution_backend: Option<&str>,
+        profile: Option<&str>,
+        start: bool,
+    ) -> Result<EnvironmentRuntimeProviderReport> {
         let profile = profile
             .map(str::to_string)
             .unwrap_or(configured_colima_profile(
@@ -876,20 +928,46 @@ impl Trail {
 
         let mut desired = self.config.runtime.clone();
         desired.provider = "colima".to_string();
+        if let Some(execution_backend) = execution_backend {
+            match execution_backend {
+                "host" | "colima" => {
+                    desired.execution_backend = execution_backend.to_string();
+                }
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "runtime.execution_backend must be host or colima, got `{other}`"
+                    )));
+                }
+            }
+        }
+        if desired.execution_backend == "colima" && !start {
+            return Err(Error::InvalidInput(
+                "Colima managed execution requires a started and verified profile; remove --no-start or select --execution-backend host"
+                    .to_string(),
+            ));
+        }
         desired.colima_profile = Some(profile.clone());
         desired.colima_autostart = start;
         let report = if start {
-            CliRuntimeProvider::detect_colima_with_toolchain(
+            let report = CliRuntimeProvider::detect_colima_with_toolchain(
                 &desired,
                 &self.config.workspace.id.0,
                 toolchain.clone(),
             )?
-            .1
+            .1;
+            if desired.execution_backend == "colima" {
+                super::workspace_guest_execution::preflight_colima_guest_execution(
+                    &toolchain, &profile,
+                )?;
+            }
+            report
         } else {
             EnvironmentRuntimeProviderReport {
                 provider: "colima".to_string(),
+                execution_backend: desired.execution_backend.clone(),
                 status: "configured".to_string(),
                 profile: Some(profile.clone()),
+                lima_instance: Some(colima_lima_instance(&profile)),
                 docker_context: Some(colima_docker_context(&profile)),
                 autostart: false,
                 started: false,

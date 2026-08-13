@@ -1000,6 +1000,7 @@ trail lane spawn task-a --from main --workdir-mode auto
 trail lane mount task-a [--foreground]
 trail lane unmount task-a
 trail lane exec task-a -- <command>
+trail lane exec task-a --turn <TURN_ID> --timeout-secs 900 -- <command>
 trail lane checkpoint task-a -m "checkpoint"
 trail lane update task-a --from main
 trail lane space task-a
@@ -1025,6 +1026,14 @@ reconcile runtime resources, mount, execute, checkpoint durable source,
 dispose execution-owned runtime resources, and unmount. Every phase produces a
 durable receipt. Generated and scratch changes are accounted for but excluded
 from the source checkpoint.
+
+When `runtime.execution_backend=colima`, the mount remains a host-side input to
+Trail only. Trail streams a deterministic bounded projection through verified
+`limactl`, executes in a workspace/execution-derived guest namespace, exports a
+bounded candidate, validates it in host staging, rejects concurrent source
+edits, and applies only its source delta before the normal checkpoint. This is
+a data-plane backend beneath the shared lifecycle; agents, Trail storage, and
+checkpoint authority remain on the host.
 
 Shared report types include:
 

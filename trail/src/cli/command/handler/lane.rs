@@ -164,7 +164,12 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
         }
         LaneSubcommand::Exec(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.exec_lane_workspace(&args.name, &args.command)?;
+            let report = db.exec_lane_workspace_with_options(
+                &args.name,
+                &args.command,
+                args.turn.as_deref(),
+                args.timeout_secs,
+            )?;
             render_workspace_exec(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Mount(args) => {

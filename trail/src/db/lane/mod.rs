@@ -39,6 +39,7 @@ mod workspace_cmake;
 mod workspace_environment;
 mod workspace_git;
 mod workspace_go;
+mod workspace_guest_execution;
 mod workspace_layer;
 mod workspace_node;
 mod workspace_oci;

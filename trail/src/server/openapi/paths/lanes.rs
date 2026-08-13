@@ -247,7 +247,7 @@ pub(super) fn lane_paths() -> Value {
             ], Some("WorkspaceCheckpointRequest"), "WorkspaceCheckpointReport", true)
         },
         "/v1/lanes/{lane_or_id}/exec": {
-            "post": openapi_operation_with_response_schema("laneWorkspaceExec", "Execute in lane workspace", "Discover, synchronize, reconcile, mount, execute, checkpoint source changes, dispose runtime artifacts, and unmount one managed lane command.", vec![
+            "post": openapi_operation_with_response_schema("laneWorkspaceExec", "Execute in lane workspace", "Discover, synchronize, reconcile, mount, execute through the configured host or no-mount Colima backend, validate and checkpoint source changes, dispose runtime artifacts, and unmount one managed lane command.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], Some("WorkspaceExecRequest"), "WorkspaceExecReport", true)
         },

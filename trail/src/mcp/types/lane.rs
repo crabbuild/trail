@@ -193,6 +193,10 @@ pub(crate) struct WorkspaceExecArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
     pub(crate) command: Vec<String>,
+    #[serde(default)]
+    pub(crate) turn_id: Option<String>,
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

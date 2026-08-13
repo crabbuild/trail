@@ -554,6 +554,8 @@ mod tests {
             "colima",
             "--profile",
             "trail-ci",
+            "--execution-backend",
+            "colima",
             "--no-start",
         ])
         .expect("Colima runtime setup should parse");
@@ -570,6 +572,7 @@ mod tests {
             panic!("expected Colima runtime setup command");
         };
         assert_eq!(args.profile.as_deref(), Some("trail-ci"));
+        assert_eq!(args.execution_backend.as_deref(), Some("colima"));
         assert!(args.no_start);
     }
 

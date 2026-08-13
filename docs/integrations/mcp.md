@@ -50,6 +50,12 @@ task with:
 trail.begin_turn -> trail.add_message -> trail.span_start/span_end or trail.add_event -> trail.apply_patch or trail.sync_workdir -> trail.end_turn
 ```
 
+For commands that must see a filesystem, call `trail.lane_exec` with the open
+turn's `turn_id`. This associates the resulting operation and lifecycle with
+the turn. If `runtime.execution_backend=colima`, only that command data plane
+runs in the no-mount Lima guest; the MCP host and Trail server remain the
+contained host control plane. Test/eval tools use the same backend.
+
 When a run pauses for approval or interruption, use `trail.run_pause` and later
 `trail.run_resume`. If a branch goes sideways, use `trail.lane_rewind` with
 `record_current=true` to preserve the failed head before returning to a

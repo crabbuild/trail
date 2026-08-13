@@ -314,6 +314,12 @@ CLI daemon routing can read the token from `--daemon-token`, `TRAIL_DAEMON_TOKEN
 - Patch rejected: `PATCH_REJECTED`, exit 7.
 - Missing capability enforcement rejects the action; it does not silently run
   an untrusted resolver or constructor unsandboxed.
+- Colima lane execution accepts only a verified no-host-mount profile, passes
+  direct argv through explicit `limactl`, clears ambient credentials and Docker
+  endpoints, bounds projection/archive/output/time/concurrency, validates every
+  returned path and symlink before mutation, and rejects concurrent host source
+  edits. `.trail`, real Git state, host home, and the Docker socket never enter
+  the guest projection.
 - Secret-tainted output remains private and non-promotable even when its content
   would otherwise match a shared desired key.
 - Divergent ready content for one desired key and trust scope quarantines both

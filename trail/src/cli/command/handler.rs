@@ -521,7 +521,8 @@ fn handle_environment_command(ctx: &RuntimeContext, environment: EnvironmentComm
             },
             EnvironmentRuntimeSubcommand::Setup(setup) => match setup.command {
                 EnvironmentRuntimeSetupSubcommand::Colima(args) => {
-                    let report = db.setup_colima_workspace_environment_runtime(
+                    let report = db.setup_colima_workspace_environment_runtime_with_backend(
+                        args.execution_backend.as_deref(),
                         args.profile.as_deref(),
                         !args.no_start,
                     )?;

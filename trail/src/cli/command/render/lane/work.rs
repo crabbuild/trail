@@ -201,6 +201,14 @@ pub(crate) fn render_workspace_exec(
         ("Command".to_string(), report.command.join(" ")),
         ("View".to_string(), report.view_id.clone()),
         ("Backend".to_string(), report.backend.clone()),
+        (
+            "Execution backend".to_string(),
+            report.execution_backend.clone(),
+        ),
+        (
+            "Exit classification".to_string(),
+            report.exit_classification.clone(),
+        ),
         ("Generation".to_string(), report.generation.to_string()),
         (
             "Execution".to_string(),

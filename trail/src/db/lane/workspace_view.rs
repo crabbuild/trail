@@ -856,36 +856,109 @@ impl Trail {
         lane: &str,
         command: &[String],
     ) -> Result<WorkspaceExecReport> {
+        self.exec_lane_workspace_for_turn(lane, command, None)
+    }
+
+    pub fn exec_lane_workspace_for_turn(
+        &mut self,
+        lane: &str,
+        command: &[String],
+        turn_id: Option<&str>,
+    ) -> Result<WorkspaceExecReport> {
+        self.exec_lane_workspace_with_options(lane, command, turn_id, None)
+    }
+
+    pub fn exec_lane_workspace_with_options(
+        &mut self,
+        lane: &str,
+        command: &[String],
+        turn_id: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<WorkspaceExecReport> {
+        if timeout_secs == Some(0)
+            || timeout_secs.is_some_and(|timeout| {
+                timeout > super::workspace_guest_execution::MAX_GUEST_COMMAND_TIMEOUT_SECS
+            })
+        {
+            return Err(Error::InvalidInput(format!(
+                "managed lane execution timeout must be between 1 and {} seconds",
+                super::workspace_guest_execution::MAX_GUEST_COMMAND_TIMEOUT_SECS
+            )));
+        }
+        let turn = turn_id.map(|turn_id| self.lane_turn(turn_id)).transpose()?;
+        if let Some(turn) = turn.as_ref() {
+            let branch = self.lane_branch(lane)?;
+            if turn.lane_id != branch.lane_id {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` does not belong to lane `{lane}`",
+                    turn.turn_id
+                )));
+            }
+            if turn.ended_at.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` is already ended",
+                    turn.turn_id
+                )));
+            }
+        }
         let mut context = self.prepare_managed_lane_execution(lane, "lane_exec", command)?;
+        if let Some(turn) = turn {
+            context.session_id = turn.session_id;
+            context.trace_id = Some(default_trace_id_for_turn(&turn.turn_id));
+            context.turn_id = Some(turn.turn_id);
+        }
         let view = context.view.clone().ok_or_else(|| {
             Error::InvalidInput(format!(
                 "lane `{lane}` does not have a layered workspace view"
             ))
         })?;
-        let exit_code = match self.run_workspace_command(&view, &context.source_root, command) {
+        let guest_execution = context.execution_backend == "colima";
+        let mut timed_out = false;
+        let command_result = if guest_execution {
+            self.run_colima_lane_command(
+                &mut context,
+                &view,
+                command,
+                Duration::from_secs(timeout_secs.unwrap_or(
+                    super::workspace_guest_execution::DEFAULT_GUEST_COMMAND_TIMEOUT_SECS,
+                )),
+            )
+            .map(|run| {
+                timed_out = run.timed_out;
+                run.exit_code.unwrap_or(128)
+            })
+        } else {
+            self.run_workspace_command(&view, &context.source_root, command)
+        };
+        let exit_code = match command_result {
             Ok(exit_code) => {
-                self.mark_managed_lane_execution_command(
-                    &mut context,
-                    if exit_code == 0 {
-                        "succeeded"
-                    } else {
-                        "failed"
-                    },
-                    None,
-                    Some(exit_code),
-                )?;
+                if !guest_execution {
+                    self.mark_managed_lane_execution_command(
+                        &mut context,
+                        if exit_code == 0 {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        None,
+                        Some(exit_code),
+                    )?;
+                }
                 exit_code
             }
             Err(error) => {
-                self.mark_managed_lane_execution_command(
-                    &mut context,
-                    "failed",
-                    Some(&error.to_string()),
-                    None,
-                )?;
-                let lifecycle = self.finalize_managed_lane_execution(
+                if !guest_execution {
+                    self.mark_managed_lane_execution_command(
+                        &mut context,
+                        "failed",
+                        Some(&error.to_string()),
+                        None,
+                    )?;
+                }
+                let lifecycle = self.finalize_managed_lane_execution_for_turn(
                     context,
                     Some("Managed lane execution checkpoint".to_string()),
+                    turn_id,
                 );
                 let finalization_errors = [
                     lifecycle.checkpoint_error.as_deref(),
@@ -903,9 +976,10 @@ impl Trail {
                 )));
             }
         };
-        let lifecycle = self.finalize_managed_lane_execution(
+        let lifecycle = self.finalize_managed_lane_execution_for_turn(
             context,
             Some("Managed lane execution checkpoint".to_string()),
+            turn_id,
         );
         self.insert_lane_event(
             &view.lane_id,
@@ -920,6 +994,9 @@ impl Trail {
                 "command_fingerprint": sha256_hex(&serde_json::to_vec(command)?),
                 "exit_code": exit_code,
                 "execution_id": lifecycle.execution_id,
+                "session_id": lifecycle.session_id,
+                "turn_id": lifecycle.turn_id,
+                "trace_id": lifecycle.trace_id,
             }),
         )?;
         Ok(WorkspaceExecReport {
@@ -933,8 +1010,22 @@ impl Trail {
             generation: view.generation,
             environment_generation: lifecycle.environment_generation.clone(),
             backend: view.backend,
+            execution_backend: lifecycle
+                .preparation
+                .as_ref()
+                .map(|preparation| preparation.execution_backend.clone())
+                .unwrap_or_else(|| "host".to_string()),
             command: command.to_vec(),
             exit_code,
+            timed_out,
+            exit_classification: if timed_out {
+                "timed_out"
+            } else if exit_code == 0 {
+                "succeeded"
+            } else {
+                "command_failed"
+            }
+            .to_string(),
             lifecycle,
         })
     }

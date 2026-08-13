@@ -134,7 +134,12 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
         "trail.lane_exec" => {
             let args: WorkspaceExecArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;
-            tool_result(db.exec_lane_workspace(&lane, &args.command)?)
+            tool_result(db.exec_lane_workspace_with_options(
+                &lane,
+                &args.command,
+                args.turn_id.as_deref(),
+                args.timeout_secs,
+            )?)
         }
         "trail.deps_status" => {
             let args: LaneHandleArgs = parse_args(arguments)?;

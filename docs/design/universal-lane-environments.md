@@ -593,6 +593,16 @@ verifies the observed repository digest before creating anything. Existing names
 adopted only when Trail ownership labels match exactly. A dead lifecycle owner is marked
 `orphaned` on reopen and safely inspected on the next reconcile.
 
+Colima can also be selected as the managed-command data plane. Trail resolves
+the exact profile to its Lima instance and uses a deterministic tar protocol
+instead of mounting the host lane. Source and accepted portable symlinks enter
+an execution namespace under bounded limits; secret/internal state does not.
+Runtime bindings stay on guest loopback because both the Colima Docker daemon
+and command inhabit the VM. Trail validates the exported candidate and imports
+only source changes before the existing checkpoint barrier. The adapter remains
+a planner, the host Trail process retains publication authority, and the agent
+provider remains a separately contained host control plane.
+
 ## Monorepos and multiple lanes
 
 Discovery roots are explicit. A monorepo can have many overlapping environment graphs,

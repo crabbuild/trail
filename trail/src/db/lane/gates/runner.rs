@@ -232,20 +232,38 @@ impl Trail {
         };
 
         let environment = managed.environment.clone();
-        let run = match run_command_with_timeout_env(
-            &command,
-            &managed.workdir,
-            Duration::from_secs(timeout_secs),
-            &environment,
-        ) {
+        let guest_execution = managed.execution_backend == "colima";
+        let run_result = if guest_execution {
+            let view = managed.view.clone().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "lane `{lane}` does not have a layered workspace view required for Colima execution"
+                ))
+            })?;
+            self.run_colima_managed_command(
+                &mut managed,
+                &view,
+                &command,
+                Some(Duration::from_secs(timeout_secs)),
+            )
+        } else {
+            run_command_with_timeout_env(
+                &command,
+                &managed.workdir,
+                Duration::from_secs(timeout_secs),
+                &environment,
+            )
+        };
+        let run = match run_result {
             Ok(run) => run,
             Err(error) => {
-                self.mark_managed_lane_execution_command(
-                    &mut managed,
-                    "failed",
-                    Some(&error.to_string()),
-                    None,
-                )?;
+                if !guest_execution {
+                    self.mark_managed_lane_execution_command(
+                        &mut managed,
+                        "failed",
+                        Some(&error.to_string()),
+                        None,
+                    )?;
+                }
                 let lifecycle = self.finalize_managed_lane_execution(
                     managed,
                     Some(format!("Managed lane {kind} failed-launch checkpoint")),
@@ -268,12 +286,14 @@ impl Trail {
         };
         let execution_error = (!run.success && run.exit_code.is_none())
             .then(|| String::from_utf8_lossy(&run.stderr).trim().to_string());
-        self.mark_managed_lane_execution_command(
-            &mut managed,
-            if run.success { "succeeded" } else { "failed" },
-            execution_error.as_deref(),
-            run.exit_code,
-        )?;
+        if !guest_execution {
+            self.mark_managed_lane_execution_command(
+                &mut managed,
+                if run.success { "succeeded" } else { "failed" },
+                execution_error.as_deref(),
+                run.exit_code,
+            )?;
+        }
         let lifecycle = self.finalize_managed_lane_execution(
             managed,
             Some(format!("Managed lane {kind} checkpoint")),

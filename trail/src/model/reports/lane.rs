@@ -728,8 +728,12 @@ pub struct EnvironmentRuntimeResourceReport {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentRuntimeProviderReport {
     pub provider: String,
+    #[serde(default = "default_runtime_execution_backend_report")]
+    pub execution_backend: String,
     pub status: String,
     pub profile: Option<String>,
+    #[serde(default)]
+    pub lima_instance: Option<String>,
     pub docker_context: Option<String>,
     pub autostart: bool,
     pub started: bool,
@@ -739,6 +743,10 @@ pub struct EnvironmentRuntimeProviderReport {
     #[serde(default)]
     pub toolchain_version: Option<String>,
     pub reason: Option<String>,
+}
+
+fn default_runtime_execution_backend_report() -> String {
+    "host".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1110,9 +1118,19 @@ pub struct WorkspaceExecReport {
     pub generation: u64,
     pub environment_generation: Option<String>,
     pub backend: String,
+    #[serde(default = "default_runtime_execution_backend_report")]
+    pub execution_backend: String,
     pub command: Vec<String>,
     pub exit_code: i32,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default = "default_workspace_exec_classification")]
+    pub exit_classification: String,
     pub lifecycle: ManagedExecutionLifecycleReport,
+}
+
+fn default_workspace_exec_classification() -> String {
+    "legacy_unclassified".to_string()
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1155,6 +1173,8 @@ pub struct ManagedExecutionOutputPin {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedExecutionPreparationReceipt {
     pub source_root: ObjectId,
+    #[serde(default = "default_runtime_execution_backend_report")]
+    pub execution_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1164,6 +1184,39 @@ pub struct ManagedExecutionPreparationReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_generation: Option<String>,
     pub output_pins: Vec<ManagedExecutionOutputPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<ManagedExecutionSandboxPreparationReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionSandboxPreparationReceipt {
+    pub backend: String,
+    pub provider: String,
+    pub profile: String,
+    pub lima_instance: String,
+    pub guest_namespace: String,
+    pub toolchain_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_version: Option<String>,
+    pub input_digest: String,
+    pub projected_entries: u64,
+    pub projected_bytes: u64,
+    pub entry_limit: u64,
+    pub total_bytes_limit: u64,
+    pub file_bytes_limit: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_bindings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedExecutionSandboxFinalizationReceipt {
+    pub output_digest: String,
+    pub imported_paths: Vec<String>,
+    pub removed_paths: Vec<String>,
+    pub unchanged: bool,
+    pub cleanup_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1190,6 +1243,8 @@ pub struct ManagedExecutionFinalizationReceipt {
     pub complete: bool,
     pub sealing_decisions: Vec<ManagedExecutionSealingDecision>,
     pub errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<ManagedExecutionSandboxFinalizationReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1333,6 +1388,12 @@ pub struct ManagedExecutionLifecycleReport {
     pub execution_id: String,
     pub surface: String,
     pub command_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation: Option<ManagedExecutionPreparationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1786,8 +1847,10 @@ mod workdir_mode_tests {
     fn runtime_provider_report_has_stable_explicit_fields() {
         let report = EnvironmentRuntimeProviderReport {
             provider: "colima".to_string(),
+            execution_backend: "colima".to_string(),
             status: "ready".to_string(),
             profile: Some("trail-workspace".to_string()),
+            lima_instance: Some("colima-trail-workspace".to_string()),
             docker_context: Some("colima-trail-workspace".to_string()),
             autostart: true,
             started: true,
@@ -1803,8 +1866,10 @@ mod workdir_mode_tests {
             value,
             serde_json::json!({
                 "provider": "colima",
+                "execution_backend": "colima",
                 "status": "ready",
                 "profile": "trail-workspace",
+                "lima_instance": "colima-trail-workspace",
                 "docker_context": "colima-trail-workspace",
                 "autostart": true,
                 "started": true,
@@ -1833,12 +1898,18 @@ mod workdir_mode_tests {
         .unwrap();
         assert!(legacy.preparation.is_none());
         assert!(legacy.finalization.is_none());
+        assert!(legacy.session_id.is_none());
+        assert!(legacy.turn_id.is_none());
+        assert!(legacy.trace_id.is_none());
 
         let current: ManagedExecutionLifecycleReport = serde_json::from_value(
             serde_json::json!({
                 "execution_id": "exec-current",
                 "surface": "lane_test",
                 "command_fingerprint": "command",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "trace_id": "trace-1",
                 "preparation": {
                     "source_root": "object_source",
                     "view_id": "view-1",
@@ -1882,6 +1953,9 @@ mod workdir_mode_tests {
         )
         .unwrap();
         let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["turn_id"], "turn-1");
+        assert_eq!(value["trace_id"], "trace-1");
         assert_eq!(
             value["preparation"]["missing_resolution_policy"],
             "explicit"

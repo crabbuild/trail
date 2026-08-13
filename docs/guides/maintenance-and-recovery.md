@@ -113,6 +113,19 @@ trail env artifact quarantine list
   resolution. Never delete rows or CAS files manually.
 - After restore, rerun sync for each retained lane before managed execution.
 
+## Interrupted Colima Guest Execution
+
+`trail doctor` includes `managed_guest_executions` with bounded counts for
+live, safely recoverable, ambiguous, and terminal receipts. Trail automatically
+cleans an abandoned namespace only before candidate import. It fails closed for
+an interrupted execute/export/import/checkpoint boundary because discarding or
+reapplying state could overwrite lane work.
+
+For an ambiguous receipt, inspect the lane workdir and history, checkpoint
+intentional source with `trail lane checkpoint <LANE>`, and retry after the
+state is understood. Do not edit `.trail/managed-executions`, delete a guest
+namespace, or stop the shared Colima profile as a repair shortcut.
+
 ## Schema-v1 Upgrade and Rollback Boundary
 
 Trail still accepts exactly SQLite schema v1 and has no in-place database

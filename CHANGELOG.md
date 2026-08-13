@@ -19,6 +19,15 @@ All notable changes to Trail are documented in this file. Trail follows
   SHA-256 identities, retains their licenses, and atomically publishes them in
   a Trail-owned cache. All non-setup provider operations remain network-free.
 
+- Managed lane commands and test/eval gates can now select a no-host-mount
+  Colima/Lima execution backend. Trail deterministically projects bounded lane
+  state into an execution-scoped guest namespace, runs direct argv with a
+  bounded environment and timeout, validates and imports only source changes,
+  checkpoints non-zero and timed-out results, and cleans up without stopping
+  the profile. CLI, HTTP, MCP, OpenAPI, lifecycle receipts, turn provenance, and
+  doctor recovery diagnostics share the same contract; `host` remains the
+  compatibility default.
+
 ## [0.4.0] - 2026-08-12
 
 ### Added

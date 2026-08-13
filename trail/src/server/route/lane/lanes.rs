@@ -589,7 +589,12 @@ pub(super) fn handle_lane_resources(
     {
         let lane = db.resolve_lane_handle(parts[2])?;
         let body: WorkspaceExecRequest = serde_json::from_slice(&request.body)?;
-        let report = db.exec_lane_workspace(&lane, &body.command)?;
+        let report = db.exec_lane_workspace_with_options(
+            &lane,
+            &body.command,
+            body.turn_id.as_deref(),
+            body.timeout_secs,
+        )?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

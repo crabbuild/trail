@@ -302,7 +302,7 @@ pub(super) fn lane_schemas() -> Value {
             "required": ["phase", "status"],
             "additionalProperties": false,
             "properties": {
-                "phase": { "type": "string", "enum": ["resolve", "discover_plan", "sync_all", "prefetch", "reconcile", "mount", "execute", "checkpoint", "dispose", "unmount"] },
+                "phase": { "type": "string", "enum": ["resolve", "discover_plan", "sync_all", "prefetch", "reconcile", "mount", "guest_project", "execute", "guest_export", "guest_import", "guest_cleanup", "checkpoint", "dispose", "unmount"] },
                 "status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
                 "error": { "type": "string" },
                 "details": { "$ref": "#/components/schemas/JsonValue" }
@@ -339,16 +339,52 @@ pub(super) fn lane_schemas() -> Value {
         },
         "ManagedExecutionPreparationReceipt": {
             "type": "object",
-            "required": ["source_root", "missing_resolution_policy", "resolution_pins", "output_pins"],
+            "required": ["source_root", "execution_backend", "missing_resolution_policy", "resolution_pins", "output_pins"],
             "additionalProperties": false,
             "properties": {
                 "source_root": { "type": "string" },
+                "execution_backend": { "type": "string", "enum": ["host", "colima"] },
                 "view_id": { "type": "string" },
                 "view_generation": { "type": "integer", "minimum": 0 },
                 "missing_resolution_policy": { "type": "string", "enum": ["explicit"] },
                 "resolution_pins": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionResolutionPin" } },
                 "environment_generation": { "type": "string" },
-                "output_pins": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionOutputPin" } }
+                "output_pins": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionOutputPin" } },
+                "sandbox": { "$ref": "#/components/schemas/ManagedExecutionSandboxPreparationReceipt" }
+            }
+        },
+        "ManagedExecutionSandboxPreparationReceipt": {
+            "type": "object",
+            "required": ["backend", "provider", "profile", "lima_instance", "guest_namespace", "toolchain_source", "input_digest", "projected_entries", "projected_bytes", "entry_limit", "total_bytes_limit", "file_bytes_limit"],
+            "additionalProperties": false,
+            "properties": {
+                "backend": { "type": "string", "enum": ["colima"] },
+                "provider": { "type": "string", "enum": ["colima"] },
+                "profile": { "type": "string" },
+                "lima_instance": { "type": "string" },
+                "guest_namespace": { "type": "string" },
+                "toolchain_source": { "type": "string", "enum": ["system", "trail_managed"] },
+                "toolchain_version": { "type": "string" },
+                "input_digest": { "type": "string" },
+                "projected_entries": { "type": "integer", "minimum": 0 },
+                "projected_bytes": { "type": "integer", "minimum": 0 },
+                "entry_limit": { "type": "integer", "minimum": 1 },
+                "total_bytes_limit": { "type": "integer", "minimum": 1 },
+                "file_bytes_limit": { "type": "integer", "minimum": 1 },
+                "service_bindings": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ManagedExecutionSandboxFinalizationReceipt": {
+            "type": "object",
+            "required": ["output_digest", "imported_paths", "removed_paths", "unchanged", "cleanup_status"],
+            "additionalProperties": false,
+            "properties": {
+                "output_digest": { "type": "string" },
+                "imported_paths": { "type": "array", "items": { "type": "string" } },
+                "removed_paths": { "type": "array", "items": { "type": "string" } },
+                "unchanged": { "type": "boolean" },
+                "cleanup_status": { "type": "string", "enum": ["succeeded", "failed"] },
+                "cleanup_error": { "type": "string" }
             }
         },
         "ManagedExecutionSealingDecision": {
@@ -378,7 +414,8 @@ pub(super) fn lane_schemas() -> Value {
                 "unmount_status": { "type": "string", "enum": ["succeeded", "failed", "skipped"] },
                 "complete": { "type": "boolean" },
                 "sealing_decisions": { "type": "array", "items": { "$ref": "#/components/schemas/ManagedExecutionSealingDecision" } },
-                "errors": { "type": "array", "items": { "type": "string" } }
+                "errors": { "type": "array", "items": { "type": "string" } },
+                "sandbox": { "$ref": "#/components/schemas/ManagedExecutionSandboxFinalizationReceipt" }
             }
         },
         "ManagedExecutionLifecycleReport": {
@@ -389,6 +426,9 @@ pub(super) fn lane_schemas() -> Value {
                 "execution_id": { "type": "string" },
                 "surface": { "type": "string", "enum": ["lane_exec", "lane_test", "lane_eval", "terminal_agent", "acp_prompt"] },
                 "command_fingerprint": { "type": "string" },
+                "session_id": { "type": "string" },
+                "turn_id": { "type": "string" },
+                "trace_id": { "type": "string" },
                 "preparation": { "$ref": "#/components/schemas/ManagedExecutionPreparationReceipt" },
                 "environment_generation": { "type": "string" },
                 "checkpoint": { "$ref": "#/components/schemas/WorkspaceCheckpointReport" },
@@ -402,7 +442,7 @@ pub(super) fn lane_schemas() -> Value {
         },
         "WorkspaceExecReport": {
             "type": "object",
-            "required": ["view_id", "lane_id", "source_root", "generation", "environment_generation", "backend", "command", "exit_code", "lifecycle"],
+            "required": ["view_id", "lane_id", "source_root", "generation", "environment_generation", "backend", "execution_backend", "command", "exit_code", "timed_out", "exit_classification", "lifecycle"],
             "additionalProperties": false,
             "properties": {
                 "view_id": { "type": "string" },
@@ -411,8 +451,11 @@ pub(super) fn lane_schemas() -> Value {
                 "generation": { "type": "integer", "minimum": 0 },
                 "environment_generation": { "type": ["string", "null"] },
                 "backend": { "type": "string" },
+                "execution_backend": { "type": "string", "enum": ["host", "colima"] },
                 "command": { "type": "array", "items": { "type": "string" } },
                 "exit_code": { "type": "integer" },
+                "timed_out": { "type": "boolean" },
+                "exit_classification": { "type": "string", "enum": ["succeeded", "command_failed", "timed_out", "legacy_unclassified"] },
                 "lifecycle": { "$ref": "#/components/schemas/ManagedExecutionLifecycleReport" }
             }
         },
@@ -877,7 +920,9 @@ pub(super) fn lane_schemas() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1
-                }
+                },
+                "turn_id": { "type": "string", "description": "Optional open lane turn receiving the checkpoint and session/turn/trace provenance." },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 86400, "description": "Optional Colima guest command timeout; defaults to 3600 seconds." }
             }
         },
         "DependencySyncRequest": {

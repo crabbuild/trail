@@ -121,6 +121,8 @@ pub struct WorkspaceViewsConfig {
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_provider")]
     pub provider: String,
+    #[serde(default = "default_runtime_execution_backend")]
+    pub execution_backend: String,
     #[serde(default)]
     pub colima_profile: Option<String>,
     #[serde(default = "default_colima_autostart")]
@@ -162,6 +164,7 @@ fn default_workspace_views_config() -> WorkspaceViewsConfig {
 fn default_runtime_config() -> RuntimeConfig {
     RuntimeConfig {
         provider: default_runtime_provider(),
+        execution_backend: default_runtime_execution_backend(),
         colima_profile: None,
         colima_autostart: default_colima_autostart(),
     }
@@ -169,6 +172,10 @@ fn default_runtime_config() -> RuntimeConfig {
 
 fn default_runtime_provider() -> String {
     "auto".to_string()
+}
+
+fn default_runtime_execution_backend() -> String {
+    "host".to_string()
 }
 
 fn default_colima_autostart() -> bool {

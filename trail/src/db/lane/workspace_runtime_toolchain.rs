@@ -21,6 +21,8 @@ const RECEIPT_SCHEMA: u32 = 1;
 const MAX_ARCHIVE_ENTRIES: usize = 8_192;
 const MAX_EXPANDED_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+const CONTAINED_PROFILE_RECEIPT_SCHEMA: u32 = 1;
+const CONTAINED_PROFILE_CONTRACT: &str = "trail_no_host_mounts_v1";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const THIRD_PARTY_NOTICES: &[u8] =
@@ -121,6 +123,7 @@ const DARWIN_X86_64_MANIFEST: ManagedManifest = ManagedManifest {
 #[derive(Clone, Debug)]
 pub(super) struct ColimaToolchain {
     pub(super) colima: PathBuf,
+    pub(super) limactl: PathBuf,
     pub(super) docker: PathBuf,
     managed_path: Option<OsString>,
     state: ColimaStatePaths,
@@ -149,7 +152,36 @@ struct ManagedToolchainReceipt {
     docker_version: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContainedProfileReceipt {
+    schema: u32,
+    profile: String,
+    contract: String,
+    toolchain_source: String,
+    toolchain_version: Option<String>,
+}
+
 impl ColimaToolchain {
+    #[cfg(test)]
+    pub(super) fn for_guest_protocol_test(limactl: PathBuf, state_root: &Path) -> Self {
+        Self {
+            colima: limactl.clone(),
+            limactl: limactl.clone(),
+            docker: limactl,
+            managed_path: None,
+            state: ColimaStatePaths {
+                colima_home: state_root.join("colima"),
+                lima_home: state_root.join("lima"),
+                docker_config: state_root.join("docker"),
+                colima_cache: state_root.join("cache"),
+            },
+            source: "system",
+            version: None,
+            managed_vz: false,
+        }
+    }
+
     pub(super) fn resolve(allow_install: bool) -> Result<Self> {
         if let Ok(system) = Self::resolve_system() {
             return Ok(system);
@@ -173,10 +205,11 @@ impl ColimaToolchain {
 
     fn resolve_system() -> Result<Self> {
         let colima = super::workspace_environment::resolve_workspace_tool_executable("colima")?;
-        let _limactl = super::workspace_environment::resolve_workspace_tool_executable("limactl")?;
+        let limactl = super::workspace_environment::resolve_workspace_tool_executable("limactl")?;
         let docker = super::workspace_environment::resolve_workspace_tool_executable("docker")?;
         Ok(Self {
             colima: colima.path,
+            limactl: limactl.path,
             docker: docker.path,
             managed_path: None,
             state: colima_state_paths()?,
@@ -190,6 +223,7 @@ impl ColimaToolchain {
         validate_managed_toolchain(manifest, install_dir)?;
         Ok(Self {
             colima: install_dir.join("bin/colima"),
+            limactl: install_dir.join("bin/limactl"),
             docker: install_dir.join("bin/docker"),
             managed_path: Some(prepend_path(&install_dir.join("bin"))?),
             state: colima_state_paths()?,
@@ -230,6 +264,55 @@ impl ColimaToolchain {
         let mut command = self.command(&self.docker);
         command.env_remove("DOCKER_HOST");
         command
+    }
+
+    pub(super) fn limactl_command(&self) -> Command {
+        self.command(&self.limactl)
+    }
+
+    pub(super) fn record_contained_profile(&self, profile: &str) -> Result<()> {
+        let directory = self.state.colima_home.join("trail-profile-receipts");
+        ensure_private_directory(&directory)?;
+        let receipt = ContainedProfileReceipt {
+            schema: CONTAINED_PROFILE_RECEIPT_SCHEMA,
+            profile: profile.to_string(),
+            contract: CONTAINED_PROFILE_CONTRACT.to_string(),
+            toolchain_source: self.source.to_string(),
+            toolchain_version: self.version.clone(),
+        };
+        write_file_atomic(
+            &directory.join(format!("{profile}.json")),
+            &serde_json::to_vec_pretty(&receipt)?,
+            false,
+        )
+    }
+
+    pub(super) fn contained_profile_verified(&self, profile: &str) -> bool {
+        let path = self
+            .state
+            .colima_home
+            .join("trail-profile-receipts")
+            .join(format!("{profile}.json"));
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_RECEIPT_BYTES
+        {
+            return false;
+        }
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        let Ok(receipt) = serde_json::from_slice::<ContainedProfileReceipt>(&bytes) else {
+            return false;
+        };
+        receipt.schema == CONTAINED_PROFILE_RECEIPT_SCHEMA
+            && receipt.profile == profile
+            && receipt.contract == CONTAINED_PROFILE_CONTRACT
+            && receipt.toolchain_source == self.source
+            && receipt.toolchain_version == self.version
     }
 
     fn command(&self, executable: &Path) -> Command {

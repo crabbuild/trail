@@ -222,10 +222,12 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.lane_exec",
             "title": "Execute In Lane Workspace",
-            "description": "Mount a layered lane for one open-world command with isolated cache and target variables.",
+            "description": "Run one managed lane command through the workspace's configured host or no-mount Colima backend, then validate and checkpoint source changes with optional open-turn provenance.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" },
-                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "turn_id": { "type": "string" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 86400 }
             }), vec!["lane", "command"])
         },
         {

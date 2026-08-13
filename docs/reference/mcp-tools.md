@@ -271,6 +271,17 @@ before non-dry-run apply.
 - `trail.lane_handoff`
 - `trail.lane_rewind`
 - `trail.lane_remove`
+- `trail.lane_workspace`
+- `trail.lane_mount`
+- `trail.lane_unmount`
+- `trail.lane_checkpoint`
+- `trail.lane_exec`
+
+`trail.lane_exec` accepts a direct `command` argv plus optional open-lane
+`turn_id` and Colima `timeout_secs` (1 through 86400). It uses the workspace's
+configured execution backend and returns the shared managed lifecycle,
+checkpoint, sandbox, cleanup, and session/turn/trace provenance report. The
+Colima backend never exposes a host mount or Docker socket to the guest.
 
 ## Lane Environments and Artifacts
 

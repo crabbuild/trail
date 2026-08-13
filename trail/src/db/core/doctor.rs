@@ -27,6 +27,7 @@ impl Trail {
 
         doctor_runtime::push_write_lock_check(self, &mut checks);
         doctor_runtime::push_daemon_token_check(self, &mut checks);
+        checks.push(self.managed_guest_recovery_doctor_check());
         doctor_runtime::push_fsck_check(self, &mut checks);
 
         doctor_activity::push_pending_approvals_check(self, &mut checks);

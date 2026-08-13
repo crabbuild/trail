@@ -24,9 +24,17 @@ fn lane_exec_runs_the_ordered_managed_lifecycle_and_checkpoints_only_source() {
         false,
     )
     .unwrap();
+    let turn = db
+        .begin_lane_turn(
+            "managed",
+            None,
+            Some("managed execution provenance".to_string()),
+            None,
+        )
+        .unwrap();
 
     let report = db
-        .exec_lane_workspace(
+        .exec_lane_workspace_for_turn(
             "managed",
             &[
                 "/bin/sh".into(),
@@ -34,11 +42,22 @@ fn lane_exec_runs_the_ordered_managed_lifecycle_and_checkpoints_only_source() {
                 "printf durable > source.txt; mkdir -p target; printf disposable > target/build.bin; exit 7"
                     .into(),
             ],
+            Some(&turn.turn.turn_id),
         )
         .unwrap();
 
     assert_eq!(report.exit_code, 7);
     assert_eq!(report.lifecycle.surface, "lane_exec");
+    assert_eq!(report.lifecycle.turn_id, Some(turn.turn.turn_id.clone()));
+    assert_eq!(
+        report.lifecycle.session_id,
+        Some(turn.session.session_id.clone())
+    );
+    assert!(report
+        .lifecycle
+        .trace_id
+        .as_deref()
+        .is_some_and(|trace_id| trace_id.starts_with("trace_")));
     let checkpoint = report
         .lifecycle
         .checkpoint
@@ -203,6 +222,44 @@ fn root_managed_preparation_ignores_unrelated_nested_environment_components() {
         .unwrap();
     assert_eq!(context.lane, "root-only");
     assert!(context.environment_generation.is_none());
+}
+
+#[test]
+fn lane_exec_rejects_cross_lane_turn_before_command_launch() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("README.md"), "root\n").unwrap();
+    Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(root.path()).unwrap();
+    for lane in ["first", "second"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::PortableCopy,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+    let turn = db
+        .begin_lane_turn("second", None, Some("second lane".to_string()), None)
+        .unwrap();
+    let marker = root.path().join("must-not-run");
+    let error = db
+        .exec_lane_workspace_for_turn(
+            "first",
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", marker.display()),
+            ],
+            Some(&turn.turn.turn_id),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong to lane"));
+    assert!(!marker.exists());
 }
 
 #[test]

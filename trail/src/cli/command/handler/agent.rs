@@ -1664,6 +1664,8 @@ fn run_terminal_agent_task(
         }
         .to_string(),
         sandbox_backend,
+        control_plane_backend: "host".to_string(),
+        managed_command_backend: managed.execution_backend.clone(),
         filesystem_enforcement: filesystem_enforcement.clone(),
         lane_root: workdir.clone(),
         git_work_tree,

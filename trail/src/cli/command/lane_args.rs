@@ -289,6 +289,12 @@ pub(super) struct LaneSpaceArgs {
 #[derive(Args)]
 pub(super) struct LaneExecArgs {
     pub(super) name: String,
+    /// Associate the execution checkpoint and provenance with an open lane turn.
+    #[arg(long)]
+    pub(super) turn: Option<String>,
+    /// Bound Colima guest command duration (default: 3600 seconds).
+    #[arg(long)]
+    pub(super) timeout_secs: Option<u64>,
     #[arg(last = true, num_args = 1.., required = true)]
     pub(super) command: Vec<String>,
 }

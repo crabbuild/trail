@@ -371,6 +371,19 @@ trail env runtime reconcile <LANE>
 trail env runtime stop <LANE>
 ```
 
+Add `--execution-backend colima` when managed `lane exec`, test, and eval
+commands should execute inside the Lima guest rather than on the host:
+
+```sh
+trail env runtime setup colima --execution-backend colima
+trail lane exec <LANE> --timeout-secs 900 -- cargo test
+```
+
+The default remains `host`. Guest setup requires a running, preflighted profile;
+it cannot be combined with `--no-start`. See
+[Colima-sandboxed lane execution](../../lanes/colima-sandboxed-execution.md) for
+the projection/import protocol, agent workflow, guarantees, and recovery model.
+
 The default profile name is stable and workspace-derived. Override it only with
 a contained profile dedicated to Trail:
 
@@ -417,9 +430,10 @@ trail env runtime setup colima --profile trail-ci --no-start
 trail config set runtime.colima_autostart true
 ```
 
-The typed provider report contains `provider`, `status`, `profile`,
-`docker_context`, `autostart`, `started`, `containment`, `toolchain_source`,
-`toolchain_version`, and `reason`. `toolchain_source` is `system`,
+The typed provider report contains `provider`, `execution_backend`, `status`,
+`profile`, `lima_instance`, `docker_context`, `autostart`, `started`,
+`containment`, `toolchain_source`, `toolchain_version`, and `reason`.
+`toolchain_source` is `system`,
 `trail_managed`, or `unavailable`; managed reports include the complete pinned
 version identity. Provider
 setup/status and their provider report are currently workspace-local Rust and
@@ -433,6 +447,7 @@ stops only Trail-owned lane containers, while named volumes follow the existing
 lane runtime retention rules. To return to ambient Docker/Podman detection:
 
 ```sh
+trail config set runtime.execution_backend host
 trail config set runtime.provider auto
 ```
 

@@ -233,6 +233,12 @@ pub(crate) fn config_entries_from(config: &TrailConfig) -> Vec<ConfigEntry> {
             false,
         ),
         config_entry(
+            "runtime.execution_backend",
+            &config.runtime.execution_backend,
+            "string",
+            false,
+        ),
+        config_entry(
             "runtime.colima_profile",
             config.runtime.colima_profile.as_deref().unwrap_or_default(),
             "string",
